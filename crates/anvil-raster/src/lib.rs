@@ -1224,10 +1224,13 @@ impl Framebuffer {
         let mut pen = x;
         for ch in text.chars() {
             if let Some(bmp) = font.rasterize_glyph(ch, font_size) {
-                let origin_x = pen.round() as i32 + bmp.bearing_x;
+                // Saturating math: a run placed far off the canvas must not overflow.
+                let origin_x = (pen.round() as i32).saturating_add(bmp.bearing_x);
                 let width = bmp.width as usize;
                 for row in 0..bmp.height {
-                    let screen_y = baseline.round() as i32 + bmp.bearing_y - row as i32;
+                    let screen_y = (baseline.round() as i32)
+                        .saturating_add(bmp.bearing_y)
+                        .saturating_sub(row as i32);
                     for col in 0..bmp.width {
                         let cov = bmp.coverage[row as usize * width + col as usize];
                         if cov == 0 {
@@ -1235,7 +1238,7 @@ impl Framebuffer {
                         }
                         let a = ((u16::from(color.a) * u16::from(cov)) / 255) as u8;
                         self.set_pixel(
-                            origin_x + col as i32,
+                            origin_x.saturating_add(col as i32),
                             screen_y,
                             Color {
                                 r: color.r,
@@ -1261,7 +1264,7 @@ impl Framebuffer {
         let glyph_height = 7 * scale;
         let line_height = (font_size * 1.25).round() as i32;
         let pad_y = ((line_height - glyph_height) / 2).max(0);
-        let base_y = y.round() as i32 + pad_y;
+        let base_y = (y.round() as i32).saturating_add(pad_y);
 
         for (index, ch) in text.chars().enumerate() {
             let char_x = (x + index as f32 * advance).round() as i32;
@@ -1269,11 +1272,11 @@ impl Framebuffer {
             for (row_idx, row_bits) in rows.iter().copied().enumerate() {
                 for col_idx in 0..5 {
                     if (row_bits >> (4 - col_idx)) & 1 == 1 {
-                        let gx = char_x + col_idx * scale;
-                        let gy = base_y + (row_idx as i32) * scale;
+                        let gx = char_x.saturating_add(col_idx * scale);
+                        let gy = base_y.saturating_add((row_idx as i32) * scale);
                         for sy in 0..scale {
                             for sx in 0..scale {
-                                self.set_pixel(gx + sx, gy + sy, color);
+                                self.set_pixel(gx.saturating_add(sx), gy.saturating_add(sy), color);
                             }
                         }
                     }
