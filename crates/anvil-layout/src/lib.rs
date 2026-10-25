@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-Proprietary
 // Copyright (c) 2026 Buntato
-//! Block, inline, flex, table, and positioned layout, plus hit testing.
+//! Block, inline, flex, grid, table, and positioned layout, plus hit testing.
 //!
 //! Third stage of the pipeline. anvil-style has computed a `StyleMap` for a
 //! anvil-dom `Document`. This crate borrows both and returns an owned
@@ -23,6 +23,13 @@
 //! columns with a 24px floor; column widths are not shared across rows. Line breaking uses
 //! [`measure`], a fixed advance of half the font size per character, not
 //! [`measure_proportional`].
+//!
+//! Grid columns come from `grid-template-columns` and rows from
+//! `grid-template-rows`, with `grid-auto-rows` for rows past that list.
+//! Tracks accept `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()`. An
+//! `auto` column acts as `1fr`; an `auto` row fits its tallest single-row
+//! item. A row `fr` shares the definite container height, or fits the
+//! largest item per `fr` when the height is not definite.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -34,7 +41,7 @@ pub use anvil_style::{
     AlignItems, BoxShadow, Color, Edge, FlexDirection, FlexWrap, JustifyContent, LinearGradient,
     Overflow, Position,
 };
-use anvil_style::{ComputedStyle, Display, GridTrack, Size, StyleMap};
+use anvil_style::{ComputedStyle, Display, GridTrack, Size, StyleMap, TrackBreadth};
 use anvil_ttf::TtfFont;
 
 /// Axis-aligned box. `x` and `y` are the top-left in y-down CSS pixels.
@@ -851,8 +858,322 @@ fn layout_table_row(
     }
 }
 
-/// One flex item after its base border box has been measured.
+/// One grid item's area in track indices. `col` and `row` are zero-based
+/// starts. Spans are at least 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridArea {
+    row: usize,
+    col: usize,
+    row_span: usize,
+    col_span: usize,
+}
+
+/// How one track is sized once the axis is known.
+#[derive(Clone, Copy, Debug)]
+enum TrackPlan {
+    /// A definite size.
+    Fixed(f32),
+    /// Sized to content, then clamped to `[min, max]`.
+    Content { min: f32, max: f32 },
+    /// Starts at `min` and grows into free space up to `max`.
+    Grow { min: f32, max: f32 },
+    /// A flexible share with a floor.
+    Flex { fr: f32, min: f32 },
+}
+
+/// Turn a track into a plan. `basis` is the container content size on this
+/// axis, or `None` when it is not definite. `auto_is_flex` is true for
+/// columns, where `auto` behaves like `1fr`.
+fn plan_track(track: GridTrack, basis: Option<f32>, auto_is_flex: bool) -> TrackPlan {
+    let breadth = |b: TrackBreadth| -> Option<f32> {
+        match b {
+            TrackBreadth::Px(px) => Some(px.max(0.0)),
+            TrackBreadth::Percent(pct) => basis.map(|size| (size * pct / 100.0).max(0.0)),
+            TrackBreadth::Fr(_) | TrackBreadth::Auto => None,
+        }
+    };
+    let auto = if auto_is_flex {
+        TrackPlan::Flex { fr: 1.0, min: 0.0 }
+    } else {
+        TrackPlan::Content {
+            min: 0.0,
+            max: f32::INFINITY,
+        }
+    };
+    match track {
+        GridTrack::Px(px) => TrackPlan::Fixed(px.max(0.0)),
+        GridTrack::Percent(pct) => match basis {
+            Some(size) => TrackPlan::Fixed((size * pct / 100.0).max(0.0)),
+            None => auto,
+        },
+        GridTrack::Fr(fr) => TrackPlan::Flex {
+            fr: fr.max(0.0),
+            min: 0.0,
+        },
+        GridTrack::Auto => auto,
+        GridTrack::MinMax(min, max) => {
+            let min_px = breadth(min);
+            match max {
+                TrackBreadth::Fr(fr) => TrackPlan::Flex {
+                    fr: fr.max(0.0),
+                    min: min_px.unwrap_or(0.0),
+                },
+                TrackBreadth::Auto if auto_is_flex => TrackPlan::Flex {
+                    fr: 1.0,
+                    min: min_px.unwrap_or(0.0),
+                },
+                TrackBreadth::Auto => TrackPlan::Content {
+                    min: min_px.unwrap_or(0.0),
+                    max: f32::INFINITY,
+                },
+                TrackBreadth::Px(_) | TrackBreadth::Percent(_) => {
+                    let max_px = breadth(max);
+                    match (min_px, max_px) {
+                        (Some(lo), Some(hi)) => TrackPlan::Grow {
+                            min: lo,
+                            max: hi.max(lo),
+                        },
+                        (None, Some(hi)) => TrackPlan::Content { min: 0.0, max: hi },
+                        (Some(lo), None) => TrackPlan::Content {
+                            min: lo,
+                            max: f32::INFINITY,
+                        },
+                        (None, None) => auto,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Size the tracks on one axis.
+///
+/// `content[i]` is the largest outer size of an item that sits only in
+/// track `i` (0 when none). `spanning` lists `(start, span, size)` for items
+/// that cross more than one track. `available` is the container content size,
+/// or `None` when it is not definite. Steps: fixed and content sizes, then
+/// spanning items grow the content tracks they cross, then growable tracks
+/// take free space up to their maximum, then flexible tracks share what is
+/// left. With no definite size, a flexible track is sized so the largest
+/// item per `fr` fits.
+fn size_tracks(
+    plans: &[TrackPlan],
+    content: &[f32],
+    spanning: &[(usize, usize, f32)],
+    available: Option<f32>,
+    gap: f32,
+) -> Vec<f32> {
+    let count = plans.len();
+    let mut sizes: Vec<f32> = plans
+        .iter()
+        .enumerate()
+        .map(|(i, plan)| match *plan {
+            TrackPlan::Fixed(px) => px,
+            TrackPlan::Content { min, max } => content
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                .max(min)
+                .min(max.max(min)),
+            TrackPlan::Grow { min, .. } => min,
+            TrackPlan::Flex { min, .. } => min,
+        })
+        .collect();
+
+    for &(start, span, size) in spanning {
+        let end = (start + span).min(count);
+        if start >= end {
+            continue;
+        }
+        if plans[start..end]
+            .iter()
+            .any(|plan| matches!(plan, TrackPlan::Flex { .. }))
+        {
+            continue;
+        }
+        let current: f32 = sizes[start..end].iter().sum::<f32>() + gap * (end - start - 1) as f32;
+        let extra = size - current;
+        if extra <= 0.0 {
+            continue;
+        }
+        let growable: Vec<usize> = (start..end)
+            .filter(|&i| matches!(plans[i], TrackPlan::Content { .. }))
+            .collect();
+        if growable.is_empty() {
+            continue;
+        }
+        let share = extra / growable.len() as f32;
+        for i in growable {
+            if let TrackPlan::Content { max, .. } = plans[i] {
+                sizes[i] = (sizes[i] + share).min(max.max(sizes[i]));
+            }
+        }
+    }
+
+    let gaps = gap * count.saturating_sub(1) as f32;
+    let used = |sizes: &[f32]| -> f32 {
+        sizes
+            .iter()
+            .zip(plans)
+            .filter(|(_, plan)| !matches!(plan, TrackPlan::Flex { .. }))
+            .map(|(size, _)| *size)
+            .sum::<f32>()
+    };
+
+    // Growable tracks take free space in equal steps, each up to its maximum.
+    let mut free = match available {
+        Some(size) => size - gaps - used(&sizes) - flex_floor_sum(plans),
+        None => f32::INFINITY,
+    };
+    let mut open: Vec<usize> = (0..count)
+        .filter(|&i| matches!(plans[i], TrackPlan::Grow { .. }))
+        .collect();
+    while free > 0.0 && !open.is_empty() {
+        let share = if free.is_finite() {
+            free / open.len() as f32
+        } else {
+            f32::INFINITY
+        };
+        let mut next_open = Vec::new();
+        let mut spent = 0.0;
+        for &i in &open {
+            if let TrackPlan::Grow { max, .. } = plans[i] {
+                let room = max - sizes[i];
+                if room <= share {
+                    sizes[i] = max;
+                    spent += room;
+                } else {
+                    sizes[i] += share;
+                    spent += share;
+                    next_open.push(i);
+                }
+            }
+        }
+        if !free.is_finite() || next_open.len() == open.len() {
+            break;
+        }
+        free -= spent;
+        open = next_open;
+    }
+
+    let flex: Vec<usize> = (0..count)
+        .filter(|&i| matches!(plans[i], TrackPlan::Flex { .. }))
+        .collect();
+    if flex.is_empty() {
+        return sizes;
+    }
+    let fr_of = |i: usize| match plans[i] {
+        TrackPlan::Flex { fr, .. } => fr,
+        _ => 0.0,
+    };
+    let floor_of = |i: usize| match plans[i] {
+        TrackPlan::Flex { min, .. } => min,
+        _ => 0.0,
+    };
+    match available {
+        Some(size) => {
+            // Flexible tracks share the leftover space. A track whose share is
+            // below its floor keeps the floor and leaves the shared pool.
+            let leftover = (size - gaps - used(&sizes)).max(0.0);
+            let mut active = flex.clone();
+            let mut pool = leftover;
+            loop {
+                let fr_sum: f32 = active.iter().map(|&i| fr_of(i)).sum();
+                let unit = if fr_sum > 0.0 { pool / fr_sum } else { 0.0 };
+                let frozen: Vec<usize> = active
+                    .iter()
+                    .copied()
+                    .filter(|&i| fr_of(i) * unit < floor_of(i))
+                    .collect();
+                if frozen.is_empty() {
+                    for &i in &active {
+                        sizes[i] = fr_of(i) * unit;
+                    }
+                    break;
+                }
+                for &i in &frozen {
+                    sizes[i] = floor_of(i);
+                    pool = (pool - floor_of(i)).max(0.0);
+                }
+                active.retain(|i| !frozen.contains(i));
+                if active.is_empty() {
+                    break;
+                }
+            }
+        }
+        None => {
+            let mut unit = 0.0_f32;
+            for &i in &flex {
+                let fr = fr_of(i);
+                let need = content.get(i).copied().unwrap_or(0.0);
+                // A factor below 1 divides by 1, so a small `fr` does not blow up.
+                if fr > 0.0 {
+                    unit = unit.max(need / fr.max(1.0));
+                }
+            }
+            for &i in &flex {
+                sizes[i] = (fr_of(i) * unit).max(floor_of(i));
+            }
+        }
+    }
+    sizes
+}
+
+/// Sum of the floors of flexible tracks. Growable tracks leave this room.
+fn flex_floor_sum(plans: &[TrackPlan]) -> f32 {
+    plans
+        .iter()
+        .map(|plan| match plan {
+            TrackPlan::Flex { min, .. } => *min,
+            _ => 0.0,
+        })
+        .sum()
+}
+
+/// Start offsets of each track, from `origin`, with `gap` between tracks.
+fn track_offsets(sizes: &[f32], origin: f32, gap: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(sizes.len() + 1);
+    let mut run = origin;
+    for size in sizes {
+        out.push(run);
+        run += size + gap;
+    }
+    out.push(run - if sizes.is_empty() { 0.0 } else { gap });
+    out
+}
+
+/// Size of an area that spans `span` tracks from `start`, including the gaps inside it.
+fn span_size(sizes: &[f32], start: usize, span: usize, gap: f32) -> f32 {
+    let end = (start + span).min(sizes.len());
+    if start >= end {
+        return 0.0;
+    }
+    sizes[start..end].iter().sum::<f32>() + gap * (end - start - 1) as f32
+}
+
+/// Place items in order, left to right and then top to bottom, one cell each.
+fn place_grid_items(count: usize, col_count: usize) -> Vec<GridArea> {
+    let cols = col_count.max(1);
+    (0..count)
+        .map(|i| GridArea {
+            row: i / cols,
+            col: i % cols,
+            row_span: 1,
+            col_span: 1,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
+/// Grid layout.
+///
+/// Columns come from `grid-template-columns`; with none set there is one
+/// `1fr` column. Rows come from `grid-template-rows`, then `grid-auto-rows`
+/// for every row past the explicit list. Items are laid out at their column
+/// width to measure their height, then rows are sized and items are moved
+/// into their rows. `gap` is used between both rows and columns.
+/// `align-items: stretch` grows an `auto`-height item to its area height;
+/// `center` and `end` move it inside the area.
 fn layout_grid(
     doc: &Document,
     styles: &StyleMap,
@@ -877,45 +1198,6 @@ fn layout_grid(
     let content_y = border_y + border.top + padding.top;
     let specified_height = used_length(style.height, containing_height, &style, styles);
 
-    let default_track = [GridTrack::Fr(1.0)];
-    let tracks = if style.grid_column_count > 0 {
-        style.grid_tracks()
-    } else {
-        &default_track
-    };
-    let col_count = tracks.len().max(1);
-    let total_col_gap = style.gap * ((col_count.saturating_sub(1)) as f32);
-
-    let mut fixed_sum = 0.0f32;
-    let mut fr_sum = 0.0f32;
-    for &t in tracks {
-        match t {
-            GridTrack::Px(px) => fixed_sum += px,
-            GridTrack::Percent(pct) => fixed_sum += content_width * pct / 100.0,
-            GridTrack::Fr(fr) => fr_sum += fr.max(0.0),
-        }
-    }
-    let free_w = (content_width - fixed_sum - total_col_gap).max(0.0);
-    let mut col_widths = Vec::with_capacity(col_count);
-    let mut col_offsets = Vec::with_capacity(col_count);
-    let mut run_x = content_x;
-    for &t in tracks {
-        let w = match t {
-            GridTrack::Px(px) => px,
-            GridTrack::Percent(pct) => content_width * pct / 100.0,
-            GridTrack::Fr(fr) => {
-                if fr_sum > 0.0 {
-                    free_w * (fr.max(0.0) / fr_sum)
-                } else {
-                    0.0
-                }
-            }
-        };
-        col_offsets.push(run_x);
-        col_widths.push(w.max(0.0));
-        run_x += w.max(0.0) + style.gap;
-    }
-
     let mut in_flow = Vec::new();
     let mut out_of_flow = Vec::new();
     for &cid in doc.children(id) {
@@ -935,47 +1217,108 @@ fn layout_grid(
         }
     }
 
-    let mut children = Vec::with_capacity(in_flow.len() + out_of_flow.len());
-    let mut cursor_y = content_y;
-    for (row_idx, row_ids) in in_flow.chunks(col_count).enumerate() {
-        if row_idx > 0 {
-            cursor_y += style.gap;
-        }
-        let row_start = children.len();
-        let mut row_h = 0.0f32;
-        for (col_idx, &cid) in row_ids.iter().enumerate() {
-            let cell_x = col_offsets[col_idx];
-            let cell_w = col_widths[col_idx];
-            let child_box = layout_node(
-                doc,
-                styles,
-                images,
-                focused_input,
-                cid,
-                cell_x,
-                cursor_y,
-                cell_w,
-                specified_height,
-                None,
-            );
-            let cstyle = styles.get(cid);
-            let outer_h = cstyle.margin.top + child_box.rect.height + cstyle.margin.bottom;
-            row_h = row_h.max(outer_h);
-            children.push(child_box);
-        }
-        if style.align_items == AlignItems::Stretch {
-            for item_box in &mut children[row_start..] {
-                let cstyle = styles.get(item_box.node);
-                if matches!(cstyle.height, Size::Auto) {
-                    item_box.rect.height = (row_h - cstyle.margin.top - cstyle.margin.bottom)
-                        .max(item_box.rect.height);
-                }
-            }
-        }
-        cursor_y += row_h;
+    let explicit_cols = style.grid_tracks();
+    let explicit_col_count = explicit_cols.len().max(1);
+    let areas = place_grid_items(in_flow.len(), explicit_col_count);
+    let col_count = areas
+        .iter()
+        .map(|a| a.col + a.col_span)
+        .max()
+        .unwrap_or(0)
+        .max(explicit_col_count);
+    let row_count = areas
+        .iter()
+        .map(|a| a.row + a.row_span)
+        .max()
+        .unwrap_or(0)
+        .max(style.grid_row_tracks().len());
+
+    let col_plans: Vec<TrackPlan> = (0..col_count)
+        .map(|i| {
+            let track = explicit_cols.get(i).copied().unwrap_or(GridTrack::Fr(1.0));
+            plan_track(track, Some(content_width), true)
+        })
+        .collect();
+    let col_widths = size_tracks(
+        &col_plans,
+        &vec![0.0; col_count],
+        &[],
+        Some(content_width),
+        style.gap,
+    );
+    let col_offsets = track_offsets(&col_widths, content_x, style.gap);
+
+    // Lay each item out at its area width to learn its height.
+    let mut boxes = Vec::with_capacity(in_flow.len());
+    for (&cid, area) in in_flow.iter().zip(&areas) {
+        let cell_w = span_size(&col_widths, area.col, area.col_span, style.gap);
+        let child_box = layout_node(
+            doc,
+            styles,
+            images,
+            focused_input,
+            cid,
+            col_offsets[area.col],
+            content_y,
+            cell_w,
+            specified_height,
+            None,
+        );
+        boxes.push(child_box);
     }
 
-    let flow_height = (cursor_y - content_y).max(0.0);
+    let row_tracks = style.grid_row_tracks();
+    let row_plans: Vec<TrackPlan> = (0..row_count)
+        .map(|i| {
+            let track = row_tracks.get(i).copied().unwrap_or(style.grid_auto_rows);
+            plan_track(track, specified_height, false)
+        })
+        .collect();
+    let mut row_content = vec![0.0_f32; row_count];
+    let mut row_spanning = Vec::new();
+    for (child_box, area) in boxes.iter().zip(&areas) {
+        let cstyle = styles.get(child_box.node);
+        let outer_h = cstyle.margin.top + child_box.rect.height + cstyle.margin.bottom;
+        if area.row_span == 1 {
+            row_content[area.row] = row_content[area.row].max(outer_h);
+        } else {
+            row_spanning.push((area.row, area.row_span, outer_h));
+        }
+    }
+    row_spanning.sort_by_key(|(_, span, _)| *span);
+    let row_heights = size_tracks(
+        &row_plans,
+        &row_content,
+        &row_spanning,
+        specified_height,
+        style.gap,
+    );
+    let row_offsets = track_offsets(&row_heights, content_y, style.gap);
+
+    let mut children = Vec::with_capacity(in_flow.len() + out_of_flow.len());
+    for (mut item_box, area) in boxes.into_iter().zip(&areas) {
+        let cstyle = styles.get(item_box.node);
+        let area_h = span_size(&row_heights, area.row, area.row_span, style.gap);
+        let outer_h = cstyle.margin.top + item_box.rect.height + cstyle.margin.bottom;
+        let dy_in_area = match style.align_items {
+            AlignItems::Start | AlignItems::Stretch => 0.0,
+            AlignItems::Center => ((area_h - outer_h) * 0.5).max(0.0),
+            AlignItems::End => (area_h - outer_h).max(0.0),
+        };
+        let dy = row_offsets[area.row] + dy_in_area - content_y;
+        offset_box(&mut item_box, 0.0, dy);
+        if style.align_items == AlignItems::Stretch && matches!(cstyle.height, Size::Auto) {
+            item_box.rect.height =
+                (area_h - cstyle.margin.top - cstyle.margin.bottom).max(item_box.rect.height);
+        }
+        children.push(item_box);
+    }
+
+    let flow_height = if row_count == 0 {
+        0.0
+    } else {
+        (row_offsets[row_count] - content_y).max(0.0)
+    };
     let content_height = specified_height.unwrap_or(0.0).max(flow_height);
     let parent_rect = Rect {
         x: border_x,
@@ -1014,6 +1357,7 @@ fn layout_grid(
     }
 }
 
+/// One flex item after its base border box has been measured.
 struct FlexItem {
     node_box: LayoutBox,
     outer_w: f32,
@@ -1912,5 +2256,114 @@ mod tests {
         assert_eq!(rect("c4").x, 0.0);
         assert_eq!(rect("c4").y, 40.0);
         assert_eq!(rect("wide").width, 480.0);
+    }
+
+    /// Border box of the element whose `id` attribute is `id`.
+    fn rect_of(doc: &Document, tree: &LayoutBox, id: &str) -> Rect {
+        fn find<'a>(doc: &Document, tree: &'a LayoutBox, id: &str) -> Option<&'a LayoutBox> {
+            if doc.get(tree.node).data().attr("id") == Some(id) {
+                return Some(tree);
+            }
+            tree.children.iter().find_map(|child| find(doc, child, id))
+        }
+        find(doc, tree, id)
+            .unwrap_or_else(|| panic!("no box for #{id}"))
+            .rect
+    }
+
+    #[test]
+    fn sizes_fixed_auto_and_flexible_grid_rows() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #grid { display: grid; width: 110px; height: 200px; gap: 10px;
+                        grid-template-columns: 50px 50px; grid-template-rows: 20px auto 1fr; }
+             </style>
+             <div id=\"grid\">
+               <div id=\"a\" style=\"height: 5px\"></div><div id=\"b\"></div>
+               <div id=\"c\" style=\"height: 30px\"></div><div id=\"d\"></div>
+               <div id=\"e\" style=\"height: 12px\"></div><div id=\"f\"></div>
+             </div>",
+            300.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+        assert_eq!((r("a").y, r("a").height), (0.0, 5.0));
+        assert_eq!((r("b").x, r("b").y, r("b").height), (60.0, 0.0, 20.0));
+        assert_eq!((r("c").y, r("c").height), (30.0, 30.0));
+        assert_eq!((r("d").y, r("d").height), (30.0, 30.0));
+        // 200 - 2 gaps - 20 - 30 leaves 130 for the 1fr row.
+        assert_eq!((r("e").y, r("e").height), (70.0, 12.0));
+        assert_eq!((r("f").y, r("f").height), (70.0, 130.0));
+        assert_eq!(r("grid").height, 200.0);
+    }
+
+    #[test]
+    fn sizes_implicit_minmax_percent_and_repeated_rows() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                .g { display: grid; width: 90px; grid-template-columns: repeat(3, 30px); }
+                #auto { grid-template-rows: 40px; grid-auto-rows: 25px; }
+                #mm { grid-template-rows: minmax(30px, auto) minmax(30px, auto) minmax(10px, 40px); grid-template-columns: 30px; }
+                #pct { height: 200px; grid-template-rows: 25% repeat(2, 15px); grid-template-columns: 30px; }
+                #fr { grid-template-rows: 1fr 2fr; grid-template-columns: 30px; }
+             </style>
+             <div id=\"auto\" class=\"g\">
+               <div id=\"a1\"></div><div></div><div></div><div id=\"a4\"></div><div></div><div></div><div id=\"a7\"></div>
+             </div>
+             <div id=\"mm\" class=\"g\">
+               <div id=\"m1\" style=\"height: 10px\"></div><div id=\"m2\" style=\"height: 50px\"></div><div id=\"m3\"></div>
+             </div>
+             <div id=\"pct\" class=\"g\"><div id=\"p1\"></div><div id=\"p2\"></div><div id=\"p3\"></div></div>
+             <div id=\"fr\" class=\"g\">
+               <div id=\"f1\" style=\"height: 30px\"></div><div id=\"f2\" style=\"height: 20px\"></div>
+             </div>",
+            300.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+        assert_eq!((r("a1").y, r("a1").height), (0.0, 40.0));
+        assert_eq!((r("a4").y, r("a4").height), (40.0, 25.0));
+        assert_eq!((r("a7").y, r("a7").height), (65.0, 25.0));
+        assert_eq!(r("auto").height, 90.0);
+
+        let top = r("mm").y;
+        assert_eq!((r("m1").y - top, r("m1").height), (0.0, 10.0));
+        assert_eq!((r("m2").y - top, r("m2").height), (30.0, 50.0));
+        // A fixed minmax with no definite height grows to its maximum.
+        assert_eq!((r("m3").y - top, r("m3").height), (80.0, 40.0));
+        assert_eq!(r("mm").height, 120.0);
+
+        let top = r("pct").y;
+        assert_eq!((r("p1").y - top, r("p1").height), (0.0, 50.0));
+        assert_eq!((r("p2").y - top, r("p2").height), (50.0, 15.0));
+        assert_eq!((r("p3").y - top, r("p3").height), (65.0, 15.0));
+
+        // No definite height: one fr unit fits the largest item per fr.
+        let top = r("fr").y;
+        assert_eq!((r("f1").y - top, r("f1").height), (0.0, 30.0));
+        assert_eq!((r("f2").y - top, r("f2").height), (30.0, 20.0));
+        assert_eq!(r("fr").height, 90.0);
+    }
+
+    #[test]
+    fn grid_columns_share_space_with_minmax_floors() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #g { display: grid; width: 200px; grid-template-columns: minmax(120px, 1fr) 1fr; }
+                #h { display: grid; width: 200px; grid-template-columns: minmax(20px, 60px) auto; }
+             </style>
+             <div id=\"g\"><div id=\"g1\"></div><div id=\"g2\"></div></div>
+             <div id=\"h\"><div id=\"h1\"></div><div id=\"h2\"></div></div>",
+            300.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+        // 1fr would be 100px, below the 120px floor, so the floor holds and
+        // the other column takes the rest.
+        assert_eq!((r("g1").x, r("g1").width), (0.0, 120.0));
+        assert_eq!((r("g2").x, r("g2").width), (120.0, 80.0));
+        // The fixed minmax grows to 60px; `auto` acts as 1fr on columns.
+        assert_eq!((r("h1").x, r("h1").width), (0.0, 60.0));
+        assert_eq!((r("h2").x, r("h2").width), (60.0, 140.0));
     }
 }

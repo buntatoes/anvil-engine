@@ -553,15 +553,37 @@ pub struct LinearGradient {
     pub end_color: Color,
 }
 
-/// One column track in `grid-template-columns`.
+/// One track in `grid-template-columns`, `grid-template-rows`, or `grid-auto-rows`.
+///
+/// Columns size `auto` as `1fr`, because this engine does not measure the
+/// intrinsic width of grid items. Rows size `auto` to the tallest item that
+/// sits only in that row.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GridTrack {
-    /// Fixed pixel width (`120px`).
+    /// Fixed pixel size (`120px`).
     Px(f32),
-    /// Percentage of the grid container content width (`25%`).
+    /// Percentage of the grid container content size on that axis (`25%`).
+    /// A row percentage with no definite container height acts as `auto`.
     Percent(f32),
-    /// Share of remaining free space (`1fr`, `2fr`). `auto` maps to `Fr(1.0)`.
+    /// Share of remaining free space (`1fr`, `2fr`).
     Fr(f32),
+    /// `auto`. See the type docs for how each axis sizes it.
+    Auto,
+    /// `minmax(min, max)`. The minimum is never a flexible size.
+    MinMax(TrackBreadth, TrackBreadth),
+}
+
+/// One side of a `minmax()` track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrackBreadth {
+    /// Fixed pixel size.
+    Px(f32),
+    /// Percentage of the grid container content size on that axis.
+    Percent(f32),
+    /// Flexible share. Only valid as the maximum.
+    Fr(f32),
+    /// Content size on rows, `1fr` behavior on columns when it is the maximum.
+    Auto,
 }
 
 /// Used values for one element after the user-agent defaults, the cascade,
@@ -608,6 +630,11 @@ pub struct ComputedStyle {
     pub align_items: AlignItems,
     pub grid_template_columns: [GridTrack; 12],
     pub grid_column_count: u8,
+    /// Explicit row tracks from `grid-template-rows`. See [`Self::grid_row_tracks`].
+    pub grid_template_rows: [GridTrack; 12],
+    pub grid_row_count: u8,
+    /// Size of rows past the explicit grid (`grid-auto-rows`). The initial value is `auto`.
+    pub grid_auto_rows: GridTrack,
     pub gap: f32,
 }
 
@@ -646,17 +673,26 @@ impl ComputedStyle {
             align_items: AlignItems::Stretch,
             grid_template_columns: [GridTrack::Fr(1.0); 12],
             grid_column_count: 0,
+            grid_template_rows: [GridTrack::Auto; 12],
+            grid_row_count: 0,
+            grid_auto_rows: GridTrack::Auto,
             gap: 0.0,
         }
     }
 
-    /// Style a child element starts from. Copies `color`, `font_size`, and
-    /// `underline`, sets `border_color` to that color, and resets everything else.
     /// Active column tracks parsed from `grid-template-columns`.
     pub fn grid_tracks(&self) -> &[GridTrack] {
         &self.grid_template_columns[..(self.grid_column_count as usize).min(12)]
     }
 
+    /// Active explicit row tracks parsed from `grid-template-rows`.
+    /// Empty when the property is unset; every row is then a `grid-auto-rows` row.
+    pub fn grid_row_tracks(&self) -> &[GridTrack] {
+        &self.grid_template_rows[..(self.grid_row_count as usize).min(12)]
+    }
+
+    /// Style a child element starts from. Copies `color`, `font_size`, and
+    /// `underline`, sets `border_color` to that color, and resets everything else.
     fn inherited_child(self) -> Self {
         Self {
             color: self.color,
@@ -1396,9 +1432,25 @@ fn apply_declaration(
             };
         }
         "grid-template-columns" => {
-            if let Some((tracks, count)) = parse_grid_template_columns(value) {
+            if value.eq_ignore_ascii_case("none") {
+                style.grid_column_count = 0;
+            } else if let Some((tracks, count)) = parse_grid_template(value) {
                 style.grid_template_columns = tracks;
                 style.grid_column_count = count;
+            }
+        }
+        "grid-template-rows" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.grid_row_count = 0;
+            } else if let Some((tracks, count)) = parse_grid_template(value) {
+                style.grid_template_rows = tracks;
+                style.grid_row_count = count;
+            }
+        }
+        "grid-auto-rows" => {
+            // Only one track is kept. A list such as `10px 20px` is not cycled.
+            if let Some(track) = parse_single_grid_track(value) {
+                style.grid_auto_rows = track;
             }
         }
         "gap" | "grid-gap" => {
@@ -1459,23 +1511,54 @@ fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
     out
 }
 
+/// One track: a length, a percentage, `Nfr`, `auto`, or `minmax(min, max)`.
+/// `None` for anything else, including a flexible minimum such as `minmax(1fr, 2fr)`.
 fn parse_single_grid_track(token: &str) -> Option<GridTrack> {
     let t = token.trim();
-    if t.eq_ignore_ascii_case("auto") {
-        return Some(GridTrack::Fr(1.0));
+    let is_minmax = t
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case("minmax("));
+    if is_minmax && t.ends_with(')') && t.len() > 7 {
+        let inner = &t[7..t.len() - 1];
+        let (min_src, max_src) = inner.split_once(',')?;
+        let min = parse_track_breadth(min_src)?;
+        let max = parse_track_breadth(max_src)?;
+        if matches!(min, TrackBreadth::Fr(_)) {
+            return None;
+        }
+        return Some(GridTrack::MinMax(min, max));
     }
-    if let Some(fr_str) = t.strip_suffix("fr").or_else(|| t.strip_suffix("FR")) {
-        let fr = fr_str.trim().parse::<f32>().ok()?;
-        return (fr >= 0.0 && fr.is_finite()).then_some(GridTrack::Fr(fr.max(0.01)));
+    Some(match parse_track_breadth(t)? {
+        TrackBreadth::Px(px) => GridTrack::Px(px),
+        TrackBreadth::Percent(pct) => GridTrack::Percent(pct),
+        TrackBreadth::Fr(fr) => GridTrack::Fr(fr),
+        TrackBreadth::Auto => GridTrack::Auto,
+    })
+}
+
+/// A single track size: `auto`, `Nfr`, a pixel length, or a percentage.
+/// Negative sizes are clamped to 0. A flexible size is at least `0.01fr`.
+fn parse_track_breadth(token: &str) -> Option<TrackBreadth> {
+    let t = token.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Some(TrackBreadth::Auto);
+    }
+    if let Some(fr_str) = strip_unit(t, "fr") {
+        let fr = fr_str.parse::<f32>().ok()?;
+        return (fr >= 0.0 && fr.is_finite()).then_some(TrackBreadth::Fr(fr.max(0.01)));
     }
     match parse_length(t)? {
-        Size::Px(px) => Some(GridTrack::Px(px.max(0.0))),
-        Size::Percent(pct) => Some(GridTrack::Percent(pct.max(0.0))),
+        Size::Px(px) if px.is_finite() => Some(TrackBreadth::Px(px.max(0.0))),
+        Size::Percent(pct) if pct.is_finite() => Some(TrackBreadth::Percent(pct.max(0.0))),
         _ => None,
     }
 }
 
-fn parse_grid_template_columns(value: &str) -> Option<([GridTrack; 12], u8)> {
+/// Track list for `grid-template-columns` or `grid-template-rows`.
+///
+/// Tokens are tracks or `repeat(N, tracks...)`. At most 12 tracks are kept;
+/// later ones are dropped. `None` when a token does not parse or the list is empty.
+fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8)> {
     let mut tracks = [GridTrack::Fr(1.0); 12];
     let mut count = 0usize;
     for token in split_css_tokens(value) {
@@ -1692,7 +1775,9 @@ fn parse_size(value: &str) -> Size {
 fn parse_length(value: &str) -> Option<Size> {
     let value = value.trim();
     // `get` rather than an index: byte 5 can fall inside a multi-byte character.
-    let is_calc = value.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("calc("));
+    let is_calc = value
+        .get(..5)
+        .is_some_and(|head| head.eq_ignore_ascii_case("calc("));
     if value.len() > 5 && is_calc && value.ends_with(')') {
         return parse_calc(&value[5..value.len() - 1]);
     }
@@ -2314,6 +2399,40 @@ mod tests {
         assert_eq!(
             styles.get(card_id).width.used_px(300.0, 16.0, 16.0),
             Some(276.0)
+        );
+    }
+
+    #[test]
+    fn parses_grid_row_tracks_minmax_and_auto_rows() {
+        let doc = parse_html("<div id=\"g\"></div><div id=\"h\"></div>");
+        let sheet = parse_css(
+            "#g { grid-template-rows: 20px auto 1fr repeat(2, minmax(10px, 2fr)) 25%; grid-auto-rows: minmax(5px, auto); }
+             #h { grid-template-rows: minmax(1fr, 2fr); grid-template-columns: auto 10px; grid-auto-rows: bogus; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let g = doc.get_element_by_id("g").unwrap();
+        let h = doc.get_element_by_id("h").unwrap();
+        assert_eq!(
+            styles.get(g).grid_row_tracks(),
+            &[
+                GridTrack::Px(20.0),
+                GridTrack::Auto,
+                GridTrack::Fr(1.0),
+                GridTrack::MinMax(TrackBreadth::Px(10.0), TrackBreadth::Fr(2.0)),
+                GridTrack::MinMax(TrackBreadth::Px(10.0), TrackBreadth::Fr(2.0)),
+                GridTrack::Percent(25.0),
+            ]
+        );
+        assert_eq!(
+            styles.get(g).grid_auto_rows,
+            GridTrack::MinMax(TrackBreadth::Px(5.0), TrackBreadth::Auto)
+        );
+        // A flexible minimum is invalid, so the declaration is dropped.
+        assert!(styles.get(h).grid_row_tracks().is_empty());
+        assert_eq!(styles.get(h).grid_auto_rows, GridTrack::Auto);
+        assert_eq!(
+            styles.get(h).grid_tracks(),
+            &[GridTrack::Auto, GridTrack::Px(10.0)]
         );
     }
 }
