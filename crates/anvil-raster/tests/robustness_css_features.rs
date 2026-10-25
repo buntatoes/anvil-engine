@@ -197,6 +197,11 @@ const PROPERTIES: &[&str] = &[
     "display",
     "width",
     "height",
+    "max-width",
+    "left",
+    "top",
+    "position",
+    "font-size",
     "gap",
     "grid-template-columns",
     "grid-template-rows",
@@ -272,6 +277,12 @@ const VALUES: &[&str] = &[
     "-1",
     "100 / -100",
     "span 100 / span 100",
+    "10ch",
+    "-1ch",
+    "1e30ch",
+    "chch",
+    "ch",
+    "0.5CH",
 ];
 
 /// Random but CSS-shaped text aimed at the grid properties.

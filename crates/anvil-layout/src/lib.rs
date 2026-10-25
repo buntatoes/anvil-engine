@@ -17,6 +17,7 @@
 //! the containing block width. A percentage height uses the containing block
 //! height when that height is set, and is treated as `auto` when it is not.
 //! `em` uses the element's font size. `rem` uses [`StyleMap::root_font_px`].
+//! `ch` uses [`ch_width`] at the element's font size.
 //! A flex row wraps when `flex-wrap` is `wrap`. `flex-grow` shares positive
 //! free space on each of those lines and does not shrink items. Column flex
 //! does not wrap or grow. A table row splits its content width into equal
@@ -312,7 +313,8 @@ fn layout_node(
 ///
 /// `None` means `auto`, including a percentage whose basis was not passed.
 /// `em` uses the element's font size. `rem` uses the root font size.
-/// `vw`, `vh`, `vmin`, and `vmax` use the viewport on `styles`.
+/// `vw`, `vh`, `vmin`, and `vmax` use the viewport on `styles`. `ch` uses
+/// [`ch_width`] at the element's font size.
 fn used_length(
     size: Size,
     basis: Option<f32>,
@@ -327,6 +329,7 @@ fn used_length(
         Size::Vh(value) => Some(vh * value / 100.0),
         Size::Vmin(value) => Some(vw.min(vh) * value / 100.0),
         Size::Vmax(value) => Some(vw.max(vh) * value / 100.0),
+        Size::Ch(value) => Some(ch_width(style.font_size) * value),
         Size::Percent(_) => size.used_px(basis?, style.font_size, styles.root_font_px()),
         Size::Calc { percent, .. } if percent != 0.0 => {
             size.used_px(basis?, style.font_size, styles.root_font_px())
@@ -2192,12 +2195,37 @@ pub fn measure(text: &str, font_size: f32) -> f32 {
 /// fallback width is used. Layout does not call this; callers that want a
 /// measured string do. `text` is borrowed.
 pub fn measure_proportional(text: &str, font_size: f32) -> f32 {
-    static SYSTEM_FONT: OnceLock<Option<TtfFont>> = OnceLock::new();
-    let font = SYSTEM_FONT.get_or_init(|| TtfFont::load_system_font(false, false));
-    if let Some(ttf) = font {
+    if let Some(ttf) = system_font() {
         ttf.measure_text(text, font_size)
     } else {
         anvil_ttf::measure_proportional_fallback(text, font_size)
+    }
+}
+
+/// The system font from anvil-ttf, loaded once. `None` when it did not load.
+fn system_font() -> Option<&'static TtfFont> {
+    static SYSTEM_FONT: OnceLock<Option<TtfFont>> = OnceLock::new();
+    SYSTEM_FONT
+        .get_or_init(|| TtfFont::load_system_font(false, false))
+        .as_ref()
+}
+
+/// Width of one `ch` at `font_size`: the advance of the `0` glyph.
+///
+/// The engine has one text font, so "the element's font" is that font at the
+/// element's size. When the anvil-ttf system font loads and maps `0`, its
+/// advance is used. Otherwise the fallback is the fixed advance [`measure`]
+/// gives every character, half the font size, so `20ch` then fits exactly 20
+/// characters of laid-out text.
+pub fn ch_width(font_size: f32) -> f32 {
+    ch_width_with(system_font(), font_size)
+}
+
+/// [`ch_width`] with an explicit font, or the fallback when `font` is `None`.
+fn ch_width_with(font: Option<&TtfFont>, font_size: f32) -> f32 {
+    match font {
+        Some(ttf) if ttf.glyph_id('0') != 0 => ttf.glyph_advance_px('0', font_size),
+        _ => measure("0", font_size),
     }
 }
 
@@ -2665,5 +2693,31 @@ mod tests {
         // The empty first row is 0px tall, so the next item starts at the grid top.
         assert_eq!((r("after").x, r("after").y), (0.0, r("h").y));
         assert_eq!(r("after").width, 30.0);
+    }
+
+    #[test]
+    fn resolves_ch_units_from_the_zero_glyph() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #box { font-size: 20px; width: 10ch; height: 2ch; }
+                #cap { font-size: 10px; width: 300px; max-width: 12ch; padding-left: 4px; }
+                #rel { position: relative; left: 3ch; height: 1px; }
+             </style>
+             <div id=\"box\"></div><div id=\"cap\"></div><div id=\"rel\"></div>",
+            400.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+        let ch20 = ch_width(20.0);
+        let ch16 = ch_width(16.0);
+        assert_eq!((r("box").width, r("box").height), (10.0 * ch20, 2.0 * ch20));
+        assert_eq!(r("cap").width, 12.0 * ch_width(10.0) + 4.0);
+        assert_eq!(r("rel").x, 3.0 * ch16);
+        // Without font metrics, one ch is the layout advance: half the font size.
+        assert_eq!(ch_width_with(None, 20.0), 10.0);
+        assert_eq!(ch_width_with(None, 20.0), measure("0", 20.0));
+        if system_font().is_none() {
+            assert_eq!(ch20, 10.0);
+        }
     }
 }

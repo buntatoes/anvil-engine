@@ -8,12 +8,12 @@
 //! [`StyleMap`] and places boxes. This crate does not lay out or paint.
 //!
 //! `width`, `height`, `max-width`, and the offset properties keep `px`, `%`,
-//! `em`, `rem`, `vw`, `vh`, `vmin`, and `vmax`. Any other unit becomes
+//! `em`, `rem`, `vw`, `vh`, `vmin`, `vmax`, and `ch`. Any other unit becomes
 //! [`Size::Auto`]. `font-size` accepts `px`, `%`, `em`, and `rem` and resolves
 //! them here: `%` and `em` use the parent font size, and `rem` uses the
 //! `html` font size (16px until that element sets one). Margin, padding,
 //! border, and `gap` still accept only `px` and `0`. `calc()` does not mix
-//! viewport units. `display` accepts `block`, `inline`, `inline-block`,
+//! viewport units or `ch`. `display` accepts `block`, `inline`, `inline-block`,
 //! `list-item`, `flow-root`, `flex`, `inline-flex`, `grid`, `inline-grid`,
 //! and `none`. A descendant selector is whitespace between compounds. `>`,
 //! `+`, `~`, attribute selectors, and pseudo-classes are not parsed.
@@ -452,6 +452,9 @@ pub enum Size {
     Vmin(f32),
     /// A percentage of the larger viewport side. `50.0` means `50vmax`.
     Vmax(f32),
+    /// A multiple of the width of the `0` glyph in the element's font.
+    /// `20.0` means `20ch`. Layout resolves it; see `anvil_layout::ch_width`.
+    Ch(f32),
     /// A combined `calc(...)` expression across `px`, `%`, `em`, and `rem`.
     Calc {
         px: f32,
@@ -463,6 +466,9 @@ pub enum Size {
 
 impl Size {
     /// Used CSS pixels, or `None` when this length is [`Size::Auto`].
+    ///
+    /// Viewport units and `ch` also return `None` here, because they need
+    /// the viewport or font metrics that only layout has.
     ///
     /// `percent_basis` is the containing-block size on this axis, in CSS pixels.
     /// A percentage needs a finite basis. `em_px` is this element's font size.
@@ -480,7 +486,7 @@ impl Size {
             }
             Size::Em(value) => Some(em_px * value),
             Size::Rem(value) => Some(rem_px * value),
-            Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) => None,
+            Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) | Size::Ch(_) => None,
             Size::Calc {
                 px,
                 percent,
@@ -1235,7 +1241,7 @@ fn is_block_tag(tag: &str) -> bool {
 /// `display: grid` and `var(--token)` are applied when the value parses. On
 /// `width`, `height`, `max-width`, and the offsets, `px`, `%`, `em`, `rem`,
 /// `vw`, `vh`, `vmin`, and `vmax` are kept. Another unit becomes
-/// [`Size::Auto`]. `font-size` resolves `%` and `em` against `parent_font_px`,
+/// [`Size::Auto`]. `ch` is kept for layout. `font-size` resolves `%` and `em` against `parent_font_px`,
 /// and `rem` against `root_font_px`. Margin, padding, border, and `gap` still
 /// accept only `px` and `0`. `overflow` values `scroll` and
 /// `auto` are stored as [`Overflow::Hidden`].
@@ -1891,7 +1897,7 @@ fn split_css_tokens(value: &str) -> Vec<&str> {
 }
 
 /// `auto` and `none` become [`Size::Auto`]. `px`, `%`, `em`, `rem`, `vw`,
-/// `vh`, `vmin`, `vmax`, and `0` keep their unit. Any other unit becomes
+/// `vh`, `vmin`, `vmax`, `ch`, and `0` keep their unit. Any other unit becomes
 /// [`Size::Auto`].
 fn parse_size(value: &str) -> Size {
     let value = value.trim();
@@ -1902,8 +1908,8 @@ fn parse_size(value: &str) -> Size {
     }
 }
 
-/// `0`, or a number with a `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`, or
-/// `vmax` suffix. `rem` is matched before `em`, and `vmin` / `vmax` before
+/// `0`, or a number with a `px`, `%`, `em`, `rem`, `vw`, `vh`, `vmin`,
+/// `vmax`, or `ch` suffix. `rem` is matched before `em`, and `vmin` / `vmax` before
 /// `vw` / `vh`. Other units, including a bare number other than `0`, return
 /// `None`.
 fn parse_length(value: &str) -> Option<Size> {
@@ -1940,6 +1946,9 @@ fn parse_length(value: &str) -> Option<Size> {
     if let Some(num) = strip_unit(value, "vw") {
         return num.parse::<f32>().ok().map(Size::Vw);
     }
+    if let Some(num) = strip_unit(value, "ch") {
+        return num.parse::<f32>().ok().map(Size::Ch);
+    }
     if let Some(num) = value.strip_suffix('%') {
         return num.trim().parse::<f32>().ok().map(Size::Percent);
     }
@@ -1959,14 +1968,15 @@ fn strip_unit<'a>(value: &'a str, unit: &str) -> Option<&'a str> {
 }
 
 /// Resolve `font-size`. `%` and `em` use the parent font size. `rem` uses the
-/// root font size. `px` and `0` are already pixels. Other units return `None`.
+/// root font size. `px` and `0` are already pixels. Other units, including
+/// viewport units and `ch`, return `None`.
 fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
     Some(match parse_length(value)? {
         Size::Px(value) => value,
         Size::Em(value) => parent_px * value,
         Size::Rem(value) => root_px * value,
         Size::Percent(value) => parent_px * value / 100.0,
-        Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) => return None,
+        Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) | Size::Ch(_) => return None,
         Size::Calc {
             px,
             percent,
@@ -2485,7 +2495,7 @@ mod tests {
         assert_eq!(styles.get(child).height, Size::Vh(20.0));
         assert_eq!(styles.get(child).max_width, Size::Rem(4.0));
         assert_eq!(styles.get(child).top, Size::Percent(25.0));
-        assert_eq!(styles.get(child).left, Size::Auto);
+        assert_eq!(styles.get(child).left, Size::Ch(20.0));
         assert_eq!(styles.get(child).font_size, 20.0);
         assert_eq!(styles.get(child).flex_grow, 2.0);
         assert_eq!(styles.get(child).display, Display::Block);
