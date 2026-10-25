@@ -26,7 +26,7 @@ other product.
 This file does not license:
 
 - `anvil-browser` (the window, network stack, sandbox, built-in pages,
-  and brand mark), which has its own proprietary license
+  and brand mark), which is Apache License 2.0
 - `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and
   `anvil-compress`, which are separate Mozilla Public License 2.0
   repositories

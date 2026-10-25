@@ -6,4 +6,4 @@ All rights reserved.
 
 `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and `anvil-compress` are separate Mozilla Public License 2.0 repositories.
 
-`anvil-browser` is a separate repository. Its license is not this file.
+`anvil-browser` is a separate repository under the Apache License 2.0. Its license is not this file.

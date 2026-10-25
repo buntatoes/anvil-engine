@@ -48,7 +48,7 @@ Proprietary. All rights reserved. See `LICENSE`.
 | Repository | License |
 | --- | --- |
 | This one (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Proprietary. All rights reserved |
-| `anvil-browser` | Proprietary. Separate terms. Not this file |
+| `anvil-browser` | Apache-2.0. Not this file |
 | `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories |
 
 Revisions of these crates that were already published in `anvil-browser` under the Apache License 2.0 stay under that license for those revisions only.
