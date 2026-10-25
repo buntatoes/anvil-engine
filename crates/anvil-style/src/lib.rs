@@ -30,13 +30,18 @@
 //! `opacity` takes a number or a percentage, clamped to `0..=1`.
 //! `transition` and its `-property`, `-duration`, `-delay`, and
 //! `-timing-function` longhands keep up to [`MAX_TRANSITIONS`] entries.
-//! [`compute_styles_animated`] runs them through an [`Animator`]; the plain
+//! `animation` and its `-name`, `-duration`, `-delay`, `-iteration-count`,
+//! `-direction`, `-fill-mode`, and `-timing-function` longhands keep up to
+//! [`MAX_ANIMATIONS`] entries and play `@keyframes` blocks;
+//! `animation-play-state` is accepted and ignored.
+//! [`compute_styles_animated`] runs both through an [`Animator`]; the plain
 //! `compute_styles` functions ignore them. See [`Animator`] for what moves.
 //!
 //! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
 //! Only `dark` matches a color scheme; `light` and any other value do not.
 //! An inner `@media` replaces the outer query instead of combining with it.
-//! Other at-rules are skipped. The cascade is user-agent defaults, then author
+//! `@keyframes` blocks are kept on the [`Stylesheet`], whether or not they sit
+//! inside `@media`. Other at-rules are skipped. The cascade is user-agent defaults, then author
 //! rules by specificity `(ids, classes, types)` and source order, then the
 //! `style` attribute, which always wins.
 
@@ -45,9 +50,10 @@ use std::collections::HashMap;
 
 mod animation;
 pub use animation::{
-    ANIMATABLE, AnimProperty, AnimValue, Animator, FrameClock, MAX_TRANSITIONS, ManualClock,
-    MonotonicClock, StepPosition, TimingFunction, TransitionSpec, Transitions, interpolate,
-    read_value, write_value,
+    ANIMATABLE, AnimProperty, AnimValue, AnimationDirection, AnimationSpec, Animations, Animator,
+    FillMode, FrameClock, Keyframe, KeyframesRule, MAX_ANIMATIONS, MAX_TRANSITIONS, ManualClock,
+    MonotonicClock, StepPosition, TimingFunction, TransitionSpec, Transitions, animation_name_hash,
+    interpolate, read_value, write_value,
 };
 
 /// A parsed style sheet. Rules are owned, in source order, including rules
@@ -55,6 +61,8 @@ pub use animation::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// `@keyframes` blocks in source order, including any inside `@media`.
+    pub keyframes: Vec<KeyframesRule>,
 }
 
 /// Viewport tests attached to a rule. Absent fields are unconstrained.
@@ -778,6 +786,8 @@ pub struct ComputedStyle {
     pub opacity: f32,
     /// `transition` and its longhands. Not inherited.
     pub transitions: Transitions,
+    /// `animation` and its longhands. Not inherited.
+    pub animations: Animations,
 }
 
 impl ComputedStyle {
@@ -831,6 +841,7 @@ impl ComputedStyle {
             transform_origin: TransformOrigin::CENTER,
             opacity: 1.0,
             transitions: Transitions::INITIAL,
+            animations: Animations::INITIAL,
         }
     }
 
@@ -897,13 +908,14 @@ const FALLBACK: ComputedStyle = ComputedStyle::initial();
 /// Parse `input` into an owned style sheet.
 ///
 /// Comments (`/* */`) are replaced with a space. Rules inside `@media` keep
-/// that query. An inner `@media` does not combine with the outer one. At-rules
-/// other than `@media` are skipped. The input is borrowed.
+/// that query. An inner `@media` does not combine with the outer one.
+/// `@keyframes` blocks go to [`Stylesheet::keyframes`]. Other at-rules are
+/// skipped. The input is borrowed.
 pub fn parse_css(input: &str) -> Stylesheet {
     let input = strip_comments(input);
-    let mut rules = Vec::new();
-    parse_css_rules(&input, None, &mut rules);
-    Stylesheet { rules }
+    let mut sheet = Stylesheet::default();
+    parse_css_rules(&input, None, &mut sheet);
+    sheet
 }
 
 /// Index of the `}` that closes a body whose opening `{` was already consumed.
@@ -927,12 +939,12 @@ fn find_matching_brace(src: &str) -> usize {
     src.len()
 }
 
-/// Split `rest` into rules, appending to `rules`.
+/// Split `rest` into rules and keyframes, appending to `sheet`.
 ///
 /// `active_media` is cloned onto each rule. `@media` replaces it for the
 /// nested body instead of intersecting the two queries. A prelude that starts
-/// with `@` and is not `@media` is dropped, body included.
-fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, rules: &mut Vec<Rule>) {
+/// with `@` and is not `@media` or `@keyframes` is dropped, body included.
+fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
     while let Some(open) = rest.find('{') {
         let selector_src = rest[..open].trim();
         rest = &rest[open + 1..];
@@ -945,7 +957,13 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, rules: &mut
         };
         if let Some(cond) = selector_src.strip_prefix("@media") {
             let mq = MediaQuery::parse(cond);
-            parse_css_rules(body_src, Some(mq), rules);
+            parse_css_rules(body_src, Some(mq), sheet);
+            continue;
+        }
+        if let Some(name) = selector_src.strip_prefix("@keyframes") {
+            sheet
+                .keyframes
+                .extend(animation::parse_keyframes(name, body_src));
             continue;
         }
         if selector_src.starts_with('@') {
@@ -955,7 +973,7 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, rules: &mut
         if selectors.is_empty() {
             continue;
         }
-        rules.push(Rule {
+        sheet.rules.push(Rule {
             selectors,
             declarations: parse_declarations(body_src),
             media: active_media.clone(),
@@ -1114,8 +1132,14 @@ fn walk(
                     let mut scratch = parent_vars.clone();
                     cascade_element(doc, id, tag, parent, &mut scratch, cx)
                 };
+                let input = animation::AnimInput {
+                    keyframes: &cx.sheet.keyframes,
+                    vars: &vars,
+                    parent_font_px: parent.font_size,
+                    root_font_px: cx.root_font_px,
+                };
                 if let Some(animator) = cx.animator.as_deref_mut() {
-                    animator.apply(id, &base, &mut style);
+                    animator.apply(id, &base, &mut style, &input);
                 }
                 style
             };
@@ -1626,6 +1650,18 @@ fn apply_declaration(
         | "transition-timing-function" => {
             let name = declaration.name.as_str();
             animation::apply_transition_declaration(&mut style.transitions, name, value);
+        }
+        "animation"
+        | "animation-name"
+        | "animation-duration"
+        | "animation-delay"
+        | "animation-iteration-count"
+        | "animation-direction"
+        | "animation-fill-mode"
+        | "animation-timing-function"
+        | "animation-play-state" => {
+            let name = declaration.name.as_str();
+            animation::apply_animation_declaration(&mut style.animations, name, value);
         }
         "transform-origin" => {
             if let Some(origin) = parse_transform_origin(value) {
@@ -3388,5 +3424,154 @@ mod tests {
     fn frame_all(animator: &mut Animator, doc: &Document, sheet: &Stylesheet, now: f64) {
         animator.tick(now);
         compute_styles_animated(doc, sheet, 800.0, 600.0, animator);
+    }
+
+    #[test]
+    fn parses_keyframes_and_animation_lists() {
+        let sheet = parse_css(
+            "@keyframes slide { from { margin-left: 0 } 50%, 75% { margin-left: 10px }
+                                to { opacity: 0.5 } 120% { color: red } bogus { color: red } }
+             @media (min-width: 1px) { @keyframes 'quoted' { 0% { opacity: 0 } } }
+             @keyframes none { from { opacity: 0 } }
+             @keyframes two words { from { opacity: 0 } }
+             div { color: blue; }",
+        );
+        assert_eq!(sheet.rules.len(), 1);
+        let names: Vec<&str> = sheet.keyframes.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, ["slide", "quoted"]);
+        let offsets: Vec<u32> = sheet.keyframes[0]
+            .frames
+            .iter()
+            .map(|f| f.offset_millionths)
+            .collect();
+        assert_eq!(offsets, [0, 500_000, 750_000, 1_000_000]);
+        assert_eq!(
+            sheet.keyframes[0].frames[1].declarations,
+            [Declaration {
+                name: "margin-left".to_string(),
+                value: "10px".to_string()
+            }]
+        );
+
+        let doc = parse_html("<div id=\"a\"></div><div id=\"b\"></div>");
+        let sheet = parse_css(
+            "#a { animation: slide 2s ease-out 100ms infinite alternate-reverse both paused,
+                             'fade' 50ms; }
+             #b { animation-name: x, y, none; animation-duration: 1s, 2s; animation-delay: -1s;
+                  animation-iteration-count: 2.5; animation-direction: reverse, normal;
+                  animation-fill-mode: forwards; animation-timing-function: steps(2);
+                  animation: slide 1s 2s 3s; animation-duration: -1s; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let get = |id: &str| *styles.get(doc.get_element_by_id(id).unwrap());
+        assert_eq!(
+            get("a").animations.specs(),
+            [
+                AnimationSpec {
+                    name_hash: animation_name_hash("slide"),
+                    duration_ms: 2000.0,
+                    delay_ms: 100.0,
+                    iterations: f32::INFINITY,
+                    direction: AnimationDirection::AlternateReverse,
+                    fill: FillMode::Both,
+                    timing: TimingFunction::CubicBezier(0.0, 0.0, 0.58, 1.0),
+                },
+                AnimationSpec {
+                    name_hash: animation_name_hash("fade"),
+                    duration_ms: 50.0,
+                    delay_ms: 0.0,
+                    iterations: 1.0,
+                    direction: AnimationDirection::Normal,
+                    fill: FillMode::None,
+                    timing: TimingFunction::EASE,
+                },
+            ]
+        );
+        // `none` entries are skipped; shorter lists repeat; the bad
+        // shorthand and the negative duration are ignored.
+        let b = get("b").animations.specs();
+        assert_eq!(b.len(), 2);
+        assert_eq!(
+            b[1],
+            AnimationSpec {
+                name_hash: animation_name_hash("y"),
+                duration_ms: 2000.0,
+                delay_ms: -1000.0,
+                iterations: 2.5,
+                direction: AnimationDirection::Normal,
+                fill: FillMode::Forwards,
+                timing: TimingFunction::Steps(2, StepPosition::End),
+            }
+        );
+        assert_eq!(b[0].direction, AnimationDirection::Reverse);
+    }
+
+    #[test]
+    fn runs_keyframe_animations_on_an_injected_clock() {
+        let mut doc = parse_html("<div id=\"a\"></div>");
+        let sheet = parse_css(
+            "@keyframes slide {
+                from { margin-left: 0; width: auto }
+                50% { margin-left: 100px; animation-timing-function: linear }
+                to { margin-left: 50px; width: 100px }
+             }
+             @keyframes fade { from { opacity: 0 } }
+             #a { animation: slide 1s linear 100ms 2 alternate both, fade 100ms linear; }",
+        );
+        let a = doc.get_element_by_id("a").unwrap();
+        let mut animator = Animator::new();
+        let at = |animator: &mut Animator, doc: &Document, now: f64| {
+            let style = frame(animator, doc, &sheet, now, "a");
+            (style.margin.left, style.opacity, style.width)
+        };
+        // Waiting on the delay, filled backwards from the first keyframe.
+        assert_eq!(at(&mut animator, &doc, 0.0), (0.0, 0.0, Size::Auto));
+        assert!(animator.is_animating());
+        assert_eq!(at(&mut animator, &doc, 25.0), (0.0, 0.25, Size::Auto));
+        // 250ms in: halfway to the 50% keyframe. `auto` does not blend.
+        assert_eq!(at(&mut animator, &doc, 350.0), (50.0, 1.0, Size::Auto));
+        assert_eq!(at(&mut animator, &doc, 850.0), (75.0, 1.0, Size::Px(100.0)));
+        // The second run plays backward.
+        assert_eq!(
+            at(&mut animator, &doc, 1350.0),
+            (75.0, 1.0, Size::Px(100.0))
+        );
+        // Done after two runs; filled forwards at the start of the curve.
+        assert!(animator.tick(2099.0));
+        assert_eq!(at(&mut animator, &doc, 2200.0), (0.0, 1.0, Size::Auto));
+        assert!(!animator.is_animating());
+
+        // Keeping the name keeps the start time: 2100ms into a 4s run is
+        // 52.5%, just past the middle keyframe. A new name starts now.
+        doc.set_attribute(a, "style", "animation-duration: 4s, 100ms");
+        let (left, _, _) = at(&mut animator, &doc, 2200.0);
+        assert_eq!(left, 97.5);
+        doc.set_attribute(a, "style", "animation: fade 100ms linear infinite");
+        assert_eq!(at(&mut animator, &doc, 3000.0).1, 0.0);
+        assert_eq!(at(&mut animator, &doc, 3150.0).1, 0.5);
+        assert!(animator.tick(1e12));
+        // Removing the animation stops it.
+        doc.set_attribute(a, "style", "animation: none");
+        assert_eq!(at(&mut animator, &doc, 1e12), (0.0, 1.0, Size::Auto));
+        assert!(!animator.is_animating());
+    }
+
+    #[test]
+    fn far_apart_keyframes_fill_forwards_with_their_last_value() {
+        let doc = parse_html("<div id=\"a\"></div><div id=\"b\"></div>");
+        let sheet = parse_css(
+            "@keyframes far { from { margin-left: 1e30px } to { margin-left: -370px } }
+             #a { animation: far 100ms linear forwards; }
+             #b { animation: far 100ms linear reverse forwards; }",
+        );
+        let mut animator = Animator::new();
+        let mut left = |now: f64, id: &str| frame(&mut animator, &doc, &sheet, now, id).margin.left;
+        assert_eq!(left(0.0, "a"), 1e30);
+        assert_eq!(left(0.0, "b"), -370.0);
+        assert_eq!(left(100.0, "a"), -370.0);
+        assert_eq!(left(5000.0, "a"), -370.0);
+        // Played backward, the fill keeps the `from` value.
+        assert_eq!(left(5000.0, "b"), 1e30);
+        assert!(!animator.is_animating());
     }
 }

@@ -229,6 +229,14 @@ const PROPERTIES: &[&str] = &[
     "transition-duration",
     "transition-delay",
     "transition-timing-function",
+    "animation",
+    "animation-name",
+    "animation-duration",
+    "animation-delay",
+    "animation-iteration-count",
+    "animation-direction",
+    "animation-fill-mode",
+    "animation-timing-function",
 ];
 
 /// Values for those properties, valid and broken.
@@ -343,13 +351,37 @@ const VALUES: &[&str] = &[
     "step-start",
     ",",
     "width 1ms",
+    "k",
+    "'k'",
+    "k 1s infinite alternate",
+    "infinite",
+    "1e30",
+    "2.5",
+    "both",
+    "forwards",
+    "reverse",
+    "alternate-reverse",
+    "k 10ms steps(2) -5ms 3 backwards",
+    "k, k, k, k, k",
 ];
 
 /// Random but CSS-shaped text aimed at the grid properties.
 fn css_soup(rng: &mut Rng) -> String {
     let mut out = String::new();
     for _ in 0..rng.below(10) {
-        out.push_str(rng.pick(&["#g", ".i", "div", "#a", "*", "@media (min-width: 1px)"]));
+        out.push_str(rng.pick(&[
+            "#g",
+            ".i",
+            "div",
+            "#a",
+            "*",
+            "@media (min-width: 1px)",
+            "@keyframes k { from",
+            "@keyframes k { 50%, to } 10%",
+            "@keyframes 'k' { 100%",
+            "to",
+            "@keyframes",
+        ]));
         out.push_str(" { ");
         for _ in 0..rng.below(6) {
             out.push_str(rng.pick(PROPERTIES));

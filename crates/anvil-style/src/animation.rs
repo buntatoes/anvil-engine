@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: LicenseRef-Proprietary
 // Copyright (c) 2026 Buntato
-//! Transitions: timing functions, interpolation, and the [`Animator`] that
-//! runs them against a clock.
+//! Transitions and `@keyframes` animations: timing functions,
+//! interpolation, and the [`Animator`] that runs them against a clock.
 //!
 //! See [`Animator`] for how a frame loop drives them.
 
-use crate::{Color, ComputedStyle, Display, Edge, Size, TransformFn, TransformList};
+use crate::{
+    Color, ComputedStyle, Declaration, Display, Edge, Size, TransformFn, TransformList,
+    apply_declaration, parse_declarations,
+};
 use anvil_dom::NodeId;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -345,14 +348,14 @@ pub(crate) fn parse_time_ms(value: &str) -> Option<f32> {
 }
 
 /// Fill a fixed list from comma-separated `value`. Fails on an empty list,
-/// a list past [`MAX_TRANSITIONS`], or any bad entry.
-fn parse_list<T: Copy>(
+/// a list longer than `out`, or any bad entry.
+fn parse_list<T: Copy, const N: usize>(
     value: &str,
-    out: &mut [T; MAX_TRANSITIONS],
+    out: &mut [T; N],
     parse: impl Fn(&str) -> Option<T>,
 ) -> Option<u8> {
     let parts = split_top_level(value, ',');
-    if parts.is_empty() || parts.len() > MAX_TRANSITIONS {
+    if parts.is_empty() || parts.len() > N {
         return None;
     }
     let mut parsed = *out;
@@ -823,6 +826,530 @@ impl Decomposed {
     }
 }
 
+/// Most entries kept in each `animation-*` list. Longer lists are ignored.
+pub const MAX_ANIMATIONS: usize = 4;
+
+/// One `@keyframes` block. The name is as written, without quotes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyframesRule {
+    pub name: String,
+    pub frames: Vec<Keyframe>,
+}
+
+/// One keyframe. `offset_millionths` is the position from `0` (`from`) to
+/// `1_000_000` (`to`). A selector list like `from, 50%` gives one keyframe
+/// per offset, each with the same declarations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Keyframe {
+    pub offset_millionths: u32,
+    pub declarations: Vec<Declaration>,
+}
+
+/// Parse the body of `@keyframes <name> { ... }`. `None` when the name is
+/// missing or not one word. Keyframes with a bad selector are dropped.
+pub(crate) fn parse_keyframes(prelude: &str, body: &str) -> Option<KeyframesRule> {
+    let name = prelude
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    if name.is_empty() || name.contains(char::is_whitespace) || name.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut frames = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find('{') {
+        let selector = &rest[..open];
+        let after = &rest[open + 1..];
+        let close = after.find('}').unwrap_or(after.len());
+        let declarations = parse_declarations(&after[..close]);
+        rest = after.get(close + 1..).unwrap_or("");
+        let offsets: Option<Vec<u32>> = selector.split(',').map(parse_keyframe_offset).collect();
+        for offset in offsets.unwrap_or_default() {
+            frames.push(Keyframe {
+                offset_millionths: offset,
+                declarations: declarations.clone(),
+            });
+        }
+    }
+    Some(KeyframesRule {
+        name: name.to_string(),
+        frames,
+    })
+}
+
+/// `from`, `to`, or a percentage in `0..=100`, in millionths.
+fn parse_keyframe_offset(selector: &str) -> Option<u32> {
+    let selector = selector.trim().to_ascii_lowercase();
+    match selector.as_str() {
+        "from" => Some(0),
+        "to" => Some(1_000_000),
+        _ => {
+            let pct = selector.strip_suffix('%')?.trim().parse::<f64>().ok()?;
+            (0.0..=100.0)
+                .contains(&pct)
+                .then(|| (pct * 10_000.0).round() as u32)
+        }
+    }
+}
+
+/// A stable 64-bit hash of an animation name, so [`Animations`] can stay
+/// `Copy`. Never 0, which stands for `none`.
+pub fn animation_name_hash(name: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+/// `animation-direction`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationDirection {
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+/// `animation-fill-mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillMode {
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+impl FillMode {
+    fn backwards(self) -> bool {
+        matches!(self, Self::Backwards | Self::Both)
+    }
+
+    fn forwards(self) -> bool {
+        matches!(self, Self::Forwards | Self::Both)
+    }
+}
+
+/// The `animation-*` longhands as parsed lists. Lists shorter than
+/// `animation-name` repeat, as in CSS.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Animations {
+    names: [u64; MAX_ANIMATIONS],
+    name_count: u8,
+    durations_ms: [f32; MAX_ANIMATIONS],
+    duration_count: u8,
+    delays_ms: [f32; MAX_ANIMATIONS],
+    delay_count: u8,
+    iterations: [f32; MAX_ANIMATIONS],
+    iteration_count: u8,
+    directions: [AnimationDirection; MAX_ANIMATIONS],
+    direction_count: u8,
+    fills: [FillMode; MAX_ANIMATIONS],
+    fill_count: u8,
+    timings: [TimingFunction; MAX_ANIMATIONS],
+    timing_count: u8,
+}
+
+/// One entry of [`Animations`], with its repeated longhands filled in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimationSpec {
+    /// [`animation_name_hash`] of the name.
+    pub name_hash: u64,
+    pub duration_ms: f32,
+    pub delay_ms: f32,
+    /// `infinite` is `f32::INFINITY`.
+    pub iterations: f32,
+    pub direction: AnimationDirection,
+    pub fill: FillMode,
+    pub timing: TimingFunction,
+}
+
+impl Animations {
+    /// `animation: none`.
+    pub const INITIAL: Self = Self {
+        names: [0; MAX_ANIMATIONS],
+        name_count: 0,
+        durations_ms: [0.0; MAX_ANIMATIONS],
+        duration_count: 1,
+        delays_ms: [0.0; MAX_ANIMATIONS],
+        delay_count: 1,
+        iterations: [1.0; MAX_ANIMATIONS],
+        iteration_count: 1,
+        directions: [AnimationDirection::Normal; MAX_ANIMATIONS],
+        direction_count: 1,
+        fills: [FillMode::None; MAX_ANIMATIONS],
+        fill_count: 1,
+        timings: [TimingFunction::EASE; MAX_ANIMATIONS],
+        timing_count: 1,
+    };
+
+    /// Every named entry in list order. `none` entries are skipped.
+    pub fn specs(&self) -> Vec<AnimationSpec> {
+        let count = usize::from(self.name_count).min(MAX_ANIMATIONS);
+        (0..count)
+            .filter(|&i| self.names[i] != 0)
+            .map(|i| {
+                let pick = |n: u8| i % usize::from(n.max(1));
+                AnimationSpec {
+                    name_hash: self.names[i],
+                    duration_ms: self.durations_ms[pick(self.duration_count)],
+                    delay_ms: self.delays_ms[pick(self.delay_count)],
+                    iterations: self.iterations[pick(self.iteration_count)],
+                    direction: self.directions[pick(self.direction_count)],
+                    fill: self.fills[pick(self.fill_count)],
+                    timing: self.timings[pick(self.timing_count)],
+                }
+            })
+            .collect()
+    }
+}
+
+/// `infinite` or a non-negative finite number.
+fn parse_iterations(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("infinite") {
+        return Some(f32::INFINITY);
+    }
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+fn parse_direction(value: &str) -> Option<AnimationDirection> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => AnimationDirection::Normal,
+        "reverse" => AnimationDirection::Reverse,
+        "alternate" => AnimationDirection::Alternate,
+        "alternate-reverse" => AnimationDirection::AlternateReverse,
+        _ => return None,
+    })
+}
+
+fn parse_fill(value: &str) -> Option<FillMode> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "none" => FillMode::None,
+        "forwards" => FillMode::Forwards,
+        "backwards" => FillMode::Backwards,
+        "both" => FillMode::Both,
+        _ => return None,
+    })
+}
+
+/// A name: one word, optionally quoted, or `none` (hash 0).
+fn parse_animation_name(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(0);
+    }
+    let name = value.trim_matches(|c| c == '"' || c == '\'');
+    let ok = !name.is_empty() && !name.contains(|c: char| c.is_whitespace() || c == '(');
+    ok.then(|| animation_name_hash(name))
+}
+
+/// Apply one `animation` or `animation-*` declaration. Returns false when
+/// `name` is not one of them; a bad value leaves the lists alone.
+/// `animation-play-state` is accepted and ignored.
+pub(crate) fn apply_animation_declaration(a: &mut Animations, name: &str, value: &str) -> bool {
+    match name {
+        "animation-name" => {
+            if let Some(n) = parse_list(value, &mut a.names, parse_animation_name) {
+                a.name_count = n;
+            }
+        }
+        "animation-duration" => {
+            if let Some(n) = parse_list(value, &mut a.durations_ms, |v| {
+                parse_time_ms(v).filter(|ms| *ms >= 0.0)
+            }) {
+                a.duration_count = n;
+            }
+        }
+        "animation-delay" => {
+            if let Some(n) = parse_list(value, &mut a.delays_ms, parse_time_ms) {
+                a.delay_count = n;
+            }
+        }
+        "animation-iteration-count" => {
+            if let Some(n) = parse_list(value, &mut a.iterations, parse_iterations) {
+                a.iteration_count = n;
+            }
+        }
+        "animation-direction" => {
+            if let Some(n) = parse_list(value, &mut a.directions, parse_direction) {
+                a.direction_count = n;
+            }
+        }
+        "animation-fill-mode" => {
+            if let Some(n) = parse_list(value, &mut a.fills, parse_fill) {
+                a.fill_count = n;
+            }
+        }
+        "animation-timing-function" => {
+            if let Some(n) = parse_list(value, &mut a.timings, TimingFunction::parse) {
+                a.timing_count = n;
+            }
+        }
+        "animation-play-state" => {}
+        "animation" => {
+            if let Some(parsed) = parse_animation_shorthand(value) {
+                *a = parsed;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// `animation: <name> <duration> <timing> <delay> <count> <direction>
+/// <fill>, ...` in any order within an entry. The first time is the
+/// duration, the second the delay. A word that is not a keyword is the name.
+fn parse_animation_shorthand(value: &str) -> Option<Animations> {
+    let entries = split_top_level(value, ',');
+    if entries.is_empty() || entries.len() > MAX_ANIMATIONS {
+        return None;
+    }
+    let mut a = Animations::INITIAL;
+    let count = entries.len() as u8;
+    a.name_count = count;
+    a.duration_count = count;
+    a.delay_count = count;
+    a.iteration_count = count;
+    a.direction_count = count;
+    a.fill_count = count;
+    a.timing_count = count;
+    for (i, entry) in entries.iter().enumerate() {
+        let mut name = None;
+        let mut duration = None;
+        let mut delay = None;
+        let mut iterations = None;
+        let mut direction = None;
+        let mut fill = None;
+        let mut timing = None;
+        for token in split_top_level(entry, ' ') {
+            if let Some(ms) = parse_time_ms(token) {
+                if duration.is_none() {
+                    if ms < 0.0 {
+                        return None;
+                    }
+                    duration = Some(ms);
+                } else if delay.is_none() {
+                    delay = Some(ms);
+                } else {
+                    return None;
+                }
+            } else if let Some(f) = TimingFunction::parse(token).filter(|_| timing.is_none()) {
+                timing = Some(f);
+            } else if let Some(n) = parse_iterations(token).filter(|_| iterations.is_none()) {
+                iterations = Some(n);
+            } else if let Some(d) = parse_direction(token).filter(|_| direction.is_none()) {
+                direction = Some(d);
+            } else if let Some(f) = parse_fill(token).filter(|_| fill.is_none()) {
+                fill = Some(f);
+            } else if matches!(token.to_ascii_lowercase().as_str(), "running" | "paused") {
+                continue;
+            } else if name.is_none() {
+                name = Some(parse_animation_name(token)?);
+            } else {
+                return None;
+            }
+        }
+        a.names[i] = name.unwrap_or(0);
+        a.durations_ms[i] = duration.unwrap_or(0.0);
+        a.delays_ms[i] = delay.unwrap_or(0.0);
+        a.iterations[i] = iterations.unwrap_or(1.0);
+        a.directions[i] = direction.unwrap_or(AnimationDirection::Normal);
+        a.fills[i] = fill.unwrap_or(FillMode::None);
+        a.timings[i] = timing.unwrap_or(TimingFunction::EASE);
+    }
+    Some(a)
+}
+
+/// The animatable properties one declaration sets, shorthands expanded.
+fn declared_properties(name: &str) -> Vec<AnimProperty> {
+    use AnimProperty as P;
+    match name {
+        "margin" => vec![P::MarginTop, P::MarginRight, P::MarginBottom, P::MarginLeft],
+        "padding" => vec![
+            P::PaddingTop,
+            P::PaddingRight,
+            P::PaddingBottom,
+            P::PaddingLeft,
+        ],
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            vec![P::BorderColor]
+        }
+        "background-image" => vec![P::BackgroundColor],
+        _ => match AnimProperty::from_name(name) {
+            P::All | P::Other => Vec::new(),
+            property => vec![property],
+        },
+    }
+}
+
+/// Phase and progress of an animation `local_ms` after its start, before
+/// keyframe easing. `None` when it has no effect at that time.
+fn animation_progress(spec: &AnimationSpec, local_ms: f64) -> Option<f64> {
+    let duration = f64::from(spec.duration_ms.max(0.0));
+    let iterations = f64::from(spec.iterations.max(0.0));
+    let active = if duration == 0.0 || iterations == 0.0 {
+        0.0
+    } else {
+        duration * iterations
+    };
+    let (iteration, progress) = if local_ms < 0.0 {
+        if !spec.fill.backwards() {
+            return None;
+        }
+        (0.0, 0.0)
+    } else if local_ms < active {
+        let overall = local_ms / duration;
+        let iteration = overall.floor();
+        (iteration, overall - iteration)
+    } else {
+        if !spec.fill.forwards() {
+            return None;
+        }
+        if iterations.is_infinite() {
+            (0.0, 1.0)
+        } else if iterations > 0.0 && iterations.fract() == 0.0 {
+            (iterations - 1.0, 1.0)
+        } else {
+            (iterations.floor(), iterations.fract())
+        }
+    };
+    let odd = iteration % 2.0 == 1.0;
+    let reversed = match spec.direction {
+        AnimationDirection::Normal => false,
+        AnimationDirection::Reverse => true,
+        AnimationDirection::Alternate => odd,
+        AnimationDirection::AlternateReverse => !odd,
+    };
+    Some(if reversed { 1.0 - progress } else { progress })
+}
+
+/// True while the animation can still change: waiting on its delay or in
+/// its active time.
+fn animation_is_live(spec: &AnimationSpec, local_ms: f64) -> bool {
+    let duration = f64::from(spec.duration_ms.max(0.0));
+    let iterations = f64::from(spec.iterations.max(0.0));
+    let active = if duration == 0.0 || iterations == 0.0 {
+        0.0
+    } else {
+        duration * iterations
+    };
+    local_ms < active
+}
+
+/// Write one animation's values for directed progress `p` onto `out`.
+///
+/// Each property the keyframes name blends between the two keyframes
+/// around `p`, eased by the earlier keyframe's `animation-timing-function`
+/// or the animation's. A missing `0%` or `100%` uses `underlying`. Values
+/// that cannot blend switch halfway through the eased interval.
+fn apply_keyframes(
+    rule: &KeyframesRule,
+    spec: &AnimationSpec,
+    p: f64,
+    underlying: &ComputedStyle,
+    input: &AnimInput,
+    out: &mut ComputedStyle,
+) {
+    // Each keyframe's style, from the underlying one plus its declarations.
+    let mut frames: Vec<(f64, ComputedStyle, Vec<AnimProperty>, TimingFunction)> = Vec::new();
+    for frame in &rule.frames {
+        let mut style = *underlying;
+        let mut vars = input.vars.clone();
+        let mut declared = Vec::new();
+        let mut timing = spec.timing;
+        for declaration in &frame.declarations {
+            if declaration.name == "animation-timing-function" {
+                if let Some(f) = TimingFunction::parse(&declaration.value) {
+                    timing = f;
+                }
+                continue;
+            }
+            declared.extend(declared_properties(&declaration.name));
+            apply_declaration(
+                &mut style,
+                &mut vars,
+                declaration,
+                input.parent_font_px,
+                input.root_font_px,
+            );
+        }
+        let offset = f64::from(frame.offset_millionths) / 1_000_000.0;
+        frames.push((offset, style, declared, timing));
+    }
+    let mut properties: Vec<AnimProperty> = Vec::new();
+    for (_, _, declared, _) in &frames {
+        for property in declared {
+            if !properties.contains(property) {
+                properties.push(*property);
+            }
+        }
+    }
+    for property in properties {
+        let Some(base) = read_value(underlying, property) else {
+            continue;
+        };
+        // (offset, value, easing) for keyframes naming this property; at a
+        // repeated offset the later keyframe wins.
+        let mut stops: Vec<(f64, AnimValue, TimingFunction)> = Vec::new();
+        for (offset, style, declared, timing) in &frames {
+            if !declared.contains(&property) {
+                continue;
+            }
+            let Some(value) = read_value(style, property) else {
+                continue;
+            };
+            stops.retain(|(o, _, _)| o != offset);
+            stops.push((*offset, value, *timing));
+        }
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if stops.first().is_none_or(|s| s.0 > 0.0) {
+            stops.insert(0, (0.0, base, spec.timing));
+        }
+        if stops.last().is_none_or(|s| s.0 < 1.0) {
+            stops.push((1.0, base, spec.timing));
+        }
+        let after = stops
+            .iter()
+            .position(|s| s.0 > p)
+            .unwrap_or(stops.len() - 1)
+            .max(1);
+        let (from, to) = (stops[after - 1], stops[after]);
+        let span = to.0 - from.0;
+        let local = if span > 0.0 {
+            ((p - from.0) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let eased = from.2.eval(local);
+        let value =
+            interpolate(from.1, to.1, eased).unwrap_or(if eased < 0.5 { from.1 } else { to.1 });
+        write_value(out, property, value);
+    }
+}
+
+/// What applying keyframes needs from the cascade.
+pub(crate) struct AnimInput<'a> {
+    pub keyframes: &'a [KeyframesRule],
+    pub vars: &'a HashMap<String, String>,
+    pub parent_font_px: f32,
+    pub root_font_px: f32,
+}
+
+impl AnimInput<'_> {
+    /// The last `@keyframes` with this name hash.
+    fn rule(&self, name_hash: u64) -> Option<&KeyframesRule> {
+        self.keyframes
+            .iter()
+            .rev()
+            .find(|rule| animation_name_hash(&rule.name) == name_hash)
+    }
+}
+
 /// A source of frame times in milliseconds.
 pub trait FrameClock {
     fn now_ms(&self) -> f64;
@@ -914,6 +1441,9 @@ struct NodeState {
     /// The style the cascade produced last time, before any animation.
     base: ComputedStyle,
     transitions: Vec<RunningTransition>,
+    /// Named animations in list order, with the time each name first
+    /// appeared and whether a `@keyframes` rule matched it.
+    animations: Vec<(AnimationSpec, f64, bool)>,
     /// Pass number when this element was last styled.
     seen: u64,
 }
@@ -968,6 +1498,17 @@ struct NodeState {
 /// shortened reverse of an interrupted transition (a reverse takes the full
 /// duration from the current value), and starting on an element's first
 /// styled pass or while it is `display: none`.
+///
+/// Animations play the `@keyframes` block named by `animation-name` (the
+/// last one with that name), from the time the name first appears on the
+/// element; changing other `animation-*` values keeps that start time.
+/// Keyframes blend the same properties as transitions, with values that
+/// cannot blend switching halfway; a keyframe's own
+/// `animation-timing-function` eases the interval after it. A missing
+/// `0%` or `100%` keyframe uses the element's value without the animation.
+/// Animations apply under transitions, and animated values do not start
+/// transitions. Not supported: animation events, `animation-play-state`,
+/// `animation-composition`, and `!important` inside keyframes.
 #[derive(Clone, Debug, Default)]
 pub struct Animator {
     nodes: HashMap<NodeId, NodeState>,
@@ -983,7 +1524,7 @@ impl Animator {
 
     /// Set the current time to `now_ms` and drop finished transitions.
     /// Returns true when something is still running or waiting on a delay,
-    /// so the caller should draw another frame. Time never runs backward;
+    /// so the caller should draw another frame (see [`Self::is_animating`]). Time never runs backward;
     /// an earlier time is treated as the current one.
     pub fn tick(&mut self, now_ms: f64) -> bool {
         if now_ms.is_finite() && now_ms > self.now_ms {
@@ -1006,13 +1547,17 @@ impl Animator {
         self.now_ms
     }
 
-    /// True when any transition has not finished at the current time.
-    /// A pass that starts a transition makes this true at once.
+    /// True when any transition has not finished at the current time, or
+    /// any animation is waiting on its delay or still in its active time.
+    /// A pass that starts one makes this true at once.
     pub fn is_animating(&self) -> bool {
         let now = self.now_ms;
-        self.nodes
-            .values()
-            .any(|state| state.transitions.iter().any(|t| !t.is_done(now)))
+        self.nodes.values().any(|state| {
+            state.transitions.iter().any(|t| !t.is_done(now))
+                || state.animations.iter().any(|(spec, start, has_rule)| {
+                    *has_rule && animation_is_live(spec, now - start - f64::from(spec.delay_ms))
+                })
+        })
     }
 
     /// Start a restyle pass.
@@ -1029,12 +1574,19 @@ impl Animator {
     /// Note `base`, the element's freshly cascaded style, start transitions
     /// for properties that changed since the last pass, and write running
     /// values onto `out`, the style the page will use.
-    pub(crate) fn apply(&mut self, id: NodeId, base: &ComputedStyle, out: &mut ComputedStyle) {
+    pub(crate) fn apply(
+        &mut self,
+        id: NodeId,
+        base: &ComputedStyle,
+        out: &mut ComputedStyle,
+        input: &AnimInput,
+    ) {
         let now = self.now_ms;
         let pass = self.pass;
         let state = self.nodes.entry(id).or_insert_with(|| NodeState {
             base: *base,
             transitions: Vec::new(),
+            animations: Vec::new(),
             seen: pass,
         });
         state.seen = pass;
@@ -1081,6 +1633,35 @@ impl Animator {
             }
         }
         state.base = *base;
+        // Animations keep their start time while their name stays listed;
+        // a new name starts now. Hidden elements run none.
+        let specs = if hidden {
+            Vec::new()
+        } else {
+            base.animations.specs()
+        };
+        let animations: Vec<(AnimationSpec, f64, bool)> = specs
+            .iter()
+            .map(|spec| {
+                let start = state
+                    .animations
+                    .iter()
+                    .find(|(old, _, _)| old.name_hash == spec.name_hash)
+                    .map_or(now, |(_, start, _)| *start);
+                (*spec, start, input.rule(spec.name_hash).is_some())
+            })
+            .collect();
+        state.animations = animations;
+        let underlying = *out;
+        for (spec, start, _) in &state.animations {
+            let Some(rule) = input.rule(spec.name_hash) else {
+                continue;
+            };
+            let local = now - start - f64::from(spec.delay_ms);
+            if let Some(p) = animation_progress(spec, local) {
+                apply_keyframes(rule, spec, p, &underlying, input, out);
+            }
+        }
         for t in &state.transitions {
             if !t.is_done(now) {
                 write_value(out, t.property, t.value_at(now));
