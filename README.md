@@ -1,8 +1,15 @@
-# Anvil Engine
+<div align="center">
+  <h1>Anvil Engine</h1>
+  <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
+  <p>
+    <img src="https://img.shields.io/badge/release-v.22-ff6b24?style=flat-square" alt="v.22" />
+    <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Proprietary-e8c37a?style=flat-square" alt="Proprietary" /></a>
+    <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
+  </p>
+</div>
 
-Page pipeline for Anvil Browser. Version 0.22. Author: Buntos.
-
-This is not the window, the network stack, or the profile file. Those stay in `anvil-browser`.
+Version 0.22. Author: Buntos.
 
 There are no crates.io dependencies.
 
