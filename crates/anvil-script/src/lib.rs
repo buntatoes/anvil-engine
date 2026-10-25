@@ -4628,6 +4628,18 @@ fn script_stays_on_rust(source: &str) -> bool {
         "fetch",
         "addEventListener",
         "window",
+        "Promise",
+        "setTimeout",
+        "setInterval",
+        "clearTimeout",
+        "clearInterval",
+        "requestAnimationFrame",
+        "queueMicrotask",
+        "then",
+        "catch",
+        "finally",
+        "async",
+        "await",
     ];
     let mut ident = String::new();
     for ch in source.chars() {

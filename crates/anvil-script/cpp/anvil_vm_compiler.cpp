@@ -103,6 +103,17 @@ inline bool match_kw(const char* s, u32 len, const char* kw, u32 kw_len) noexcep
     return true;
 }
 
+// Names served by the Rust event loop (promises, async functions, and timers).
+// The numeric VM has no job queue, so a script that names one is rejected and
+// runs on the Rust interpreter instead of having the call dropped.
+inline bool is_event_loop_word(const char* s, u32 len) noexcept {
+    return match_kw(s, len, "async", 5) || match_kw(s, len, "await", 5) ||
+           match_kw(s, len, "Promise", 7) || match_kw(s, len, "setTimeout", 10) ||
+           match_kw(s, len, "setInterval", 11) || match_kw(s, len, "clearTimeout", 12) ||
+           match_kw(s, len, "clearInterval", 13) || match_kw(s, len, "queueMicrotask", 14) ||
+           match_kw(s, len, "requestAnimationFrame", 21);
+}
+
 f64 parse_f64_slice(const char* s, u32 len) noexcept {
     f64 int_part = 0.0;
     u32 i = 0u;
@@ -211,6 +222,9 @@ struct AnvilLexer {
                 else if (match_kw(s, id_len, "false", 5)) kind = TokenKind::KwFalse;
                 else if (match_kw(s, id_len, "null", 4)) kind = TokenKind::KwNull;
                 else if (match_kw(s, id_len, "new", 3)) kind = TokenKind::KwNew;
+                if (is_event_loop_word(s, id_len)) {
+                    return false;
+                }
                 tokens[count++] = Token{kind, start, id_len, 0.0};
                 continue;
             }
