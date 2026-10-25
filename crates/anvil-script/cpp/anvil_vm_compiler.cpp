@@ -1212,6 +1212,13 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
 
     u8 last_reg = 0u;
     while (g_compiler.peek().kind != TokenKind::Eof && !g_compiler.had_error) {
+        if (g_compiler.peek().kind == TokenKind::RBrace) {
+            // A '}' with no open block. compile_statement returns without
+            // consuming it, so this loop would never end. Reject the script;
+            // the Rust interpreter runs it instead.
+            g_compiler.had_error = true;
+            break;
+        }
         last_reg = g_compiler.compile_statement();
     }
     ctx.program.emit(AnvilInstruction::make_abc(AnvilOpcode::Halt, last_reg, 0u, 0u));

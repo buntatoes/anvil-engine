@@ -529,6 +529,11 @@ pub const MAX_CALL_DEPTH: usize = 64;
 /// Maximum elements kept from one array literal.
 pub const MAX_ARRAY_LEN: usize = 10_000;
 
+/// Maximum UTF-8 bytes in one string built by `+`, `+=`, a template literal,
+/// `repeat`, or `join`. A longer result aborts the turn, like the step budget,
+/// so a doubling loop cannot exhaust memory before the steps run out.
+pub const MAX_STRING_LEN: usize = 1024 * 1024;
+
 /// Maximum `setTimeout` and `requestAnimationFrame` callbacks kept on the runtime.
 pub const MAX_TIMERS: usize = 64;
 
@@ -846,6 +851,18 @@ impl ScriptRuntime {
         self.thrown_error = None;
         self.loop_break = false;
         self.loop_continue = false;
+    }
+
+    /// Join two values as text, or abort the turn when the result would pass
+    /// [`MAX_STRING_LEN`].
+    fn concat_strings(&mut self, doc: &Document, left: &Value, right: &Value) -> Value {
+        let left = left.as_string(doc);
+        let right = right.as_string(doc);
+        if left.len().saturating_add(right.len()) > MAX_STRING_LEN {
+            self.aborted = true;
+            return Value::Null;
+        }
+        Value::Str(left + &right)
     }
 
     fn consume_step(&mut self) -> bool {
@@ -1775,7 +1792,7 @@ impl ScriptRuntime {
             let add = self.eval_expr(doc, rhs.trim());
             let next = match (&cur, &add) {
                 (Value::Number(a), Value::Number(b)) => Value::Number(a + b),
-                _ => Value::Str(format!("{}{}", cur.as_string(doc), add.as_string(doc))),
+                _ => self.concat_strings(doc, &cur, &add),
             };
             self.assign_target(doc, lhs, next);
             return;
@@ -2242,7 +2259,7 @@ impl ScriptRuntime {
             if let (Value::Number(a), Value::Number(b)) = (&l, &r) {
                 return Value::Number(a + b);
             }
-            return Value::Str(format!("{}{}", l.as_string(doc), r.as_string(doc)));
+            return self.concat_strings(doc, &l, &r);
         }
 
         for op in ["-", "*", "/", "%"] {
@@ -2675,6 +2692,10 @@ impl ScriptRuntime {
                 let expr_str = &after[..end];
                 let val = self.eval_expr(doc, expr_str);
                 out.push_str(&val.as_string(doc));
+                if out.len() > MAX_STRING_LEN {
+                    self.aborted = true;
+                    return String::new();
+                }
                 rest = &after[end + 1..];
             } else {
                 out.push_str(&rest[start..]);
@@ -3461,7 +3482,12 @@ impl ScriptRuntime {
                                     .and_then(|a| self.eval_expr(doc, a).as_number())
                                     .unwrap_or(0.0)
                                     .clamp(0.0, 1024.0) as usize;
-                            Value::Str(s.repeat(count))
+                            if s.len().saturating_mul(count) > MAX_STRING_LEN {
+                                self.aborted = true;
+                                Value::Null
+                            } else {
+                                Value::Str(s.repeat(count))
+                            }
                         }
                         "padStart" | "padEnd" => {
                             let target_len =
@@ -3549,11 +3575,17 @@ impl ScriptRuntime {
                                 .first()
                                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                                 .unwrap_or_else(|| ",".to_string());
-                            let joined = items
-                                .iter()
-                                .map(|v| v.as_string(doc))
-                                .collect::<Vec<_>>()
-                                .join(&sep);
+                            let mut joined = String::new();
+                            for (index, item) in items.iter().enumerate() {
+                                if index > 0 {
+                                    joined.push_str(&sep);
+                                }
+                                joined.push_str(&item.as_string(doc));
+                                if joined.len() > MAX_STRING_LEN {
+                                    self.aborted = true;
+                                    return Value::Null;
+                                }
+                            }
                             Value::Str(joined)
                         }
                         "includes" => {

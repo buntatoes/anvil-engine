@@ -1691,7 +1691,9 @@ fn parse_size(value: &str) -> Size {
 /// `None`.
 fn parse_length(value: &str) -> Option<Size> {
     let value = value.trim();
-    if value.len() > 5 && value[..5].eq_ignore_ascii_case("calc(") && value.ends_with(')') {
+    // `get` rather than an index: byte 5 can fall inside a multi-byte character.
+    let is_calc = value.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("calc("));
+    if value.len() > 5 && is_calc && value.ends_with(')') {
         return parse_calc(&value[5..value.len() - 1]);
     }
     let value = value.trim();
