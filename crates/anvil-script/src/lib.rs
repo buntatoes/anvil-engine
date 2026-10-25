@@ -537,8 +537,11 @@ pub const MAX_STRING_LEN: usize = 1024 * 1024;
 /// Maximum `setTimeout` and `requestAnimationFrame` callbacks kept on the runtime.
 pub const MAX_TIMERS: usize = 64;
 
-/// Maximum queued Promise / `queueMicrotask` callbacks per turn.
-pub const MAX_MICROTASKS: usize = 128;
+/// Maximum jobs waiting on the microtask queue at one time.
+///
+/// Promise reactions and `queueMicrotask` callbacks share this queue. A job
+/// past the cap is dropped. The step budget, not this cap, stops a flood.
+pub const MAX_MICROTASKS: usize = 8192;
 
 /// Maximum stored rows in one `localStorage` or `sessionStorage` list.
 ///
@@ -550,6 +553,202 @@ pub const MAX_STORAGE_ENTRIES: usize = 256;
 /// A `setItem` that would pass this cap does not run. The previous value stays.
 /// `sessionStorage` uses the same cap and is not written to `profile.anvil`.
 pub const MAX_STORAGE_ORIGIN_BYTES: usize = 64 * 1024;
+
+/// Safety cap on event-loop iterations in one drain. The step budget is the
+/// real limit. This only stops a settle cycle that spends no script steps.
+const MAX_EVENT_LOOP_TICKS: usize = 2_000_000;
+
+/// Maximum promise records kept by one runtime.
+const MAX_PROMISES: usize = 100_000;
+
+/// Marks a reaction that settles no result promise.
+const NO_RESULT: usize = usize::MAX;
+
+/// Settlement state of one promise record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+/// What a reaction does when the promise it watches settles.
+#[derive(Clone, Debug, PartialEq)]
+enum HandlerKind {
+    /// Run script text with the settled value bound to `param`. `env` holds
+    /// the async-function locals and resolver names the callback captured.
+    Js {
+        param: Option<String>,
+        body: String,
+        env: Vec<(String, Value)>,
+        is_async: bool,
+    },
+    /// Pass the outcome through to the result promise unchanged.
+    Pass,
+    /// Run `body`, then pass the original outcome through.
+    Finally {
+        body: String,
+        env: Vec<(String, Value)>,
+    },
+    /// Fulfill or adopt `target` with the settled value.
+    Resolve { target: usize },
+    /// Reject `target` with the settled value.
+    Reject { target: usize },
+    /// Report slot `index` of a combinator.
+    Collect { agg: usize, index: usize },
+    /// Resume the suspended async function in frame slot `frame`.
+    Resume { frame: usize },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Reaction {
+    kind: HandlerKind,
+    result: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PromiseRec {
+    state: PromiseState,
+    value: Value,
+    on_fulfill: Vec<Reaction>,
+    on_reject: Vec<Reaction>,
+    handled: bool,
+}
+
+/// One entry on the microtask queue.
+#[derive(Clone, Debug, PartialEq)]
+enum Job {
+    /// Script text from `queueMicrotask` or a load listener.
+    Script {
+        code: String,
+        env: Vec<(String, Value)>,
+        is_async: bool,
+    },
+    /// Call the `then` method of a class instance to settle `target`.
+    Adopt { target: usize, thenable: Value },
+    /// A promise reaction with the value it was settled with.
+    React {
+        kind: HandlerKind,
+        result: usize,
+        value: Value,
+        rejected: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CombinatorKind {
+    All,
+    AllSettled,
+    Race,
+    Any,
+}
+
+/// Shared state of one `Promise.all`, `allSettled`, `race`, or `any` call.
+#[derive(Clone, Debug, PartialEq)]
+struct Aggregator {
+    kind: CombinatorKind,
+    result: usize,
+    remaining: usize,
+    values: Vec<Value>,
+    done: bool,
+}
+
+/// One `setTimeout`, `setInterval`, or `requestAnimationFrame` entry.
+#[derive(Clone, Debug, PartialEq)]
+struct Timer {
+    id: u64,
+    seq: u64,
+    due: u64,
+    body: String,
+    env: Vec<(String, Value)>,
+    is_async: bool,
+    period: Option<u64>,
+    cleared: bool,
+}
+
+/// How a run of statements inside an async function ended early.
+#[derive(Clone, Debug, PartialEq)]
+enum Completion {
+    Return(Value),
+    Throw(Value),
+    Break,
+    Continue,
+}
+
+/// A loop that is being stepped one iteration at a time inside an async
+/// function, so its body may suspend at an `await`.
+#[derive(Clone, Debug, PartialEq)]
+enum LoopState {
+    While {
+        cond: String,
+        body: String,
+        iters: usize,
+    },
+    For {
+        cond: String,
+        step: String,
+        body: String,
+        iters: usize,
+    },
+    ForOf {
+        binding: String,
+        items: Vec<Value>,
+        next: usize,
+        body: String,
+        awaits: bool,
+    },
+}
+
+/// One entry on the work stack of a suspended async function. The top of the
+/// stack is the next thing to run.
+#[derive(Clone, Debug, PartialEq)]
+enum Work {
+    Stmt(String),
+    Loop(LoopState),
+    /// End of a `try` block. A throw that unwinds to here runs the catch
+    /// body; any other exit runs the finally body.
+    TryEnd {
+        catch_param: String,
+        catch_body: Option<String>,
+        finally_body: Option<String>,
+    },
+    /// End of a finally body, carrying the exit it interrupted.
+    FinallyEnd(Option<Completion>),
+}
+
+/// The saved state of one async function call between its awaits.
+#[derive(Clone, Debug, PartialEq)]
+struct AsyncFrame {
+    result: usize,
+    work: Vec<Work>,
+    names: Vec<String>,
+    saved: Vec<(String, Value)>,
+    resume_temp: Option<String>,
+    temps: usize,
+}
+
+/// One entry in the async frame table. A slot stays `Running` while its
+/// frame is out of the table and being driven, so an async call started
+/// from inside that frame gets a different slot.
+#[derive(Clone, Debug, PartialEq)]
+enum FrameSlot {
+    Free,
+    Running,
+    Waiting(AsyncFrame),
+}
+
+enum FrameOutcome {
+    Suspended,
+    Returned(Value),
+    Threw(Value),
+    Stopped,
+}
+
+enum StepResult {
+    Next,
+    Suspend,
+    Complete(Completion),
+}
 
 /// Value carried by the interpreter.
 #[derive(Clone, Debug, PartialEq)]
@@ -601,6 +800,7 @@ impl Value {
                 .map(|v| v.as_string(doc))
                 .collect::<Vec<_>>()
                 .join(","),
+            Self::Json(j) if promise_id_of_json(j).is_some() => "[object Promise]".to_string(),
             Self::Json(j) => to_json_string(j),
         }
     }
@@ -647,6 +847,7 @@ struct ClassDef {
     name: String,
     super_class: Option<String>,
     methods: Vec<(String, Vec<String>, String)>,
+    async_methods: Vec<String>,
 }
 
 /// Interpreter and C++20 `AnvilVM` runtime state for one page.
@@ -656,8 +857,18 @@ pub struct ScriptRuntime {
     functions: Vec<(String, Vec<String>, String)>,
     classes: Vec<ClassDef>,
     click_listeners: Vec<(NodeId, String)>,
-    timers: Vec<(u64, String)>,
-    microtasks: Vec<String>,
+    timers: Vec<Timer>,
+    microtasks: std::collections::VecDeque<Job>,
+    promises: Vec<PromiseRec>,
+    aggregators: Vec<Aggregator>,
+    async_functions: Vec<String>,
+    frames: Vec<FrameSlot>,
+    frame_names: Vec<String>,
+    next_timer_id: u64,
+    next_seq: u64,
+    clock_ms: u64,
+    timer_depth: u32,
+    abort_reason: Option<String>,
     local_storage: Vec<(String, String, String)>,
     session_storage: Vec<(String, String, String)>,
     fetch_mocks: Vec<(String, u16, String)>,
@@ -689,7 +900,17 @@ impl Default for ScriptRuntime {
             classes: Vec::new(),
             click_listeners: Vec::new(),
             timers: Vec::new(),
-            microtasks: Vec::new(),
+            microtasks: std::collections::VecDeque::new(),
+            promises: Vec::new(),
+            aggregators: Vec::new(),
+            async_functions: Vec::new(),
+            frames: Vec::new(),
+            frame_names: Vec::new(),
+            next_timer_id: 1,
+            next_seq: 0,
+            clock_ms: 0,
+            timer_depth: 0,
+            abort_reason: None,
             local_storage: Vec::new(),
             session_storage: Vec::new(),
             fetch_mocks: Vec::new(),
@@ -848,6 +1069,7 @@ impl ScriptRuntime {
         self.steps = 0;
         self.call_depth = 0;
         self.aborted = false;
+        self.abort_reason = None;
         self.thrown_error = None;
         self.loop_break = false;
         self.loop_continue = false;
@@ -871,10 +1093,22 @@ impl ScriptRuntime {
         }
         self.steps = self.steps.saturating_add(1);
         if self.steps > MAX_EXECUTION_STEPS {
-            self.aborted = true;
+            self.abort_with("step budget exhausted");
             return false;
         }
         true
+    }
+
+    /// Run deferred script text (a timer, microtask, or promise handler).
+    ///
+    /// Deferred code shares the page's variables, so it stays on the Rust
+    /// interpreter and is never offered to the numeric VM, whose globals are
+    /// separate.
+    fn eval_deferred(&mut self, doc: &mut Document, code: &str) {
+        let outer = self.in_rust_eval;
+        self.in_rust_eval = true;
+        self.eval_script(doc, code);
+        self.in_rust_eval = outer;
     }
 
     /// Load the self-hosted JS runtime prelude (`RUNTIME_CORE_JS` and `RUNTIME_ASYNC_WEB_JS`)
@@ -910,35 +1144,1420 @@ impl ScriptRuntime {
         self.fetch_host.inner = Some(host);
     }
 
-    /// Drain all queued Promise / `queueMicrotask` callbacks in FIFO order.
+    // ---- Promise core and the host event loop ----
+    //
+    // This block is the self-hosted job system for `anvil-script`. It extends
+    // the existing string-walking interpreter instead of replacing it, so every
+    // value (promises included) still flows through the same expression paths.
+    //
+    //   * A promise is a `Value::Json` object carrying `__anvil_promise: <id>`
+    //     that indexes `self.promises`. Treating a promise as an ordinary
+    //     document value means assignment, arrays, return values, and template
+    //     text already carry it with no new plumbing.
+    //   * `then`/`catch`/`finally` never run a handler inline. They push a job
+    //     onto the microtask queue, so a chain of a thousand `then` calls drains
+    //     iteratively in `run_microtasks` and never grows the Rust call stack.
+    //     Each call builds a fresh result promise, so values and errors chain.
+    //     A promise resolved with another promise follows it. One resolved
+    //     with a class instance that has a `then` method calls that method
+    //     from a microtask with this promise's resolve and reject functions.
+    //   * The event loop drains every microtask, then fires the next due timer,
+    //     then drains microtasks again, matching "tasks, then microtasks".
+    //     Timers are ordered by due time and then by insertion order.
+    //   * async/await uses generator-like resumable frames. This interpreter
+    //     walks statement text, so the frame of an async call is a work stack
+    //     of statement strings plus stepped loops (`while`, `for`, `for...of`,
+    //     `for await...of`) and `try` markers. A statement with no `await` of
+    //     its own runs whole. Blocks, `if`, loops, and `try` whose bodies await
+    //     are opened onto the stack. Any other statement is suspended at its
+    //     first `await`: the operand is evaluated, a `Resume` reaction is
+    //     subscribed to it, and the statement goes back on the stack with that
+    //     `await` replaced by a slot that receives the settled value. When the
+    //     promise settles, the reaction runs as a microtask and drives the frame
+    //     on to its next `await`. A rejection unwinds the stack to the nearest
+    //     catch or finally body. So an async call returns a pending promise at
+    //     its first `await`, and code after the call runs first, as it should.
+    //     A frame keeps its parameters and `let`/`const`/`var` names in its own
+    //     scope between awaits, so overlapping calls do not share locals.
+    //     Each pending call has its own slot in the frame table. A slot stays
+    //     reserved while its frame runs, so an async call started from inside
+    //     that frame without `await` gets another slot and is not lost when
+    //     the caller suspends. A slot is freed when its call returns or throws.
+    //     A callback created inside a frame keeps a copy of those locals.
+    //     Fallbacks: an `await` inside a `switch`, a `do...while`, or a loop
+    //     condition waits in place by running the loop until the promise
+    //     settles (`await_value`), and so does an `await` outside any async
+    //     function, such as at the top level of a script. Async class methods
+    //     also wait in place, because a method writes `this` back to its
+    //     object when it returns. They still return a promise.
+    //   * The step budget bounds all of it. Every job and every timer fire spends
+    //     a step, so a microtask flood, a self-rescheduling timer, or an endless
+    //     `setInterval` is cut off cleanly with a reason instead of hanging.
+
+    /// Record the first budget cutoff reason, then abort the turn.
+    fn abort_with(&mut self, reason: &str) {
+        if self.abort_reason.is_none() {
+            self.abort_reason = Some(reason.to_string());
+        }
+        self.aborted = true;
+    }
+
+    /// Reason the current turn was cut off, if the budget stopped it.
+    pub fn abort_reason(&self) -> Option<&str> {
+        self.abort_reason.as_deref()
+    }
+
+    /// Number of promises left rejected with no handler attached.
+    pub fn unhandled_rejections(&self) -> usize {
+        self.promises
+            .iter()
+            .filter(|p| p.state == PromiseState::Rejected && !p.handled)
+            .count()
+    }
+
+    fn alloc_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        s
+    }
+
+    fn alloc_timer_id(&mut self) -> u64 {
+        let id = self.next_timer_id;
+        self.next_timer_id = self.next_timer_id.wrapping_add(1);
+        id
+    }
+
+    fn new_promise(&mut self) -> usize {
+        if self.promises.len() >= MAX_PROMISES {
+            self.abort_with("promise limit reached");
+            return self.promises.len().saturating_sub(1);
+        }
+        let id = self.promises.len();
+        self.promises.push(PromiseRec {
+            state: PromiseState::Pending,
+            value: Value::Null,
+            on_fulfill: Vec::new(),
+            on_reject: Vec::new(),
+            handled: false,
+        });
+        id
+    }
+
+    fn make_promise_value(&self, id: usize) -> Value {
+        let mut obj = JsonValue::empty_object();
+        obj.insert("__anvil_promise", JsonValue::Number(id as f64));
+        Value::Json(obj)
+    }
+
+    fn new_resolved(&mut self, value: Value) -> usize {
+        let id = self.new_promise();
+        self.resolve_promise(id, value);
+        id
+    }
+
+    fn new_rejected(&mut self, reason: Value) -> usize {
+        let id = self.new_promise();
+        self.reject_promise(id, reason);
+        id
+    }
+
+    /// Return the promise id of `value`, wrapping a plain value in a fulfilled
+    /// promise. Our own promises are returned as they are (thenable assimilation).
+    fn value_as_promise(&mut self, value: Value) -> usize {
+        match promise_id_of(&value) {
+            Some(id) => id,
+            None => self.new_resolved(value),
+        }
+    }
+
+    fn schedule_job(&mut self, job: Job) {
+        if self.microtasks.len() < MAX_MICROTASKS {
+            self.microtasks.push_back(job);
+        }
+    }
+
+    fn resolve_promise(&mut self, id: usize, value: Value) {
+        if id >= self.promises.len() || self.promises[id].state != PromiseState::Pending {
+            return;
+        }
+        if self.instance_has_method(&value, "then") {
+            self.schedule_job(Job::Adopt {
+                target: id,
+                thenable: value,
+            });
+            return;
+        }
+        if let Some(inner) = promise_id_of(&value) {
+            if inner == id {
+                self.reject_promise(id, make_named_error("TypeError", "chaining cycle detected"));
+                return;
+            }
+            self.subscribe(
+                inner,
+                HandlerKind::Resolve { target: id },
+                HandlerKind::Reject { target: id },
+                NO_RESULT,
+            );
+            return;
+        }
+        self.promises[id].state = PromiseState::Fulfilled;
+        self.promises[id].value = value.clone();
+        let reactions = std::mem::take(&mut self.promises[id].on_fulfill);
+        self.promises[id].on_reject.clear();
+        for r in reactions {
+            self.schedule_job(Job::React {
+                kind: r.kind,
+                result: r.result,
+                value: value.clone(),
+                rejected: false,
+            });
+        }
+    }
+
+    fn reject_promise(&mut self, id: usize, reason: Value) {
+        if id >= self.promises.len() || self.promises[id].state != PromiseState::Pending {
+            return;
+        }
+        self.promises[id].state = PromiseState::Rejected;
+        self.promises[id].value = reason.clone();
+        let reactions = std::mem::take(&mut self.promises[id].on_reject);
+        self.promises[id].on_fulfill.clear();
+        for r in reactions {
+            self.schedule_job(Job::React {
+                kind: r.kind,
+                result: r.result,
+                value: reason.clone(),
+                rejected: true,
+            });
+        }
+    }
+
+    /// Attach fulfill and reject reactions, or schedule one now if already settled.
+    fn subscribe(
+        &mut self,
+        id: usize,
+        on_fulfill: HandlerKind,
+        on_reject: HandlerKind,
+        result: usize,
+    ) {
+        if id >= self.promises.len() {
+            return;
+        }
+        self.promises[id].handled = true;
+        match self.promises[id].state {
+            PromiseState::Pending => {
+                self.promises[id].on_fulfill.push(Reaction {
+                    kind: on_fulfill,
+                    result,
+                });
+                self.promises[id].on_reject.push(Reaction {
+                    kind: on_reject,
+                    result,
+                });
+            }
+            PromiseState::Fulfilled => {
+                let value = self.promises[id].value.clone();
+                self.schedule_job(Job::React {
+                    kind: on_fulfill,
+                    result,
+                    value,
+                    rejected: false,
+                });
+            }
+            PromiseState::Rejected => {
+                let value = self.promises[id].value.clone();
+                self.schedule_job(Job::React {
+                    kind: on_reject,
+                    result,
+                    value,
+                    rejected: true,
+                });
+            }
+        }
+    }
+
+    /// Turn one `then`/`catch`/`finally` argument into a handler.
+    fn make_handler(&self, arg: &str) -> HandlerKind {
+        let a = arg.trim();
+        if a.is_empty() || a == "null" || a == "undefined" {
+            return HandlerKind::Pass;
+        }
+        if is_identifier(a) {
+            let body = format!("{a}(__anvil_arg)");
+            return HandlerKind::Js {
+                param: Some("__anvil_arg".to_string()),
+                env: self.capture_env(&body),
+                body,
+                is_async: false,
+            };
+        }
+        let (is_async, rest) = split_async_prefix(a);
+        let (param, body) = if is_async {
+            let (params, body) = async_callback_parts(rest);
+            (params.into_iter().next().unwrap_or_default(), body)
+        } else {
+            extract_single_param_callback(rest)
+        };
+        HandlerKind::Js {
+            param: if param.is_empty() { None } else { Some(param) },
+            env: self.capture_env(&body),
+            body,
+            is_async,
+        }
+    }
+
+    /// Split a timer or microtask callback into its body, the names it
+    /// captured, and whether it is an async function.
+    fn deferred_callback(&self, raw: &str) -> (String, Vec<(String, Value)>, bool) {
+        let (is_async, rest) = split_async_prefix(raw);
+        let body = if is_async {
+            async_callback_parts(rest).1
+        } else {
+            extract_callback_body(rest)
+        };
+        let env = self.capture_env(&body);
+        (body, env, is_async)
+    }
+
+    /// Values a deferred callback must keep: the locals of the async function
+    /// it was created in, and any `resolve`/`reject` function of a pending
+    /// `new Promise` executor. Other names are read live when it runs.
+    fn capture_env(&self, body: &str) -> Vec<(String, Value)> {
+        let mut env: Vec<(String, Value)> = Vec::new();
+        let masked = strip_string_literals(body);
+        let bytes = masked.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !is_ident_start_byte(bytes[i]) || (i > 0 && is_ident_byte(bytes[i - 1])) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let name = &masked[start..i];
+            if env.iter().any(|(k, _)| k == name) {
+                continue;
+            }
+            let Some(value) = self.get_var(name) else {
+                continue;
+            };
+            let resolver = matches!(value, Value::Str(m)
+                if m.starts_with("__anvil_resolve:") || m.starts_with("__anvil_reject:"));
+            if resolver || self.frame_names.iter().any(|n| n == name) {
+                env.push((name.to_string(), value.clone()));
+            }
+        }
+        env
+    }
+
+    /// Push `entries` as a new innermost scope. Returns its base index.
+    fn push_scope(&mut self, entries: &[(String, Value)]) -> usize {
+        let base = self.vars.len();
+        self.vars.extend(entries.iter().cloned());
+        base
+    }
+
+    /// Pop the scope starting at `base`. Entries named in `names` are returned
+    /// with their final values; anything else written there is kept as a
+    /// page variable.
+    fn pop_scope(&mut self, base: usize, names: &[String]) -> Vec<(String, Value)> {
+        if base > self.vars.len() {
+            return Vec::new();
+        }
+        let tail = self.vars.split_off(base);
+        let mut kept: Vec<(String, Value)> = Vec::new();
+        for (name, value) in tail {
+            if names.iter().any(|n| n == &name) {
+                if let Some(slot) = kept.iter_mut().find(|(k, _)| k == &name) {
+                    slot.1 = value;
+                } else {
+                    kept.push((name, value));
+                }
+            } else {
+                self.set_var(&name, value);
+            }
+        }
+        kept
+    }
+
+    /// Run deferred script text with captured names bound around it.
+    fn eval_deferred_env(&mut self, doc: &mut Document, code: &str, env: &[(String, Value)]) {
+        if env.is_empty() {
+            self.eval_deferred(doc, code);
+            return;
+        }
+        let names: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
+        let base = self.push_scope(env);
+        self.eval_deferred(doc, code);
+        let _ = self.pop_scope(base, &names);
+    }
+
+    /// Apply a `then`/`catch`/`finally` to a settled-or-pending promise.
+    fn promise_method(&mut self, pid: usize, method: &str, args: &[String]) -> Value {
+        match method {
+            "then" => {
+                let on_f = args
+                    .first()
+                    .map(|a| self.make_handler(a))
+                    .unwrap_or(HandlerKind::Pass);
+                let on_r = args
+                    .get(1)
+                    .map(|a| self.make_handler(a))
+                    .unwrap_or(HandlerKind::Pass);
+                let result = self.new_promise();
+                self.subscribe(pid, on_f, on_r, result);
+                self.make_promise_value(result)
+            }
+            "catch" => {
+                let on_r = args
+                    .first()
+                    .map(|a| self.make_handler(a))
+                    .unwrap_or(HandlerKind::Pass);
+                let result = self.new_promise();
+                self.subscribe(pid, HandlerKind::Pass, on_r, result);
+                self.make_promise_value(result)
+            }
+            "finally" => {
+                let body = args
+                    .first()
+                    .map(|a| extract_callback_body(a.trim()))
+                    .unwrap_or_default();
+                let env = self.capture_env(&body);
+                let result = self.new_promise();
+                self.subscribe(
+                    pid,
+                    HandlerKind::Finally {
+                        body: body.clone(),
+                        env: env.clone(),
+                    },
+                    HandlerKind::Finally { body, env },
+                    result,
+                );
+                self.make_promise_value(result)
+            }
+            _ => self.make_promise_value(pid),
+        }
+    }
+
+    /// `Promise.resolve/reject/all/allSettled/race/any`. `None` means the method
+    /// is not a combinator and should fall through to ordinary handling.
+    fn promise_static(
+        &mut self,
+        doc: &mut Document,
+        method: &str,
+        args: &[String],
+    ) -> Option<Value> {
+        match method {
+            "resolve" => {
+                let v = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+                let id = self.value_as_promise(v);
+                Some(self.make_promise_value(id))
+            }
+            "reject" => {
+                let v = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+                let id = self.new_rejected(v);
+                Some(self.make_promise_value(id))
+            }
+            "all" | "allSettled" | "race" | "any" => {
+                let list = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Array(Vec::new()));
+                let items: Vec<Value> = match list {
+                    Value::Array(v) => v,
+                    Value::Json(JsonValue::Array(v)) => {
+                        v.into_iter().map(Value::from_json_value).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let kind = match method {
+                    "all" => CombinatorKind::All,
+                    "allSettled" => CombinatorKind::AllSettled,
+                    "race" => CombinatorKind::Race,
+                    _ => CombinatorKind::Any,
+                };
+                let result = self.new_promise();
+                let n = items.len();
+                if n == 0 {
+                    match kind {
+                        CombinatorKind::All | CombinatorKind::AllSettled => {
+                            self.resolve_promise(result, Value::Array(Vec::new()));
+                        }
+                        CombinatorKind::Any => {
+                            self.reject_promise(result, make_aggregate_error(&[]));
+                        }
+                        CombinatorKind::Race => {}
+                    }
+                    return Some(self.make_promise_value(result));
+                }
+                let agg = self.aggregators.len();
+                self.aggregators.push(Aggregator {
+                    kind,
+                    result,
+                    remaining: n,
+                    values: vec![Value::Null; n],
+                    done: false,
+                });
+                for (index, item) in items.into_iter().enumerate() {
+                    let pid = self.value_as_promise(item);
+                    self.subscribe(
+                        pid,
+                        HandlerKind::Collect { agg, index },
+                        HandlerKind::Collect { agg, index },
+                        NO_RESULT,
+                    );
+                }
+                Some(self.make_promise_value(result))
+            }
+            _ => None,
+        }
+    }
+
+    /// When `callee` names a resolve or reject function handed to a
+    /// `new Promise` executor, returns the promise id and whether it rejects.
+    fn resolver_marker(&self, callee: &str) -> Option<(usize, bool)> {
+        if !is_identifier(callee) {
+            return None;
+        }
+        let Some(Value::Str(marker)) = self.get_var(callee) else {
+            return None;
+        };
+        if let Some(rest) = marker.strip_prefix("__anvil_resolve:") {
+            return rest.parse().ok().map(|pid| (pid, false));
+        }
+        marker
+            .strip_prefix("__anvil_reject:")
+            .and_then(|rest| rest.parse().ok())
+            .map(|pid| (pid, true))
+    }
+
+    /// Run a promise/finally handler body with `param` bound, returning the
+    /// value it produced or the error it threw. An async handler returns the
+    /// promise of its call.
+    fn run_handler(
+        &mut self,
+        doc: &mut Document,
+        param: &Option<String>,
+        value: Value,
+        body: &str,
+        env: &[(String, Value)],
+        is_async: bool,
+    ) -> Result<Value, Value> {
+        let param = param.as_deref().filter(|n| !n.is_empty());
+        if is_async {
+            let params: Vec<String> = param.map(|p| vec![p.to_string()]).unwrap_or_default();
+            return Ok(self.start_async(doc, &params, vec![value], body, env));
+        }
+        let mut scope = env.to_vec();
+        if let Some(name) = param {
+            scope.push((name.to_string(), value));
+        }
+        let names: Vec<String> = scope.iter().map(|(k, _)| k.clone()).collect();
+        let base = self.push_scope(&scope);
+        let prev_throw = self.thrown_error.take();
+        let outer = self.in_rust_eval;
+        self.in_rust_eval = true;
+        let out = self.eval_callback_return(doc, body);
+        self.in_rust_eval = outer;
+        let thrown = self.thrown_error.take();
+        self.thrown_error = prev_throw;
+        let _ = self.pop_scope(base, &names);
+        match thrown {
+            Some(err) => Err(err),
+            None => Ok(out),
+        }
+    }
+
+    fn collect_into(
+        &mut self,
+        doc: &mut Document,
+        agg: usize,
+        index: usize,
+        value: Value,
+        rejected: bool,
+    ) {
+        if agg >= self.aggregators.len() || self.aggregators[agg].done {
+            return;
+        }
+        let kind = self.aggregators[agg].kind;
+        let result = self.aggregators[agg].result;
+        match kind {
+            CombinatorKind::All => {
+                if rejected {
+                    self.aggregators[agg].done = true;
+                    self.reject_promise(result, value);
+                } else {
+                    self.aggregators[agg].values[index] = value;
+                    self.aggregators[agg].remaining -= 1;
+                    if self.aggregators[agg].remaining == 0 {
+                        self.aggregators[agg].done = true;
+                        let vals = self.aggregators[agg].values.clone();
+                        self.resolve_promise(result, Value::Array(vals));
+                    }
+                }
+            }
+            CombinatorKind::Race => {
+                self.aggregators[agg].done = true;
+                if rejected {
+                    self.reject_promise(result, value);
+                } else {
+                    self.resolve_promise(result, value);
+                }
+            }
+            CombinatorKind::AllSettled => {
+                let mut obj = JsonValue::empty_object();
+                if rejected {
+                    obj.insert("status", JsonValue::String("rejected".to_string()));
+                    obj.insert("reason", value.to_json_value(doc));
+                } else {
+                    obj.insert("status", JsonValue::String("fulfilled".to_string()));
+                    obj.insert("value", value.to_json_value(doc));
+                }
+                self.aggregators[agg].values[index] = Value::Json(obj);
+                self.aggregators[agg].remaining -= 1;
+                if self.aggregators[agg].remaining == 0 {
+                    self.aggregators[agg].done = true;
+                    let vals = self.aggregators[agg].values.clone();
+                    self.resolve_promise(result, Value::Array(vals));
+                }
+            }
+            CombinatorKind::Any => {
+                if !rejected {
+                    self.aggregators[agg].done = true;
+                    self.resolve_promise(result, value);
+                } else {
+                    self.aggregators[agg].values[index] = value;
+                    self.aggregators[agg].remaining -= 1;
+                    if self.aggregators[agg].remaining == 0 {
+                        self.aggregators[agg].done = true;
+                        let errs = self.aggregators[agg].values.clone();
+                        let agg_err = make_aggregate_error(
+                            &errs
+                                .iter()
+                                .map(|v| v.to_json_value(doc))
+                                .collect::<Vec<_>>(),
+                        );
+                        self.reject_promise(result, agg_err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// True when `value` is a class instance whose class defines `method`.
+    fn instance_has_method(&self, value: &Value, method: &str) -> bool {
+        let Value::Json(obj) = value else {
+            return false;
+        };
+        obj.get("__class")
+            .and_then(|v| v.as_str())
+            .is_some_and(|class_name| self.find_class_method(class_name, method).is_some())
+    }
+
+    fn run_job(&mut self, doc: &mut Document, job: Job) {
+        if !self.consume_step() {
+            self.abort_with("step budget exhausted");
+            return;
+        }
+        match job {
+            Job::Adopt { target, thenable } => {
+                let env = vec![
+                    ("__anvil_thenable".to_string(), thenable),
+                    (
+                        "__anvil_res".to_string(),
+                        Value::Str(format!("__anvil_resolve:{target}")),
+                    ),
+                    (
+                        "__anvil_rej".to_string(),
+                        Value::Str(format!("__anvil_reject:{target}")),
+                    ),
+                ];
+                let prev_throw = self.thrown_error.take();
+                self.eval_deferred_env(
+                    doc,
+                    "__anvil_thenable.then(__anvil_res, __anvil_rej)",
+                    &env,
+                );
+                if let Some(err) = self.thrown_error.take() {
+                    self.reject_promise(target, err);
+                }
+                self.thrown_error = prev_throw;
+            }
+            Job::Script {
+                code,
+                env,
+                is_async,
+            } => {
+                if is_async {
+                    let _ = self.start_async(doc, &[], Vec::new(), &code, &env);
+                } else {
+                    self.eval_deferred_env(doc, &code, &env);
+                }
+            }
+            Job::React {
+                kind,
+                result,
+                value,
+                rejected,
+            } => match kind {
+                HandlerKind::Js {
+                    param,
+                    body,
+                    env,
+                    is_async,
+                } => match self.run_handler(doc, &param, value, &body, &env, is_async) {
+                    Ok(r) => {
+                        if result != NO_RESULT {
+                            self.resolve_promise(result, r);
+                        }
+                    }
+                    Err(e) => {
+                        if result != NO_RESULT {
+                            self.reject_promise(result, e);
+                        }
+                    }
+                },
+                HandlerKind::Pass => {
+                    if result != NO_RESULT {
+                        if rejected {
+                            self.reject_promise(result, value);
+                        } else {
+                            self.resolve_promise(result, value);
+                        }
+                    }
+                }
+                HandlerKind::Finally { body, env } => {
+                    match self.run_handler(doc, &None, Value::Null, &body, &env, false) {
+                        Err(e) => {
+                            if result != NO_RESULT {
+                                self.reject_promise(result, e);
+                            }
+                        }
+                        Ok(_) => {
+                            if result != NO_RESULT {
+                                if rejected {
+                                    self.reject_promise(result, value);
+                                } else {
+                                    self.resolve_promise(result, value);
+                                }
+                            }
+                        }
+                    }
+                }
+                HandlerKind::Resolve { target } => self.resolve_promise(target, value),
+                HandlerKind::Reject { target } => self.reject_promise(target, value),
+                HandlerKind::Collect { agg, index } => {
+                    self.collect_into(doc, agg, index, value, rejected)
+                }
+                HandlerKind::Resume { frame } => {
+                    self.run_frame(doc, frame, Some((value, rejected)))
+                }
+            },
+        }
+    }
+
+    /// Drain the microtask queue in FIFO order. Returns the number of jobs run.
     pub fn run_microtasks(&mut self, doc: &mut Document) -> usize {
         let mut total = 0usize;
-        while !self.microtasks.is_empty() && total < MAX_MICROTASKS && !self.aborted {
-            let batch = std::mem::take(&mut self.microtasks);
-            for code in batch {
-                if self.aborted {
-                    break;
-                }
-                total += 1;
-                self.eval_script(doc, &code);
+        let mut ticks = 0usize;
+        while !self.aborted {
+            let Some(job) = self.microtasks.pop_front() else {
+                break;
+            };
+            ticks += 1;
+            if ticks > MAX_EVENT_LOOP_TICKS {
+                self.abort_with("microtask loop did not settle");
+                break;
             }
+            total += 1;
+            self.run_job(doc, job);
         }
         total
     }
 
+    fn has_pending_timer(&self) -> bool {
+        self.timers.iter().any(|t| !t.cleared)
+    }
+
+    /// Index of the next timer to fire: smallest due time, then insertion order.
+    fn next_timer_index(&self) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, t) in self.timers.iter().enumerate() {
+            if t.cleared {
+                continue;
+            }
+            match best {
+                None => best = Some(i),
+                Some(b) => {
+                    let cur = &self.timers[b];
+                    if (t.due, t.seq) < (cur.due, cur.seq) {
+                        best = Some(i);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Fire the next due timer. An interval is rescheduled; a timeout is removed.
+    fn fire_one_timer(&mut self, doc: &mut Document) {
+        let Some(idx) = self.next_timer_index() else {
+            return;
+        };
+        let timer = self.timers[idx].clone();
+        self.clock_ms = self.clock_ms.max(timer.due);
+        if let Some(period) = timer.period {
+            let seq = self.alloc_seq();
+            self.timers[idx].seq = seq;
+            self.timers[idx].due = self.clock_ms.saturating_add(period.max(1));
+        } else {
+            self.timers.remove(idx);
+        }
+        self.timer_depth = self.timer_depth.saturating_add(1);
+        if timer.is_async {
+            let _ = self.start_async(doc, &[], Vec::new(), &timer.body, &timer.env);
+        } else {
+            self.eval_deferred_env(doc, &timer.body, &timer.env);
+        }
+        self.timer_depth = self.timer_depth.saturating_sub(1);
+    }
+
+    /// Run the host event loop: microtasks, then each due timer with its
+    /// microtasks drained in between. Returns the number of timer callbacks run.
     pub fn run_timers(&mut self, doc: &mut Document) -> usize {
         let _ = self.run_microtasks(doc);
-        let mut pending = std::mem::take(&mut self.timers);
-        pending.sort_by_key(|(delay, _)| *delay);
-        let count = pending.len();
-        for (_, code) in pending {
-            if self.aborted {
+        let mut fired = 0usize;
+        let mut ticks = 0usize;
+        while self.has_pending_timer() && !self.aborted {
+            ticks += 1;
+            if ticks > MAX_EVENT_LOOP_TICKS {
+                self.abort_with("timer loop did not settle");
                 break;
             }
-            self.eval_script(doc, &code);
+            if !self.consume_step() {
+                self.abort_with("step budget exhausted");
+                break;
+            }
+            self.fire_one_timer(doc);
+            fired += 1;
             let _ = self.run_microtasks(doc);
         }
-        count
+        fired
+    }
+
+    /// Drive the loop until `value` (a promise) settles, then yield its value.
+    /// A rejection is raised as a thrown error so `try`/`catch` can see it.
+    fn await_value(&mut self, doc: &mut Document, value: Value) -> Value {
+        let Some(id) = promise_id_of(&value) else {
+            return value;
+        };
+        if id < self.promises.len() {
+            self.promises[id].handled = true;
+        }
+        let mut ticks = 0usize;
+        loop {
+            if id >= self.promises.len() {
+                return Value::Null;
+            }
+            match self.promises[id].state {
+                PromiseState::Fulfilled => return self.promises[id].value.clone(),
+                PromiseState::Rejected => {
+                    let reason = self.promises[id].value.clone();
+                    self.thrown_error = Some(reason);
+                    return Value::Null;
+                }
+                PromiseState::Pending => {}
+            }
+            if self.aborted {
+                return Value::Null;
+            }
+            if !self.consume_step() {
+                self.abort_with("step budget exhausted");
+                return Value::Null;
+            }
+            ticks += 1;
+            if ticks > MAX_EVENT_LOOP_TICKS {
+                self.abort_with("await did not settle");
+                return Value::Null;
+            }
+            if let Some(job) = self.microtasks.pop_front() {
+                self.run_job(doc, job);
+            } else if self.has_pending_timer() {
+                self.fire_one_timer(doc);
+            } else {
+                return Value::Null;
+            }
+        }
+    }
+
+    /// Call an async function: build its frame, run it to its first `await`,
+    /// and return the promise of its result.
+    fn start_async(
+        &mut self,
+        doc: &mut Document,
+        params: &[String],
+        args: Vec<Value>,
+        body: &str,
+        env: &[(String, Value)],
+    ) -> Value {
+        let result = self.new_promise();
+        let promise = self.make_promise_value(result);
+        if self.aborted {
+            return promise;
+        }
+        let cleaned = strip_comments(body);
+        let mut names: Vec<String> = Vec::new();
+        let mut saved: Vec<(String, Value)> = Vec::new();
+        for (name, value) in env {
+            push_unique_name(&mut names, name);
+            saved.push((name.clone(), value.clone()));
+        }
+        let mut declared = Vec::new();
+        collect_declared_names(&cleaned, &mut declared);
+        for name in declared {
+            push_unique_name(&mut names, &name);
+            saved.push((name, Value::Null));
+        }
+        for (index, param) in params.iter().enumerate() {
+            let param = param.trim();
+            if !is_identifier(param) {
+                continue;
+            }
+            push_unique_name(&mut names, param);
+            saved.push((
+                param.to_string(),
+                args.get(index).cloned().unwrap_or(Value::Null),
+            ));
+        }
+        // Function declarations are hoisted ahead of the other statements.
+        let (decls, rest): (Vec<String>, Vec<String>) =
+            split_statements(&cleaned).into_iter().partition(|stmt| {
+                let t = stmt.trim_start();
+                t.starts_with("function ") || t.starts_with("async function ")
+            });
+        let mut work: Vec<Work> = Vec::new();
+        for stmt in rest.into_iter().rev() {
+            work.push(Work::Stmt(stmt));
+        }
+        for stmt in decls.into_iter().rev() {
+            work.push(Work::Stmt(stmt));
+        }
+        let frame = AsyncFrame {
+            result,
+            work,
+            names,
+            saved,
+            resume_temp: None,
+            temps: 0,
+        };
+        let slot = match self
+            .frames
+            .iter()
+            .position(|entry| matches!(entry, FrameSlot::Free))
+        {
+            Some(slot) => {
+                self.frames[slot] = FrameSlot::Waiting(frame);
+                slot
+            }
+            None => {
+                if self.frames.len() >= MAX_PROMISES {
+                    self.abort_with("async call limit reached");
+                    return promise;
+                }
+                self.frames.push(FrameSlot::Waiting(frame));
+                self.frames.len() - 1
+            }
+        };
+        self.run_frame(doc, slot, None);
+        promise
+    }
+
+    /// Run the frame in `slot` until it suspends, returns, or throws.
+    /// `input` is the settled outcome of the promise it was waiting on.
+    fn run_frame(&mut self, doc: &mut Document, slot: usize, input: Option<(Value, bool)>) {
+        // Only a waiting frame can run. Its slot is marked `Running` until
+        // the frame suspends again or ends, so nothing else can take it.
+        let taken = self
+            .frames
+            .get_mut(slot)
+            .map(|entry| std::mem::replace(entry, FrameSlot::Running));
+        let mut frame = match taken {
+            Some(FrameSlot::Waiting(frame)) => frame,
+            Some(other) => {
+                self.frames[slot] = other;
+                return;
+            }
+            None => return,
+        };
+        if self.call_depth >= MAX_CALL_DEPTH {
+            self.frames[slot] = FrameSlot::Free;
+            self.aborted = true;
+            return;
+        }
+        let saved = std::mem::take(&mut frame.saved);
+        let base = self.push_scope(&saved);
+        let prev_names = std::mem::replace(&mut self.frame_names, frame.names.clone());
+        let prev_return = self.return_value.take();
+        let prev_throw = self.thrown_error.take();
+        let prev_break = std::mem::replace(&mut self.loop_break, false);
+        let prev_continue = std::mem::replace(&mut self.loop_continue, false);
+        let outer_rust = self.in_rust_eval;
+        self.in_rust_eval = true;
+        self.call_depth += 1;
+
+        let mut pending = None;
+        if let Some((value, rejected)) = input {
+            let temp = frame.resume_temp.take();
+            if rejected {
+                pending = Some(Completion::Throw(value));
+            } else if let Some(temp) = temp {
+                self.set_var(&temp, value);
+            }
+        }
+        let outcome = self.drive_frame(doc, slot, &mut frame, pending);
+
+        self.call_depth = self.call_depth.saturating_sub(1);
+        self.in_rust_eval = outer_rust;
+        self.return_value = prev_return;
+        self.thrown_error = prev_throw;
+        self.loop_break = prev_break;
+        self.loop_continue = prev_continue;
+        frame.saved = self.pop_scope(base, &frame.names);
+        self.frame_names = prev_names;
+        if let FrameOutcome::Suspended = outcome {
+            self.frames[slot] = FrameSlot::Waiting(frame);
+            return;
+        }
+        self.frames[slot] = FrameSlot::Free;
+        match outcome {
+            FrameOutcome::Returned(value) => self.resolve_promise(frame.result, value),
+            FrameOutcome::Threw(err) => self.reject_promise(frame.result, err),
+            FrameOutcome::Suspended | FrameOutcome::Stopped => {}
+        }
+    }
+
+    fn drive_frame(
+        &mut self,
+        doc: &mut Document,
+        slot: usize,
+        frame: &mut AsyncFrame,
+        mut pending: Option<Completion>,
+    ) -> FrameOutcome {
+        loop {
+            if self.aborted {
+                return FrameOutcome::Stopped;
+            }
+            if let Some(completion) = pending.take() {
+                if let Some(done) = self.unwind_frame(frame, completion) {
+                    return done;
+                }
+                continue;
+            }
+            let Some(work) = frame.work.pop() else {
+                return FrameOutcome::Returned(Value::Null);
+            };
+            let step = match work {
+                Work::Stmt(stmt) => self.frame_statement(doc, slot, frame, &stmt),
+                Work::Loop(state) => self.frame_loop(doc, frame, state),
+                Work::TryEnd { finally_body, .. } => {
+                    if let Some(body) = finally_body {
+                        frame.work.push(Work::FinallyEnd(None));
+                        push_block(&mut frame.work, &body);
+                    }
+                    StepResult::Next
+                }
+                Work::FinallyEnd(Some(completion)) => StepResult::Complete(completion),
+                Work::FinallyEnd(None) => StepResult::Next,
+            };
+            match step {
+                StepResult::Next => {}
+                StepResult::Suspend => return FrameOutcome::Suspended,
+                StepResult::Complete(completion) => pending = Some(completion),
+            }
+        }
+    }
+
+    /// Unwind the work stack for a `return`, `throw`, `break`, or `continue`.
+    /// Returns the frame's final outcome once nothing is left to catch it.
+    fn unwind_frame(
+        &mut self,
+        frame: &mut AsyncFrame,
+        completion: Completion,
+    ) -> Option<FrameOutcome> {
+        loop {
+            let Some(work) = frame.work.pop() else {
+                return Some(match completion {
+                    Completion::Return(value) => FrameOutcome::Returned(value),
+                    Completion::Throw(err) => FrameOutcome::Threw(err),
+                    Completion::Break | Completion::Continue => FrameOutcome::Returned(Value::Null),
+                });
+            };
+            match work {
+                Work::Loop(state) => match completion {
+                    Completion::Break => return None,
+                    Completion::Continue => {
+                        frame.work.push(Work::Loop(state));
+                        return None;
+                    }
+                    Completion::Return(_) | Completion::Throw(_) => {}
+                },
+                Work::TryEnd {
+                    catch_param,
+                    catch_body,
+                    finally_body,
+                } => {
+                    if let (Completion::Throw(err), Some(body)) = (&completion, &catch_body) {
+                        if is_identifier(&catch_param) {
+                            self.set_var(&catch_param, err.clone());
+                        }
+                        frame.work.push(Work::TryEnd {
+                            catch_param: String::new(),
+                            catch_body: None,
+                            finally_body,
+                        });
+                        push_block(&mut frame.work, body);
+                        return None;
+                    }
+                    if let Some(body) = finally_body {
+                        frame.work.push(Work::FinallyEnd(Some(completion)));
+                        push_block(&mut frame.work, &body);
+                        return None;
+                    }
+                }
+                // A new exit from inside a finally body replaces the old one.
+                Work::Stmt(_) | Work::FinallyEnd(_) => {}
+            }
+        }
+    }
+
+    /// Turn the interpreter's control flags into a step result.
+    fn take_completion(&mut self) -> StepResult {
+        if let Some(err) = self.thrown_error.take() {
+            return StepResult::Complete(Completion::Throw(err));
+        }
+        if let Some(value) = self.return_value.take() {
+            return StepResult::Complete(Completion::Return(value));
+        }
+        if self.loop_break {
+            self.loop_break = false;
+            return StepResult::Complete(Completion::Break);
+        }
+        if self.loop_continue {
+            self.loop_continue = false;
+            return StepResult::Complete(Completion::Continue);
+        }
+        StepResult::Next
+    }
+
+    /// Run one statement of an async function. A statement with no `await`
+    /// of its own runs whole. A block, `if`, loop, or `try` whose body awaits
+    /// is opened onto the work stack, and any other awaiting statement
+    /// suspends at its first `await`.
+    fn frame_statement(
+        &mut self,
+        doc: &mut Document,
+        slot: usize,
+        frame: &mut AsyncFrame,
+        raw: &str,
+    ) -> StepResult {
+        let stmt = raw.trim();
+        if stmt.is_empty() {
+            return StepResult::Next;
+        }
+        let masked = mask_nested_code(stmt);
+        let Some(first) = find_await(&masked) else {
+            return self.frame_run_whole(doc, frame, stmt);
+        };
+        if starts_with_word(stmt, "if") {
+            let rest = stmt[2..].trim_start();
+            let Some((cond, after_cond)) = extract_paren_group(rest) else {
+                return self.frame_run_whole(doc, frame, stmt);
+            };
+            let cond_end = stmt.len() - after_cond.len();
+            if first >= cond_end {
+                let Some((then_body, after_then)) = extract_first_brace_block(after_cond) else {
+                    return self.frame_run_whole(doc, frame, stmt);
+                };
+                let ok = self.eval_expr(doc, &cond).is_truthy();
+                if let Some(err) = self.thrown_error.take() {
+                    return StepResult::Complete(Completion::Throw(err));
+                }
+                if ok {
+                    push_block(&mut frame.work, &then_body);
+                } else if let Some(else_rest) = after_then.trim().strip_prefix("else") {
+                    let else_rest = else_rest.trim();
+                    match extract_first_brace_block(else_rest) {
+                        Some((else_body, _)) => push_block(&mut frame.work, &else_body),
+                        None => frame.work.push(Work::Stmt(else_rest.to_string())),
+                    }
+                }
+                return StepResult::Next;
+            }
+            // The condition itself awaits: suspend on it below.
+        } else if starts_with_word(stmt, "while") {
+            let parsed = extract_paren_group(stmt[5..].trim_start()).and_then(|(cond, after)| {
+                extract_first_brace_block(after).map(|(body, _)| (cond, body))
+            });
+            let Some((cond, body)) = parsed else {
+                return self.frame_run_whole(doc, frame, stmt);
+            };
+            frame.work.push(Work::Loop(LoopState::While {
+                cond,
+                body,
+                iters: 0,
+            }));
+            return StepResult::Next;
+        } else if starts_with_word(stmt, "for") {
+            let mut rest = stmt[3..].trim_start();
+            let awaits = starts_with_word(rest, "await");
+            if awaits {
+                rest = rest[5..].trim_start();
+            }
+            let Some((header, after)) = extract_paren_group(rest) else {
+                return self.frame_run_whole(doc, frame, stmt);
+            };
+            let Some((body, _)) = extract_first_brace_block(after) else {
+                return self.frame_run_whole(doc, frame, stmt);
+            };
+            let header_end = stmt.len() - after.len();
+            let parts: Vec<&str> = header.splitn(3, ';').collect();
+            if parts.len() == 3 && !awaits {
+                self.exec_statement(doc, parts[0]);
+                if let Some(err) = self.thrown_error.take() {
+                    return StepResult::Complete(Completion::Throw(err));
+                }
+                frame.work.push(Work::Loop(LoopState::For {
+                    cond: parts[1].to_string(),
+                    step: parts[2].to_string(),
+                    body,
+                    iters: 0,
+                }));
+                return StepResult::Next;
+            }
+            if awaits || first >= header_end {
+                let Some((lhs, rhs)) = split_for_of_or_in(&header, " of ") else {
+                    return self.frame_run_whole(doc, frame, stmt);
+                };
+                let iterable = self.eval_expr(doc, rhs.trim());
+                if let Some(err) = self.thrown_error.take() {
+                    return StepResult::Complete(Completion::Throw(err));
+                }
+                if awaits {
+                    push_unique_name(&mut frame.names, "__anvil_item");
+                }
+                frame.work.push(Work::Loop(LoopState::ForOf {
+                    binding: lhs.trim().to_string(),
+                    items: iterable_items(iterable),
+                    next: 0,
+                    body,
+                    awaits,
+                }));
+                return StepResult::Next;
+            }
+            // The iterable expression awaits: suspend on it below.
+        } else if starts_with_word(stmt, "try") {
+            let Some((try_body, after_try)) = extract_first_brace_block(stmt[3..].trim_start())
+            else {
+                return self.frame_run_whole(doc, frame, stmt);
+            };
+            let mut rem = after_try.trim();
+            let mut catch_param = String::new();
+            let mut catch_body = None;
+            if let Some(catch_rest) = rem.strip_prefix("catch") {
+                let mut catch_rest = catch_rest.trim_start();
+                if let Some((param, after)) = extract_paren_group(catch_rest) {
+                    catch_param = param.trim().to_string();
+                    catch_rest = after;
+                }
+                if let Some((body, after)) = extract_first_brace_block(catch_rest) {
+                    catch_body = Some(body);
+                    rem = after.trim();
+                }
+            }
+            let finally_body = rem
+                .strip_prefix("finally")
+                .and_then(extract_first_brace_block)
+                .map(|(body, _)| body);
+            frame.work.push(Work::TryEnd {
+                catch_param,
+                catch_body,
+                finally_body,
+            });
+            push_block(&mut frame.work, &try_body);
+            return StepResult::Next;
+        } else if stmt.starts_with('{') {
+            if let Some((inner, _)) = extract_first_brace_block(stmt) {
+                push_block(&mut frame.work, &inner);
+                return StepResult::Next;
+            }
+        } else if starts_with_word(stmt, "switch")
+            || starts_with_word(stmt, "do")
+            || starts_with_word(stmt, "class")
+            || starts_with_word(stmt, "function")
+            || stmt.starts_with("async function ")
+        {
+            return self.frame_run_whole(doc, frame, stmt);
+        }
+        self.suspend_at_await(doc, slot, frame, stmt, &masked, first)
+    }
+
+    /// Run a statement in one go. An `await` left inside it (in a `switch`,
+    /// a `do`/`while`, or a loop condition) waits in place instead.
+    fn frame_run_whole(
+        &mut self,
+        doc: &mut Document,
+        frame: &mut AsyncFrame,
+        stmt: &str,
+    ) -> StepResult {
+        self.exec_statement(doc, stmt);
+        frame.temps = 0;
+        self.take_completion()
+    }
+
+    /// Evaluate the operand of the `await` at `at`, then suspend until it
+    /// settles. The statement is queued again with the `await` replaced by a
+    /// slot that receives the settled value when the frame resumes.
+    fn suspend_at_await(
+        &mut self,
+        doc: &mut Document,
+        slot: usize,
+        frame: &mut AsyncFrame,
+        stmt: &str,
+        masked: &[u8],
+        at: usize,
+    ) -> StepResult {
+        let end = await_operand_end(masked, at + 5);
+        let (Some(head), Some(operand), Some(tail)) =
+            (stmt.get(..at), stmt.get(at + 5..end), stmt.get(end..))
+        else {
+            return self.frame_run_whole(doc, frame, stmt);
+        };
+        if !self.consume_step() {
+            return StepResult::Next;
+        }
+        let value = self.eval_expr(doc, operand.trim());
+        if let Some(err) = self.thrown_error.take() {
+            return StepResult::Complete(Completion::Throw(err));
+        }
+        if self.aborted {
+            return StepResult::Next;
+        }
+        let temp = format!("__anvil_await{}", frame.temps);
+        frame.temps += 1;
+        push_unique_name(&mut frame.names, &temp);
+        let pid = self.value_as_promise(value);
+        self.subscribe(
+            pid,
+            HandlerKind::Resume { frame: slot },
+            HandlerKind::Resume { frame: slot },
+            NO_RESULT,
+        );
+        frame.work.push(Work::Stmt(format!("{head}{temp}{tail}")));
+        frame.resume_temp = Some(temp);
+        StepResult::Suspend
+    }
+
+    /// Run one iteration of a stepped loop.
+    fn frame_loop(
+        &mut self,
+        doc: &mut Document,
+        frame: &mut AsyncFrame,
+        state: LoopState,
+    ) -> StepResult {
+        if !self.consume_step() {
+            return StepResult::Next;
+        }
+        match state {
+            LoopState::While { cond, body, iters } => {
+                if iters >= 10_000 {
+                    return StepResult::Next;
+                }
+                let ok = self.eval_expr(doc, &cond).is_truthy();
+                if let Some(err) = self.thrown_error.take() {
+                    return StepResult::Complete(Completion::Throw(err));
+                }
+                if ok {
+                    frame.work.push(Work::Loop(LoopState::While {
+                        cond,
+                        body: body.clone(),
+                        iters: iters + 1,
+                    }));
+                    push_block(&mut frame.work, &body);
+                }
+            }
+            LoopState::For {
+                cond,
+                step,
+                body,
+                iters,
+            } => {
+                if iters >= 10_000 {
+                    return StepResult::Next;
+                }
+                if iters > 0 {
+                    self.exec_statement(doc, &step);
+                }
+                let ok = cond.trim().is_empty() || self.eval_expr(doc, &cond).is_truthy();
+                if let Some(err) = self.thrown_error.take() {
+                    return StepResult::Complete(Completion::Throw(err));
+                }
+                if ok {
+                    frame.work.push(Work::Loop(LoopState::For {
+                        cond,
+                        step,
+                        body: body.clone(),
+                        iters: iters + 1,
+                    }));
+                    push_block(&mut frame.work, &body);
+                }
+            }
+            LoopState::ForOf {
+                binding,
+                items,
+                next,
+                body,
+                awaits,
+            } => {
+                if next >= MAX_ARRAY_LEN {
+                    return StepResult::Next;
+                }
+                let Some(item) = items.get(next).cloned() else {
+                    return StepResult::Next;
+                };
+                frame.work.push(Work::Loop(LoopState::ForOf {
+                    binding: binding.clone(),
+                    items,
+                    next: next + 1,
+                    body: body.clone(),
+                    awaits,
+                }));
+                push_block(&mut frame.work, &body);
+                if awaits {
+                    self.set_var("__anvil_item", item);
+                    frame
+                        .work
+                        .push(Work::Stmt(format!("{binding} = await __anvil_item")));
+                } else {
+                    let pattern = binding
+                        .strip_prefix("let ")
+                        .or_else(|| binding.strip_prefix("const "))
+                        .or_else(|| binding.strip_prefix("var "))
+                        .unwrap_or(&binding)
+                        .trim()
+                        .to_string();
+                    self.bind_pattern(doc, &pattern, item);
+                }
+            }
+        }
+        StepResult::Next
     }
 
     pub fn get_var(&self, name: &str) -> Option<&Value> {
@@ -1031,7 +2650,10 @@ impl ScriptRuntime {
         let statements = split_statements(&cleaned);
         for stmt in &statements {
             let s = stmt.trim_start();
-            if s.starts_with("function ") || s.starts_with("class ") {
+            if s.starts_with("function ")
+                || s.starts_with("async function ")
+                || s.starts_with("class ")
+            {
                 self.exec_statement(doc, stmt);
             }
         }
@@ -1060,7 +2682,10 @@ impl ScriptRuntime {
                     break;
                 }
                 let s = stmt.trim_start();
-                if !s.starts_with("function ") && !s.starts_with("class ") {
+                if !s.starts_with("function ")
+                    && !s.starts_with("async function ")
+                    && !s.starts_with("class ")
+                {
                     self.exec_statement(doc, &stmt);
                 }
             }
@@ -1106,7 +2731,11 @@ impl ScriptRuntime {
         let mut ops = Vec::with_capacity(statements.len());
         for raw in statements {
             let stmt = raw.trim();
-            if stmt.is_empty() || stmt.starts_with("function ") || stmt.starts_with("class ") {
+            if stmt.is_empty()
+                || stmt.starts_with("function ")
+                || stmt.starts_with("async function ")
+                || stmt.starts_with("class ")
+            {
                 continue;
             }
             if stmt.starts_with("if")
@@ -1470,6 +3099,7 @@ impl ScriptRuntime {
                         name: name.clone(),
                         super_class,
                         methods,
+                        async_methods: async_method_names(&class_body),
                     };
                     if let Some(existing) = self.classes.iter_mut().find(|c| c.name == name) {
                         *existing = def;
@@ -1529,6 +3159,11 @@ impl ScriptRuntime {
                     }
                 }
             }
+        }
+
+        if let Some(rest) = stmt.strip_prefix("async function ") {
+            self.define_named_function(rest, true);
+            return;
         }
 
         if let Some(rest) = stmt.strip_prefix("function ") {
@@ -1831,8 +3466,12 @@ impl ScriptRuntime {
                 self.bind_pattern(doc, lhs_trimmed, value);
                 return;
             }
+            let (rhs_async, rhs_eff) = match rhs_trimmed.strip_prefix("async ") {
+                Some(rest) => (true, rest.trim()),
+                None => (false, rhs_trimmed),
+            };
             if is_identifier(lhs_trimmed) {
-                if let Some((params_part, arrow_body)) = split_top_level_arrow(rhs_trimmed) {
+                if let Some((params_part, arrow_body)) = split_top_level_arrow(rhs_eff) {
                     let params_str = params_part
                         .trim()
                         .trim_start_matches('(')
@@ -1859,9 +3498,12 @@ impl ScriptRuntime {
                     } else {
                         self.functions.push((lhs_trimmed.to_string(), params, body));
                     }
+                    if rhs_async && !self.async_functions.iter().any(|n| n == lhs_trimmed) {
+                        self.async_functions.push(lhs_trimmed.to_string());
+                    }
                     return;
                 }
-                if let Some(rest_fn) = rhs_trimmed.strip_prefix("function") {
+                if let Some(rest_fn) = rhs_eff.strip_prefix("function") {
                     if let Some((sig, body)) = split_brace_block(rest_fn) {
                         if let Some((_, params_raw)) = sig.split_once('(') {
                             let params_str = params_raw.trim().trim_end_matches(')');
@@ -1872,6 +3514,9 @@ impl ScriptRuntime {
                                 .map(String::from)
                                 .collect();
                             self.functions.push((lhs_trimmed.to_string(), params, body));
+                            if rhs_async && !self.async_functions.iter().any(|n| n == lhs_trimmed) {
+                                self.async_functions.push(lhs_trimmed.to_string());
+                            }
                             return;
                         }
                     }
@@ -2357,6 +4002,11 @@ impl ScriptRuntime {
             return Value::Number(count as f64);
         }
 
+        if let Some(rest) = expr.strip_prefix("await ") {
+            let awaited = self.eval_expr(doc, rest.trim());
+            return self.await_value(doc, awaited);
+        }
+
         if expr.ends_with(')') {
             if let Some(open) = find_call_open_paren(expr) {
                 let callee = expr[..open].trim();
@@ -2557,6 +4207,25 @@ impl ScriptRuntime {
         };
         let args = split_args(args_src);
         match callee {
+            "Promise" => {
+                let id = self.new_promise();
+                if let Some(executor) = args.first() {
+                    let (params, body) = extract_multi_param_callback(executor.trim());
+                    if let Some(resolve_name) = params.first().filter(|n| !n.is_empty()) {
+                        self.set_var(resolve_name, Value::Str(format!("__anvil_resolve:{id}")));
+                    }
+                    if let Some(reject_name) = params.get(1).filter(|n| !n.is_empty()) {
+                        self.set_var(reject_name, Value::Str(format!("__anvil_reject:{id}")));
+                    }
+                    let prev_throw = self.thrown_error.take();
+                    self.eval_deferred(doc, &body);
+                    if let Some(err) = self.thrown_error.take() {
+                        self.reject_promise(id, err);
+                    }
+                    self.thrown_error = prev_throw;
+                }
+                self.make_promise_value(id)
+            }
             "Object" | "Map" | "Set" => Value::Json(JsonValue::empty_object()),
             "Array" => {
                 if args.len() == 1 {
@@ -2682,6 +4351,24 @@ impl ScriptRuntime {
         None
     }
 
+    /// True when the method `find_class_method` would pick is `async`.
+    fn class_method_is_async(&self, class_name: &str, method_name: &str) -> bool {
+        let mut next_class = Some(class_name.to_string());
+        for _ in 0..=16 {
+            let Some(curr) = next_class else {
+                return false;
+            };
+            let Some(def) = self.classes.iter().find(|c| c.name == curr) else {
+                return false;
+            };
+            if def.methods.iter().any(|(m, _, _)| m == method_name) {
+                return def.async_methods.iter().any(|m| m == method_name);
+            }
+            next_class = def.super_class.clone();
+        }
+        false
+    }
+
     fn eval_template_literal(&mut self, doc: &mut Document, inner: &str) -> String {
         let mut out = String::new();
         let mut rest = inner;
@@ -2753,10 +4440,36 @@ impl ScriptRuntime {
             if let Some((inner_fn, rem)) = extract_paren_group(callee) {
                 if rem.trim().is_empty() {
                     let args = split_args(args_src);
+                    // `(async () => { ... })()` runs as an async call, so it
+                    // returns at its first `await` like a named one. It keeps
+                    // a copy of the enclosing async function's locals, the
+                    // same as a callback created there.
+                    let (is_async, rest) = split_async_prefix(inner_fn.trim());
+                    if is_async {
+                        let (params, body) = async_callback_parts(rest);
+                        let values: Vec<Value> =
+                            args.iter().map(|a| self.eval_expr(doc, a)).collect();
+                        let env = self.capture_env(&body);
+                        return self.start_async(doc, &params, values, &body, &env);
+                    }
                     let (params, body) = extract_multi_param_callback(inner_fn.trim());
                     return self.invoke_method_body(doc, &params, &body, &args, None);
                 }
             }
+        }
+
+        if let Some((pid, rejects)) = self.resolver_marker(callee) {
+            let args = split_args(args_src);
+            let v = args
+                .first()
+                .map(|a| self.eval_expr(doc, a))
+                .unwrap_or(Value::Null);
+            if rejects {
+                self.reject_promise(pid, v);
+            } else {
+                self.resolve_promise(pid, v);
+            }
+            return Value::Null;
         }
 
         match callee {
@@ -2965,9 +4678,12 @@ impl ScriptRuntime {
             "queueMicrotask" => {
                 let args = split_args(args_src);
                 if let Some(first) = args.first() {
-                    if self.microtasks.len() < MAX_MICROTASKS {
-                        self.microtasks.push(extract_callback_body(first.trim()));
-                    }
+                    let (code, env, is_async) = self.deferred_callback(first);
+                    self.schedule_job(Job::Script {
+                        code,
+                        env,
+                        is_async,
+                    });
                 }
                 return Value::Null;
             }
@@ -3008,7 +4724,22 @@ impl ScriptRuntime {
                 }
                 return Value::Json(obj);
             }
-            "clearTimeout" | "clearInterval" | "cancelAnimationFrame" | "scrollTo" | "scrollBy" => {
+            "cancelAnimationFrame" | "scrollTo" | "scrollBy" => {
+                return Value::Null;
+            }
+            "clearTimeout" | "clearInterval" => {
+                let args = split_args(args_src);
+                if let Some(target) = args
+                    .first()
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                {
+                    let target = target.max(0.0) as u64;
+                    for t in self.timers.iter_mut() {
+                        if t.id == target {
+                            t.cleared = true;
+                        }
+                    }
+                }
                 return Value::Null;
             }
             "addEventListener" => {
@@ -3021,9 +4752,13 @@ impl ScriptRuntime {
                     } else if matches!(
                         event.to_ascii_lowercase().as_str(),
                         "domcontentloaded" | "load" | "readystatechange"
-                    ) && self.microtasks.len() < MAX_MICROTASKS
-                    {
-                        self.microtasks.push(body);
+                    ) {
+                        let (code, env, is_async) = self.deferred_callback(&args[1]);
+                        self.schedule_job(Job::Script {
+                            code,
+                            env,
+                            is_async,
+                        });
                     }
                 }
                 return Value::Null;
@@ -3033,19 +4768,42 @@ impl ScriptRuntime {
 
         if callee == "setTimeout" || callee == "setInterval" || callee == "requestAnimationFrame" {
             let args = split_args(args_src);
+            let mut new_id = 0u64;
             if let Some(first) = args.first() {
                 if self.timers.len() < MAX_TIMERS {
-                    let handler_raw = first.trim();
-                    let body = extract_callback_body(handler_raw);
-                    let delay = args
+                    let (body, env, is_async) = self.deferred_callback(first);
+                    let mut delay = args
                         .get(1)
                         .and_then(|d| self.eval_expr(doc, d).as_number())
                         .unwrap_or(0.0)
                         .max(0.0) as u64;
-                    self.timers.push((delay, body));
+                    // Clamp a nested timer to 4 ms, as a browser does, so a
+                    // zero-delay timer that reschedules itself still advances
+                    // the clock and keeps a fair order with other timers.
+                    if self.timer_depth > 0 && delay < 4 {
+                        delay = 4;
+                    }
+                    let period = if callee == "setInterval" {
+                        Some(delay.max(1))
+                    } else {
+                        None
+                    };
+                    new_id = self.alloc_timer_id();
+                    let seq = self.alloc_seq();
+                    let due = self.clock_ms.saturating_add(delay);
+                    self.timers.push(Timer {
+                        id: new_id,
+                        seq,
+                        due,
+                        body,
+                        env,
+                        is_async,
+                        period,
+                        cleared: false,
+                    });
                 }
             }
-            return Value::Number(self.timers.len() as f64);
+            return Value::Number(new_id as f64);
         }
 
         if callee == "fetch" {
@@ -3104,6 +4862,16 @@ impl ScriptRuntime {
                 .unwrap_or(obj_expr_raw.trim())
                 .trim();
             let method = method.trim();
+
+            if matches!(method, "then" | "catch" | "finally") {
+                let target = self.eval_expr(doc, obj_expr);
+                // A class instance with its own method of this name keeps it.
+                if !self.instance_has_method(&target, method) {
+                    let pid = self.value_as_promise(target);
+                    let args = split_args(args_src);
+                    return self.promise_method(pid, method, &args);
+                }
+            }
 
             if obj_expr == "localStorage" || obj_expr == "window.localStorage" {
                 let args = split_args(args_src);
@@ -3171,15 +4939,11 @@ impl ScriptRuntime {
                 };
             }
 
-            if obj_expr == "Promise" && method == "resolve" {
+            if obj_expr == "Promise" || obj_expr == "window.Promise" {
                 let args = split_args(args_src);
-                let val = args
-                    .first()
-                    .map(|a| self.eval_expr(doc, a))
-                    .unwrap_or(Value::Null);
-                let mut obj = JsonValue::empty_object();
-                obj.insert("__promise_resolved", val.to_json_value(doc));
-                return Value::Json(obj);
+                if let Some(result) = self.promise_static(doc, method, &args) {
+                    return result;
+                }
             }
 
             if obj_expr == "console" {
@@ -3397,9 +5161,13 @@ impl ScriptRuntime {
                         } else if matches!(
                             first.to_ascii_lowercase().as_str(),
                             "domcontentloaded" | "load" | "readystatechange"
-                        ) && self.microtasks.len() < MAX_MICROTASKS
-                        {
-                            self.microtasks.push(body);
+                        ) {
+                            let (code, env, is_async) = self.deferred_callback(&args[1]);
+                            self.schedule_job(Job::Script {
+                                code,
+                                env,
+                                is_async,
+                            });
                         }
                         Value::Null
                     }
@@ -3806,15 +5574,25 @@ impl ScriptRuntime {
                             self.find_class_method(&class_name, method)
                         {
                             let args = split_args(args_src);
+                            let is_async = self.class_method_is_async(&class_name, method);
                             let prev_this = self.get_var("this").cloned();
                             self.set_var("this", Value::Json(jval));
-                            let out = self.invoke_method_body(
+                            let mut out = self.invoke_method_body(
                                 doc,
                                 &params,
                                 &body,
                                 &args,
                                 sup_class.as_deref(),
                             );
+                            if is_async {
+                                // An async method's awaits wait in place, so its
+                                // promise is already settled when it returns.
+                                let id = match self.thrown_error.take() {
+                                    Some(err) => self.new_rejected(err),
+                                    None => self.new_resolved(out),
+                                };
+                                out = self.make_promise_value(id);
+                            }
                             if is_identifier(obj_expr) {
                                 if let Some(updated_this) = self.get_var("this").cloned() {
                                     self.set_var(obj_expr, updated_this);
@@ -3874,28 +5652,6 @@ impl ScriptRuntime {
                             return parse_json(body)
                                 .map(Value::from_json_value)
                                 .unwrap_or(Value::Null);
-                        }
-                        "then" => {
-                            let args = split_args(args_src);
-                            if let Some(cb) = args.first() {
-                                if let Some(resolved) = jval.get("__promise_resolved").cloned() {
-                                    let (param_name, body) =
-                                        extract_single_param_callback(cb.trim());
-                                    let val_lit = to_json_string(&resolved);
-                                    let scheduled = if !param_name.is_empty() {
-                                        format!("let {param_name} = {val_lit}; {body}")
-                                    } else {
-                                        body
-                                    };
-                                    if self.microtasks.len() < MAX_MICROTASKS {
-                                        self.microtasks.push(scheduled);
-                                    }
-                                }
-                            }
-                            return Value::Json(jval);
-                        }
-                        "catch" | "finally" => {
-                            return Value::Json(jval);
                         }
                         _ => {}
                     }
@@ -4100,10 +5856,52 @@ impl ScriptRuntime {
             .cloned()
         {
             let args = split_args(args_src);
+            if self.async_functions.iter().any(|name| name == callee) {
+                let values: Vec<Value> = args.iter().map(|a| self.eval_expr(doc, a)).collect();
+                return self.start_async(doc, &params, values, &body, &[]);
+            }
             return self.invoke_method_body(doc, &params, &body, &args, None);
         }
 
         Value::Null
+    }
+
+    /// Define `name(params) { body }` from the text after `function `.
+    fn define_named_function(&mut self, rest: &str, is_async: bool) {
+        let Some((sig, body)) = split_brace_block(rest) else {
+            return;
+        };
+        let Some((name, params_raw)) = sig.split_once('(') else {
+            return;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let params: Vec<String> = params_raw
+            .trim()
+            .trim_end_matches(')')
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if let Some((_, existing_params, existing_body)) =
+            self.functions.iter_mut().find(|(n, _, _)| n == &name)
+        {
+            *existing_params = params;
+            *existing_body = body;
+        } else {
+            self.functions.push((name.clone(), params, body));
+        }
+        let listed = self.async_functions.iter().position(|n| n == &name);
+        match (is_async, listed) {
+            (true, None) => self.async_functions.push(name),
+            (false, Some(index)) => {
+                self.async_functions.remove(index);
+            }
+            _ => {}
+        }
     }
 
     fn eval_callback_return(&mut self, doc: &mut Document, body: &str) -> Value {
@@ -4126,6 +5924,386 @@ impl ScriptRuntime {
             self.eval_expr(doc, trimmed)
         }
     }
+}
+
+/// Promise id carried by a promise value, if `value` is one.
+fn promise_id_of(value: &Value) -> Option<usize> {
+    match value {
+        Value::Json(j) => promise_id_of_json(j),
+        _ => None,
+    }
+}
+
+fn promise_id_of_json(j: &JsonValue) -> Option<usize> {
+    match j.get("__anvil_promise") {
+        Some(JsonValue::Number(n)) if *n >= 0.0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+fn is_ident_start_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn push_unique_name(names: &mut Vec<String>, name: &str) {
+    if !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+    }
+}
+
+/// True when `text` starts with the keyword `word` as a whole word.
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.starts_with(word)
+        && !text
+            .as_bytes()
+            .get(word.len())
+            .copied()
+            .is_some_and(is_ident_byte)
+}
+
+/// True when `word` appears as a whole word at byte `at` of `buf`.
+fn word_at(buf: &[u8], at: usize, word: &[u8]) -> bool {
+    buf.get(at..at + word.len()) == Some(word)
+        && (at == 0 || !is_ident_byte(buf[at - 1]))
+        && !buf.get(at + word.len()).copied().is_some_and(is_ident_byte)
+}
+
+/// Push the statements of `body` so the first one runs next.
+fn push_block(work: &mut Vec<Work>, body: &str) {
+    for stmt in split_statements(body).into_iter().rev() {
+        work.push(Work::Stmt(stmt));
+    }
+}
+
+/// Items a `for...of` walks over.
+fn iterable_items(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items,
+        Value::Json(JsonValue::Array(items)) => {
+            items.into_iter().map(Value::from_json_value).collect()
+        }
+        Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Split a leading `async` keyword off a callback.
+fn split_async_prefix(raw: &str) -> (bool, &str) {
+    let t = raw.trim();
+    match t.strip_prefix("async") {
+        Some(rest) if rest.starts_with(|c: char| c.is_whitespace() || c == '(') => {
+            (true, rest.trim_start())
+        }
+        _ => (false, t),
+    }
+}
+
+/// Parameters and body of an async callback. An expression body becomes a
+/// `return` so the call's promise carries its value.
+fn async_callback_parts(raw: &str) -> (Vec<String>, String) {
+    let (params, body) = extract_multi_param_callback(raw);
+    match split_top_level_arrow(raw) {
+        Some((_, rhs)) if !rhs.trim_start().starts_with('{') => {
+            (params, format!("return {}", body.trim()))
+        }
+        _ => (params, body),
+    }
+}
+
+/// Index just past the bracket that closes the one at `open`.
+fn match_close(buf: &[u8], open: usize) -> usize {
+    let mut depth = 0_i32;
+    let mut k = open;
+    while k < buf.len() {
+        match buf[k] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth <= 0 {
+                    return k + 1;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    buf.len()
+}
+
+/// Blank the inside of the brace block opening at `open`, keeping the braces.
+fn blank_brace_block(buf: &mut [u8], open: usize) {
+    let mut depth = 0_i32;
+    for byte in buf.iter_mut().skip(open) {
+        match *byte {
+            b'{' => {
+                depth += 1;
+                if depth == 1 {
+                    continue;
+                }
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        *byte = b' ';
+    }
+}
+
+/// A same-length copy of `src` with string contents and the bodies of nested
+/// functions blanked out, so a scan for `await` or a declaration only sees
+/// the code of the function being run.
+fn mask_nested_code(src: &str) -> Vec<u8> {
+    let mut out = src.as_bytes().to_vec();
+    let n = out.len();
+    let mut i = 0;
+    while i < n {
+        let b = out[i];
+        if b == b'"' || b == b'\'' || b == b'`' {
+            i += 1;
+            while i < n && out[i] != b {
+                if out[i] == b'\\' && i + 1 < n {
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    continue;
+                }
+                out[i] = b' ';
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < n {
+        if out[i] == b'=' && out.get(i + 1) == Some(&b'>') {
+            let mut j = i + 2;
+            while j < n && out[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < n && out[j] == b'{' {
+                blank_brace_block(&mut out, j);
+            } else {
+                let mut depth = 0_i32;
+                while j < n {
+                    match out[j] {
+                        b'(' | b'[' | b'{' => depth += 1,
+                        b')' | b']' | b'}' => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        b',' | b';' | b'\n' if depth == 0 => break,
+                        _ => {}
+                    }
+                    out[j] = b' ';
+                    j += 1;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if word_at(&out, i, b"function") {
+            let mut j = i + 8;
+            while j < n && out[j] != b'{' {
+                j += 1;
+            }
+            if j < n {
+                blank_brace_block(&mut out, j);
+            }
+            i += 8;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Byte offset of the first `await` that belongs to this function.
+fn find_await(masked: &[u8]) -> Option<usize> {
+    (0..masked.len()).find(|&i| word_at(masked, i, b"await"))
+}
+
+/// End of the operand of an `await` whose keyword ends at `start`: a primary
+/// expression with any member accesses, calls, and index operations.
+fn await_operand_end(m: &[u8], start: usize) -> usize {
+    let n = m.len();
+    let mut j = start;
+    while j < n && m[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if word_at(m, j, b"await") {
+        return await_operand_end(m, j + 5);
+    }
+    if word_at(m, j, b"new") {
+        j += 3;
+        while j < n && m[j].is_ascii_whitespace() {
+            j += 1;
+        }
+    }
+    if j < n {
+        match m[j] {
+            b'(' | b'[' | b'{' => j = match_close(m, j),
+            b'"' | b'\'' | b'`' => {
+                let q = m[j];
+                j += 1;
+                while j < n && m[j] != q {
+                    j += 1;
+                }
+                j = (j + 1).min(n);
+            }
+            _ => {
+                while j < n && is_ident_byte(m[j]) {
+                    j += 1;
+                }
+            }
+        }
+    }
+    loop {
+        if j < n && m[j] == b'.' {
+            j += 1;
+        } else if j + 1 < n && m[j] == b'?' && m[j + 1] == b'.' {
+            j += 2;
+        } else if j < n && (m[j] == b'(' || m[j] == b'[') {
+            j = match_close(m, j);
+            continue;
+        } else {
+            break;
+        }
+        while j < n && is_ident_byte(m[j]) {
+            j += 1;
+        }
+    }
+    j
+}
+
+/// Names declared with `let`, `const`, `var`, or `catch (name)` in `body`,
+/// leaving out nested functions. These become the locals of an async frame.
+fn collect_declared_names(body: &str, out: &mut Vec<String>) {
+    let m = mask_nested_code(body);
+    let n = m.len();
+    let mut i = 0;
+    let mut depth = 0_i32;
+    // (depth of the declaration, expecting a name next)
+    let mut decl: Option<(i32, bool)> = None;
+    let mut after_catch = false;
+    while i < n {
+        let b = m[i];
+        if is_ident_start_byte(b) && (i == 0 || !is_ident_byte(m[i - 1])) {
+            let start = i;
+            while i < n && is_ident_byte(m[i]) {
+                i += 1;
+            }
+            let word = &body[start..i];
+            match decl {
+                Some((d, true)) if d == depth => {
+                    if is_identifier(word) {
+                        push_unique_name(out, word);
+                    }
+                    decl = Some((d, false));
+                }
+                Some((d, false)) if d == depth && (word == "of" || word == "in") => decl = None,
+                _ => {}
+            }
+            if matches!(word, "let" | "const" | "var") {
+                decl = Some((depth, true));
+            }
+            after_catch = word == "catch";
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => {
+                if b != b'(' && decl == Some((depth, true)) {
+                    let close = match_close(&m, i);
+                    push_pattern_names(&body[i..close], out);
+                    decl = Some((depth, false));
+                    i = close;
+                    continue;
+                }
+                if b == b'(' && after_catch {
+                    let close = match_close(&m, i);
+                    let inner = body[i + 1..close.saturating_sub(1).max(i + 1)].trim();
+                    if is_identifier(inner) {
+                        push_unique_name(out, inner);
+                    }
+                }
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if matches!(decl, Some((d, _)) if depth < d) {
+                    decl = None;
+                }
+            }
+            b',' => {
+                if decl == Some((depth, false)) {
+                    decl = Some((depth, true));
+                }
+            }
+            b';' | b'\n' => {
+                if matches!(decl, Some((d, _)) if d == depth) {
+                    decl = None;
+                }
+            }
+            _ => {}
+        }
+        if !b.is_ascii_whitespace() {
+            after_catch = false;
+        }
+        i += 1;
+    }
+}
+
+/// Binding names in a destructuring pattern such as `{ a, b: c }` or `[x, y]`.
+fn push_pattern_names(pattern: &str, out: &mut Vec<String>) {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_start_byte(bytes[i]) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let mut k = i;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_key = bytes.get(k) == Some(&b':');
+            if !is_key {
+                push_unique_name(out, &pattern[start..i]);
+            }
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// An error object shaped like `new <name>(message)`.
+fn make_named_error(name: &str, message: &str) -> Value {
+    let mut obj = JsonValue::empty_object();
+    obj.insert("name", JsonValue::String(name.to_string()));
+    obj.insert("message", JsonValue::String(message.to_string()));
+    Value::Json(obj)
+}
+
+/// The rejection reason of `Promise.any` when every input rejected.
+fn make_aggregate_error(errors: &[JsonValue]) -> Value {
+    let mut obj = JsonValue::empty_object();
+    obj.insert("name", JsonValue::String("AggregateError".to_string()));
+    obj.insert(
+        "message",
+        JsonValue::String("All promises were rejected".to_string()),
+    );
+    obj.insert("errors", JsonValue::Array(errors.to_vec()));
+    Value::Json(obj)
 }
 
 fn extract_callback_body(handler_raw: &str) -> String {
@@ -4226,6 +6404,27 @@ fn find_template_expr_end(after_dollar_brace: &str) -> Option<usize> {
     None
 }
 
+/// Names of the methods declared `async` in a class body.
+fn async_method_names(class_body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rem = class_body.trim();
+    while let Some(open_paren) = rem.find('(') {
+        let head = rem[..open_paren].trim().trim_start_matches(';').trim();
+        let head = head.strip_prefix("static ").unwrap_or(head).trim();
+        if let Some(name) = head.strip_prefix("async ") {
+            names.push(name.trim().to_string());
+        }
+        let Some((_, after_params)) = extract_paren_group(&rem[open_paren..]) else {
+            break;
+        };
+        let Some((_, after_body)) = extract_first_brace_block(after_params) else {
+            break;
+        };
+        rem = after_body.trim();
+    }
+    names
+}
+
 fn parse_class_methods(class_body: &str) -> Vec<(String, Vec<String>, String)> {
     let mut methods = Vec::new();
     let mut rem = class_body.trim();
@@ -4233,13 +6432,9 @@ fn parse_class_methods(class_body: &str) -> Vec<(String, Vec<String>, String)> {
         let Some(open_paren) = rem.find('(') else {
             break;
         };
-        let raw_name = rem[..open_paren]
-            .trim()
-            .trim_start_matches(';')
-            .trim()
-            .strip_prefix("static ")
-            .unwrap_or(rem[..open_paren].trim().trim_start_matches(';').trim())
-            .trim();
+        let head = rem[..open_paren].trim().trim_start_matches(';').trim();
+        let head = head.strip_prefix("static ").unwrap_or(head).trim();
+        let raw_name = head.strip_prefix("async ").unwrap_or(head).trim();
         let after_name = &rem[open_paren..];
         let Some((params_str, after_params)) = extract_paren_group(after_name) else {
             break;
