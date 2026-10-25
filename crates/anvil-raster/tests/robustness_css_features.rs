@@ -204,6 +204,13 @@ const PROPERTIES: &[&str] = &[
     "align-items",
     "margin",
     "padding",
+    "grid-column",
+    "grid-row",
+    "grid-area",
+    "grid-column-start",
+    "grid-column-end",
+    "grid-row-start",
+    "grid-row-end",
 ];
 
 /// Values for those properties, valid and broken.
@@ -246,6 +253,25 @@ const VALUES: &[&str] = &[
     "}",
     "(",
     ")",
+    "span 2",
+    "span 0",
+    "span -3",
+    "span",
+    "span span",
+    "2 span",
+    "1 / -1",
+    "-1 / 1",
+    "-200",
+    "3 / span 2",
+    "span 99999 / 2",
+    "1 / 2 / 3 / 4",
+    "1/2/3/4/5",
+    "a / b",
+    "/",
+    "//",
+    "-1",
+    "100 / -100",
+    "span 100 / span 100",
 ];
 
 /// Random but CSS-shaped text aimed at the grid properties.

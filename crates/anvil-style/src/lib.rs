@@ -573,6 +573,31 @@ pub enum GridTrack {
     MinMax(TrackBreadth, TrackBreadth),
 }
 
+/// Largest grid line number or span kept by the parser. Bigger values are
+/// clamped, so a typo such as `span 99999` does not build a huge grid.
+pub const MAX_GRID_LINE: i16 = 100;
+
+/// One end of a grid item's placement on an axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GridLine {
+    /// Auto-placed. This is the initial value.
+    #[default]
+    Auto,
+    /// A numbered line. Positive counts from the start (1 is the first
+    /// line), negative from the end of the explicit grid (-1 is the last).
+    /// Never 0.
+    Line(i16),
+    /// `span N`. Always at least 1.
+    Span(i16),
+}
+
+/// `grid-column` or `grid-row` after parsing: a start and an end line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GridPlacement {
+    pub start: GridLine,
+    pub end: GridLine,
+}
+
 /// One side of a `minmax()` track.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrackBreadth {
@@ -635,6 +660,10 @@ pub struct ComputedStyle {
     pub grid_row_count: u8,
     /// Size of rows past the explicit grid (`grid-auto-rows`). The initial value is `auto`.
     pub grid_auto_rows: GridTrack,
+    /// Placement from `grid-column` and its longhands. Not inherited.
+    pub grid_column: GridPlacement,
+    /// Placement from `grid-row` and its longhands. Not inherited.
+    pub grid_row: GridPlacement,
     pub gap: f32,
 }
 
@@ -676,6 +705,14 @@ impl ComputedStyle {
             grid_template_rows: [GridTrack::Auto; 12],
             grid_row_count: 0,
             grid_auto_rows: GridTrack::Auto,
+            grid_column: GridPlacement {
+                start: GridLine::Auto,
+                end: GridLine::Auto,
+            },
+            grid_row: GridPlacement {
+                start: GridLine::Auto,
+                end: GridLine::Auto,
+            },
             gap: 0.0,
         }
     }
@@ -1447,6 +1484,42 @@ fn apply_declaration(
                 style.grid_row_count = count;
             }
         }
+        "grid-column" => {
+            if let Some(placement) = parse_grid_placement(value) {
+                style.grid_column = placement;
+            }
+        }
+        "grid-row" => {
+            if let Some(placement) = parse_grid_placement(value) {
+                style.grid_row = placement;
+            }
+        }
+        "grid-column-start" => {
+            if let Some(line) = parse_grid_line(value) {
+                style.grid_column.start = line;
+            }
+        }
+        "grid-column-end" => {
+            if let Some(line) = parse_grid_line(value) {
+                style.grid_column.end = line;
+            }
+        }
+        "grid-row-start" => {
+            if let Some(line) = parse_grid_line(value) {
+                style.grid_row.start = line;
+            }
+        }
+        "grid-row-end" => {
+            if let Some(line) = parse_grid_line(value) {
+                style.grid_row.end = line;
+            }
+        }
+        "grid-area" => {
+            if let Some((row, column)) = parse_grid_area(value) {
+                style.grid_row = row;
+                style.grid_column = column;
+            }
+        }
         "grid-auto-rows" => {
             // Only one track is kept. A list such as `10px 20px` is not cycled.
             if let Some(track) = parse_single_grid_track(value) {
@@ -1509,6 +1582,67 @@ fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
         out.replace_range(pos..=(pos + 4 + close_idx), &replacement);
     }
     out
+}
+
+/// One grid line: `auto`, a non-zero integer, `span N`, `N span`, or `span`
+/// (span 1). Line names are not supported and return `None`, as do 0 and a
+/// span below 1. Numbers past [`MAX_GRID_LINE`] are clamped.
+fn parse_grid_line(value: &str) -> Option<GridLine> {
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    let clamp = |n: i64| n.clamp(-i64::from(MAX_GRID_LINE), i64::from(MAX_GRID_LINE)) as i16;
+    let int = |t: &str| t.parse::<i64>().ok();
+    match tokens.as_slice() {
+        [one] if one.eq_ignore_ascii_case("auto") => Some(GridLine::Auto),
+        [one] if one.eq_ignore_ascii_case("span") => Some(GridLine::Span(1)),
+        [one] => {
+            let n = int(one)?;
+            (n != 0).then(|| GridLine::Line(clamp(n)))
+        }
+        [a, b] if a.eq_ignore_ascii_case("span") || b.eq_ignore_ascii_case("span") => {
+            let num = if a.eq_ignore_ascii_case("span") { b } else { a };
+            let n = int(num)?;
+            (n > 0).then(|| GridLine::Span(clamp(n)))
+        }
+        _ => None,
+    }
+}
+
+/// `start` or `start / end` for `grid-column` and `grid-row`. A missing end is `auto`.
+fn parse_grid_placement(value: &str) -> Option<GridPlacement> {
+    let mut parts = value.split('/');
+    let start = parse_grid_line(parts.next()?)?;
+    let end = match parts.next() {
+        Some(end) => parse_grid_line(end)?,
+        None => GridLine::Auto,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(GridPlacement { start, end })
+}
+
+/// `grid-area: row-start / column-start / row-end / column-end` with numeric
+/// lines or spans. Missing parts are `auto`. Area names are not supported.
+/// Returns the row placement, then the column placement.
+fn parse_grid_area(value: &str) -> Option<(GridPlacement, GridPlacement)> {
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut lines = [GridLine::Auto; 4];
+    for (slot, part) in lines.iter_mut().zip(&parts) {
+        *slot = parse_grid_line(part)?;
+    }
+    Some((
+        GridPlacement {
+            start: lines[0],
+            end: lines[2],
+        },
+        GridPlacement {
+            start: lines[1],
+            end: lines[3],
+        },
+    ))
 }
 
 /// One track: a length, a percentage, `Nfr`, `auto`, or `minmax(min, max)`.
@@ -2434,5 +2568,42 @@ mod tests {
             styles.get(h).grid_tracks(),
             &[GridTrack::Auto, GridTrack::Px(10.0)]
         );
+    }
+
+    #[test]
+    fn parses_grid_lines_spans_and_areas() {
+        let doc = parse_html(
+            "<div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div><div id=\"d\"></div>",
+        );
+        let sheet = parse_css(
+            "#a { grid-column: 2 / span 3; grid-row: span 2; }
+             #b { grid-area: 1 / -1 / 3; grid-column-end: 4 span; }
+             #c { grid-column: 0; grid-row: name / 2; grid-row-start: 5000; }
+             #d { grid-column: span 0; grid-row: 1 / 2 / 3; grid-area: 2 / 3 / 4 / 5 / 6; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let get = |id: &str| *styles.get(doc.get_element_by_id(id).unwrap());
+        let place = |start, end| GridPlacement { start, end };
+        assert_eq!(
+            get("a").grid_column,
+            place(GridLine::Line(2), GridLine::Span(3))
+        );
+        assert_eq!(get("a").grid_row, place(GridLine::Span(2), GridLine::Auto));
+        assert_eq!(
+            get("b").grid_row,
+            place(GridLine::Line(1), GridLine::Line(3))
+        );
+        assert_eq!(
+            get("b").grid_column,
+            place(GridLine::Line(-1), GridLine::Span(4))
+        );
+        // Line 0 and named lines are invalid; a huge line is clamped.
+        assert_eq!(get("c").grid_column, GridPlacement::default());
+        assert_eq!(
+            get("c").grid_row,
+            place(GridLine::Line(MAX_GRID_LINE), GridLine::Auto)
+        );
+        assert_eq!(get("d").grid_column, GridPlacement::default());
+        assert_eq!(get("d").grid_row, GridPlacement::default());
     }
 }

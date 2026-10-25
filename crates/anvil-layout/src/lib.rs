@@ -30,6 +30,13 @@
 //! `auto` column acts as `1fr`; an `auto` row fits its tallest single-row
 //! item. A row `fr` shares the definite container height, or fits the
 //! largest item per `fr` when the height is not definite.
+//!
+//! Items are placed by `grid-column`, `grid-row`, their `-start` / `-end`
+//! longhands, and numeric `grid-area`, with line numbers, negative lines,
+//! and `span N`. The rest are auto-placed row by row (sparse), and spans
+//! push later items around. Named lines and areas, `grid-auto-flow`,
+//! `grid-auto-columns`, and implicit tracks before the first line are not
+//! supported; an item that would start before line 1 starts at line 1.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -41,7 +48,10 @@ pub use anvil_style::{
     AlignItems, BoxShadow, Color, Edge, FlexDirection, FlexWrap, JustifyContent, LinearGradient,
     Overflow, Position,
 };
-use anvil_style::{ComputedStyle, Display, GridTrack, Size, StyleMap, TrackBreadth};
+use anvil_style::{
+    ComputedStyle, Display, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE, Size, StyleMap,
+    TrackBreadth,
+};
 use anvil_ttf::TtfFont;
 
 /// Axis-aligned box. `x` and `y` are the top-left in y-down CSS pixels.
@@ -1151,15 +1161,210 @@ fn span_size(sizes: &[f32], start: usize, span: usize, gap: f32) -> f32 {
     sizes[start..end].iter().sum::<f32>() + gap * (end - start - 1) as f32
 }
 
-/// Place items in order, left to right and then top to bottom, one cell each.
-fn place_grid_items(count: usize, col_count: usize) -> Vec<GridArea> {
-    let cols = col_count.max(1);
-    (0..count)
-        .map(|i| GridArea {
-            row: i / cols,
-            col: i % cols,
-            row_span: 1,
-            col_span: 1,
+/// One axis of an item's placement after line numbers are resolved:
+/// a definite zero-based start, or auto, plus a span of at least 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AxisSpan {
+    start: Option<usize>,
+    span: usize,
+}
+
+/// Resolve `placement` against `explicit` tracks on this axis.
+///
+/// Positive lines count from 1. Negative lines count back from the last
+/// explicit line. A line before the first line is clamped to the first.
+/// `a / b` with `b` before `a` is swapped; equal lines span one track.
+fn resolve_axis(placement: GridPlacement, explicit: usize) -> AxisSpan {
+    let max = MAX_GRID_LINE as usize;
+    let line_index = |n: i16| -> usize {
+        let last_line = explicit as i64 + 1;
+        let line = if n > 0 {
+            i64::from(n)
+        } else {
+            last_line + 1 + i64::from(n)
+        };
+        (line.max(1) - 1) as usize
+    };
+    let span_of = |n: i16| (n.max(1) as usize).min(max);
+    match (placement.start, placement.end) {
+        (GridLine::Line(s), GridLine::Line(e)) => {
+            let (a, b) = (line_index(s), line_index(e));
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            AxisSpan {
+                start: Some(lo),
+                span: (hi - lo).max(1),
+            }
+        }
+        (GridLine::Line(s), GridLine::Span(n)) => AxisSpan {
+            start: Some(line_index(s)),
+            span: span_of(n),
+        },
+        (GridLine::Line(s), GridLine::Auto) => AxisSpan {
+            start: Some(line_index(s)),
+            span: 1,
+        },
+        (GridLine::Span(n), GridLine::Line(e)) => {
+            let end = line_index(e);
+            let span = span_of(n);
+            AxisSpan {
+                start: Some(end.saturating_sub(span)),
+                span: span.min(end.max(1)),
+            }
+        }
+        (GridLine::Auto, GridLine::Line(e)) => AxisSpan {
+            start: Some(line_index(e).saturating_sub(1)),
+            span: 1,
+        },
+        (GridLine::Span(n), _) | (GridLine::Auto, GridLine::Span(n)) => AxisSpan {
+            start: None,
+            span: span_of(n),
+        },
+        (GridLine::Auto, GridLine::Auto) => AxisSpan {
+            start: None,
+            span: 1,
+        },
+    }
+}
+
+/// Cells already taken by placed items. Rows grow on demand.
+struct Occupancy {
+    cols: usize,
+    cells: Vec<Vec<bool>>,
+}
+
+impl Occupancy {
+    fn fits(&self, row: usize, col: usize, row_span: usize, col_span: usize) -> bool {
+        if col + col_span > self.cols {
+            return false;
+        }
+        (row..row + row_span).all(|r| {
+            self.cells
+                .get(r)
+                .is_none_or(|cells| cells[col..col + col_span].iter().all(|taken| !taken))
+        })
+    }
+
+    fn take(&mut self, area: GridArea) {
+        if area.col + area.col_span > self.cols {
+            let cols = area.col + area.col_span;
+            for row in &mut self.cells {
+                row.resize(cols, false);
+            }
+            self.cols = cols;
+        }
+        while self.cells.len() < area.row + area.row_span {
+            self.cells.push(vec![false; self.cols]);
+        }
+        for row in &mut self.cells[area.row..area.row + area.row_span] {
+            for cell in &mut row[area.col..area.col + area.col_span] {
+                *cell = true;
+            }
+        }
+    }
+}
+
+/// Place grid items with row-major sparse auto-placement.
+///
+/// Items with a definite row and column go first. Items with only a definite
+/// row go next, each after the ones already put in that row. The rest walk
+/// a cursor left to right and then down, skipping taken cells. An item with
+/// a definite column moves the cursor to that column, to the next row when
+/// the column is behind the cursor. Spans wider than the explicit columns
+/// add implicit columns before anything is placed.
+fn place_grid_items(items: &[(AxisSpan, AxisSpan)], explicit_cols: usize) -> Vec<GridArea> {
+    let mut cols = explicit_cols.max(1);
+    for (_, col) in items {
+        cols = cols.max(col.start.unwrap_or(0) + col.span);
+    }
+    let mut grid = Occupancy {
+        cols,
+        cells: Vec::new(),
+    };
+    let mut areas: Vec<Option<GridArea>> = vec![None; items.len()];
+
+    for (i, (row, col)) in items.iter().enumerate() {
+        if let (Some(r), Some(c)) = (row.start, col.start) {
+            let area = GridArea {
+                row: r,
+                col: c,
+                row_span: row.span,
+                col_span: col.span,
+            };
+            grid.take(area);
+            areas[i] = Some(area);
+        }
+    }
+
+    let mut row_cursor: HashMap<usize, usize> = HashMap::new();
+    for (i, (row, col)) in items.iter().enumerate() {
+        let (Some(r), None) = (row.start, col.start) else {
+            continue;
+        };
+        let mut c = row_cursor.get(&r).copied().unwrap_or(0);
+        while !grid.fits(r, c, row.span, col.span) && c + col.span <= grid.cols {
+            c += 1;
+        }
+        let area = GridArea {
+            row: r,
+            col: c,
+            row_span: row.span,
+            col_span: col.span,
+        };
+        grid.take(area);
+        row_cursor.insert(r, c + col.span);
+        areas[i] = Some(area);
+    }
+
+    let (mut cur_row, mut cur_col) = (0usize, 0usize);
+    for (i, (row, col)) in items.iter().enumerate() {
+        if row.start.is_some() {
+            continue;
+        }
+        let area = if let Some(c) = col.start {
+            if c < cur_col {
+                cur_row += 1;
+            }
+            cur_col = c;
+            while !grid.fits(cur_row, c, row.span, col.span) {
+                cur_row += 1;
+            }
+            GridArea {
+                row: cur_row,
+                col: c,
+                row_span: row.span,
+                col_span: col.span,
+            }
+        } else {
+            loop {
+                if cur_col + col.span > grid.cols {
+                    cur_row += 1;
+                    cur_col = 0;
+                    continue;
+                }
+                if grid.fits(cur_row, cur_col, row.span, col.span) {
+                    break;
+                }
+                cur_col += 1;
+            }
+            GridArea {
+                row: cur_row,
+                col: cur_col,
+                row_span: row.span,
+                col_span: col.span,
+            }
+        };
+        grid.take(area);
+        areas[i] = Some(area);
+    }
+    areas
+        .into_iter()
+        .map(|area| {
+            area.unwrap_or(GridArea {
+                row: 0,
+                col: 0,
+                row_span: 1,
+                col_span: 1,
+            })
         })
         .collect()
 }
@@ -1218,8 +1423,28 @@ fn layout_grid(
     }
 
     let explicit_cols = style.grid_tracks();
+    let explicit_rows = style.grid_row_tracks();
+    let spans: Vec<(AxisSpan, AxisSpan)> = in_flow
+        .iter()
+        .map(|&cid| {
+            // Text runs are anonymous items. They copy the parent's style, so
+            // they must not pick up the container's own placement.
+            if matches!(doc.get(cid).data(), NodeData::Text(_)) {
+                let auto = AxisSpan {
+                    start: None,
+                    span: 1,
+                };
+                return (auto, auto);
+            }
+            let cstyle = styles.get(cid);
+            (
+                resolve_axis(cstyle.grid_row, explicit_rows.len()),
+                resolve_axis(cstyle.grid_column, explicit_cols.len()),
+            )
+        })
+        .collect();
+    let areas = place_grid_items(&spans, explicit_cols.len());
     let explicit_col_count = explicit_cols.len().max(1);
-    let areas = place_grid_items(in_flow.len(), explicit_col_count);
     let col_count = areas
         .iter()
         .map(|a| a.col + a.col_span)
@@ -1231,11 +1456,11 @@ fn layout_grid(
         .map(|a| a.row + a.row_span)
         .max()
         .unwrap_or(0)
-        .max(style.grid_row_tracks().len());
+        .max(explicit_rows.len());
 
     let col_plans: Vec<TrackPlan> = (0..col_count)
         .map(|i| {
-            let track = explicit_cols.get(i).copied().unwrap_or(GridTrack::Fr(1.0));
+            let track = explicit_cols.get(i).copied().unwrap_or(GridTrack::Auto);
             plan_track(track, Some(content_width), true)
         })
         .collect();
@@ -1267,7 +1492,7 @@ fn layout_grid(
         boxes.push(child_box);
     }
 
-    let row_tracks = style.grid_row_tracks();
+    let row_tracks = explicit_rows;
     let row_plans: Vec<TrackPlan> = (0..row_count)
         .map(|i| {
             let track = row_tracks.get(i).copied().unwrap_or(style.grid_auto_rows);
@@ -2365,5 +2590,80 @@ mod tests {
         // The fixed minmax grows to 60px; `auto` acts as 1fr on columns.
         assert_eq!((r("h1").x, r("h1").width), (0.0, 60.0));
         assert_eq!((r("h2").x, r("h2").width), (60.0, 140.0));
+    }
+
+    #[test]
+    fn places_spanning_grid_items_and_auto_flows_around_them() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #g { display: grid; width: 320px; gap: 10px;
+                     grid-template-columns: repeat(4, 1fr); grid-auto-rows: 20px; }
+                #wide { grid-column: span 2; }
+                #tall { grid-row: span 2; }
+                #pin { grid-area: 3 / 1 / 4 / -1; }
+                #late { grid-column: 2; }
+                #lines { grid-row: 5; grid-column: 4 / 2; }
+             </style>
+             <div id=\"g\">
+               <div id=\"wide\"></div><div id=\"tall\"></div><div id=\"a\"></div>
+               <div id=\"b\"></div><div id=\"c\"></div>
+               <div id=\"pin\"></div><div id=\"late\"></div><div id=\"lines\"></div>
+               <div id=\"d\"></div>
+             </div>",
+            400.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+        // Four 1fr columns of 72.5px with 10px gaps: lines at 0, 82.5, 165, 247.5.
+        assert_eq!(
+            (r("wide").x, r("wide").y, r("wide").width),
+            (0.0, 0.0, 155.0)
+        );
+        assert_eq!(
+            (r("tall").x, r("tall").y, r("tall").height),
+            (165.0, 0.0, 50.0)
+        );
+        assert_eq!((r("a").x, r("a").y), (247.5, 0.0));
+        // Row two has the tall item in column three, so b and c take 1, 2, then 4.
+        assert_eq!((r("b").x, r("b").y), (0.0, 30.0));
+        assert_eq!((r("c").x, r("c").y), (82.5, 30.0));
+        assert_eq!((r("pin").x, r("pin").y, r("pin").width), (0.0, 60.0, 320.0));
+        // Column 2 is behind the cursor after row two, so it drops to row four.
+        assert_eq!((r("late").x, r("late").y), (82.5, 90.0));
+        assert_eq!(
+            (r("lines").x, r("lines").y, r("lines").width),
+            (82.5, 120.0, 155.0)
+        );
+        // `d` continues after `late` on row four.
+        assert_eq!((r("d").x, r("d").y), (165.0, 90.0));
+        assert_eq!(r("g").height, 140.0);
+    }
+
+    #[test]
+    fn spanning_items_grow_auto_rows_and_add_implicit_columns() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #g { display: grid; width: 100px; grid-template-columns: 50px 50px; }
+                #big { grid-row: 1 / span 2; height: 60px; }
+                #s1 { height: 10px; }
+                #s2 { height: 10px; }
+                #h { display: grid; width: 90px; grid-template-columns: 30px; }
+                #span3 { grid-column: span 3; }
+             </style>
+             <div id=\"g\"><div id=\"big\"></div><div id=\"s1\"></div><div id=\"s2\"></div></div>
+             <div id=\"h\"><div id=\"span3\"></div><div id=\"after\"></div></div>",
+            200.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+        // Rows start at 10px each; the 60px item adds 20px to each auto row it spans.
+        assert_eq!((r("s1").x, r("s1").y), (50.0, 0.0));
+        assert_eq!((r("s2").x, r("s2").y), (50.0, 30.0));
+        assert_eq!(r("g").height, 60.0);
+        // Two implicit auto columns share the 60px left after the 30px column.
+        assert_eq!((r("span3").x, r("span3").width), (0.0, 90.0));
+        // The empty first row is 0px tall, so the next item starts at the grid top.
+        assert_eq!((r("after").x, r("after").y), (0.0, r("h").y));
+        assert_eq!(r("after").width, 30.0);
     }
 }
