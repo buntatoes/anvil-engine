@@ -1,0 +1,13 @@
+/target
+/dist
+**/*.rs.bk
+*.pdb
+*.ppm
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+.idea/

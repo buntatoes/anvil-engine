@@ -1,0 +1,14 @@
+# Display list and zoom (50% to 250%). Reads anvil-layout boxes.
+# anvil-raster is the only consumer. This crate does not write a framebuffer.
+
+[package]
+name = "anvil-paint"
+description = "Display list and zoom."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "LicenseRef-Proprietary"
+publish.workspace = true
+
+[dependencies]
+anvil-layout = { path = "../anvil-layout" }
