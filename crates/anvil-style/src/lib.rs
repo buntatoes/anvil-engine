@@ -18,6 +18,15 @@
 //! and `none`. A descendant selector is whitespace between compounds. `>`,
 //! `+`, `~`, attribute selectors, and pseudo-classes are not parsed.
 //!
+//! `transform` keeps up to [`MAX_TRANSFORM_FNS`] 2D functions:
+//! `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`,
+//! `scaleY()`, `rotate()`, `skew()`, `skewX()`, `skewY()`, and `matrix()`.
+//! Angles take `deg`, `rad`, `grad`, `turn`, or `0`. 3D functions,
+//! `calc()` inside a function, and the standalone `translate`, `scale`,
+//! and `rotate` properties are not parsed; a list holding any of them is
+//! ignored. `transform-origin` takes one or two keywords, lengths, or
+//! percentages; a third (z) length is accepted and ignored.
+//!
 //! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
 //! Only `dark` matches a color scheme; `light` and any other value do not.
 //! An inner `@media` replaces the outer query instead of combining with it.
@@ -621,6 +630,78 @@ pub enum TrackBreadth {
     Auto,
 }
 
+/// Most functions one `transform` list keeps. A longer list is ignored.
+pub const MAX_TRANSFORM_FNS: usize = 8;
+
+/// One 2D transform function. Angles are radians. Translations keep their
+/// unit; layout resolves percentages against the border box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformFn {
+    /// `translate()`, `translateX()`, `translateY()`.
+    Translate(Size, Size),
+    /// `scale()`, `scaleX()`, `scaleY()`.
+    Scale(f32, f32),
+    /// `rotate()`. Positive turns clockwise on screen.
+    Rotate(f32),
+    /// `skew()`, `skewX()`, `skewY()`.
+    Skew(f32, f32),
+    /// `matrix(a, b, c, d, e, f)`, with `e` and `f` in CSS pixels.
+    Matrix([f32; 6]),
+}
+
+/// A parsed `transform` list in source order. Empty is `none`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformList {
+    fns: [TransformFn; MAX_TRANSFORM_FNS],
+    len: u8,
+}
+
+impl TransformList {
+    /// The empty list, `transform: none`.
+    pub const NONE: Self = Self {
+        fns: [TransformFn::Scale(1.0, 1.0); MAX_TRANSFORM_FNS],
+        len: 0,
+    };
+
+    /// A list holding `fns`, or `None` when there are more than
+    /// [`MAX_TRANSFORM_FNS`].
+    pub fn new(fns: &[TransformFn]) -> Option<Self> {
+        if fns.len() > MAX_TRANSFORM_FNS {
+            return None;
+        }
+        let mut list = Self::NONE;
+        list.fns[..fns.len()].copy_from_slice(fns);
+        list.len = fns.len() as u8;
+        Some(list)
+    }
+
+    /// The functions in source order.
+    pub fn functions(&self) -> &[TransformFn] {
+        &self.fns[..usize::from(self.len).min(MAX_TRANSFORM_FNS)]
+    }
+
+    /// True for `none`.
+    pub fn is_none(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// `transform-origin` as a horizontal and a vertical length. Percentages
+/// are of the border box. The initial value is `50% 50%`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformOrigin {
+    pub x: Size,
+    pub y: Size,
+}
+
+impl TransformOrigin {
+    /// `50% 50%`, the center of the border box.
+    pub const CENTER: Self = Self {
+        x: Size::Percent(50.0),
+        y: Size::Percent(50.0),
+    };
+}
+
 /// Used values for one element after the user-agent defaults, the cascade,
 /// and the inline `style` attribute.
 ///
@@ -675,6 +756,10 @@ pub struct ComputedStyle {
     /// Placement from `grid-row` and its longhands. Not inherited.
     pub grid_row: GridPlacement,
     pub gap: f32,
+    /// `transform`. Not inherited. See [`TransformList`].
+    pub transform: TransformList,
+    /// `transform-origin`. Not inherited.
+    pub transform_origin: TransformOrigin,
 }
 
 impl ComputedStyle {
@@ -724,6 +809,8 @@ impl ComputedStyle {
                 end: GridLine::Auto,
             },
             gap: 0.0,
+            transform: TransformList::NONE,
+            transform_origin: TransformOrigin::CENTER,
         }
     }
 
@@ -1428,6 +1515,16 @@ fn apply_declaration(
         "right" => style.right = parse_size(value),
         "bottom" => style.bottom = parse_size(value),
         "left" => style.left = parse_size(value),
+        "transform" => {
+            if let Some(list) = parse_transform(value) {
+                style.transform = list;
+            }
+        }
+        "transform-origin" => {
+            if let Some(origin) = parse_transform_origin(value) {
+                style.transform_origin = origin;
+            }
+        }
         "z-index" => {
             if let Ok(z) = value.parse::<i32>() {
                 style.z_index = z;
@@ -2021,6 +2118,196 @@ fn parse_edge(value: &str) -> Option<Edge> {
         },
         _ => return None,
     })
+}
+
+/// Parse a `transform` value: `none`, or up to [`MAX_TRANSFORM_FNS`]
+/// functions separated by whitespace. Any bad function, unit, or argument
+/// count rejects the whole value.
+fn parse_transform(value: &str) -> Option<TransformList> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(TransformList::NONE);
+    }
+    let mut fns = Vec::new();
+    let mut rest = value;
+    while !rest.is_empty() {
+        let open = rest.find('(')?;
+        let name = rest[..open].trim().to_ascii_lowercase();
+        let close = open + rest[open..].find(')')?;
+        let args: Vec<&str> = rest[open + 1..close]
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|arg| !arg.is_empty())
+            .collect();
+        fns.push(parse_transform_fn(&name, &args)?);
+        if fns.len() > MAX_TRANSFORM_FNS {
+            return None;
+        }
+        rest = rest[close + 1..].trim_start();
+    }
+    TransformList::new(&fns).filter(|list| !list.is_none())
+}
+
+/// One transform function from its lowercase name and split arguments.
+fn parse_transform_fn<'a>(name: &str, args: &[&'a str]) -> Option<TransformFn> {
+    let one = |args: &[&'a str]| (args.len() == 1).then(|| args[0]);
+    let length = |arg: &str| {
+        parse_length(arg)
+            .filter(|size| !matches!(size, Size::Calc { .. }) && size_number(*size).is_finite())
+    };
+    let zero = Size::Px(0.0);
+    Some(match name {
+        "translate" => match args {
+            [x] => TransformFn::Translate(length(x)?, zero),
+            [x, y] => TransformFn::Translate(length(x)?, length(y)?),
+            _ => return None,
+        },
+        "translatex" => TransformFn::Translate(length(one(args)?)?, zero),
+        "translatey" => TransformFn::Translate(zero, length(one(args)?)?),
+        "scale" => match args {
+            [s] => {
+                let s = parse_scale_number(s)?;
+                TransformFn::Scale(s, s)
+            }
+            [x, y] => TransformFn::Scale(parse_scale_number(x)?, parse_scale_number(y)?),
+            _ => return None,
+        },
+        "scalex" => TransformFn::Scale(parse_scale_number(one(args)?)?, 1.0),
+        "scaley" => TransformFn::Scale(1.0, parse_scale_number(one(args)?)?),
+        "rotate" => TransformFn::Rotate(parse_angle(one(args)?)?),
+        "skew" => match args {
+            [x] => TransformFn::Skew(parse_angle(x)?, 0.0),
+            [x, y] => TransformFn::Skew(parse_angle(x)?, parse_angle(y)?),
+            _ => return None,
+        },
+        "skewx" => TransformFn::Skew(parse_angle(one(args)?)?, 0.0),
+        "skewy" => TransformFn::Skew(0.0, parse_angle(one(args)?)?),
+        "matrix" => {
+            if args.len() != 6 {
+                return None;
+            }
+            let mut m = [0.0f32; 6];
+            for (slot, arg) in m.iter_mut().zip(args) {
+                *slot = parse_finite(arg)?;
+            }
+            TransformFn::Matrix(m)
+        }
+        _ => return None,
+    })
+}
+
+/// The number inside a single-unit [`Size`], for finiteness checks.
+fn size_number(size: Size) -> f32 {
+    match size {
+        Size::Auto => 0.0,
+        Size::Px(v)
+        | Size::Percent(v)
+        | Size::Em(v)
+        | Size::Rem(v)
+        | Size::Vw(v)
+        | Size::Vh(v)
+        | Size::Vmin(v)
+        | Size::Vmax(v)
+        | Size::Ch(v) => v,
+        Size::Calc {
+            px,
+            percent,
+            em,
+            rem,
+        } => px + percent + em + rem,
+    }
+}
+
+/// A finite plain number.
+fn parse_finite(value: &str) -> Option<f32> {
+    value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+}
+
+/// A scale factor: a plain number, or a percentage where `50%` is `0.5`.
+fn parse_scale_number(value: &str) -> Option<f32> {
+    match value.trim().strip_suffix('%') {
+        Some(pct) => parse_finite(pct).map(|p| p / 100.0),
+        None => parse_finite(value),
+    }
+}
+
+/// An angle in radians from `deg`, `rad`, `grad`, `turn`, or a bare `0`.
+fn parse_angle(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value == "0" {
+        return Some(0.0);
+    }
+    let lower = value.to_ascii_lowercase();
+    // `grad` before `rad`, which it ends with.
+    let units = [
+        ("deg", std::f32::consts::PI / 180.0),
+        ("grad", std::f32::consts::PI / 200.0),
+        ("rad", 1.0),
+        ("turn", std::f32::consts::TAU),
+    ];
+    let (num, per_unit) = units
+        .iter()
+        .find_map(|&(unit, per_unit)| lower.strip_suffix(unit).map(|n| (n, per_unit)))?;
+    parse_finite(num)
+        .map(|n| n * per_unit)
+        .filter(|a| a.is_finite())
+}
+
+/// Parse `transform-origin`: one or two of a length, a percentage, or
+/// `left`, `center`, `right`, `top`, `bottom`. A third value (the z
+/// offset) must be a length and is ignored, since only 2D is drawn.
+fn parse_transform_origin(value: &str) -> Option<TransformOrigin> {
+    let parts: Vec<&str> = value.split_ascii_whitespace().collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    if let Some(z) = parts.get(2) {
+        parse_length(z).filter(|size| matches!(size, Size::Px(_)))?;
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Axis {
+        X,
+        Y,
+        Center,
+        Length,
+    }
+    let term = |part: &str| -> Option<(Axis, Size)> {
+        Some(match part.to_ascii_lowercase().as_str() {
+            "left" => (Axis::X, Size::Percent(0.0)),
+            "right" => (Axis::X, Size::Percent(100.0)),
+            "top" => (Axis::Y, Size::Percent(0.0)),
+            "bottom" => (Axis::Y, Size::Percent(100.0)),
+            "center" => (Axis::Center, Size::Percent(50.0)),
+            _ => {
+                let size = parse_length(part)
+                    .filter(|s| !matches!(s, Size::Calc { .. }) && size_number(*s).is_finite())?;
+                (Axis::Length, size)
+            }
+        })
+    };
+    let (a_axis, a) = term(parts[0])?;
+    let Some(second) = parts.get(1) else {
+        return Some(match a_axis {
+            Axis::Y => TransformOrigin {
+                x: Size::Percent(50.0),
+                y: a,
+            },
+            _ => TransformOrigin {
+                x: a,
+                y: Size::Percent(50.0),
+            },
+        });
+    };
+    let (b_axis, b) = term(second)?;
+    // Keywords may name y first (`top left`); a length always pairs with
+    // the axis its position implies.
+    match (a_axis, b_axis) {
+        (Axis::Y, Axis::Y) | (Axis::X, Axis::X) => None,
+        (Axis::Y, Axis::X | Axis::Center) | (Axis::Center, Axis::X) => {
+            Some(TransformOrigin { x: b, y: a })
+        }
+        (Axis::Y, Axis::Length) | (Axis::Length, Axis::X) => None,
+        _ => Some(TransformOrigin { x: a, y: b }),
+    }
 }
 
 /// Parse `0` or a number with a `px` suffix. `%`, `em`, `rem`, and other units
@@ -2620,5 +2907,103 @@ mod tests {
         );
         assert_eq!(get("d").grid_column, GridPlacement::default());
         assert_eq!(get("d").grid_row, GridPlacement::default());
+    }
+
+    #[test]
+    fn parses_transform_lists_and_origins() {
+        let doc = parse_html(
+            "<div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div><div id=\"d\"></div>",
+        );
+        let sheet = parse_css(
+            "#a { transform: translate(10px, 50%) scale(2) rotate(0.5turn) skewY(0);
+                  transform-origin: right top; }
+             #b { transform: translateX(1em) translateY(-3px) scaleX(150%) scaleY(-1)
+                  matrix(1, 0, 0, 1, 5, 6) skew(90deg, 1rad) rotate(200grad);
+                  transform-origin: 10px; }
+             #c { transform: rotate(45deg); transform: rotate(45); transform-origin: 0 bottom 0;
+                  transform-origin: left 5px left; }
+             #d { transform: scale(1) scale(1) scale(1) scale(1) scale(1) scale(1) scale(1);
+                  transform: none; transform-origin: center left; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let get = |id: &str| *styles.get(doc.get_element_by_id(id).unwrap());
+        use std::f32::consts::PI;
+        assert_eq!(
+            get("a").transform.functions(),
+            [
+                TransformFn::Translate(Size::Px(10.0), Size::Percent(50.0)),
+                TransformFn::Scale(2.0, 2.0),
+                TransformFn::Rotate(PI),
+                TransformFn::Skew(0.0, 0.0),
+            ]
+        );
+        assert_eq!(
+            get("a").transform_origin,
+            TransformOrigin {
+                x: Size::Percent(100.0),
+                y: Size::Percent(0.0)
+            }
+        );
+        assert_eq!(
+            get("b").transform.functions(),
+            [
+                TransformFn::Translate(Size::Em(1.0), Size::Px(0.0)),
+                TransformFn::Translate(Size::Px(0.0), Size::Px(-3.0)),
+                TransformFn::Scale(1.5, 1.0),
+                TransformFn::Scale(1.0, -1.0),
+                TransformFn::Matrix([1.0, 0.0, 0.0, 1.0, 5.0, 6.0]),
+                TransformFn::Skew(PI / 2.0, 1.0),
+                TransformFn::Rotate(PI),
+            ]
+        );
+        assert_eq!(
+            get("b").transform_origin,
+            TransformOrigin {
+                x: Size::Px(10.0),
+                y: Size::Percent(50.0)
+            }
+        );
+        // A bare number is not an angle, so the second rotate is dropped;
+        // two horizontal keywords are invalid, so the 3-value origin stays.
+        assert_eq!(
+            get("c").transform.functions(),
+            [TransformFn::Rotate(PI / 4.0)]
+        );
+        assert_eq!(
+            get("c").transform_origin,
+            TransformOrigin {
+                x: Size::Px(0.0),
+                y: Size::Percent(100.0)
+            }
+        );
+        // `center left` puts the keyword on its own axis.
+        assert!(get("d").transform.is_none());
+        assert_eq!(
+            get("d").transform_origin,
+            TransformOrigin {
+                x: Size::Percent(0.0),
+                y: Size::Percent(50.0)
+            }
+        );
+        // Lists longer than the limit, unknown functions, and broken syntax
+        // are rejected whole.
+        let ten = "scale(1) ".repeat(MAX_TRANSFORM_FNS + 1);
+        for bad in [
+            ten.as_str(),
+            "rotate(10deg) spin(3)",
+            "translate(1px, 2px, 3px)",
+            "matrix(1, 0, 0, 1, 0)",
+            "translate(calc(1px + 2px))",
+            "scale(inf)",
+            "rotate(10deg",
+            "(1)",
+            "translate(1)",
+        ] {
+            assert_eq!(parse_transform(bad), None, "{bad}");
+        }
+        assert_eq!(parse_transform_origin("top 10px"), None);
+        assert_eq!(parse_transform_origin("10px left"), None);
+        assert_eq!(parse_transform_origin("top bottom"), None);
+        assert_eq!(parse_transform_origin("1px 2px 3%"), None);
     }
 }

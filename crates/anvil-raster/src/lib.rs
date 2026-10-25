@@ -16,6 +16,12 @@
 //!
 //! Display list layers: a sticky layer is moved by its constraint for the
 //! current scroll and the viewport size, then drawn like any other items.
+//! A transform layer that only moves and evenly scales is drawn directly.
+//! Any other transform (rotation, skew, uneven or negative scale) is drawn
+//! into a layer buffer and resampled with bilinear filtering, so its edges
+//! are smoothed. Clips inside the layer turn with it; clips from outside it
+//! stay screen-aligned. A transform that cannot be inverted draws nothing.
+//! Fixed boxes inside a transformed box move with it.
 //!
 //! Text on Windows tries Win32 GDI in `font` and, if that returns false, the
 //! built-in 5x7 bitmap. Text on Linux loads DejaVu Sans or Liberation Sans
@@ -29,7 +35,7 @@ mod font;
 #[cfg(not(anvil_cpp_accel))]
 use anvil_gpu::{GpuColor, sample_linear_gradient, sdf_box_shadow_alpha, sdf_rounded_box};
 use anvil_image::Image;
-use anvil_paint::{DisplayItem, DisplayList, Layer, LayerEffect};
+use anvil_paint::{DisplayItem, DisplayList, Layer, LayerEffect, Transform2D};
 pub use anvil_style::Color;
 pub use anvil_ttf::{TtfFont, interpret_type2_charstring, interpret_type2_charstring_with_subrs};
 
@@ -1495,7 +1501,301 @@ fn paint_layer(
             paint_span(fb, list, layer.start, layer.end, next_layer, &mut inner);
             ctx.fixed_depth = inner.fixed_depth;
         }
+        LayerEffect::Transform(m) => {
+            paint_mapped_layer(fb, list, layer, m, 1.0, next_layer, ctx);
+        }
     }
+}
+
+/// Largest side, in pixels, of the buffer a transformed layer is drawn into.
+/// Content past it is not drawn.
+const MAX_LAYER_SIDE: i32 = 2048;
+
+/// Draw a layer's range through `m` (a page-space map), at `opacity`.
+///
+/// A plain move plus an even, positive scale is drawn directly by folding
+/// it into the context's map. Anything else is drawn twice into a small
+/// buffer, once over black and once over white, which gives back each
+/// pixel's color and coverage. Every screen pixel in the layer's bounds and
+/// the current clip then samples that buffer through the inverse map. The
+/// buffer is aligned to a fixed grid in layer space, so bands and tiles
+/// produce the same pixels. A map that cannot be inverted draws nothing.
+fn paint_mapped_layer(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    layer: Layer,
+    m: Transform2D,
+    opacity: f32,
+    next_layer: &mut usize,
+    ctx: &mut PaintCtx,
+) {
+    if !m.is_finite() || opacity <= 0.0 {
+        return;
+    }
+    let opacity = opacity.min(1.0);
+    if opacity >= 1.0 && m.b == 0.0 && m.c == 0.0 && m.a == m.d && m.a > 0.0 {
+        let mut inner = PaintCtx {
+            s: ctx.s * m.a,
+            tx: ctx.tx + ctx.s * m.e,
+            ty: ctx.ty + ctx.s * m.f,
+            ..*ctx
+        };
+        paint_span(fb, list, layer.start, layer.end, next_layer, &mut inner);
+        ctx.fixed_depth = inner.fixed_depth;
+        return;
+    }
+    let dy = ctx.dy();
+    let total = Transform2D {
+        a: ctx.s * m.a,
+        b: ctx.s * m.b,
+        c: ctx.s * m.c,
+        d: ctx.s * m.d,
+        e: ctx.s * m.e + ctx.tx,
+        f: ctx.s * m.f + ctx.ty - dy,
+    };
+    let Some(inverse) = total.inverse() else {
+        return;
+    };
+    let local_bounds = match layer_local_bounds(list, layer) {
+        LayerBounds::Empty => return,
+        LayerBounds::Unknown => None,
+        LayerBounds::Known(bounds) => Some(bounds),
+    };
+    let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+    let (mut x0, mut y0, mut x1, mut y1) = (cx0, cy0, cx1, cy1);
+    if let Some(bounds) = local_bounds {
+        let screen = total.map_rect(bounds);
+        x0 = x0.max(floor_px(screen.x));
+        y0 = y0.max(floor_px(screen.y));
+        x1 = x1.min(ceil_px(screen.x + screen.width));
+        y1 = y1.min(ceil_px(screen.y + screen.height));
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let mut region = inverse.map_rect(anvil_paint::Rect {
+        x: x0 as f32,
+        y: y0 as f32,
+        width: (x1 - x0) as f32,
+        height: (y1 - y0) as f32,
+    });
+    if let Some(bounds) = local_bounds {
+        let rx0 = region.x.max(bounds.x);
+        let ry0 = region.y.max(bounds.y);
+        let rx1 = (region.x + region.width).min(bounds.x + bounds.width);
+        let ry1 = (region.y + region.height).min(bounds.y + bounds.height);
+        region = anvil_paint::Rect {
+            x: rx0,
+            y: ry0,
+            width: rx1 - rx0,
+            height: ry1 - ry0,
+        };
+    }
+    if !(region.width > 0.0 && region.height > 0.0) {
+        return;
+    }
+    // Draw at about the screen density so scaled-up content stays sharp.
+    let density = (total.a.hypot(total.b))
+        .max(total.c.hypot(total.d))
+        .clamp(1.0, 4.0);
+    let i0 = floor_px(region.x * density) - 2;
+    let j0 = floor_px(region.y * density) - 2;
+    let w = (ceil_px((region.x + region.width) * density) + 2 - i0).clamp(1, MAX_LAYER_SIDE);
+    let h = (ceil_px((region.y + region.height) * density) + 2 - j0).clamp(1, MAX_LAYER_SIDE);
+    let mut inner = PaintCtx {
+        offscreen: true,
+        s: density,
+        tx: -(i0 as f32),
+        ty: -(j0 as f32),
+        ..*ctx
+    };
+    let black = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+    let mut over_black = Framebuffer::new(w as u32, h as u32, black);
+    let mut over_white = Framebuffer::new(w as u32, h as u32, Color::WHITE);
+    let mut white_next = *next_layer;
+    let mut white_ctx = inner;
+    paint_span(
+        &mut over_black,
+        list,
+        layer.start,
+        layer.end,
+        next_layer,
+        &mut inner,
+    );
+    paint_span(
+        &mut over_white,
+        list,
+        layer.start,
+        layer.end,
+        &mut white_next,
+        &mut white_ctx,
+    );
+    ctx.fixed_depth = inner.fixed_depth;
+    let to_buffer = Transform2D {
+        a: density,
+        b: 0.0,
+        c: 0.0,
+        d: density,
+        e: -(i0 as f32) - 0.5,
+        f: -(j0 as f32) - 0.5,
+    }
+    .then_inner(&inverse);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let (u, v) = to_buffer.apply(px as f32 + 0.5, py as f32 + 0.5);
+            let dark = sample_bilinear(&over_black, u, v, 0.0);
+            let light = sample_bilinear(&over_white, u, v, 255.0);
+            let cover =
+                255.0 - ((light[0] - dark[0]) + (light[1] - dark[1]) + (light[2] - dark[2])) / 3.0;
+            let alpha = (cover.clamp(0.0, 255.0) / 255.0) * opacity;
+            if alpha <= 0.0 {
+                continue;
+            }
+            blend_premultiplied(fb, px, py, dark, opacity, alpha);
+        }
+    }
+}
+
+/// `x.floor()` as a pixel index, saturating far off the canvas.
+fn floor_px(x: f32) -> i32 {
+    x.floor().clamp(-1e9, 1e9) as i32
+}
+
+/// `x.ceil()` as a pixel index, saturating far off the canvas.
+fn ceil_px(x: f32) -> i32 {
+    x.ceil().clamp(-1e9, 1e9) as i32
+}
+
+/// RGB at `(u, v)` in pixel-center coordinates, blending the four nearest
+/// pixels. Outside the buffer reads as `outside` on every channel.
+fn sample_bilinear(fb: &Framebuffer, u: f32, v: f32, outside: f32) -> [f32; 3] {
+    if !(u.is_finite() && v.is_finite()) {
+        return [outside; 3];
+    }
+    let fu = u.floor();
+    let fv = v.floor();
+    let (tu, tv) = (u - fu, v - fv);
+    let (iu, iv) = (fu.clamp(-2.0, 1e7) as i64, fv.clamp(-2.0, 1e7) as i64);
+    let read = |x: i64, y: i64| -> [f32; 3] {
+        if x < 0 || y < 0 || x >= i64::from(fb.width) || y >= i64::from(fb.height) {
+            return [outside; 3];
+        }
+        let offset = ((y as usize) * (fb.width as usize) + (x as usize)) * 4;
+        [
+            f32::from(fb.pixels[offset]),
+            f32::from(fb.pixels[offset + 1]),
+            f32::from(fb.pixels[offset + 2]),
+        ]
+    };
+    let (p00, p10, p01, p11) = (
+        read(iu, iv),
+        read(iu + 1, iv),
+        read(iu, iv + 1),
+        read(iu + 1, iv + 1),
+    );
+    let mut out = [0.0f32; 3];
+    for (ch, slot) in out.iter_mut().enumerate() {
+        let top = p00[ch] + (p10[ch] - p00[ch]) * tu;
+        let bottom = p01[ch] + (p11[ch] - p01[ch]) * tu;
+        *slot = top + (bottom - top) * tv;
+    }
+    out
+}
+
+/// Put premultiplied `color` (already scaled by its own coverage) over the
+/// pixel at `opacity`, where `alpha` is coverage times opacity.
+fn blend_premultiplied(
+    fb: &mut Framebuffer,
+    x: i32,
+    y: i32,
+    color: [f32; 3],
+    opacity: f32,
+    alpha: f32,
+) {
+    if x < 0 || y < 0 || x as u32 >= fb.width || y as u32 >= fb.height {
+        return;
+    }
+    let offset = ((y as usize) * (fb.width as usize) + (x as usize)) * 4;
+    for (ch, value) in color.iter().enumerate() {
+        let dst = f32::from(fb.pixels[offset + ch]);
+        let out = value * opacity + dst * (1.0 - alpha);
+        fb.pixels[offset + ch] = out.round().clamp(0.0, 255.0) as u8;
+    }
+    fb.pixels[offset + 3] = 255;
+}
+
+/// What is known about where a layer's items draw, in page space.
+enum LayerBounds {
+    /// A nested layer can move items past their listed positions.
+    Unknown,
+    /// Nothing in the range has a size.
+    Empty,
+    Known(anvil_paint::Rect),
+}
+
+/// Page-space bounds of a layer's items, generous for text and shadows.
+fn layer_local_bounds(list: &DisplayList, layer: Layer) -> LayerBounds {
+    let nested = list
+        .layers
+        .iter()
+        .any(|other| *other != layer && other.start >= layer.start && other.end <= layer.end);
+    let Some(items) = list.items.get(layer.start..layer.end).filter(|_| !nested) else {
+        return LayerBounds::Unknown;
+    };
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
+    for item in items {
+        let (x, y, w, h) = match item {
+            DisplayItem::Text {
+                x,
+                y,
+                text,
+                font_size,
+                ..
+            } => {
+                let size = font_size.abs();
+                (
+                    *x - size,
+                    *y - size,
+                    (text.chars().count() as f32 + 2.0) * size,
+                    size * 3.0,
+                )
+            }
+            DisplayItem::BoxShadow { blur_radius, .. } => {
+                let Some((x, y, w, h)) = item_screen_bounds(item, 0.0, false) else {
+                    continue;
+                };
+                // The blur can reach past the listed pad.
+                let pad = blur_radius.abs() + 4.0;
+                (x - pad, y - pad, w + pad * 2.0, h + pad * 2.0)
+            }
+            other => match item_screen_bounds(other, 0.0, false) {
+                Some(b) => b,
+                None => continue,
+            },
+        };
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) {
+            return LayerBounds::Unknown;
+        }
+        let (x1, y1) = (x + w.max(0.0), y + h.max(0.0));
+        bounds = Some(match bounds {
+            None => (x, y, x1, y1),
+            Some((bx0, by0, bx1, by1)) => (bx0.min(x), by0.min(y), bx1.max(x1), by1.max(y1)),
+        });
+    }
+    let Some((x0, y0, x1, y1)) = bounds else {
+        return LayerBounds::Empty;
+    };
+    LayerBounds::Known(anvil_paint::Rect {
+        x: x0 - 1.0,
+        y: y0 - 1.0,
+        width: x1 - x0 + 2.0,
+        height: y1 - y0 + 2.0,
+    })
 }
 
 /// Draw one item through the context's map.
@@ -2425,5 +2725,124 @@ mod tests {
         let zoomed = rasterize(&list.scaled(2.0), 80, 150, 200.0);
         assert_eq!(zoomed.pixel(5, 39), Some(red));
         assert_ne!(zoomed.pixel(5, 40), Some(red));
+    }
+
+    /// Lay out and paint `html` (with its own `<style>`) `width` pixels wide.
+    fn page_list(html: &str, width: f32) -> DisplayList {
+        use anvil_dom::parse_html;
+        use anvil_layout::layout_document;
+        use anvil_paint::paint;
+        use anvil_style::{compute_styles, parse_css};
+
+        let doc = parse_html(html);
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        paint(&layout_document(&doc, &styles, width))
+    }
+
+    const RED: Color = Color {
+        r: 255,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+
+    #[test]
+    fn moves_and_scales_transformed_boxes_directly() {
+        // 10x10 at (10, 10); scale(2) about its center covers 5..25.
+        let list = page_list(
+            "<style>html, body, div { margin: 0; padding: 0; }
+             #t { margin: 10px; width: 10px; height: 10px; background: #ff0000;
+                  transform: translate(20px, 0) scale(2); }</style><div id=\"t\"></div>",
+            60.0,
+        );
+        assert_eq!(list.layers.len(), 1);
+        let fb = rasterize(&list, 60, 40, 0.0);
+        assert_eq!(fb.pixel(25, 5), Some(RED));
+        assert_eq!(fb.pixel(44, 24), Some(RED));
+        assert_eq!(fb.pixel(24, 5), Some(Color::WHITE));
+        assert_eq!(fb.pixel(45, 24), Some(Color::WHITE));
+        assert_eq!(fb.pixel(25, 25), Some(Color::WHITE));
+        assert_eq!(fb.pixel(10, 10), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn rotates_through_a_layer_buffer_with_exact_interior_pixels() {
+        // 20x10 at (10, 10), turned 90 degrees about (20, 15): x 15..25, y 5..25.
+        let list = page_list(
+            "<style>html, body, div { margin: 0; padding: 0; }
+             #t { margin: 10px; width: 20px; height: 10px; background: #ff0000;
+                  transform: rotate(90deg); }</style><div id=\"t\"></div>",
+            40.0,
+        );
+        let fb = rasterize(&list, 40, 40, 0.0);
+        for (x, y) in [(15, 5), (24, 5), (15, 24), (24, 24), (20, 15)] {
+            assert_eq!(fb.pixel(x, y), Some(RED), "inside at {x},{y}");
+        }
+        for (x, y) in [(14, 15), (25, 15), (20, 4), (20, 25), (11, 11), (28, 18)] {
+            assert_eq!(fb.pixel(x, y), Some(Color::WHITE), "outside at {x},{y}");
+        }
+        // The same frame from bands, tiles, and a scroll.
+        let tall = rasterize(&list, 40, 300, 0.0);
+        assert_eq!(rasterize_parallel(&list, 40, 300, 0.0), tall);
+        let mut fb = Framebuffer::new(40, 300, Color::WHITE);
+        rasterize_incremental(&DisplayList::default(), &list, 0.0, 0.0, &mut fb);
+        assert_eq!(fb, tall);
+        let scrolled = rasterize(&list, 40, 40, 3.0);
+        assert_eq!(scrolled.pixel(15, 2), Some(RED));
+        assert_eq!(scrolled.pixel(15, 22), Some(Color::WHITE));
+        // Zoom 2x doubles every edge.
+        let zoomed = rasterize(&list.scaled(2.0), 80, 80, 0.0);
+        assert_eq!(zoomed.pixel(30, 10), Some(RED));
+        assert_eq!(zoomed.pixel(49, 49), Some(RED));
+        assert_eq!(zoomed.pixel(29, 30), Some(Color::WHITE));
+        assert_eq!(zoomed.pixel(50, 30), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn outer_clips_stay_square_and_own_clips_turn_with_the_box() {
+        // The outer box clips at 0..30; the inner box is turned 45 degrees and
+        // clips its own 40px wide child, so the child shows as a diamond.
+        let list = page_list(
+            "<style>html, body, div { margin: 0; padding: 0; }
+             #clip { width: 30px; height: 30px; overflow: hidden; }
+             #turn { width: 20px; height: 20px; margin: 5px; overflow: hidden;
+                     transform: rotate(45deg); }
+             #fill { width: 40px; height: 20px; background: #ff0000; }
+             </style><div id=\"clip\"><div id=\"turn\"><div id=\"fill\"></div></div></div>",
+            60.0,
+        );
+        let fb = rasterize(&list, 60, 60, 0.0);
+        // Center of the diamond, and its top tip 14px above the center.
+        assert_eq!(fb.pixel(15, 15), Some(RED));
+        assert_eq!(fb.pixel(15, 3), Some(RED));
+        // Corners of the unturned 5..25 square are outside the diamond.
+        assert_eq!(fb.pixel(6, 6), Some(Color::WHITE));
+        assert_eq!(fb.pixel(23, 23), Some(Color::WHITE));
+        // Nothing passes the outer clip, even the diamond's right tip at 29.1.
+        assert_eq!(fb.pixel(30, 15), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn flattened_or_broken_transforms_draw_nothing() {
+        for transform in [
+            "scale(0)",
+            "scale(1, 0)",
+            "matrix(1, 2, 2, 4, 0, 0)",
+            "scale(1e30) scale(1e30)",
+        ] {
+            let list = page_list(
+                &format!(
+                    "<style>html, body, div {{ margin: 0; }}
+                     #t {{ width: 20px; height: 20px; background: #ff0000;
+                          transform: {transform}; }}</style><div id=\"t\"></div>"
+                ),
+                40.0,
+            );
+            let fb = rasterize(&list, 40, 40, 0.0);
+            assert!(
+                (0..40).all(|y| (0..40).all(|x| fb.pixel(x, y) == Some(Color::WHITE))),
+                "{transform}"
+            );
+        }
     }
 }

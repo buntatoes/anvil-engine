@@ -15,14 +15,17 @@
 //! fixed` wraps that range in [`DisplayItem::PushFixed`] / [`DisplayItem::PopFixed`].
 //!
 //! A sticky box against the viewport also adds a [`Layer`] over its range,
-//! so the rasterizer can move it for the scroll position.
+//! so the rasterizer can move it for the scroll position. A transformed box
+//! adds a transform layer the same way; items inside it keep their
+//! untransformed page coordinates. When one box has both, the sticky layer
+//! is the outer one.
 //!
 //! [`DisplayList::scaled`] multiplies lengths for zoom. Callers use 50%–250%
 //! (`0.5`–`2.5`). The clamp inside that method is wider (`0.25`–`4.0`).
 //! There is no node cap here; the list is as long as the box tree.
 
 use anvil_layout::{Color, Edge, Image, LayoutBox, Overflow, Position};
-pub use anvil_layout::{Rect, StickyConstraint};
+pub use anvil_layout::{Rect, StickyConstraint, Transform2D};
 
 /// One painting command. Positions and sizes are CSS pixels, y downward.
 ///
@@ -144,6 +147,10 @@ pub struct Layer {
 pub enum LayerEffect {
     /// Move the range by [`StickyConstraint::offset`] for the scroll position.
     Sticky(StickyConstraint),
+    /// Draw the range through this page-space map, after any enclosing
+    /// layers. Clips inside the range are mapped with it; clips outside it
+    /// stay screen-aligned.
+    Transform(Transform2D),
 }
 
 impl Layer {
@@ -173,6 +180,7 @@ impl Layer {
                     left: so(c.left),
                 })
             }
+            LayerEffect::Transform(m) => LayerEffect::Transform(m.scaled(s)),
         };
         Self { effect, ..*self }
     }
@@ -342,10 +350,14 @@ impl DisplayItem {
 pub fn paint(tree: &LayoutBox) -> DisplayList {
     let mut items = Vec::new();
     let mut layers = Vec::new();
-    walk(tree, &mut items, &mut layers);
-    // Layers were pushed as boxes finished, inner first. A stable sort by
-    // start, longest first, puts each outer layer before what it contains.
-    layers.sort_by_key(|layer: &Layer| (layer.start, std::cmp::Reverse(layer.end)));
+    walk(tree, &mut items, &mut layers, 0);
+    // Layers were pushed as boxes finished, inner first. Sorting by start,
+    // longest first, then tree depth and push order puts each outer layer
+    // before what it contains, even when two cover the same items.
+    layers.sort_by_key(|&(depth, order, layer): &(usize, usize, Layer)| {
+        (layer.start, std::cmp::Reverse(layer.end), depth, order)
+    });
+    let layers = layers.into_iter().map(|(_, _, layer)| layer).collect();
     DisplayList { items, layers }
 }
 
@@ -355,7 +367,12 @@ pub fn paint(tree: &LayoutBox) -> DisplayList {
 /// so a higher `z-index` paints later and ties keep tree order, with sticky
 /// boxes after plain siblings of the same `z-index`. The sort is not stable across equal
 /// keys beyond that index.
-fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>, layers: &mut Vec<Layer>) {
+fn walk(
+    tree: &LayoutBox,
+    items: &mut Vec<DisplayItem>,
+    layers: &mut Vec<(usize, usize, Layer)>,
+    depth: usize,
+) {
     let is_fixed = tree.position == Position::Fixed;
     if is_fixed {
         items.push(DisplayItem::PushFixed);
@@ -489,18 +506,25 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>, layers: &mut Vec<Layer>)
     let mut order: Vec<(usize, &LayoutBox)> = tree.children.iter().enumerate().collect();
     order.sort_by_key(|(idx, child)| (child.stacking_key(), *idx));
     for (_, child) in order {
-        walk(child, items, layers);
+        walk(child, items, layers, depth + 1);
     }
     if is_clipped {
         items.push(DisplayItem::PopClip);
     }
     let layer_end = items.len();
-    if let Some(sticky) = tree.sticky.filter(|_| layer_end > layer_start) {
-        layers.push(Layer {
-            start: layer_start,
-            end: layer_end,
-            effect: LayerEffect::Sticky(sticky),
-        });
+    if layer_end > layer_start {
+        let effects = [
+            tree.sticky.map(LayerEffect::Sticky),
+            tree.transform.map(LayerEffect::Transform),
+        ];
+        for effect in effects.into_iter().flatten() {
+            let layer = Layer {
+                start: layer_start,
+                end: layer_end,
+                effect,
+            };
+            layers.push((depth, layers.len(), layer));
+        }
     }
     if is_fixed {
         items.push(DisplayItem::PopFixed);
@@ -587,6 +611,7 @@ mod tests {
             border_radius: 0.0,
             image: None,
             sticky: None,
+            transform: None,
             text: vec![TextRun {
                 node: NodeId::from_raw(2),
                 text: "Hi".to_string(),

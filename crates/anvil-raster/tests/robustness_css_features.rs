@@ -10,7 +10,7 @@
 use anvil_dom::parse_html;
 use anvil_layout::layout_document;
 use anvil_paint::paint;
-use anvil_raster::rasterize;
+use anvil_raster::{rasterize, rasterize_parallel};
 use anvil_style::{compute_styles_for_viewport, parse_css};
 
 // ---- shared harness (same text in each repo's robustness test) ----
@@ -219,6 +219,8 @@ const PROPERTIES: &[&str] = &[
     "grid-column-end",
     "grid-row-start",
     "grid-row-end",
+    "transform",
+    "transform-origin",
 ];
 
 /// Values for those properties, valid and broken.
@@ -292,6 +294,26 @@ const VALUES: &[&str] = &[
     "relative",
     "hidden",
     "-50%",
+    "rotate(45deg)",
+    "rotate(1e30turn)",
+    "rotate(-0.25turn)",
+    "scale(0)",
+    "scale(-1, 4)",
+    "scale(1e20)",
+    "scaleX(1e-20)",
+    "skew(89.99deg)",
+    "skewY(90deg)",
+    "translate(50%, -1e9px)",
+    "translateX(10ch)",
+    "matrix(1e30, 0, 0, 1e30, 0, 0)",
+    "matrix(0, 1, -1, 0, 3, 4)",
+    "matrix(NaN, 0, 0, 1, 0, 0)",
+    "rotate(",
+    "scale()",
+    "left",
+    "top",
+    "right bottom",
+    "10px 20%",
 ];
 
 /// Random but CSS-shaped text aimed at the grid properties.
@@ -345,6 +367,8 @@ fn run_pipeline(input: &[u8]) {
                 height: h,
             },
         );
+        let _ = anvil_layout::hit_test(&tree, 10.0, 10.0);
+        let _ = rasterize_parallel(&list.scaled(2.5), 32, 140, 3.0);
     }
 }
 

@@ -34,6 +34,14 @@
 //! page. Sticky boxes paint and hit-test above plain siblings with the same
 //! `z-index`.
 //!
+//! `transform` does not change layout. After placement, each transformed
+//! element box that is not inline gets a [`Transform2D`] in page space
+//! around its `transform-origin`; paint draws through it and [`hit_test`]
+//! maps points back through its inverse. Transformed boxes paint and
+//! hit-test above plain siblings with the same `z-index`. They do not
+//! become the containing block for fixed or absolute descendants, and a
+//! sticky box inside one still measures against the untransformed view.
+//!
 //! Grid columns come from `grid-template-columns` and rows from
 //! `grid-template-rows`, with `grid-auto-rows` for rows past that list.
 //! Tracks accept `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()`. An
@@ -60,7 +68,7 @@ pub use anvil_style::{
 };
 use anvil_style::{
     ComputedStyle, Display, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE, Size, StyleMap,
-    TrackBreadth,
+    TrackBreadth, TransformFn,
 };
 use anvil_ttf::TtfFont;
 
@@ -121,6 +129,11 @@ pub struct LayoutBox {
     /// shift for the current scroll. A sticky box inside an `overflow`
     /// clip is already shifted here and has `None`.
     pub sticky: Option<StickyConstraint>,
+    /// Page-space map from `transform` and `transform-origin`, applied to
+    /// this box and its descendants when drawn and hit-tested. The rect and
+    /// every descendant rect stay untransformed. `None` when the box has
+    /// no transform.
+    pub transform: Option<Transform2D>,
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
 }
@@ -129,12 +142,191 @@ impl LayoutBox {
     /// Sort key among siblings for paint and hit-test order: `z-index`
     /// first, then boxes that form their own layer after plain boxes.
     ///
-    /// Sticky boxes are such a layer, so content that follows a sticky
-    /// header in the tree scrolls under it rather than over it. Relative,
-    /// absolute, and fixed boxes keep plain tree order, as before.
+    /// Sticky and transformed boxes are such layers, so content that
+    /// follows a sticky header in the tree scrolls under it rather than over
+    /// it. Relative, absolute, and fixed boxes keep plain tree order, as before.
     pub fn stacking_key(&self) -> (i32, u8) {
-        let layered = self.position == Position::Sticky;
+        let layered = self.position == Position::Sticky || self.transform.is_some();
         (self.z_index, u8::from(layered))
+    }
+}
+
+/// A 2D affine map in page space, y downward.
+///
+/// A point `(x, y)` maps to `(a*x + c*y + e, b*x + d*y + f)`, the same
+/// order as CSS `matrix(a, b, c, d, e, f)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform2D {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Transform2D {
+    /// The map that leaves every point where it is.
+    pub const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    /// A move by `(x, y)`.
+    pub fn translate(x: f32, y: f32) -> Self {
+        Self {
+            e: x,
+            f: y,
+            ..Self::IDENTITY
+        }
+    }
+
+    /// `self` after `inner`: the result maps `p` to `self(inner(p))`.
+    pub fn then_inner(&self, inner: &Self) -> Self {
+        Self {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    /// Map one point.
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    /// The reverse map, or `None` when the map flattens the plane or is not
+    /// finite. A box with such a transform is neither drawn nor hit.
+    pub fn inverse(&self) -> Option<Self> {
+        let det = self.a * self.d - self.b * self.c;
+        if !det.is_finite() || det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = Self {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        };
+        inv.is_finite().then_some(inv)
+    }
+
+    /// True when every coefficient is finite.
+    pub fn is_finite(&self) -> bool {
+        [self.a, self.b, self.c, self.d, self.e, self.f]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+
+    /// The same map for a subtree moved by `(dx, dy)`.
+    pub fn translated(&self, dx: f32, dy: f32) -> Self {
+        Self::translate(dx, dy)
+            .then_inner(self)
+            .then_inner(&Self::translate(-dx, -dy))
+    }
+
+    /// The map in a space scaled by `s` about the origin, as for zoom.
+    pub fn scaled(&self, s: f32) -> Self {
+        Self {
+            e: self.e * s,
+            f: self.f * s,
+            ..*self
+        }
+    }
+
+    /// Axis-aligned bounds of `rect` after the map.
+    pub fn map_rect(&self, rect: Rect) -> Rect {
+        let corners = [
+            self.apply(rect.x, rect.y),
+            self.apply(rect.x + rect.width, rect.y),
+            self.apply(rect.x, rect.y + rect.height),
+            self.apply(rect.x + rect.width, rect.y + rect.height),
+        ];
+        let (mut x0, mut y0) = corners[0];
+        let (mut x1, mut y1) = corners[0];
+        for (x, y) in corners {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        }
+    }
+}
+
+/// The page-space map for a box with `style`'s `transform` and
+/// `transform-origin`, laid out at `rect`.
+///
+/// Percentages in `translate()` and the origin are of the border box.
+/// Functions apply right to left, as in CSS, around the origin.
+fn box_transform(rect: Rect, style: &ComputedStyle, styles: &StyleMap) -> Transform2D {
+    let len = |size, basis: f32| used_length(size, Some(basis), style, styles).unwrap_or(0.0);
+    let mut local = Transform2D::IDENTITY;
+    for function in style.transform.functions() {
+        let step = match *function {
+            TransformFn::Translate(x, y) => {
+                Transform2D::translate(len(x, rect.width), len(y, rect.height))
+            }
+            TransformFn::Scale(x, y) => Transform2D {
+                a: x,
+                d: y,
+                ..Transform2D::IDENTITY
+            },
+            TransformFn::Rotate(angle) => {
+                let (sin, cos) = angle.sin_cos();
+                Transform2D {
+                    a: cos,
+                    b: sin,
+                    c: -sin,
+                    d: cos,
+                    e: 0.0,
+                    f: 0.0,
+                }
+            }
+            TransformFn::Skew(x, y) => Transform2D {
+                b: y.tan(),
+                c: x.tan(),
+                ..Transform2D::IDENTITY
+            },
+            TransformFn::Matrix([a, b, c, d, e, f]) => Transform2D { a, b, c, d, e, f },
+        };
+        local = local.then_inner(&step);
+    }
+    let ox = rect.x + len(style.transform_origin.x, rect.width);
+    let oy = rect.y + len(style.transform_origin.y, rect.height);
+    Transform2D::translate(ox, oy)
+        .then_inner(&local)
+        .then_inner(&Transform2D::translate(-ox, -oy))
+}
+
+/// Give every transformed box its [`LayoutBox::transform`], once boxes
+/// have their final positions. Only element boxes that are not inline are
+/// transformable; text keeps its parent's style but not a box of its own.
+fn resolve_transforms(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
+    let style = styles.get(tree.node);
+    let is_element = doc.get(tree.node).data().tag().is_some();
+    if is_element && !style.transform.is_none() && style.display != Display::Inline {
+        tree.transform = Some(box_transform(tree.rect, style, styles));
+    }
+    for child in &mut tree.children {
+        resolve_transforms(child, doc, styles);
     }
 }
 
@@ -312,6 +504,7 @@ pub fn layout_document_interactive(
         None,
     );
     resolve_sticky(&mut tree, styles, None);
+    resolve_transforms(&mut tree, doc, styles);
     tree
 }
 
@@ -391,7 +584,10 @@ fn resolve_sticky(tree: &mut LayoutBox, styles: &StyleMap, clip_port: Option<Rec
 /// descendants are tested, so clipped children are not hits.
 ///
 /// Sticky boxes are tested at their in-flow position. Use
-/// [`hit_test_scrolled`] to test them where they are drawn.
+/// [`hit_test_scrolled`] to test them where they are drawn. Transformed
+/// boxes are tested where they are drawn: the point is mapped back into the
+/// box's untransformed space, so a rotated box is hit only inside its
+/// rotated outline, and a box whose transform cannot be inverted is not hit.
 pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
     hit_test_inner(tree, x, y, None)
 }
@@ -409,6 +605,8 @@ pub fn hit_test_scrolled(tree: &LayoutBox, x: f32, y: f32, viewport: Rect) -> Op
 ///
 /// A sticky shift moves the point the other way instead of moving boxes,
 /// and moves the viewport with it so nested sticky boxes see the same view.
+/// A transform maps the point back through its inverse the same way; the
+/// viewport is left as it is.
 fn hit_test_inner(tree: &LayoutBox, x: f32, y: f32, viewport: Option<Rect>) -> Option<NodeId> {
     let (mut x, mut y, mut viewport) = (x, y, viewport);
     if let (Some(sticky), Some(port)) = (tree.sticky, viewport) {
@@ -420,6 +618,9 @@ fn hit_test_inner(tree: &LayoutBox, x: f32, y: f32, viewport: Option<Rect>) -> O
             y: port.y - dy,
             ..port
         });
+    }
+    if let Some(transform) = tree.transform {
+        (x, y) = transform.inverse()?.apply(x, y);
     }
     // Hidden overflow clips hit testing to the border box, not the padding edge.
     if tree.overflow == Overflow::Hidden && !tree.rect.contains(x, y) {
@@ -937,6 +1138,7 @@ fn layout_block(
         border_radius: style.border_radius,
         image: decoded_image,
         sticky: None,
+        transform: None,
         text,
         children,
     }
@@ -1096,6 +1298,7 @@ fn layout_table_row(
         border_radius: style.border_radius,
         image: None,
         sticky: None,
+        transform: None,
         text: Vec::new(),
         children,
     }
@@ -1811,6 +2014,7 @@ fn layout_grid(
         border_radius: style.border_radius,
         image: None,
         sticky: None,
+        transform: None,
         text: Vec::new(),
         children,
     }
@@ -1909,6 +2113,7 @@ fn layout_flex(
             border_radius: style.border_radius,
             image: None,
             sticky: None,
+            transform: None,
             text: Vec::new(),
             children,
         };
@@ -2088,6 +2293,7 @@ fn layout_flex(
         border_radius: style.border_radius,
         image: None,
         sticky: None,
+        transform: None,
         text: Vec::new(),
         children,
     }
@@ -2100,6 +2306,9 @@ fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
     tree.rect.y += dy;
     if let Some(sticky) = &mut tree.sticky {
         *sticky = sticky.translated(dx, dy);
+    }
+    if let Some(transform) = &mut tree.transform {
+        *transform = transform.translated(dx, dy);
     }
     for run in &mut tree.text {
         run.x += dx;
@@ -3076,5 +3285,101 @@ mod tests {
         assert_eq!(c.offset(port(48.0, 10.0)), (3.0, 0.0));
         // Never past the containing block, margins included.
         assert_eq!(c.offset(port(500.0, 100.0)), (128.0, 0.0));
+    }
+
+    #[test]
+    fn builds_box_transforms_around_the_origin() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #move { width: 100px; height: 50px; transform: translate(10px, 50%) scale(2, 0.5); }
+                #corner { width: 40px; height: 20px; transform-origin: left top;
+                          transform: matrix(1, 0, 0, 1, 3, 4) scaleX(-1); }
+                #inline { transform: scale(3); }
+                #rel { position: relative; top: 10px; }
+                #inner { width: 20px; height: 20px; transform: scale(2); }
+             </style>
+             <div id=\"move\"></div><div id=\"corner\"></div><span id=\"inline\">x</span>
+             <div id=\"rel\"><div id=\"inner\"></div></div>",
+            200.0,
+        );
+        // Origin (50, 25): move by (10, 25), then scale about the origin.
+        assert_eq!(
+            find_box(&doc, &tree, "move").transform,
+            Some(Transform2D {
+                a: 2.0,
+                b: 0.0,
+                c: 0.0,
+                d: 0.5,
+                e: -40.0,
+                f: 37.5,
+            })
+        );
+        // Origin (0, 50): mirror, then move by (3, 4).
+        assert_eq!(
+            find_box(&doc, &tree, "corner").transform,
+            Some(Transform2D {
+                a: -1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: 3.0,
+                f: 4.0,
+            })
+        );
+        // Inline boxes and text are not transformed.
+        let inline = doc.get_element_by_id("inline").unwrap();
+        let mut stack = vec![&tree];
+        while let Some(b) = stack.pop() {
+            assert!(b.node != inline || b.transform.is_none());
+            if doc.get(b.node).data().tag().is_none() {
+                assert!(b.transform.is_none());
+            }
+            stack.extend(b.children.iter());
+        }
+        // The relative offset moved the box after layout; the origin moved too.
+        let inner = find_box(&doc, &tree, "inner");
+        let center = (inner.rect.x + 10.0, inner.rect.y + 10.0);
+        let m = inner.transform.unwrap();
+        assert_eq!(m.apply(center.0, center.1), center);
+        assert_eq!(
+            m.apply(inner.rect.x, inner.rect.y),
+            (inner.rect.x - 10.0, inner.rect.y - 10.0)
+        );
+    }
+
+    #[test]
+    fn hit_tests_transformed_boxes_where_they_are_drawn() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #pad { height: 50px; }
+                #bar { width: 100px; height: 20px; transform: rotate(90deg); }
+                #flat { width: 30px; height: 30px; transform: scale(0); }
+                #ring { width: 40px; height: 40px; overflow: hidden;
+                        transform: translate(100px, 0); }
+                #in { width: 80px; height: 80px; }
+             </style>
+             <div id=\"pad\"></div><div id=\"bar\"></div><div id=\"flat\"></div>
+             <div id=\"ring\"><div id=\"in\"></div></div>",
+            200.0,
+        );
+        let id = |name: &str| doc.get_element_by_id(name);
+        // #bar is 0..100 x 50..70 turned about (50, 60): now 40..60 x 10..110.
+        assert_eq!(hit_test(&tree, 50.0, 15.0), id("bar"));
+        assert_eq!(hit_test(&tree, 50.0, 105.0), id("bar"));
+        assert_ne!(hit_test(&tree, 5.0, 60.0), id("bar"));
+        assert_ne!(hit_test(&tree, 95.0, 60.0), id("bar"));
+        // A flattened box is never hit.
+        let flat = find_box(&doc, &tree, "flat");
+        assert_ne!(
+            hit_test(&tree, flat.rect.x + 15.0, flat.rect.y + 15.0),
+            id("flat")
+        );
+        // #ring moved 100px right; its own clip moved with it.
+        let ring = find_box(&doc, &tree, "ring");
+        assert_eq!(hit_test(&tree, 110.0, ring.rect.y + 5.0), id("in"));
+        assert_ne!(hit_test(&tree, 10.0, ring.rect.y + 5.0), id("in"));
+        assert_ne!(hit_test(&tree, 150.0, ring.rect.y + 5.0), id("in"));
     }
 }
