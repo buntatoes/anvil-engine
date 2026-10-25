@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // C++20 SDF Box-Shadow, Linear-Gradient, Clipped RGBA Blitter, Glyph Coverage, and NV12 Kernels.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 #include "anvil_raster_accel.hpp"
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! Windows text path. This module is compiled only under `#[cfg(windows)]`.
 //!
 //! `Framebuffer::draw_text` calls [`draw_system_text`] before the built-in

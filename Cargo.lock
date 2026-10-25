@@ -16,7 +16,7 @@ version = "0.7.0"
 
 [[package]]
 name = "anvil-image"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anvil-compress",
 ]

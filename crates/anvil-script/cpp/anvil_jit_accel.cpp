@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // C++20 Register Virtual Machine Execution Engine, Hot-Loop Accelerator, and Rust FFI Entry Points.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 //
 // Compiled alongside anvil_vm_heap.cpp, anvil_vm_ic.cpp, and anvil_vm_compiler.cpp
 // by crates/anvil-script/build.rs when a C++20 compiler is available.

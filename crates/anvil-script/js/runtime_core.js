@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // AnvilVM Built-in JavaScript Standard Library Prelude (Core Collections, Numeric & String Utilities)
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 function anvilClampNumber(val, minVal, maxVal) {
   let n = Number(val);

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! Document tree. Nodes live in one list and point at each other by id.
 //!
 //! First stage of the pipeline. [`parse_html`] turns source into a [`Document`]
@@ -2149,5 +2151,55 @@ mod tests {
         assert_eq!(doc.element_children(list), vec![items[0], inserted, cloned]);
         doc.remove_child(list, inserted).unwrap();
         assert_eq!(doc.element_children(list), vec![items[0], cloned]);
+    }
+
+    /// Parse on a worker thread and give up after a few seconds, so a parser
+    /// that stops advancing fails the test instead of hanging the run.
+    fn parse_with_deadline(input: &str) -> Option<(Vec<String>, String)> {
+        let input = input.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let doc = parse_html(&input);
+            let tags = doc
+                .children(doc.body())
+                .iter()
+                .filter_map(|id| doc.get(*id).data().tag().map(str::to_string))
+                .collect::<Vec<_>>();
+            let text = doc.text_content(doc.body());
+            let _ = tx.send((tags, text));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    #[test]
+    fn stray_less_than_in_text_is_kept_and_does_not_stall() {
+        let (tags, text) = parse_with_deadline("<p>1 < 2</p><p>after</p>")
+            .expect("parser stalled on a '<' that does not start a tag");
+        assert_eq!(tags, ["p", "p"]);
+        assert!(text.contains("1 < 2"), "text was {text:?}");
+        assert!(text.contains("after"));
+    }
+
+    #[test]
+    fn less_than_at_odd_places_does_not_stall() {
+        for input in [
+            "<",
+            "<<",
+            "a <",
+            "< b",
+            "<p>x <= y && y >= z</p>",
+            "<p>a<1</p>",
+            "<p>a< </p>",
+            "<p>a <\u{e9}</p>",
+            "<div>< <<< <3 <-- <=></div>",
+            "<p a=1 \u{e9}\u{4e2d}>multi-byte attribute junk</p>",
+        ] {
+            assert!(
+                parse_with_deadline(input).is_some(),
+                "parser stalled on {input:?}"
+            );
+        }
+        let (_, text) = parse_with_deadline("<p>a <\u{e9}</p>").unwrap();
+        assert!(text.contains("a <\u{e9}"), "text was {text:?}");
     }
 }

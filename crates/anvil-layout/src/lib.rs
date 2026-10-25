@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! Block, inline, flex, table, and positioned layout, plus hit testing.
 //!
 //! Third stage of the pipeline. anvil-style has computed a `StyleMap` for a

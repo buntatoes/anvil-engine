@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! HTML parser for [`crate::Document`].
 //!
 //! This is the front of the engine pipeline. Bytes become a node list that
@@ -122,8 +124,12 @@ pub fn parse_html(input: &str) -> Document {
             continue;
         }
 
+        // Text runs to the next `<` that starts markup. A `<` that does not
+        // (as in `1 < 2`) is ordinary text, so step past the first byte before
+        // looking; otherwise the outer loop would sit on that `<` forever.
         let start = index;
-        while index < bytes.len() && bytes[index] != b'<' {
+        index += 1;
+        while index < bytes.len() && !(bytes[index] == b'<' && is_markup(bytes, index)) {
             index += 1;
         }
         let decoded = decode_entities(&input[start..index]);
@@ -260,7 +266,8 @@ fn read_start_tag(input: &str, start: usize) -> (String, Vec<(String, String)>, 
         }
         let attr_name = read_name(input, &mut index);
         if attr_name.is_empty() {
-            index += 1;
+            // Skip one whole character so the next slice starts on a boundary.
+            index += input[index..].chars().next().map_or(1, char::len_utf8);
             continue;
         }
         index = skip_ascii_space(bytes, index);

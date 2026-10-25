@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // C++20 4-Way Polymorphic Inline Cache (IC) Engine & DOM Selector IC Table.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 #include "anvil_vm.hpp"
 

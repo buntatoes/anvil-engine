@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! Hybrid Rust + C++20 (`AnvilVM`) script runtime, bytecode compiler, and DOM binding layer.
 //!
 //! `anvil-browser` owns the [`ScriptRuntime`]. It sets the page origin, optionally
@@ -5413,18 +5415,30 @@ mod tests {
 
     #[test]
     fn aborts_infinite_recursion_and_enforces_same_origin_fetch() {
-        let mut doc = parse_html(
-            "<p id=\"status\">Safe</p>
-             <script>
-               function recurse() {
-                 recurse();
-               }
-               recurse();
-             </script>",
-        );
-        let mut runtime = ScriptRuntime::new();
-        runtime.run_document_scripts(&mut doc);
-        assert!(runtime.was_aborted());
+        // An unoptimized build needs more than the 2 MB default test-thread
+        // stack to reach MAX_CALL_DEPTH, so the recursion check runs on its
+        // own thread with room to spare. The depth cap is still what stops it.
+        let aborted = std::thread::Builder::new()
+            .name("recursion-check".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut doc = parse_html(
+                    "<p id=\"status\">Safe</p>
+                     <script>
+                       function recurse() {
+                         recurse();
+                       }
+                       recurse();
+                     </script>",
+                );
+                let mut runtime = ScriptRuntime::new();
+                runtime.run_document_scripts(&mut doc);
+                runtime.was_aborted()
+            })
+            .expect("spawn recursion-check thread")
+            .join()
+            .expect("recursion-check thread panicked");
+        assert!(aborted);
 
         let mut sop_doc = parse_html(
             "<p id=\"out\"></p>

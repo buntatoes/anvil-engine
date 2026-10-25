@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // Optional C++20 scanline and compositor library for anvil-raster.
-// Author: Buntos
+// Author: Buntato
 //
 // Compiles and links cpp/anvil_raster_accel.cpp and cpp/anvil_raster_compositor.cpp
 // when a C++20 compiler is available, emitting cfg(anvil_cpp_accel).

@@ -9,7 +9,7 @@
   </p>
 </div>
 
-Version 0.22. Author: Buntos.
+Version 0.22. Author: Buntato.
 
 There are no crates.io dependencies.
 

@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // C++20 Register Virtual Machine, NaN-Boxed Heap, Hidden Classes, and Inline Cache Engine.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 //
 // Freestanding C++20 header used by:
 //   - anvil_vm_heap.cpp     (String interning, AnvilShape transition trees, Mark-Sweep GC)

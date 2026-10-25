@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! Display list built from a laid-out box tree.
 //!
 //! Fourth stage of the pipeline. anvil-layout has already placed boxes.

@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // Shared freestanding C++20 definitions and math helpers for anvil-raster.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 #ifndef ANVIL_RASTER_ACCEL_HPP
 #define ANVIL_RASTER_ACCEL_HPP

@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // AnvilVM Built-in Async Microtask, URL Query, Storage & DOM Event Helper Prelude
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 function anvilParseQueryParam(urlOrSearch, paramKey) {
   let raw = String(urlOrSearch);

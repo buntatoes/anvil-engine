@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // x86-64 baseline JIT for numeric AnvilVM programs.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 //
 // Compiles a bytecode program to native machine code and runs it.
 // Programs that use objects, calls, or element access stay on the interpreter.

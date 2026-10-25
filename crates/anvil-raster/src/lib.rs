@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! CPU RGBA framebuffer and signed-distance rasterizer.
 //!
 //! `anvil-browser` calls [`rasterize`] with a `anvil-paint` display list, then

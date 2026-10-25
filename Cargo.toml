@@ -15,7 +15,7 @@
 # The libraries under [workspace.dependencies] are separate MPL-2.0 repositories.
 #
 # LicenseRef-Proprietary: this repository.
-# MPL-2.0: anvil-image, anvil-json, anvil-ttf, anvil-gpu. anvil-image also links anvil-compress.
+# MPL-2.0: anvil-image, anvil-json, anvil-ttf, anvil-gpu, and anvil-compress (linked through anvil-image).
 
 [workspace]
 resolver = "3"
@@ -31,7 +31,7 @@ members = [
 [workspace.package]
 version = "0.22.0"
 edition = "2024"
-authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
+authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "HTML, CSS, layout, raster, and a budgeted script runtime."
 license = "LicenseRef-Proprietary"
 repository = "https://github.com/buntatoes/anvil-engine"

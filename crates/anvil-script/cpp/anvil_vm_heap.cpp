@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // C++20 Hidden Classes (AnvilShape), String Interning Pool, and Mark-Sweep GC Heap.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 #include "anvil_vm.hpp"
 

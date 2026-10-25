@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // CPU scanline helpers for the anvil-raster framebuffer.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 //
 // Compiled alongside anvil_raster_compositor.cpp by crates/anvil-raster/build.rs
 // when a C++20 compiler is on PATH, setting cfg(anvil_cpp_accel).

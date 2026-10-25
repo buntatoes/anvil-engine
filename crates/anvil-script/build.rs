@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // Optional C++20 AnvilVM (NaN-boxed heap, hidden classes, Inline Caches, and register VM) build script.
-// Author: Buntos
+// Author: Buntato
 //
 // Compiles and archives the freestanding C++20 translation units under `cpp/`:
 //   - cpp/anvil_vm_heap.cpp

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 //! Style sheets, selector matching, and the cascade.
 //!
 //! Second stage of the pipeline. anvil-dom has already built the node list.

@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: LicenseRef-Proprietary
+// Copyright (c) 2026 Buntato
 // C++20 Lexer, Recursive-Descent / Pratt Expression Parser, and Register Bytecode Compiler.
-// Author: Buntos
-// License: LicenseRef-Proprietary
+// Author: Buntato
 
 #include "anvil_vm.hpp"
 
