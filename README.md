@@ -4,7 +4,7 @@
   <p>
     <img src="https://img.shields.io/badge/release-v.22-ff6b24?style=flat-square" alt="v.22" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Proprietary-e8c37a?style=flat-square" alt="Proprietary" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Audit_and_use_only-e8c37a?style=flat-square" alt="Audit and use only" /></a>
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
   </p>
 </div>
@@ -50,11 +50,11 @@ cargo test
 
 ## License
 
-Proprietary. All rights reserved. See `LICENSE`.
+This engine is private. You may read it to audit it and use it as part of Anvil Browser, but you may not redistribute it on its own. Anvil Browser can be redistributed without it. See `LICENSE`.
 
 | Repository | License |
 | --- | --- |
-| This one (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Proprietary. All rights reserved |
+| This one (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Audit and use only. Not redistributable on its own |
 | `anvil-browser` | Apache-2.0. Not this file |
 | `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories |
 
