@@ -8104,4 +8104,592 @@ mod tests {
             "3:true:container:second:2:rgb(20, 30, 40):100"
         );
     }
+
+    #[test]
+    fn runs_sync_then_microtasks_then_timers_in_order() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let log = [];
+               log.push('s1');
+               queueMicrotask(() => { log.push('m1'); });
+               setTimeout(() => { log.push('t1'); }, 0);
+               Promise.resolve().then(() => { log.push('m2'); });
+               log.push('s2');
+               setTimeout(() => { document.getElementById('out').textContent = log.join(','); }, 5);
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "s1,s2,m1,m2,t1");
+        assert!(!rt.was_aborted());
+    }
+
+    #[test]
+    fn chains_promises_and_propagates_errors_to_catch() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let out = [];
+               Promise.resolve(1).then((x) => x + 1).then((x) => { out.push(x); throw new Error('boom'); }).then((x) => out.push('skipped')).catch((e) => out.push('caught:' + e.message)).then(() => { document.getElementById('out').textContent = out.join('|'); });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "2|caught:boom");
+    }
+
+    #[test]
+    fn finally_runs_and_passes_the_value_through() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let out = [];
+               Promise.resolve('v').finally(() => out.push('cleanup')).then((x) => { out.push(x); document.getElementById('out').textContent = out.join('|'); });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "cleanup|v");
+    }
+
+    #[test]
+    fn awaits_values_in_loops_and_try_catch() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               async function compute() {
+                 let a = await Promise.resolve(10);
+                 let total = 0;
+                 for (let i = 0; i < 3; i++) {
+                   total += await Promise.resolve(i);
+                 }
+                 return a + total;
+               }
+               async function guarded() {
+                 try {
+                   await Promise.reject(new Error('nope'));
+                   return 'unreached';
+                 } catch (e) {
+                   return 'caught:' + e.message;
+                 }
+               }
+               let out = [];
+               compute().then((v) => { out.push(v); return guarded(); }).then((g) => { out.push(g); document.getElementById('out').textContent = out.join('|'); });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "13|caught:nope");
+    }
+
+    #[test]
+    fn promise_constructor_resolves_from_a_timer() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let later = new Promise((resolve) => { setTimeout(() => { resolve('done'); }, 10); });
+               later.then((v) => { document.getElementById('out').textContent = v; });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "done");
+    }
+
+    #[test]
+    fn runs_the_promise_combinators() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let out = [];
+               Promise.all([Promise.resolve(1), 2, Promise.resolve(3)]).then((arr) => out.push('all:' + arr.join(',')));
+               Promise.race([Promise.resolve('fast'), Promise.resolve('slow')]).then((v) => out.push('race:' + v));
+               Promise.any([Promise.reject(new Error('e1')), Promise.resolve('ok')]).then((v) => out.push('any:' + v));
+               Promise.allSettled([Promise.resolve(9), Promise.reject(new Error('bad'))]).then((arr) => out.push('settled:' + arr.length + ':' + arr[0].status + ':' + arr[1].status));
+               setTimeout(() => { document.getElementById('out').textContent = out.join('|'); }, 0);
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        let text = doc.text_content(out);
+        assert!(text.contains("all:1,2,3"), "all: {text}");
+        assert!(text.contains("race:fast"), "race: {text}");
+        assert!(text.contains("any:ok"), "any: {text}");
+        assert!(
+            text.contains("settled:2:fulfilled:rejected"),
+            "settled: {text}"
+        );
+    }
+
+    #[test]
+    fn clears_an_interval_after_a_few_ticks() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let n = 0;
+               let id = setInterval(() => { n = n + 1; if (n >= 3) { clearInterval(id); document.getElementById('out').textContent = 'ticks:' + n; } }, 5);
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "ticks:3");
+        assert!(!rt.was_aborted());
+    }
+
+    #[test]
+    fn a_thousand_deep_promise_chain_does_not_overflow() {
+        let depth = std::thread::Builder::new()
+            .name("deep-chain".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut doc = parse_html(
+                    "<p id=\"out\"></p>
+                     <script>
+                       let p = Promise.resolve(0);
+                       for (let i = 0; i < 1000; i++) { p = p.then((x) => x + 1); }
+                       p.then((x) => { document.getElementById('out').textContent = 'depth:' + x; });
+                     </script>",
+                );
+                let mut rt = ScriptRuntime::new();
+                rt.run_document_scripts(&mut doc);
+                let out = doc.get_element_by_id("out").unwrap();
+                (doc.text_content(out), rt.was_aborted())
+            })
+            .expect("spawn deep-chain thread")
+            .join()
+            .expect("deep-chain thread panicked");
+        assert_eq!(depth.0, "depth:1000");
+        assert!(!depth.1);
+    }
+
+    #[test]
+    fn the_budget_cuts_off_an_endless_microtask_chain() {
+        let mut doc = parse_html(
+            "<script>
+               function flood() { Promise.resolve().then(flood); }
+               flood();
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        assert!(rt.was_aborted());
+        assert!(rt.abort_reason().is_some());
+    }
+
+    #[test]
+    fn the_budget_cuts_off_an_endless_timer_chain() {
+        let mut doc = parse_html(
+            "<script>
+               function tick() { setTimeout(tick, 0); }
+               tick();
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        assert!(rt.was_aborted());
+    }
+
+    #[test]
+    fn tracks_an_unhandled_rejection_without_crashing() {
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               Promise.reject(new Error('lonely'));
+               Promise.resolve('fine').then((v) => { document.getElementById('out').textContent = v; });
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "fine");
+        assert_eq!(rt.unhandled_rejections(), 1);
+    }
+
+    fn run_and_read(html: &str) -> (String, ScriptRuntime) {
+        let mut doc = parse_html(html);
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        (doc.text_content(out), rt)
+    }
+
+    #[test]
+    fn an_await_suspends_the_async_function_until_a_microtask() {
+        let (text, rt) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               let log = [];
+               async function f() { log.push('a'); await null; log.push('c'); }
+               let p = f();
+               log.push('b');
+               p.then(() => { log.push('d'); });
+               setTimeout(() => { document.getElementById('out').textContent = log.join(','); }, 0);
+             </script>",
+        );
+        assert_eq!(text, "a,b,c,d");
+        assert!(!rt.was_aborted());
+    }
+
+    #[test]
+    fn concurrent_async_calls_interleave_and_keep_their_own_locals() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               let log = [];
+               function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+               async function worker(name, ms) {
+                 for (let i = 0; i < 2; i++) {
+                   await sleep(ms);
+                   log.push(name + i);
+                 }
+                 return name;
+               }
+               Promise.all([worker('x', 10), worker('y', 15)]).then((names) => {
+                 log.push(names.join('+'));
+                 document.getElementById('out').textContent = log.join(',');
+               });
+             </script>",
+        );
+        assert_eq!(text, "x0,y0,x1,y1,x+y");
+    }
+
+    #[test]
+    fn for_await_and_try_finally_resume_in_order() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               let log = [];
+               async function run() {
+                 const items = [Promise.resolve(1), 2, new Promise((r) => setTimeout(() => r(3), 5))];
+                 let sum = 0;
+                 for await (const v of items) { sum += v; }
+                 try {
+                   await Promise.reject(new Error('x'));
+                   log.push('unreached');
+                 } catch (e) {
+                   log.push('caught ' + e.message);
+                 } finally {
+                   await null;
+                   log.push('finally');
+                 }
+                 return sum;
+               }
+               run().then((s) => { log.push('sum ' + s); document.getElementById('out').textContent = log.join(','); });
+               log.push('sync');
+             </script>",
+        );
+        assert_eq!(text, "sync,caught x,finally,sum 6");
+    }
+
+    #[test]
+    fn async_arrows_break_out_of_awaiting_loops_and_reject_late() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               let out = [];
+               const count = async (limit) => {
+                 let n = 0;
+                 while (true) {
+                   await null;
+                   n++;
+                   if (n >= limit) { break; }
+                 }
+                 return n;
+               };
+               async function late() { await count(1); throw new Error('late'); }
+               count(3).then((v) => { out.push(v); return late(); }).catch((e) => {
+                 out.push(e.message);
+                 document.getElementById('out').textContent = out.join('|');
+               });
+             </script>",
+        );
+        assert_eq!(text, "3|late");
+    }
+
+    #[test]
+    fn an_async_timer_callback_runs_as_its_own_task() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               let log = [];
+               setTimeout(async () => { log.push('t1'); await null; log.push('t1 resumed'); }, 0);
+               setTimeout(() => { log.push('t2'); }, 0);
+               setTimeout(() => { document.getElementById('out').textContent = log.join(','); }, 1);
+             </script>",
+        );
+        assert_eq!(text, "t1,t1 resumed,t2");
+    }
+
+    #[test]
+    fn an_async_class_method_returns_a_promise() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               class Store {
+                 async load(x) { let v = await Promise.resolve(x); return v * 2; }
+                 async fail() { throw new Error('bad'); }
+               }
+               const store = new Store();
+               let out = [];
+               store.load(21).then((v) => { out.push(v); return store.fail(); }).catch((e) => {
+                 out.push(e.message);
+                 document.getElementById('out').textContent = out.join('|');
+               });
+             </script>",
+        );
+        assert_eq!(text, "42|bad");
+    }
+
+    #[test]
+    fn async_callbacks_for_then_and_queue_microtask() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               let log = [];
+               queueMicrotask(async () => {
+                 for (const name of ['a', 'b']) {
+                   await null;
+                   log.push(name);
+                 }
+               });
+               Promise.resolve(2)
+                 .then(async (v) => { await null; return v * 3; })
+                 .then((v) => { log.push(v); });
+               setTimeout(() => { document.getElementById('out').textContent = log.join(','); }, 0);
+             </script>",
+        );
+        assert_eq!(text, "a,b,6");
+    }
+
+    #[test]
+    fn adopts_a_class_instance_thenable() {
+        let (text, _) = run_and_read(
+            "<p id=\"out\"></p>
+             <script>
+               class Later {
+                 then(ok, fail) { setTimeout(() => { ok(7); }, 3); }
+               }
+               class Broken {
+                 then(ok, fail) { fail('no'); }
+               }
+               let out = [];
+               async function use() { let v = await new Later(); return v + 1; }
+               use().then((v) => { out.push(v); return Promise.resolve(new Broken()); }).catch((e) => {
+                 out.push(e);
+                 document.getElementById('out').textContent = out.join('|');
+               });
+             </script>",
+        );
+        assert_eq!(text, "8|no");
+    }
+
+    fn logs_of(src: &str) -> (Vec<String>, ScriptRuntime) {
+        let mut doc = parse_html(&format!("<script>{src}</script>"));
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        (rt.console_logs().to_vec(), rt)
+    }
+
+    fn no_frames_left(rt: &ScriptRuntime) -> bool {
+        rt.frames.iter().all(|slot| matches!(slot, FrameSlot::Free))
+    }
+
+    #[test]
+    fn an_unawaited_async_call_inside_an_async_function_finishes() {
+        let (logs, rt) = logs_of(
+            "const inner = async () => { console.log('x'); await null; console.log('y'); };
+             const outer = async () => { inner(); console.log('z'); await null; console.log('w'); };
+             outer();",
+        );
+        assert_eq!(logs, ["x", "z", "y", "w"]);
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+    }
+
+    #[test]
+    fn many_pending_unawaited_async_calls_all_finish_and_free_their_slots() {
+        let (logs, rt) = logs_of(
+            "let done = 0;
+             const inner = async (i) => { await null; await null; done++; };
+             const outer = async () => {
+               for (let i = 0; i < 300; i++) { inner(i); }
+               await null;
+               console.log('outer resumed ' + done);
+               await null; await null;
+               console.log('outer done ' + done);
+             };
+             outer();",
+        );
+        assert_eq!(logs, ["outer resumed 0", "outer done 300"]);
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+        // 300 inner calls and the caller were pending together.
+        assert_eq!(rt.frames.len(), 301);
+    }
+
+    #[test]
+    fn finished_async_calls_hand_their_slots_back() {
+        let (logs, rt) = logs_of(
+            "const step = async (i) => { await null; return i; };
+             const run = async () => {
+               let total = 0;
+               for (let i = 0; i < 2000; i++) { total = total + await step(i); }
+               console.log('total ' + total);
+             };
+             run();",
+        );
+        assert_eq!(logs, ["total 1999000"]);
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+        // The caller and one step at a time.
+        assert_eq!(rt.frames.len(), 2);
+    }
+
+    #[test]
+    fn recursive_async_calls_keep_their_own_frames() {
+        let (logs, rt) = logs_of(
+            "async function down(n) {
+               if (n === 0) { return 0; }
+               down(n - 1);
+               console.log('a' + n);
+               await null;
+               console.log('b' + n);
+               return n;
+             }
+             async function sum(n) {
+               if (n === 0) { return 0; }
+               const rest = await sum(n - 1);
+               return n + rest;
+             }
+             down(3);
+             sum(20).then((v) => console.log('sum ' + v));",
+        );
+        assert_eq!(logs, ["a1", "a2", "a3", "b1", "b2", "b3", "sum 210"]);
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+    }
+
+    #[test]
+    fn a_throwing_unawaited_callee_does_not_stop_its_caller() {
+        let (logs, rt) = logs_of(
+            "const late = async () => { console.log('x'); await null; throw new Error('late'); };
+             const early = async () => { throw new Error('early'); };
+             const outer = async () => {
+               late().catch((e) => console.log('caught ' + e.message));
+               early().catch((e) => console.log('caught ' + e.message));
+               late();
+               console.log('z');
+               await null;
+               console.log('w');
+             };
+             outer();",
+        );
+        assert_eq!(logs, ["x", "x", "z", "caught early", "w", "caught late"]);
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+    }
+
+    #[test]
+    fn the_budget_stops_a_flood_of_unawaited_async_calls() {
+        for src in [
+            "const spin = async () => { while (true) { await null; } };
+             const outer = async () => { for (let i = 0; i < 200; i++) { spin(); } await null; console.log('o'); };
+             outer();",
+            "const grow = async () => { await null; grow(); grow(); };
+             grow();",
+        ] {
+            let (_, rt) = logs_of(src);
+            assert!(rt.was_aborted(), "{src}");
+            assert!(rt.abort_reason().is_some(), "{src}");
+        }
+    }
+
+    #[test]
+    fn an_async_function_called_in_place_returns_at_its_first_await() {
+        let (logs, rt) = logs_of(
+            "(async () => { console.log('a'); await null; console.log('b'); })();
+             (async function () { console.log('c'); await null; console.log('d'); })();
+             (async (n) => { console.log('n' + n); await null; console.log('m' + n); })(7);
+             (async () => 5)().then((v) => console.log('v' + v));
+             (async () => { throw new Error('bad'); })().catch((e) => console.log('caught ' + e.message));
+             (() => { console.log('sync'); })();
+             console.log('end');",
+        );
+        assert_eq!(
+            logs,
+            [
+                "a",
+                "c",
+                "n7",
+                "sync",
+                "end",
+                "b",
+                "d",
+                "m7",
+                "v5",
+                "caught bad"
+            ]
+        );
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+    }
+
+    #[test]
+    fn an_async_function_called_in_place_inside_an_async_function() {
+        let (logs, rt) = logs_of(
+            "const outer = async () => {
+               let k = 3;
+               (async () => { console.log('i' + k); await null; console.log('j' + k); })();
+               const v = await (async () => { await null; return 4; })();
+               console.log('got ' + v);
+             };
+             outer();
+             console.log('end');",
+        );
+        assert_eq!(logs, ["i3", "end", "j3", "got 4"]);
+        assert!(!rt.was_aborted());
+        assert!(no_frames_left(&rt));
+    }
+
+    #[test]
+    fn the_four_ms_floor_applies_only_while_a_timer_callback_runs() {
+        let (logs, rt) = logs_of(
+            "setTimeout(() => {
+               setTimeout(() => console.log('nested'), 0);
+               queueMicrotask(() => { setTimeout(() => console.log('from microtask'), 0); });
+             }, 0);
+             setTimeout(async () => {
+               await null;
+               setTimeout(() => console.log('after await'), 0);
+             }, 0);
+             setTimeout(() => console.log('two'), 2);",
+        );
+        assert_eq!(logs, ["from microtask", "after await", "two", "nested"]);
+        assert!(!rt.was_aborted());
+    }
+
+    #[cfg(anvil_cpp_jit)]
+    #[test]
+    fn the_numeric_vm_refuses_event_loop_scripts() {
+        if !is_cpp_jit_kernel_active() {
+            return;
+        }
+        assert!(eval_cpp_vm_script_bindings("let x = 2; x * 3").is_some());
+        for src in [
+            "let x = 1; setTimeout(x, 0); x",
+            "let n = 2; queueMicrotask(n); n",
+            "let p = 1; let q = await p; q",
+            "let t = setInterval(1, 5); clearInterval(t); t",
+        ] {
+            assert!(eval_cpp_vm_script_bindings(src).is_none(), "{src}");
+        }
+    }
 }

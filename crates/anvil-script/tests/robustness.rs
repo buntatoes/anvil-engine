@@ -207,6 +207,26 @@ const SAMPLES: &[&str] = &[
 
 const PAGE: &str = "<div id=d><p id=p>text</p><button id=b onclick=\"x = 1\">go</button></div>";
 
+/// Sources that exercise promises, async/await, and the timer queue.
+const ASYNC_SAMPLES: &[&str] = &[
+    "Promise.resolve(1).then(x => x + 1).then(x => { document.getElementById('p').textContent = x; });",
+    "async function f() { let a = await Promise.resolve(2); return a + 1; } f().then(v => { document.getElementById('p').textContent = v; });",
+    "let id = setInterval(() => { clearInterval(id); }, 0);",
+    "Promise.all([Promise.resolve(1), Promise.reject(2)]).catch(e => e);",
+    "Promise.allSettled([Promise.resolve(1), Promise.reject(2)]).then(a => a.length);",
+    "queueMicrotask(() => { setTimeout(() => { document.getElementById('p').textContent = 'q'; }, 0); });",
+    "Promise.any([Promise.reject(1), Promise.resolve(2)]).then(v => v);",
+    "Promise.race([Promise.resolve('a'), Promise.resolve('b')]).then(v => v);",
+    "let later = new Promise(res => { setTimeout(() => { res(5); }, 0); }); later.then(v => v);",
+    "async function g() { for (let i = 0; i < 3; i++) { await Promise.resolve(i); } } g();",
+    "async function h() { try { await Promise.reject('e'); } catch (err) { return err; } } h();",
+    "function sleep(ms) { return new Promise(r => setTimeout(r, ms)); } async function w(n) { for (let i = 0; i < n; i++) { await sleep(i); } return n; } w(2); w(3);",
+    "async function k() { for await (const v of [1, Promise.resolve(2)]) { if (v > 1) { break; } } try { await null; } finally { await 1; } } k();",
+    "const a = async (x) => { while (x > 0) { await null; x--; } return x; }; a(3).then(v => v);",
+    "setTimeout(async () => { await Promise.reject(1); }, 0); queueMicrotask(async () => { await 2; });",
+    "async function m() { let { q, r: [s] } = { q: 1, r: [await 2] }; return q + s; } m();",
+];
+
 /// Run `source` as an inline script, then as a direct eval, an expression,
 /// a click handler, and pending timers, each on a fresh document.
 fn run_script(input: &[u8]) {
@@ -281,6 +301,43 @@ fn runaway_scripts_are_stopped_by_the_budget() {
 
 fn rng_sample(rng: &mut Rng) -> &'static str {
     rng.pick(SAMPLES)
+}
+
+fn rng_async_sample(rng: &mut Rng) -> &'static str {
+    rng.pick(ASYNC_SAMPLES)
+}
+
+#[test]
+fn mutated_async_samples_do_not_panic() {
+    run_cases(
+        "script-async",
+        64,
+        |rng| {
+            let sample = rng_async_sample(rng);
+            mutate(rng, sample.as_bytes())
+        },
+        run_script,
+    );
+}
+
+#[test]
+fn async_and_timer_runaways_are_stopped_by_the_budget() {
+    let runaway = [
+        "function m() { Promise.resolve().then(m); } m();",
+        "function t() { setTimeout(t, 0); } t();",
+        "function iv() { let id = setInterval(iv, 0); } iv();",
+        "async function a() { while (true) { await Promise.resolve(1); } } a();",
+        "let p = Promise.resolve(0); while (true) { p = p.then(x => x + 1); }",
+        "new Promise(res => { while (true) { res(1); } });",
+    ];
+    for (index, source) in runaway.iter().enumerate() {
+        check_case(
+            "script-async-runaway",
+            index,
+            source.as_bytes().to_vec(),
+            run_script,
+        );
+    }
 }
 
 fn boundary(text: &str, mut at: usize) -> usize {
