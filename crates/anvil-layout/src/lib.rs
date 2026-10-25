@@ -25,6 +25,15 @@
 //! [`measure`], a fixed advance of half the font size per character, not
 //! [`measure_proportional`].
 //!
+//! `position: sticky` stays in flow. Its scrollport is the nearest ancestor
+//! with hidden overflow, which never scrolls, so the shift is applied here;
+//! or the viewport, in which case the box keeps its in-flow rect and carries
+//! a [`StickyConstraint`] that paint, raster, and [`hit_test_scrolled`] apply
+//! for the current scroll. There is no horizontal page scroll, so `left` and
+//! `right` only act against a clip scrollport or a viewport narrower than the
+//! page. Sticky boxes paint and hit-test above plain siblings with the same
+//! `z-index`.
+//!
 //! Grid columns come from `grid-template-columns` and rows from
 //! `grid-template-rows`, with `grid-auto-rows` for rows past that list.
 //! Tracks accept `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()`. An
@@ -107,8 +116,128 @@ pub struct LayoutBox {
     pub border_color: Color,
     pub border_radius: f32,
     pub image: Option<Image>,
+    /// Set on a `position: sticky` box whose scrollport is the viewport.
+    /// The rect stays at the in-flow position; paint and raster apply the
+    /// shift for the current scroll. A sticky box inside an `overflow`
+    /// clip is already shifted here and has `None`.
+    pub sticky: Option<StickyConstraint>,
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
+}
+
+impl LayoutBox {
+    /// Sort key among siblings for paint and hit-test order: `z-index`
+    /// first, then boxes that form their own layer after plain boxes.
+    ///
+    /// Sticky boxes are such a layer, so content that follows a sticky
+    /// header in the tree scrolls under it rather than over it. Relative,
+    /// absolute, and fixed boxes keep plain tree order, as before.
+    pub fn stacking_key(&self) -> (i32, u8) {
+        let layered = self.position == Position::Sticky;
+        (self.z_index, u8::from(layered))
+    }
+}
+
+/// What a sticky box needs to find its shift for a scroll position.
+///
+/// All rects are in the same page space as [`LayoutBox::rect`], y downward.
+/// Insets are CSS pixels; `None` is `auto` on that side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StickyConstraint {
+    /// The box's border box at its in-flow position.
+    pub rect: Rect,
+    /// The box's margins. The margin box never leaves `containing`.
+    pub margin: Edge,
+    /// Content box of the parent, which bounds the shift.
+    pub containing: Rect,
+    pub top: Option<f32>,
+    pub right: Option<f32>,
+    pub bottom: Option<f32>,
+    pub left: Option<f32>,
+}
+
+impl StickyConstraint {
+    /// Shift `(dx, dy)` that keeps the box inside `scrollport` by the insets.
+    ///
+    /// `scrollport` is the visible part of the scrolling box in page space;
+    /// for the viewport that is `(0, scroll_y, width, height)`. A box already
+    /// far enough inside does not move. The shift never moves the margin box
+    /// out of `containing`, and never moves the box back past its in-flow
+    /// position. When `top` and `bottom` both apply and conflict, `top`
+    /// wins; `left` wins over `right` the same way.
+    pub fn offset(&self, scrollport: Rect) -> (f32, f32) {
+        let r = self.rect;
+        let m = self.margin;
+        let cb = self.containing;
+        let axis = |start: f32,
+                    size: f32,
+                    margin_start: f32,
+                    margin_end: f32,
+                    cb_start: f32,
+                    cb_size: f32,
+                    port_start: f32,
+                    port_size: f32,
+                    inset_start: Option<f32>,
+                    inset_end: Option<f32>|
+         -> f32 {
+            let mut shift = 0.0_f32;
+            if let Some(inset) = inset_end {
+                let limit = port_start + port_size - inset;
+                let end = start + size;
+                if end > limit {
+                    let floor = (cb_start - (start - margin_start)).min(0.0);
+                    shift = (limit - end).max(floor);
+                }
+            }
+            if let Some(inset) = inset_start {
+                let limit = port_start + inset;
+                if start + shift < limit {
+                    let ceiling = (cb_start + cb_size - (start + size + margin_end)).max(0.0);
+                    shift = (limit - start).min(ceiling).max(shift);
+                }
+            }
+            if shift.is_finite() { shift } else { 0.0 }
+        };
+        let dx = axis(
+            r.x,
+            r.width,
+            m.left,
+            m.right,
+            cb.x,
+            cb.width,
+            scrollport.x,
+            scrollport.width,
+            self.left,
+            self.right,
+        );
+        let dy = axis(
+            r.y,
+            r.height,
+            m.top,
+            m.bottom,
+            cb.y,
+            cb.height,
+            scrollport.y,
+            scrollport.height,
+            self.top,
+            self.bottom,
+        );
+        (dx, dy)
+    }
+
+    /// The same constraint moved by `(dx, dy)`.
+    pub fn translated(&self, dx: f32, dy: f32) -> Self {
+        let mv = |r: Rect| Rect {
+            x: r.x + dx,
+            y: r.y + dy,
+            ..r
+        };
+        Self {
+            rect: mv(self.rect),
+            containing: mv(self.containing),
+            ..*self
+        }
+    }
 }
 
 /// A slice of inline text before it is broken into line tokens.
@@ -169,7 +298,7 @@ pub fn layout_document_interactive(
     images: &HashMap<NodeId, Image>,
     focused_input: Option<NodeId>,
 ) -> LayoutBox {
-    layout_node(
+    let mut tree = layout_node(
         doc,
         styles,
         images,
@@ -181,7 +310,75 @@ pub fn layout_document_interactive(
         viewport_width.max(0.0),
         None,
         None,
-    )
+    );
+    resolve_sticky(&mut tree, styles, None);
+    tree
+}
+
+/// Record or apply `position: sticky` once every box has its final position.
+///
+/// `clip_port` is the padding box of the nearest ancestor with hidden
+/// overflow, which acts as a scrollport that never scrolls. A sticky box
+/// under one is shifted here. A sticky box whose scrollport is the viewport
+/// gets a [`StickyConstraint`] instead, because its shift depends on the
+/// scroll position. Percent insets use the scrollport size; for the viewport
+/// that is the viewport on `styles`. The containing block is the parent's
+/// content box.
+fn resolve_sticky(tree: &mut LayoutBox, styles: &StyleMap, clip_port: Option<Rect>) {
+    let parent_style = styles.get(tree.node);
+    let content = Rect {
+        x: tree.rect.x + tree.border.left + parent_style.padding.left,
+        y: tree.rect.y + tree.border.top + parent_style.padding.top,
+        width: (tree.rect.width
+            - tree.border.left
+            - tree.border.right
+            - parent_style.padding.left
+            - parent_style.padding.right)
+            .max(0.0),
+        height: (tree.rect.height
+            - tree.border.top
+            - tree.border.bottom
+            - parent_style.padding.top
+            - parent_style.padding.bottom)
+            .max(0.0),
+    };
+    let own_port = if tree.overflow == Overflow::Hidden {
+        Some(Rect {
+            x: tree.rect.x + tree.border.left,
+            y: tree.rect.y + tree.border.top,
+            width: (tree.rect.width - tree.border.left - tree.border.right).max(0.0),
+            height: (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0),
+        })
+    } else {
+        clip_port
+    };
+    for child in &mut tree.children {
+        let style = *styles.get(child.node);
+        if style.position == Position::Sticky {
+            let (port_w, port_h) = match own_port {
+                Some(port) => (port.width, port.height),
+                None => (styles.viewport_width(), styles.viewport_height()),
+            };
+            let constraint = StickyConstraint {
+                rect: child.rect,
+                margin: style.margin,
+                containing: content,
+                top: used_length(style.top, Some(port_h), &style, styles),
+                right: used_length(style.right, Some(port_w), &style, styles),
+                bottom: used_length(style.bottom, Some(port_h), &style, styles),
+                left: used_length(style.left, Some(port_w), &style, styles),
+            };
+            match own_port {
+                Some(port) => {
+                    let (dx, dy) = constraint.offset(port);
+                    offset_box(child, dx, dy);
+                    child.sticky = None;
+                }
+                None => child.sticky = Some(constraint),
+            }
+        }
+        resolve_sticky(child, styles, own_port);
+    }
 }
 
 /// The front-most node under `(x, y)` in y-down pixels.
@@ -192,15 +389,46 @@ pub fn layout_document_interactive(
 /// is often a text node. The box itself is last. `None` when the point misses
 /// the tree. Overflow `hidden` rejects a point outside this box before
 /// descendants are tested, so clipped children are not hits.
+///
+/// Sticky boxes are tested at their in-flow position. Use
+/// [`hit_test_scrolled`] to test them where they are drawn.
 pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
+    hit_test_inner(tree, x, y, None)
+}
+
+/// Like [`hit_test`], with sticky boxes shifted for `viewport`.
+///
+/// `viewport` is the visible page area in page space, such as
+/// `(0, scroll_y, width, height)`. `x` and `y` are page coordinates, so a
+/// caller adds the scroll offset to a window point first.
+pub fn hit_test_scrolled(tree: &LayoutBox, x: f32, y: f32, viewport: Rect) -> Option<NodeId> {
+    hit_test_inner(tree, x, y, Some(viewport))
+}
+
+/// Shared walk for [`hit_test`] and [`hit_test_scrolled`].
+///
+/// A sticky shift moves the point the other way instead of moving boxes,
+/// and moves the viewport with it so nested sticky boxes see the same view.
+fn hit_test_inner(tree: &LayoutBox, x: f32, y: f32, viewport: Option<Rect>) -> Option<NodeId> {
+    let (mut x, mut y, mut viewport) = (x, y, viewport);
+    if let (Some(sticky), Some(port)) = (tree.sticky, viewport) {
+        let (dx, dy) = sticky.offset(port);
+        x -= dx;
+        y -= dy;
+        viewport = Some(Rect {
+            x: port.x - dx,
+            y: port.y - dy,
+            ..port
+        });
+    }
     // Hidden overflow clips hit testing to the border box, not the padding edge.
     if tree.overflow == Overflow::Hidden && !tree.rect.contains(x, y) {
         return None;
     }
     let mut order: Vec<(usize, &LayoutBox)> = tree.children.iter().enumerate().collect();
-    order.sort_by_key(|(idx, child)| (child.z_index, *idx));
+    order.sort_by_key(|(idx, child)| (child.stacking_key(), *idx));
     for (_, child) in order.into_iter().rev() {
-        if let Some(hit) = hit_test(child, x, y) {
+        if let Some(hit) = hit_test_inner(child, x, y, viewport) {
             return Some(hit);
         }
     }
@@ -708,6 +936,7 @@ fn layout_block(
         border_color,
         border_radius: style.border_radius,
         image: decoded_image,
+        sticky: None,
         text,
         children,
     }
@@ -866,6 +1095,7 @@ fn layout_table_row(
         border_color: style.border_color,
         border_radius: style.border_radius,
         image: None,
+        sticky: None,
         text: Vec::new(),
         children,
     }
@@ -1580,6 +1810,7 @@ fn layout_grid(
         border_color: style.border_color,
         border_radius: style.border_radius,
         image: None,
+        sticky: None,
         text: Vec::new(),
         children,
     }
@@ -1677,6 +1908,7 @@ fn layout_flex(
             border_color: style.border_color,
             border_radius: style.border_radius,
             image: None,
+            sticky: None,
             text: Vec::new(),
             children,
         };
@@ -1855,6 +2087,7 @@ fn layout_flex(
         border_color: style.border_color,
         border_radius: style.border_radius,
         image: None,
+        sticky: None,
         text: Vec::new(),
         children,
     }
@@ -1865,6 +2098,9 @@ fn layout_flex(
 fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
     tree.rect.x += dx;
     tree.rect.y += dy;
+    if let Some(sticky) = &mut tree.sticky {
+        *sticky = sticky.translated(dx, dy);
+    }
     for run in &mut tree.text {
         run.x += dx;
         run.y += dy;
@@ -2719,5 +2955,126 @@ mod tests {
         if system_font().is_none() {
             assert_eq!(ch20, 10.0);
         }
+    }
+
+    fn find_box<'a>(doc: &Document, tree: &'a LayoutBox, id: &str) -> &'a LayoutBox {
+        fn find<'a>(doc: &Document, tree: &'a LayoutBox, id: &str) -> Option<&'a LayoutBox> {
+            if doc.get(tree.node).data().attr("id") == Some(id) {
+                return Some(tree);
+            }
+            tree.children.iter().find_map(|child| find(doc, child, id))
+        }
+        find(doc, tree, id).unwrap_or_else(|| panic!("no box for #{id}"))
+    }
+
+    #[test]
+    fn sticky_boxes_follow_the_viewport_inside_their_containing_block() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #wrap { height: 300px; }
+                #bar { position: sticky; top: 10px; height: 20px; }
+                #low { position: sticky; bottom: 0; height: 20px; }
+             </style>
+             <div id=\"wrap\">
+               <div id=\"pre\" style=\"height: 50px\"></div>
+               <div id=\"bar\"></div>
+               <div id=\"filler\" style=\"height: 100px\"></div>
+               <div id=\"low\"></div>
+             </div>
+             <div style=\"height: 400px\"></div>",
+            200.0,
+        );
+        let bar = find_box(&doc, &tree, "bar");
+        assert_eq!(bar.rect.y, 50.0);
+        let sticky = bar.sticky.expect("bar is sticky against the viewport");
+        assert_eq!(sticky.top, Some(10.0));
+        assert_eq!(sticky.bottom, None);
+        assert_eq!(sticky.containing.height, 300.0);
+        let port = |scroll: f32| Rect {
+            x: 0.0,
+            y: scroll,
+            width: 200.0,
+            height: 100.0,
+        };
+        assert_eq!(sticky.offset(port(0.0)), (0.0, 0.0));
+        assert_eq!(sticky.offset(port(100.0)), (0.0, 60.0));
+        // The bar stops at the bottom of #wrap: 300 - 20 - 50.
+        assert_eq!(sticky.offset(port(400.0)), (0.0, 230.0));
+
+        // #low sits at 170..190 and sticks to the viewport bottom.
+        let low = find_box(&doc, &tree, "low").sticky.unwrap();
+        assert_eq!(low.offset(port(0.0)), (0.0, -90.0));
+        assert_eq!(low.offset(port(100.0)), (0.0, 0.0));
+
+        let filler = doc.get_element_by_id("filler").unwrap();
+        let bar_id = doc.get_element_by_id("bar").unwrap();
+        // At scroll 100 the bar is drawn at 110..130, over the filler.
+        assert_eq!(hit_test(&tree, 5.0, 115.0), Some(filler));
+        assert_eq!(
+            hit_test_scrolled(&tree, 5.0, 115.0, port(100.0)),
+            Some(bar_id)
+        );
+        assert_eq!(
+            hit_test_scrolled(&tree, 5.0, 55.0, port(100.0)),
+            Some(doc.get_element_by_id("wrap").unwrap())
+        );
+    }
+
+    #[test]
+    fn sticky_inside_a_clip_is_resolved_in_layout() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #clip { overflow: hidden; height: 100px; padding: 4px; }
+                #s { position: sticky; top: 15px; height: 10px; }
+                #t { position: sticky; top: 300px; height: 10px; }
+             </style>
+             <div id=\"clip\"><div id=\"s\"></div><div id=\"t\"></div></div>",
+            200.0,
+        );
+        let s = find_box(&doc, &tree, "s");
+        assert!(s.sticky.is_none());
+        // The clip's padding box starts at 0, so top: 15px moves s from 4 to 15.
+        assert_eq!(s.rect.y, 15.0);
+        // t would need 300px but stops at the bottom of the 100px content box.
+        let t = find_box(&doc, &tree, "t");
+        assert_eq!(t.rect.y, 94.0);
+    }
+
+    #[test]
+    fn sticky_offset_handles_left_right_and_conflicts() {
+        let c = StickyConstraint {
+            rect: Rect {
+                x: 50.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            margin: Edge::all(2.0),
+            containing: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 10.0,
+            },
+            top: None,
+            right: Some(5.0),
+            bottom: None,
+            left: Some(5.0),
+        };
+        let port = |x: f32, w: f32| Rect {
+            x,
+            y: 0.0,
+            width: w,
+            height: 50.0,
+        };
+        assert_eq!(c.offset(port(100.0, 100.0)), (55.0, 0.0));
+        // Right edge 70 is past 60 - 5, so the box moves left by 15.
+        assert_eq!(c.offset(port(0.0, 60.0)), (-15.0, 0.0));
+        // A port too narrow for both insets: left wins.
+        assert_eq!(c.offset(port(48.0, 10.0)), (3.0, 0.0));
+        // Never past the containing block, margins included.
+        assert_eq!(c.offset(port(500.0, 100.0)), (128.0, 0.0));
     }
 }

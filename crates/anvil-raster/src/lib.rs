@@ -14,6 +14,9 @@
 //! crate does not call `anvil-video`. A video frame is drawn only after the
 //! browser has already copied the surface into an `Image` on the display list.
 //!
+//! Display list layers: a sticky layer is moved by its constraint for the
+//! current scroll and the viewport size, then drawn like any other items.
+//!
 //! Text on Windows tries Win32 GDI in `font` and, if that returns false, the
 //! built-in 5x7 bitmap. Text on Linux loads DejaVu Sans or Liberation Sans
 //! through `anvil-ttf` when one of those files parses. Otherwise the same
@@ -26,7 +29,7 @@ mod font;
 #[cfg(not(anvil_cpp_accel))]
 use anvil_gpu::{GpuColor, sample_linear_gradient, sdf_box_shadow_alpha, sdf_rounded_box};
 use anvil_image::Image;
-use anvil_paint::{DisplayItem, DisplayList};
+use anvil_paint::{DisplayItem, DisplayList, Layer, LayerEffect};
 pub use anvil_style::Color;
 pub use anvil_ttf::{TtfFont, interpret_type2_charstring, interpret_type2_charstring_with_subrs};
 
@@ -1344,7 +1347,7 @@ impl Framebuffer {
     }
 }
 
-/// Paint `list` into a new framebuffer.
+/// Clear color: the first item when it is a large rect at the origin, else white.
 fn resolve_canvas_bg(list: &DisplayList, width: u32) -> Color {
     match list.items.first() {
         Some(DisplayItem::Rect {
@@ -1358,132 +1361,272 @@ fn resolve_canvas_bg(list: &DisplayList, width: u32) -> Color {
     }
 }
 
+/// Paint `list` into `fb` with every non-fixed item moved up by `scroll_y`
+/// and every item moved up by `band_y0`. `viewport_height` is the full
+/// visible height, which sticky boxes need even when `fb` is one band.
 fn paint_list_with_band_offset(
     fb: &mut Framebuffer,
     list: &DisplayList,
     scroll_y: f32,
     band_y0: f32,
+    viewport_height: f32,
 ) {
-    let mut fixed_depth = 0usize;
-    for item in &list.items {
-        let dy = (if fixed_depth > 0 { 0.0 } else { scroll_y }) + band_y0;
-        match item {
-            DisplayItem::PushClip {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                fb.push_clip(*x, *y - dy, *width, *height);
-            }
-            DisplayItem::PopClip => {
-                fb.pop_clip();
-            }
-            DisplayItem::PushFixed => {
-                fixed_depth += 1;
-            }
-            DisplayItem::PopFixed => {
-                fixed_depth = fixed_depth.saturating_sub(1);
-            }
-            DisplayItem::BoxShadow {
-                x,
-                y,
-                width,
-                height,
-                offset_x,
-                offset_y,
-                blur_radius,
-                spread_radius,
-                radius,
-                color,
-            } => {
-                fb.fill_box_shadow(
-                    *x,
-                    *y - dy,
-                    *width,
-                    *height,
-                    *offset_x,
-                    *offset_y,
-                    *blur_radius,
-                    *spread_radius,
-                    *radius,
-                    *color,
-                );
-            }
-            DisplayItem::LinearGradientRect {
-                x,
-                y,
-                width,
-                height,
-                radius,
-                border_width,
-                angle_deg,
-                start_color,
-                end_color,
-                border_color,
-            } => {
-                fb.fill_linear_gradient_rect(
-                    *x,
-                    *y - dy,
-                    *width,
-                    *height,
-                    *radius,
-                    *border_width,
-                    *angle_deg,
-                    *start_color,
-                    *end_color,
-                    *border_color,
-                );
-            }
-            DisplayItem::Rect {
-                x,
-                y,
-                width,
-                height,
-                color,
-            } => {
-                fb.fill_rect(*x, *y - dy, *width, *height, *color);
-            }
-            DisplayItem::RoundedRect {
-                x,
-                y,
-                width,
-                height,
-                radius,
-                border_width,
-                fill_color,
-                border_color,
-            } => {
-                fb.fill_rounded_rect(
-                    *x,
-                    *y - dy,
-                    *width,
-                    *height,
-                    *radius,
-                    *border_width,
-                    *fill_color,
-                    *border_color,
-                );
-            }
-            DisplayItem::Image {
-                x,
-                y,
-                width,
-                height,
-                border_radius,
+    let viewport_width = fb.width as f32;
+    let mut ctx = PaintCtx {
+        scroll_y,
+        band_y0,
+        viewport_width,
+        viewport_height,
+        fixed_depth: 0,
+        offscreen: false,
+        s: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+        sticky_dx: 0.0,
+        sticky_dy: 0.0,
+    };
+    let mut next_layer = 0usize;
+    paint_span(fb, list, 0, list.items.len(), &mut next_layer, &mut ctx);
+}
+
+/// Drawing state while walking a display list.
+///
+/// Items are drawn at `p * s + (tx, ty)` and then moved up by [`Self::dy`].
+/// `sticky_dx` / `sticky_dy` add up the sticky shifts of enclosing layers so
+/// a nested sticky box compares against the same view. `offscreen` is set
+/// while drawing into a layer buffer, where scroll and band offsets are
+/// already part of the map.
+#[derive(Clone, Copy, Debug)]
+struct PaintCtx {
+    scroll_y: f32,
+    band_y0: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    fixed_depth: usize,
+    offscreen: bool,
+    s: f32,
+    tx: f32,
+    ty: f32,
+    sticky_dx: f32,
+    sticky_dy: f32,
+}
+
+impl PaintCtx {
+    /// Vertical offset subtracted from mapped positions.
+    fn dy(&self) -> f32 {
+        if self.offscreen {
+            0.0
+        } else if self.fixed_depth > 0 {
+            self.band_y0
+        } else {
+            self.scroll_y + self.band_y0
+        }
+    }
+
+    /// The viewport in page space for sticky boxes, moved back by the
+    /// shifts of enclosing sticky layers. Fixed content does not scroll.
+    fn sticky_port(&self) -> anvil_paint::Rect {
+        let scroll = if self.fixed_depth > 0 {
+            0.0
+        } else {
+            self.scroll_y
+        };
+        anvil_paint::Rect {
+            x: -self.sticky_dx,
+            y: scroll - self.sticky_dy,
+            width: self.viewport_width,
+            height: self.viewport_height,
+        }
+    }
+}
+
+/// Draw items `start..end`, handing each layer that starts in the span to
+/// its effect. `next_layer` walks [`DisplayList::layers`] in order; layers
+/// that are malformed (empty, out of range, or not nested) are skipped and
+/// their items are drawn plainly.
+fn paint_span(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    start: usize,
+    end: usize,
+    next_layer: &mut usize,
+    ctx: &mut PaintCtx,
+) {
+    let end = end.min(list.items.len());
+    let mut i = start;
+    while i < end {
+        while list
+            .layers
+            .get(*next_layer)
+            .is_some_and(|layer| layer.start < i || layer.start >= layer.end)
+        {
+            *next_layer += 1;
+        }
+        let starts_here = |layer: &Layer| layer.start == i && layer.end <= end;
+        if let Some(layer) = list.layers.get(*next_layer).copied().filter(starts_here) {
+            *next_layer += 1;
+            paint_layer(fb, list, layer, next_layer, ctx);
+            i = layer.end;
+            continue;
+        }
+        paint_item(fb, &list.items[i], ctx);
+        i += 1;
+    }
+}
+
+/// Draw one layer's range with its effect applied.
+fn paint_layer(
+    fb: &mut Framebuffer,
+    list: &DisplayList,
+    layer: Layer,
+    next_layer: &mut usize,
+    ctx: &mut PaintCtx,
+) {
+    match layer.effect {
+        LayerEffect::Sticky(constraint) => {
+            let (dx, dy) = constraint.offset(ctx.sticky_port());
+            let mut inner = PaintCtx {
+                tx: ctx.tx + dx * ctx.s,
+                ty: ctx.ty + dy * ctx.s,
+                sticky_dx: ctx.sticky_dx + dx,
+                sticky_dy: ctx.sticky_dy + dy,
+                ..*ctx
+            };
+            paint_span(fb, list, layer.start, layer.end, next_layer, &mut inner);
+            ctx.fixed_depth = inner.fixed_depth;
+        }
+    }
+}
+
+/// Draw one item through the context's map.
+fn paint_item(fb: &mut Framebuffer, item: &DisplayItem, ctx: &mut PaintCtx) {
+    let s = ctx.s;
+    let dy = ctx.dy();
+    let px = |x: f32| x * s + ctx.tx;
+    let py = |y: f32| y * s + ctx.ty - dy;
+    match item {
+        DisplayItem::PushClip {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            fb.push_clip(px(*x), py(*y), *width * s, *height * s);
+        }
+        DisplayItem::PopClip => {
+            fb.pop_clip();
+        }
+        DisplayItem::PushFixed => {
+            ctx.fixed_depth += 1;
+        }
+        DisplayItem::PopFixed => {
+            ctx.fixed_depth = ctx.fixed_depth.saturating_sub(1);
+        }
+        DisplayItem::BoxShadow {
+            x,
+            y,
+            width,
+            height,
+            offset_x,
+            offset_y,
+            blur_radius,
+            spread_radius,
+            radius,
+            color,
+        } => {
+            fb.fill_box_shadow(
+                px(*x),
+                py(*y),
+                *width * s,
+                *height * s,
+                *offset_x * s,
+                *offset_y * s,
+                *blur_radius * s,
+                *spread_radius * s,
+                *radius * s,
+                *color,
+            );
+        }
+        DisplayItem::LinearGradientRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            border_width,
+            angle_deg,
+            start_color,
+            end_color,
+            border_color,
+        } => {
+            fb.fill_linear_gradient_rect(
+                px(*x),
+                py(*y),
+                *width * s,
+                *height * s,
+                *radius * s,
+                *border_width * s,
+                *angle_deg,
+                *start_color,
+                *end_color,
+                *border_color,
+            );
+        }
+        DisplayItem::Rect {
+            x,
+            y,
+            width,
+            height,
+            color,
+        } => {
+            fb.fill_rect(px(*x), py(*y), *width * s, *height * s, *color);
+        }
+        DisplayItem::RoundedRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            border_width,
+            fill_color,
+            border_color,
+        } => {
+            fb.fill_rounded_rect(
+                px(*x),
+                py(*y),
+                *width * s,
+                *height * s,
+                *radius * s,
+                *border_width * s,
+                *fill_color,
+                *border_color,
+            );
+        }
+        DisplayItem::Image {
+            x,
+            y,
+            width,
+            height,
+            border_radius,
+            image,
+        } => {
+            fb.draw_image(
+                px(*x),
+                py(*y),
+                *width * s,
+                *height * s,
+                *border_radius * s,
                 image,
-            } => {
-                fb.draw_image(*x, *y - dy, *width, *height, *border_radius, image);
-            }
-            DisplayItem::Text {
-                x,
-                y,
-                text,
-                color,
-                font_size,
-            } => {
-                fb.draw_text(*x, *y - dy, text, *font_size, *color);
-            }
+            );
+        }
+        DisplayItem::Text {
+            x,
+            y,
+            text,
+            color,
+            font_size,
+        } => {
+            fb.draw_text(px(*x), py(*y), text, *font_size * s, *color);
         }
     }
 }
@@ -1526,7 +1669,13 @@ pub fn rasterize_parallel(
         for &(band_y0, band_h) in &strips {
             handles.push(s.spawn(move || {
                 let mut band_fb = Framebuffer::new(width, band_h, canvas_bg);
-                paint_list_with_band_offset(&mut band_fb, list, scroll_y, band_y0 as f32);
+                paint_list_with_band_offset(
+                    &mut band_fb,
+                    list,
+                    scroll_y,
+                    band_y0 as f32,
+                    height as f32,
+                );
                 band_fb.pixels
             }));
         }
@@ -1675,7 +1824,11 @@ pub fn rasterize_incremental(
     fb: &mut Framebuffer,
 ) -> usize {
     let mut grid = DirtyTileGrid::new(fb.width, fb.height);
-    if (prev_scroll_y - next_scroll_y).abs() > 0.01 {
+    let viewport_h = fb.height as f32;
+    // A layer can move or reshape everything in its range, so any change to
+    // a list with layers repaints the whole frame.
+    let layered = !prev_list.layers.is_empty() || !next_list.layers.is_empty();
+    if (prev_scroll_y - next_scroll_y).abs() > 0.01 || (layered && prev_list != next_list) {
         grid.dirty.fill(true);
     } else {
         let max_len = prev_list.items.len().max(next_list.items.len());
@@ -1730,147 +1883,22 @@ pub fn rasterize_incremental(
             fb.clips.clear();
             fb.push_clip(x0, y0, tw, th);
             fb.fill_rect(x0, y0, tw, th, canvas_bg);
-            paint_list_with_band_offset(fb, next_list, next_scroll_y, 0.0);
+            paint_list_with_band_offset(fb, next_list, next_scroll_y, 0.0, viewport_h);
             fb.clips.clear();
         }
     }
     dirty_total
 }
 
+/// Paint `list` into a new `width` by `height` framebuffer, scrolled down by `scroll_y`.
+///
+/// The clear color is the first item when it is a large rect at the origin,
+/// otherwise white. Fixed items ignore the scroll. Layers are applied as
+/// described on [`anvil_paint::Layer`].
 pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> Framebuffer {
-    let canvas_bg = match list.items.first() {
-        Some(DisplayItem::Rect {
-            x,
-            y,
-            width: rw,
-            height: rh,
-            color,
-        }) if *x <= 0.0 && *y <= 0.0 && *rw >= (width as f32) * 0.9 && *rh >= 100.0 => *color,
-        _ => PAPER,
-    };
+    let canvas_bg = resolve_canvas_bg(list, width);
     let mut fb = Framebuffer::new(width, height, canvas_bg);
-    let mut fixed_depth = 0usize;
-    for item in &list.items {
-        let dy = if fixed_depth > 0 { 0.0 } else { scroll_y };
-        match item {
-            DisplayItem::PushClip {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                fb.push_clip(*x, *y - dy, *width, *height);
-            }
-            DisplayItem::PopClip => {
-                fb.pop_clip();
-            }
-            DisplayItem::PushFixed => {
-                fixed_depth += 1;
-            }
-            DisplayItem::PopFixed => {
-                fixed_depth = fixed_depth.saturating_sub(1);
-            }
-            DisplayItem::BoxShadow {
-                x,
-                y,
-                width,
-                height,
-                offset_x,
-                offset_y,
-                blur_radius,
-                spread_radius,
-                radius,
-                color,
-            } => {
-                fb.fill_box_shadow(
-                    *x,
-                    *y - dy,
-                    *width,
-                    *height,
-                    *offset_x,
-                    *offset_y,
-                    *blur_radius,
-                    *spread_radius,
-                    *radius,
-                    *color,
-                );
-            }
-            DisplayItem::LinearGradientRect {
-                x,
-                y,
-                width,
-                height,
-                radius,
-                border_width,
-                angle_deg,
-                start_color,
-                end_color,
-                border_color,
-            } => {
-                fb.fill_linear_gradient_rect(
-                    *x,
-                    *y - dy,
-                    *width,
-                    *height,
-                    *radius,
-                    *border_width,
-                    *angle_deg,
-                    *start_color,
-                    *end_color,
-                    *border_color,
-                );
-            }
-            DisplayItem::Rect {
-                x,
-                y,
-                width,
-                height,
-                color,
-            } => {
-                fb.fill_rect(*x, *y - dy, *width, *height, *color);
-            }
-            DisplayItem::RoundedRect {
-                x,
-                y,
-                width,
-                height,
-                radius,
-                border_width,
-                fill_color,
-                border_color,
-            } => {
-                fb.fill_rounded_rect(
-                    *x,
-                    *y - dy,
-                    *width,
-                    *height,
-                    *radius,
-                    *border_width,
-                    *fill_color,
-                    *border_color,
-                );
-            }
-            DisplayItem::Image {
-                x,
-                y,
-                width,
-                height,
-                border_radius,
-                image,
-            } => {
-                fb.draw_image(*x, *y - dy, *width, *height, *border_radius, image);
-            }
-            DisplayItem::Text {
-                x,
-                y,
-                text,
-                color,
-                font_size,
-            } => {
-                fb.draw_text(*x, *y - dy, text, *font_size, *color);
-            }
-        }
-    }
+    paint_list_with_band_offset(&mut fb, list, scroll_y, 0.0, height as f32);
     fb
 }
 
@@ -2039,6 +2067,7 @@ mod tests {
                 height: 5.0,
                 color: red,
             }],
+            layers: Vec::new(),
         };
         let fb = rasterize(&list, 16, 16, 0.0);
         assert_eq!(fb.pixel(2, 3), Some(red));
@@ -2077,6 +2106,7 @@ mod tests {
                 color: ink,
                 font_size: 16.0,
             }],
+            layers: Vec::new(),
         };
         let scrolled = rasterize(&list, 64, 32, 16.0);
         let lit = (0..32)
@@ -2128,6 +2158,7 @@ mod tests {
                 },
                 DisplayItem::PopFixed,
             ],
+            layers: Vec::new(),
         };
         let fb = rasterize(&list, 16, 16, 50.0);
         assert_eq!(fb.pixel(9, 3), Some(gold));
@@ -2180,6 +2211,7 @@ mod tests {
                     border_color: Color::BLACK,
                 },
             ],
+            layers: Vec::new(),
         };
         let fb = rasterize(&list, 20, 20, 0.0);
         let left = fb.pixel(1, 4).unwrap();
@@ -2314,6 +2346,7 @@ mod tests {
                 height: 16.0,
                 color: red,
             }],
+            layers: Vec::new(),
         };
         let next = DisplayList {
             items: vec![
@@ -2332,6 +2365,7 @@ mod tests {
                     color: green,
                 },
             ],
+            layers: Vec::new(),
         };
         {
             let mut fb = rasterize(&prev, 128, 128, 0.0);
@@ -2344,5 +2378,52 @@ mod tests {
             let edge = fb.pixel(80, 80).unwrap();
             assert!(edge.g > 50 && edge.g < 255);
         }
+    }
+
+    #[test]
+    fn sticky_layers_follow_scroll_in_every_raster_path() {
+        use anvil_dom::parse_html;
+        use anvil_layout::layout_document;
+        use anvil_paint::paint;
+        use anvil_style::{compute_styles, parse_css};
+
+        let doc = parse_html(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #wrap { height: 400px; }
+                #bar { position: sticky; top: 0; height: 20px; background: #ff0000; }
+             </style>
+             <div id=\"wrap\"><div style=\"height: 50px\"></div><div id=\"bar\"></div></div>
+             <div style=\"height: 400px\"></div>",
+        );
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let list = paint(&layout_document(&doc, &styles, 40.0));
+        assert_eq!(list.layers.len(), 1);
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let at_top = rasterize(&list, 40, 150, 0.0);
+        assert_eq!(at_top.pixel(5, 55), Some(red));
+        assert_ne!(at_top.pixel(5, 5), Some(red));
+        // Scrolled 100px: the bar sticks to the top edge.
+        let scrolled = rasterize(&list, 40, 150, 100.0);
+        assert_eq!(scrolled.pixel(5, 0), Some(red));
+        assert_eq!(scrolled.pixel(5, 19), Some(red));
+        assert_ne!(scrolled.pixel(5, 20), Some(red));
+        // Past the end of #wrap it scrolls away with it: 380..400 is 0..20 at 380.
+        let past = rasterize(&list, 40, 150, 390.0);
+        assert_ne!(past.pixel(5, 10), Some(red));
+        assert_eq!(past.pixel(5, 5), Some(red));
+        assert_eq!(rasterize_parallel(&list, 40, 150, 100.0), scrolled);
+        let mut fb = at_top.clone();
+        rasterize_incremental(&list, &list, 0.0, 100.0, &mut fb);
+        assert_eq!(fb, scrolled);
+        // Zoom keeps the sticky edge: at 2x the bar is 40px tall at the top.
+        let zoomed = rasterize(&list.scaled(2.0), 80, 150, 200.0);
+        assert_eq!(zoomed.pixel(5, 39), Some(red));
+        assert_ne!(zoomed.pixel(5, 40), Some(red));
     }
 }

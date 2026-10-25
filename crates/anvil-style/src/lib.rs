@@ -416,6 +416,10 @@ pub enum Position {
     Absolute,
     /// Out of flow. Laid out against the origin, not a separate viewport.
     Fixed,
+    /// In flow, then shifted while scrolling so that the box keeps the
+    /// `top` / `right` / `bottom` / `left` distance from the edge of its
+    /// scrollport, without leaving its containing block.
+    Sticky,
 }
 
 /// `overflow` as stored for layout and paint. `scroll` and `auto` become [`Self::Hidden`].
@@ -1416,6 +1420,7 @@ fn apply_declaration(
                 "relative" => Position::Relative,
                 "absolute" => Position::Absolute,
                 "fixed" => Position::Fixed,
+                "sticky" => Position::Sticky,
                 _ => return,
             };
         }

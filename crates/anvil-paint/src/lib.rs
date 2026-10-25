@@ -14,11 +14,15 @@
 //! then image and text, then children from low `z-index` to high. `position:
 //! fixed` wraps that range in [`DisplayItem::PushFixed`] / [`DisplayItem::PopFixed`].
 //!
+//! A sticky box against the viewport also adds a [`Layer`] over its range,
+//! so the rasterizer can move it for the scroll position.
+//!
 //! [`DisplayList::scaled`] multiplies lengths for zoom. Callers use 50%–250%
 //! (`0.5`–`2.5`). The clamp inside that method is wider (`0.25`–`4.0`).
 //! There is no node cap here; the list is as long as the box tree.
 
-use anvil_layout::{Color, Image, LayoutBox, Overflow, Position};
+use anvil_layout::{Color, Edge, Image, LayoutBox, Overflow, Position};
+pub use anvil_layout::{Rect, StickyConstraint};
 
 /// One painting command. Positions and sizes are CSS pixels, y downward.
 ///
@@ -113,9 +117,65 @@ pub enum DisplayItem {
 }
 
 /// Owned sequence of [`DisplayItem`]s in paint order.
+///
+/// `layers` marks item ranges that the rasterizer draws as a group. They are
+/// sorted by `start`, outer layers before the layers they contain, and two
+/// layers either nest or do not overlap. A list with no layers draws exactly
+/// as before layers existed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayList {
     pub items: Vec<DisplayItem>,
+    pub layers: Vec<Layer>,
+}
+
+/// A range `start..end` of [`DisplayList::items`] with one effect.
+///
+/// The range covers one box and its descendants. For a fixed box it sits
+/// inside that box's [`DisplayItem::PushFixed`] / [`DisplayItem::PopFixed`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layer {
+    pub start: usize,
+    pub end: usize,
+    pub effect: LayerEffect,
+}
+
+/// What the rasterizer does with a [`Layer`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LayerEffect {
+    /// Move the range by [`StickyConstraint::offset`] for the scroll position.
+    Sticky(StickyConstraint),
+}
+
+impl Layer {
+    /// This layer with its geometry scaled by `s`, for zoom.
+    pub fn scaled(&self, s: f32) -> Self {
+        let effect = match self.effect {
+            LayerEffect::Sticky(c) => {
+                let sr = |r: Rect| Rect {
+                    x: r.x * s,
+                    y: r.y * s,
+                    width: r.width * s,
+                    height: r.height * s,
+                };
+                let so = |v: Option<f32>| v.map(|v| v * s);
+                LayerEffect::Sticky(StickyConstraint {
+                    rect: sr(c.rect),
+                    margin: Edge {
+                        top: c.margin.top * s,
+                        right: c.margin.right * s,
+                        bottom: c.margin.bottom * s,
+                        left: c.margin.left * s,
+                    },
+                    containing: sr(c.containing),
+                    top: so(c.top),
+                    right: so(c.right),
+                    bottom: so(c.bottom),
+                    left: so(c.left),
+                })
+            }
+        };
+        Self { effect, ..*self }
+    }
 }
 
 impl DisplayList {
@@ -136,130 +196,142 @@ impl DisplayList {
         let items = self
             .items
             .iter()
-            .map(|item| match item {
-                DisplayItem::PushClip {
-                    x,
-                    y,
-                    width,
-                    height,
-                } => DisplayItem::PushClip {
-                    x: x * s,
-                    y: y * s,
-                    width: width * s,
-                    height: height * s,
-                },
-                DisplayItem::PopClip => DisplayItem::PopClip,
-                DisplayItem::PushFixed => DisplayItem::PushFixed,
-                DisplayItem::PopFixed => DisplayItem::PopFixed,
-                DisplayItem::BoxShadow {
-                    x,
-                    y,
-                    width,
-                    height,
-                    offset_x,
-                    offset_y,
-                    blur_radius,
-                    spread_radius,
-                    radius,
-                    color,
-                } => DisplayItem::BoxShadow {
-                    x: x * s,
-                    y: y * s,
-                    width: width * s,
-                    height: height * s,
-                    offset_x: offset_x * s,
-                    offset_y: offset_y * s,
-                    blur_radius: blur_radius * s,
-                    spread_radius: spread_radius * s,
-                    radius: radius * s,
-                    color: *color,
-                },
-                DisplayItem::LinearGradientRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    radius,
-                    border_width,
-                    angle_deg,
-                    start_color,
-                    end_color,
-                    border_color,
-                } => DisplayItem::LinearGradientRect {
-                    x: x * s,
-                    y: y * s,
-                    width: width * s,
-                    height: height * s,
-                    radius: radius * s,
-                    border_width: border_width * s,
-                    angle_deg: *angle_deg,
-                    start_color: *start_color,
-                    end_color: *end_color,
-                    border_color: *border_color,
-                },
-                DisplayItem::Rect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    color,
-                } => DisplayItem::Rect {
-                    x: x * s,
-                    y: y * s,
-                    width: width * s,
-                    height: height * s,
-                    color: *color,
-                },
-                DisplayItem::RoundedRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    radius,
-                    border_width,
-                    fill_color,
-                    border_color,
-                } => DisplayItem::RoundedRect {
-                    x: x * s,
-                    y: y * s,
-                    width: width * s,
-                    height: height * s,
-                    radius: radius * s,
-                    border_width: border_width * s,
-                    fill_color: *fill_color,
-                    border_color: *border_color,
-                },
-                DisplayItem::Image {
-                    x,
-                    y,
-                    width,
-                    height,
-                    border_radius,
-                    image,
-                } => DisplayItem::Image {
-                    x: x * s,
-                    y: y * s,
-                    width: width * s,
-                    height: height * s,
-                    border_radius: border_radius * s,
-                    image: image.clone(),
-                },
-                DisplayItem::Text {
-                    x,
-                    y,
-                    text,
-                    color,
-                    font_size,
-                } => DisplayItem::Text {
-                    x: x * s,
-                    y: y * s,
-                    text: text.clone(),
-                    color: *color,
-                    font_size: font_size * s,
-                },
-            })
+            .map(|item| item.mapped(s, 0.0, 0.0))
             .collect();
-        Self { items }
+        let layers = self.layers.iter().map(|layer| layer.scaled(s)).collect();
+        Self { items, layers }
+    }
+}
+
+impl DisplayItem {
+    /// This item scaled by `s` about the origin, then moved by `(tx, ty)`.
+    ///
+    /// Positions become `p * s + t`. Sizes, radii, blur, spread, border
+    /// width, and font size are multiplied by `s`. Colors, gradient angles,
+    /// text, and images are copied. Markers are unchanged.
+    pub fn mapped(&self, s: f32, tx: f32, ty: f32) -> Self {
+        match self {
+            DisplayItem::PushClip {
+                x,
+                y,
+                width,
+                height,
+            } => DisplayItem::PushClip {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+            },
+            DisplayItem::PopClip => DisplayItem::PopClip,
+            DisplayItem::PushFixed => DisplayItem::PushFixed,
+            DisplayItem::PopFixed => DisplayItem::PopFixed,
+            DisplayItem::BoxShadow {
+                x,
+                y,
+                width,
+                height,
+                offset_x,
+                offset_y,
+                blur_radius,
+                spread_radius,
+                radius,
+                color,
+            } => DisplayItem::BoxShadow {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                offset_x: offset_x * s,
+                offset_y: offset_y * s,
+                blur_radius: blur_radius * s,
+                spread_radius: spread_radius * s,
+                radius: radius * s,
+                color: *color,
+            },
+            DisplayItem::LinearGradientRect {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                angle_deg,
+                start_color,
+                end_color,
+                border_color,
+            } => DisplayItem::LinearGradientRect {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                radius: radius * s,
+                border_width: border_width * s,
+                angle_deg: *angle_deg,
+                start_color: *start_color,
+                end_color: *end_color,
+                border_color: *border_color,
+            },
+            DisplayItem::Rect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => DisplayItem::Rect {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                color: *color,
+            },
+            DisplayItem::RoundedRect {
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                fill_color,
+                border_color,
+            } => DisplayItem::RoundedRect {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                radius: radius * s,
+                border_width: border_width * s,
+                fill_color: *fill_color,
+                border_color: *border_color,
+            },
+            DisplayItem::Image {
+                x,
+                y,
+                width,
+                height,
+                border_radius,
+                image,
+            } => DisplayItem::Image {
+                x: x * s + tx,
+                y: y * s + ty,
+                width: width * s,
+                height: height * s,
+                border_radius: border_radius * s,
+                image: image.clone(),
+            },
+            DisplayItem::Text {
+                x,
+                y,
+                text,
+                color,
+                font_size,
+            } => DisplayItem::Text {
+                x: x * s + tx,
+                y: y * s + ty,
+                text: text.clone(),
+                color: *color,
+                font_size: font_size * s,
+            },
+        }
     }
 }
 
@@ -269,20 +341,26 @@ impl DisplayList {
 /// no fill, shadow, or image. Children are still visited.
 pub fn paint(tree: &LayoutBox) -> DisplayList {
     let mut items = Vec::new();
-    walk(tree, &mut items);
-    DisplayList { items }
+    let mut layers = Vec::new();
+    walk(tree, &mut items, &mut layers);
+    // Layers were pushed as boxes finished, inner first. A stable sort by
+    // start, longest first, puts each outer layer before what it contains.
+    layers.sort_by_key(|layer: &Layer| (layer.start, std::cmp::Reverse(layer.end)));
+    DisplayList { items, layers }
 }
 
 /// Append one box and its descendants. See the crate docs for paint order.
 ///
-/// Child order is `(z_index, source index)` ascending, so a higher `z-index`
-/// paints later and ties keep tree order. The sort is not stable across equal
+/// Child order is [`LayoutBox::stacking_key`], then source index, ascending,
+/// so a higher `z-index` paints later and ties keep tree order, with sticky
+/// boxes after plain siblings of the same `z-index`. The sort is not stable across equal
 /// keys beyond that index.
-fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
+fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>, layers: &mut Vec<Layer>) {
     let is_fixed = tree.position == Position::Fixed;
     if is_fixed {
         items.push(DisplayItem::PushFixed);
     }
+    let layer_start = items.len();
     if let Some(shadow) = tree.box_shadow {
         if tree.rect.width > 0.0 && tree.rect.height > 0.0 && shadow.color.a > 0 {
             items.push(DisplayItem::BoxShadow {
@@ -409,12 +487,20 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
         }
     }
     let mut order: Vec<(usize, &LayoutBox)> = tree.children.iter().enumerate().collect();
-    order.sort_by_key(|(idx, child)| (child.z_index, *idx));
+    order.sort_by_key(|(idx, child)| (child.stacking_key(), *idx));
     for (_, child) in order {
-        walk(child, items);
+        walk(child, items, layers);
     }
     if is_clipped {
         items.push(DisplayItem::PopClip);
+    }
+    let layer_end = items.len();
+    if let Some(sticky) = tree.sticky.filter(|_| layer_end > layer_start) {
+        layers.push(Layer {
+            start: layer_start,
+            end: layer_end,
+            effect: LayerEffect::Sticky(sticky),
+        });
     }
     if is_fixed {
         items.push(DisplayItem::PopFixed);
@@ -500,6 +586,7 @@ mod tests {
             border_color: Color::BLACK,
             border_radius: 0.0,
             image: None,
+            sticky: None,
             text: vec![TextRun {
                 node: NodeId::from_raw(2),
                 text: "Hi".to_string(),

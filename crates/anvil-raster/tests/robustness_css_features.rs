@@ -202,6 +202,9 @@ const PROPERTIES: &[&str] = &[
     "top",
     "position",
     "font-size",
+    "right",
+    "bottom",
+    "overflow",
     "gap",
     "grid-template-columns",
     "grid-template-rows",
@@ -283,6 +286,12 @@ const VALUES: &[&str] = &[
     "chch",
     "ch",
     "0.5CH",
+    "sticky",
+    "fixed",
+    "absolute",
+    "relative",
+    "hidden",
+    "-50%",
 ];
 
 /// Random but CSS-shaped text aimed at the grid properties.
@@ -322,7 +331,20 @@ fn run_pipeline(input: &[u8]) {
         let styles = compute_styles_for_viewport(&doc, &sheet, w, h);
         let tree = layout_document(&doc, &styles, w);
         let list = paint(&tree);
-        let _ = rasterize(&list, 32, 24, 0.0);
+        for scroll in [0.0, 7.5, 1e9] {
+            let _ = rasterize(&list, 32, 24, scroll);
+        }
+        let _ = anvil_layout::hit_test_scrolled(
+            &tree,
+            3.0,
+            4.0,
+            anvil_layout::Rect {
+                x: 0.0,
+                y: 5.0,
+                width: w,
+                height: h,
+            },
+        );
     }
 }
 
