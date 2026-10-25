@@ -2,7 +2,8 @@ Anvil Engine
 Copyright (c) 2026 Buntos
 All rights reserved.
 
-This repository is proprietary. See LICENSE.
+`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are proprietary. See LICENSE.
 
-anvil-image, anvil-json, anvil-ttf, anvil-gpu, and anvil-compress are
-separate repositories. Their licenses are in those repositories.
+`anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and `anvil-compress` are separate Mozilla Public License 2.0 repositories.
+
+`anvil-browser` is a separate repository. Its license is not this file.

@@ -2,23 +2,44 @@ Anvil Engine
 Copyright (c) 2026 Buntos
 All rights reserved.
 
-This repository and the software in it — source, scripts, and build
-files — are proprietary. No license is granted to use, copy, modify,
-merge, publish, distribute, sublicense, or sell any part of it without
-prior written permission from Buntos.
+1. COVERED FILES
+----------------
+This license covers this repository:
+
+- `crates/anvil-dom/`
+- `crates/anvil-style/`
+- `crates/anvil-layout/`
+- `crates/anvil-paint/`
+- `crates/anvil-raster/`
+- `crates/anvil-script/`
+- the build files and documentation in this repository
+
+No license is granted to use, copy, modify, merge, publish, distribute,
+sublicense, or sell any covered file without prior written permission
+from Buntos.
 
 The names "Anvil" and "Anvil Browser" are not licensed for use on any
 other product.
 
-Companion libraries that live in other repositories (anvil-image,
-anvil-json, anvil-ttf, anvil-gpu, and anvil-compress) are not covered
-by this file. Their licenses stay in those repositories.
+2. NOT COVERED
+--------------
+This file does not license:
 
-These crates used to live in anvil-browser. Revisions that were already
+- `anvil-browser` (the window, network stack, sandbox, built-in pages,
+  and brand mark), which has its own proprietary license
+- `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and
+  `anvil-compress`, which are separate Mozilla Public License 2.0
+  repositories
+
+3. EARLIER REVISIONS
+--------------------
+These crates used to live in `anvil-browser`. Revisions that were already
 published there under the Apache License, Version 2.0, stay under that
 license for anyone who already received those revisions. This repository,
 and every later revision, is proprietary.
 
+4. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+---------------------------------------------------
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL

@@ -11,7 +11,8 @@
 # against the document and uses anvil-json. It does not open a socket and does not link anvil-net.
 #
 # anvil-browser links these crates by path. It does not vendor them.
-# The libraries under [workspace.dependencies] are separate repositories next to this one.
+# anvil-browser has its own proprietary license. It is not this file.
+# The libraries under [workspace.dependencies] are separate MPL-2.0 repositories.
 #
 # LicenseRef-Proprietary: this repository.
 # MPL-2.0: anvil-image, anvil-json, anvil-ttf, anvil-gpu. anvil-image also links anvil-compress.
