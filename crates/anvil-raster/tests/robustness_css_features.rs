@@ -11,7 +11,7 @@ use anvil_dom::parse_html;
 use anvil_layout::layout_document;
 use anvil_paint::paint;
 use anvil_raster::{rasterize, rasterize_parallel};
-use anvil_style::{compute_styles_for_viewport, parse_css};
+use anvil_style::{Animator, compute_styles_animated, compute_styles_for_viewport, parse_css};
 
 // ---- shared harness (same text in each repo's robustness test) ----
 
@@ -221,6 +221,14 @@ const PROPERTIES: &[&str] = &[
     "grid-row-end",
     "transform",
     "transform-origin",
+    "opacity",
+    "color",
+    "background",
+    "transition",
+    "transition-property",
+    "transition-duration",
+    "transition-delay",
+    "transition-timing-function",
 ];
 
 /// Values for those properties, valid and broken.
@@ -314,6 +322,27 @@ const VALUES: &[&str] = &[
     "top",
     "right bottom",
     "10px 20%",
+    "0.5",
+    "-1",
+    "1e40",
+    "#f00",
+    "rgba(0, 0, 255, 0.5)",
+    "all",
+    "opacity",
+    "transform,",
+    "1s",
+    "0ms",
+    "-2s",
+    "1e30s",
+    "10ms linear",
+    "ease-in-out",
+    "cubic-bezier(0, 2, 1, -1)",
+    "cubic-bezier(",
+    "steps(3, jump-both)",
+    "steps(99999999999)",
+    "step-start",
+    ",",
+    "width 1ms",
 ];
 
 /// Random but CSS-shaped text aimed at the grid properties.
@@ -370,6 +399,44 @@ fn run_pipeline(input: &[u8]) {
         let _ = anvil_layout::hit_test(&tree, 10.0, 10.0);
         let _ = rasterize_parallel(&list.scaled(2.5), 32, 140, 3.0);
     }
+}
+
+/// Run `input` through animated restyles: its first half, then all of it,
+/// so properties change and transitions start, at a spread of times.
+fn run_animated(input: &[u8]) {
+    let css = String::from_utf8_lossy(input);
+    let half = css
+        .char_indices()
+        .nth(css.chars().count() / 2)
+        .map_or(0, |(i, _)| i);
+    let first = parse_css(&css[..half]);
+    let all = parse_css(&css);
+    let doc = parse_html(PAGE);
+    let mut animator = Animator::new();
+    for (now, sheet) in [
+        (0.0, &first),
+        (0.0, &all),
+        (16.5, &all),
+        (f64::NAN, &first),
+        (40.0, &first),
+        (1e15, &all),
+        (-5.0, &all),
+    ] {
+        animator.tick(now);
+        let styles = compute_styles_animated(&doc, sheet, 64.0, 48.0, &mut animator);
+        let list = paint(&layout_document(&doc, &styles, 64.0));
+        let _ = rasterize(&list, 32, 24, 0.0);
+    }
+}
+
+#[test]
+fn animated_soup_does_not_panic() {
+    run_cases(
+        "animated-soup",
+        73,
+        |rng| css_soup(rng).into_bytes(),
+        run_animated,
+    );
 }
 
 #[test]

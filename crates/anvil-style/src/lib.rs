@@ -27,6 +27,12 @@
 //! ignored. `transform-origin` takes one or two keywords, lengths, or
 //! percentages; a third (z) length is accepted and ignored.
 //!
+//! `opacity` takes a number or a percentage, clamped to `0..=1`.
+//! `transition` and its `-property`, `-duration`, `-delay`, and
+//! `-timing-function` longhands keep up to [`MAX_TRANSITIONS`] entries.
+//! [`compute_styles_animated`] runs them through an [`Animator`]; the plain
+//! `compute_styles` functions ignore them. See [`Animator`] for what moves.
+//!
 //! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
 //! Only `dark` matches a color scheme; `light` and any other value do not.
 //! An inner `@media` replaces the outer query instead of combining with it.
@@ -36,6 +42,13 @@
 
 use anvil_dom::{Document, NodeData, NodeId};
 use std::collections::HashMap;
+
+mod animation;
+pub use animation::{
+    ANIMATABLE, AnimProperty, AnimValue, Animator, FrameClock, MAX_TRANSITIONS, ManualClock,
+    MonotonicClock, StepPosition, TimingFunction, TransitionSpec, Transitions, interpolate,
+    read_value, write_value,
+};
 
 /// A parsed style sheet. Rules are owned, in source order, including rules
 /// that came from inside `@media`.
@@ -760,6 +773,11 @@ pub struct ComputedStyle {
     pub transform: TransformList,
     /// `transform-origin`. Not inherited.
     pub transform_origin: TransformOrigin,
+    /// `opacity` in `0..=1`. Not inherited; it applies to the box and
+    /// everything in it as one group.
+    pub opacity: f32,
+    /// `transition` and its longhands. Not inherited.
+    pub transitions: Transitions,
 }
 
 impl ComputedStyle {
@@ -811,6 +829,8 @@ impl ComputedStyle {
             gap: 0.0,
             transform: TransformList::NONE,
             transform_origin: TransformOrigin::CENTER,
+            opacity: 1.0,
+            transitions: Transitions::INITIAL,
         }
     }
 
@@ -974,20 +994,58 @@ pub fn compute_styles_for_viewport(
     viewport_width: f32,
     viewport_height: f32,
 ) -> StyleMap {
+    cascade_document(doc, sheet, viewport_width, viewport_height, None)
+}
+
+/// Like [`compute_styles_for_viewport`], with transitions run by `animator`
+/// at its current time.
+///
+/// Call [`Animator::tick`] first to move the time. Each element's freshly
+/// cascaded style is compared with the one from the animator's previous
+/// pass; changed properties with a `transition` start moving, and running
+/// transitions are written into the result before children inherit from
+/// it. The first pass for an element starts nothing. See [`Animator`] for
+/// a frame loop.
+pub fn compute_styles_animated(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    viewport_height: f32,
+    animator: &mut Animator,
+) -> StyleMap {
+    animator.begin_pass();
+    let styles = cascade_document(doc, sheet, viewport_width, viewport_height, Some(animator));
+    animator.end_pass();
+    styles
+}
+
+/// Shared body of the `compute_styles` entry points.
+fn cascade_document(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    viewport_height: f32,
+    animator: Option<&mut Animator>,
+) -> StyleMap {
     let viewport_width = viewport_width.max(0.0);
     let viewport_height = viewport_height.max(0.0);
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
-    let mut root_font_px = 16.0_f32;
+    let mut cx = Cascade {
+        sheet,
+        viewport_width,
+        root_font_px: 16.0,
+        animator,
+    };
     walk(
         doc,
         doc.root(),
         &ComputedStyle::initial(),
+        &ComputedStyle::initial(),
         &HashMap::new(),
-        sheet,
-        viewport_width,
-        &mut root_font_px,
+        &mut cx,
         &mut styles,
     );
+    let mut root_font_px = cx.root_font_px;
     if let Some(html_style) = styles.get(doc.html().index()) {
         root_font_px = html_style.font_size;
     }
@@ -997,6 +1055,15 @@ pub fn compute_styles_for_viewport(
         viewport_width,
         viewport_height,
     }
+}
+
+/// What stays the same across one cascade walk.
+struct Cascade<'a> {
+    sheet: &'a Stylesheet,
+    viewport_width: f32,
+    /// Font size of `html` once it is styled; 16 before that.
+    root_font_px: f32,
+    animator: Option<&'a mut Animator>,
 }
 
 /// One past the largest node index reachable from the root.
@@ -1017,69 +1084,92 @@ fn doc_len(doc: &Document) -> usize {
 /// defaults, then author rules, then the inline `style` attribute. Text and
 /// the document node copy `parent` unchanged. `out` must be long enough for
 /// every reachable index; a short slot is skipped.
+///
+/// `parent_base` is the parent's style before animation. With an animator,
+/// each element is cascaded from it for change detection, and again from
+/// the animated `parent` when the two differ, so children inherit animated
+/// values without that counting as a change of their own.
 fn walk(
     doc: &Document,
     id: NodeId,
     parent: &ComputedStyle,
+    parent_base: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
-    sheet: &Stylesheet,
-    viewport_width: f32,
-    root_font_px: &mut f32,
+    cx: &mut Cascade,
     out: &mut [ComputedStyle],
 ) {
-    let parent_font_px = parent.font_size;
     let mut vars = parent_vars.clone();
-    let style = match doc.get(id).data() {
+    let (style, base) = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
-            let mut style = parent.inherited_child();
-            apply_user_agent(&mut style, tag);
-            if doc.get(id).data().attr("hidden").is_some() {
-                style.display = Display::None;
-            }
-            apply_author(
-                &mut style,
-                &mut vars,
-                doc,
-                id,
-                sheet,
-                viewport_width,
-                parent_font_px,
-                *root_font_px,
-            );
-            if let Some(inline_css) = doc.get(id).data().attr("style") {
-                for declaration in parse_declarations(inline_css) {
-                    apply_declaration(
-                        &mut style,
-                        &mut vars,
-                        &declaration,
-                        parent_font_px,
-                        *root_font_px,
-                    );
-                }
-            }
+            let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx);
             if tag == "html" {
-                *root_font_px = style.font_size;
+                cx.root_font_px = base.font_size;
             }
-            style
+            let style = if cx.animator.is_none() {
+                base
+            } else {
+                let mut style = if parent == parent_base {
+                    base
+                } else {
+                    let mut scratch = parent_vars.clone();
+                    cascade_element(doc, id, tag, parent, &mut scratch, cx)
+                };
+                if let Some(animator) = cx.animator.as_deref_mut() {
+                    animator.apply(id, &base, &mut style);
+                }
+                style
+            };
+            (style, base)
         }
-        _ => *parent,
+        _ => (*parent, *parent_base),
     };
     if let Some(slot) = out.get_mut(id.index()) {
         *slot = style;
     }
     let children: Vec<NodeId> = doc.children(id).to_vec();
     for child in children {
-        walk(
-            doc,
-            child,
-            &style,
-            &vars,
-            sheet,
-            viewport_width,
-            root_font_px,
-            out,
-        );
+        walk(doc, child, &style, &base, &vars, cx, out);
     }
+}
+
+/// Cascade one element from `parent`: inherited values, user-agent
+/// defaults, author rules, then the inline `style` attribute.
+fn cascade_element(
+    doc: &Document,
+    id: NodeId,
+    tag: &str,
+    parent: &ComputedStyle,
+    vars: &mut HashMap<String, String>,
+    cx: &Cascade,
+) -> ComputedStyle {
+    let parent_font_px = parent.font_size;
+    let mut style = parent.inherited_child();
+    apply_user_agent(&mut style, tag);
+    if doc.get(id).data().attr("hidden").is_some() {
+        style.display = Display::None;
+    }
+    apply_author(
+        &mut style,
+        vars,
+        doc,
+        id,
+        cx.sheet,
+        cx.viewport_width,
+        parent_font_px,
+        cx.root_font_px,
+    );
+    if let Some(inline_css) = doc.get(id).data().attr("style") {
+        for declaration in parse_declarations(inline_css) {
+            apply_declaration(
+                &mut style,
+                vars,
+                &declaration,
+                parent_font_px,
+                cx.root_font_px,
+            );
+        }
+    }
+    style
 }
 
 /// Apply author rules that match `id`, in specificity order, then source order.
@@ -1519,6 +1609,23 @@ fn apply_declaration(
             if let Some(list) = parse_transform(value) {
                 style.transform = list;
             }
+        }
+        "opacity" => {
+            let parsed = match value.strip_suffix('%') {
+                Some(pct) => pct.trim().parse::<f32>().ok().map(|p| p / 100.0),
+                None => value.parse::<f32>().ok(),
+            };
+            if let Some(opacity) = parsed.filter(|o| !o.is_nan()) {
+                style.opacity = opacity.clamp(0.0, 1.0);
+            }
+        }
+        "transition"
+        | "transition-property"
+        | "transition-duration"
+        | "transition-delay"
+        | "transition-timing-function" => {
+            let name = declaration.name.as_str();
+            animation::apply_transition_declaration(&mut style.transitions, name, value);
         }
         "transform-origin" => {
             if let Some(origin) = parse_transform_origin(value) {
@@ -3005,5 +3112,281 @@ mod tests {
         assert_eq!(parse_transform_origin("10px left"), None);
         assert_eq!(parse_transform_origin("top bottom"), None);
         assert_eq!(parse_transform_origin("1px 2px 3%"), None);
+    }
+
+    #[test]
+    fn parses_opacity_and_transition_lists() {
+        let doc = parse_html("<div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div>");
+        let sheet = parse_css(
+            "#a { opacity: 40%; transition: opacity 1s ease-in, transform 250ms steps(4, jump-none) -50ms; }
+             #b { opacity: 2; transition-property: color, width; transition-duration: 2s;
+                  transition-timing-function: cubic-bezier(0.1, -1, 0.9, 2), linear;
+                  transition-delay: 10ms, 20ms, 30ms; transition: bogus 1s 2s 3s; }
+             #c { opacity: -1; opacity: nope; transition: 1s; transition-property: none;
+                  transition-duration: -1s; transition-timing-function: cubic-bezier(2, 0, 0, 1); }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let get = |id: &str| *styles.get(doc.get_element_by_id(id).unwrap());
+        assert_eq!(get("a").opacity, 0.4);
+        assert_eq!(get("b").opacity, 1.0);
+        assert_eq!(get("c").opacity, 0.0);
+        let a = get("a").transitions;
+        assert_eq!(
+            a.properties(),
+            [AnimProperty::Opacity, AnimProperty::Transform]
+        );
+        assert_eq!(
+            a.spec_for(AnimProperty::Opacity),
+            Some(TransitionSpec {
+                duration_ms: 1000.0,
+                delay_ms: 0.0,
+                timing: TimingFunction::CubicBezier(0.42, 0.0, 1.0, 1.0),
+            })
+        );
+        assert_eq!(
+            a.spec_for(AnimProperty::Transform),
+            Some(TransitionSpec {
+                duration_ms: 250.0,
+                delay_ms: -50.0,
+                timing: TimingFunction::Steps(4, StepPosition::None),
+            })
+        );
+        assert_eq!(a.spec_for(AnimProperty::Color), None);
+        // Short lists repeat; the bad shorthand (three times) is ignored.
+        let b = get("b").transitions;
+        assert_eq!(
+            b.spec_for(AnimProperty::Width),
+            Some(TransitionSpec {
+                duration_ms: 2000.0,
+                delay_ms: 20.0,
+                timing: TimingFunction::Linear,
+            })
+        );
+        assert_eq!(
+            b.spec_for(AnimProperty::Color).map(|s| s.timing),
+            Some(TimingFunction::CubicBezier(0.1, -1.0, 0.9, 2.0))
+        );
+        // `none` turns everything off; the bad duration and curve are ignored.
+        let c = get("c").transitions;
+        assert!(c.properties().is_empty());
+        assert_eq!(c.spec_for(AnimProperty::Opacity), None);
+    }
+
+    #[test]
+    fn timing_functions_follow_their_curves() {
+        let f = |s: &str| TimingFunction::parse(s).unwrap();
+        assert_eq!(f("linear").eval(0.25), 0.25);
+        // The curve constants are f32, so symmetric curves are off by ~1e-8.
+        assert!((f("ease-in-out").eval(0.5) - 0.5).abs() < 1e-6);
+        assert!((f("ease").eval(0.5) - 0.802_403_4).abs() < 1e-5);
+        assert!((f("ease-in").eval(0.5) - 0.315_356_2).abs() < 1e-5);
+        assert!((f("ease-out").eval(0.5) - 0.684_643_8).abs() < 1e-5);
+        assert!((f("cubic-bezier(0, 0, 1, 1)").eval(0.3) - 0.3).abs() < 1e-6);
+        assert_eq!(f("ease").eval(-1.0), 0.0);
+        assert_eq!(f("ease").eval(f64::NAN), 0.0);
+        assert_eq!(f("ease").eval(2.0), 1.0);
+        assert_eq!(f("steps(4)").eval(0.3), 0.25);
+        assert_eq!(f("steps(4, start)").eval(0.3), 0.5);
+        assert_eq!(f("steps(5, jump-none)").eval(0.5), 0.5);
+        assert_eq!(f("steps(3, jump-both)").eval(0.5), 0.5);
+        assert_eq!(f("step-end").eval(0.99), 0.0);
+        assert_eq!(f("step-start").eval(0.0), 1.0);
+        assert_eq!(f("steps(2)").eval(1.0), 1.0);
+        for bad in [
+            "steps(0)",
+            "steps(1, jump-none)",
+            "steps(2, middle)",
+            "cubic-bezier(1.5, 0, 0, 1)",
+            "cubic-bezier(0, 0, 1)",
+            "bounce",
+        ] {
+            assert_eq!(TimingFunction::parse(bad), None, "{bad}");
+        }
+    }
+
+    /// Restyle `doc` at `now` and return `id`'s style.
+    fn frame(
+        animator: &mut Animator,
+        doc: &Document,
+        sheet: &Stylesheet,
+        now: f64,
+        id: &str,
+    ) -> ComputedStyle {
+        animator.tick(now);
+        let styles = compute_styles_animated(doc, sheet, 800.0, 600.0, animator);
+        *styles.get(doc.get_element_by_id(id).unwrap())
+    }
+
+    #[test]
+    fn runs_transitions_on_an_injected_clock() {
+        let mut doc = parse_html("<div id=\"a\"><p id=\"kid\">x</p></div>");
+        let sheet = parse_css(
+            "#a { opacity: 1; color: #ff0000; width: 10px;
+                  transition: opacity 100ms linear, color 100ms linear 50ms, width 100ms linear; }
+             #kid { transition: opacity 1s linear; }",
+        );
+        let clock = ManualClock::new();
+        let mut animator = Animator::new();
+        let a = doc.get_element_by_id("a").unwrap();
+        // The first pass only records the style.
+        let style = frame(&mut animator, &doc, &sheet, clock.now_ms(), "a");
+        assert_eq!(style.opacity, 1.0);
+        assert!(!animator.is_animating());
+
+        doc.set_attribute(a, "style", "opacity: 0; color: #0000ff; width: 50%");
+        clock.set(1000.0);
+        let style = frame(&mut animator, &doc, &sheet, clock.now_ms(), "a");
+        assert_eq!(style.opacity, 1.0);
+        assert_eq!(
+            style.width,
+            Size::Calc {
+                px: 10.0,
+                percent: 0.0,
+                em: 0.0,
+                rem: 0.0
+            }
+        );
+        assert!(animator.is_animating());
+
+        clock.advance(25.0);
+        assert!(animator.tick_clock(&clock));
+        let style = frame(&mut animator, &doc, &sheet, clock.now_ms(), "a");
+        assert_eq!(style.opacity, 0.75);
+        assert_eq!(
+            style.width,
+            Size::Calc {
+                px: 7.5,
+                percent: 12.5,
+                em: 0.0,
+                rem: 0.0
+            }
+        );
+        // Color waits out its 50ms delay at the old value.
+        assert_eq!(
+            style.color,
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
+
+        clock.advance(75.0);
+        let style = frame(&mut animator, &doc, &sheet, clock.now_ms(), "a");
+        assert_eq!(style.opacity, 0.0);
+        assert_eq!(style.width, Size::Percent(50.0));
+        assert_eq!(
+            style.color,
+            Color {
+                r: 128,
+                g: 0,
+                b: 128,
+                a: 255
+            }
+        );
+        // The child inherits the moving color.
+        let kid = frame(&mut animator, &doc, &sheet, clock.now_ms(), "kid");
+        assert_eq!(kid.color, style.color);
+
+        assert!(!animator.tick(1150.0));
+        let style = frame(&mut animator, &doc, &sheet, 1150.0, "a");
+        assert_eq!(
+            style.color,
+            Color {
+                r: 0,
+                g: 0,
+                b: 255,
+                a: 255
+            }
+        );
+        assert!(!animator.is_animating());
+        // Time does not run backward.
+        animator.tick(5.0);
+        assert_eq!(animator.now_ms(), 1150.0);
+    }
+
+    #[test]
+    fn interrupted_transitions_restart_from_the_current_value() {
+        let mut doc = parse_html("<div id=\"a\"></div>");
+        let sheet = parse_css("#a { transition: transform 100ms linear, height 100ms linear; }");
+        let a = doc.get_element_by_id("a").unwrap();
+        let mut animator = Animator::new();
+        frame(&mut animator, &doc, &sheet, 0.0, "a");
+        doc.set_attribute(a, "style", "transform: translateX(100px); height: 20px");
+        frame(&mut animator, &doc, &sheet, 0.0, "a");
+        let style = frame(&mut animator, &doc, &sheet, 50.0, "a");
+        assert_eq!(
+            style.transform.functions(),
+            [TransformFn::Translate(Size::Px(50.0), Size::Px(0.0))]
+        );
+        // `auto` to a length does not blend, so height jumps.
+        assert_eq!(style.height, Size::Px(20.0));
+        // Going back starts at 50px and takes the full duration.
+        doc.set_attribute(a, "style", "transform: none");
+        frame(&mut animator, &doc, &sheet, 50.0, "a");
+        let style = frame(&mut animator, &doc, &sheet, 100.0, "a");
+        assert_eq!(
+            style.transform.functions(),
+            [TransformFn::Translate(Size::Px(25.0), Size::Px(0.0))]
+        );
+        // Lists of different shapes blend as matrices.
+        doc.set_attribute(a, "style", "transform: rotate(0deg); transition: none");
+        frame(&mut animator, &doc, &sheet, 300.0, "a");
+        doc.set_attribute(a, "style", "transform: scale(2)");
+        frame(&mut animator, &doc, &sheet, 300.0, "a");
+        let style = frame(&mut animator, &doc, &sheet, 350.0, "a");
+        assert_eq!(
+            style.transform.functions(),
+            [TransformFn::Matrix([1.5, 0.0, 0.0, 1.5, 0.0, 0.0])]
+        );
+        // A hidden element starts nothing, and removed elements are forgotten.
+        doc.set_attribute(a, "style", "display: none; transform: scale(3)");
+        frame(&mut animator, &doc, &sheet, 500.0, "a");
+        assert!(!animator.is_animating());
+        doc.set_attribute(a, "style", "transform: scale(4)");
+        frame(&mut animator, &doc, &sheet, 500.0, "a");
+        assert!(!animator.is_animating());
+        let root = doc.body();
+        doc.set_attribute(a, "style", "transform: scale(1)");
+        doc.remove_child(root, a).unwrap();
+        frame_all(&mut animator, &doc, &sheet, 600.0);
+        assert!(!animator.is_animating());
+    }
+
+    #[test]
+    fn far_apart_ends_blend_exactly_at_both_ends() {
+        let (a, b) = (AnimValue::Number(1e30), AnimValue::Number(-370.0));
+        assert_eq!(interpolate(a, b, 0.0), Some(a));
+        assert_eq!(interpolate(a, b, 1.0), Some(b));
+        assert_eq!(interpolate(b, a, 0.0), Some(b));
+        assert_eq!(interpolate(b, a, 1.0), Some(a));
+        let (a, b) = (
+            AnimValue::Length(Size::Px(1e30)),
+            AnimValue::Length(Size::Px(-370.0)),
+        );
+        assert_eq!(interpolate(a, b, 0.0), Some(a));
+        assert_eq!(interpolate(a, b, 1.0), Some(b));
+
+        // A running transition starts on the old value and reaches the new one.
+        let mut doc = parse_html("<div id=\"a\"></div>");
+        let sheet = parse_css("#a { margin-left: 1e30px; transition: margin-left 100ms linear; }");
+        let a = doc.get_element_by_id("a").unwrap();
+        let mut animator = Animator::new();
+        let style = frame(&mut animator, &doc, &sheet, 0.0, "a");
+        assert_eq!(style.margin.left, 1e30);
+        doc.set_attribute(a, "style", "margin-left: -370px");
+        let style = frame(&mut animator, &doc, &sheet, 0.0, "a");
+        assert_eq!(style.margin.left, 1e30);
+        assert!(animator.is_animating());
+        let style = frame(&mut animator, &doc, &sheet, 100.0, "a");
+        assert_eq!(style.margin.left, -370.0);
+        assert!(!animator.is_animating());
+    }
+
+    /// Restyle `doc` at `now` without reading any element.
+    fn frame_all(animator: &mut Animator, doc: &Document, sheet: &Stylesheet, now: f64) {
+        animator.tick(now);
+        compute_styles_animated(doc, sheet, 800.0, 600.0, animator);
     }
 }

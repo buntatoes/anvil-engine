@@ -134,6 +134,9 @@ pub struct LayoutBox {
     /// every descendant rect stay untransformed. `None` when the box has
     /// no transform.
     pub transform: Option<Transform2D>,
+    /// `opacity` of this box, applied to it and its descendants as one
+    /// group. 1 is opaque.
+    pub opacity: f32,
     pub text: Vec<TextRun>,
     pub children: Vec<LayoutBox>,
 }
@@ -142,11 +145,13 @@ impl LayoutBox {
     /// Sort key among siblings for paint and hit-test order: `z-index`
     /// first, then boxes that form their own layer after plain boxes.
     ///
-    /// Sticky and transformed boxes are such layers, so content that
-    /// follows a sticky header in the tree scrolls under it rather than over
-    /// it. Relative, absolute, and fixed boxes keep plain tree order, as before.
+    /// Sticky, transformed, and translucent boxes are such layers, so
+    /// content that follows a sticky header in the tree scrolls under it
+    /// rather than over it. Relative, absolute, and fixed boxes keep plain
+    /// tree order, as before.
     pub fn stacking_key(&self) -> (i32, u8) {
-        let layered = self.position == Position::Sticky || self.transform.is_some();
+        let layered =
+            self.position == Position::Sticky || self.transform.is_some() || self.opacity < 1.0;
         (self.z_index, u8::from(layered))
     }
 }
@@ -316,17 +321,21 @@ fn box_transform(rect: Rect, style: &ComputedStyle, styles: &StyleMap) -> Transf
         .then_inner(&Transform2D::translate(-ox, -oy))
 }
 
-/// Give every transformed box its [`LayoutBox::transform`], once boxes
-/// have their final positions. Only element boxes that are not inline are
-/// transformable; text keeps its parent's style but not a box of its own.
-fn resolve_transforms(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
+/// Give every box its [`LayoutBox::transform`] and [`LayoutBox::opacity`],
+/// once boxes have their final positions. Only element boxes that are not
+/// inline are transformable; text keeps its parent's style but not a box of
+/// its own.
+fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
     let style = styles.get(tree.node);
     let is_element = doc.get(tree.node).data().tag().is_some();
     if is_element && !style.transform.is_none() && style.display != Display::Inline {
         tree.transform = Some(box_transform(tree.rect, style, styles));
     }
+    if is_element {
+        tree.opacity = style.opacity;
+    }
     for child in &mut tree.children {
-        resolve_transforms(child, doc, styles);
+        resolve_effects(child, doc, styles);
     }
 }
 
@@ -504,7 +513,7 @@ pub fn layout_document_interactive(
         None,
     );
     resolve_sticky(&mut tree, styles, None);
-    resolve_transforms(&mut tree, doc, styles);
+    resolve_effects(&mut tree, doc, styles);
     tree
 }
 
@@ -1139,6 +1148,7 @@ fn layout_block(
         image: decoded_image,
         sticky: None,
         transform: None,
+        opacity: 1.0,
         text,
         children,
     }
@@ -1299,6 +1309,7 @@ fn layout_table_row(
         image: None,
         sticky: None,
         transform: None,
+        opacity: 1.0,
         text: Vec::new(),
         children,
     }
@@ -2015,6 +2026,7 @@ fn layout_grid(
         image: None,
         sticky: None,
         transform: None,
+        opacity: 1.0,
         text: Vec::new(),
         children,
     }
@@ -2114,6 +2126,7 @@ fn layout_flex(
             image: None,
             sticky: None,
             transform: None,
+            opacity: 1.0,
             text: Vec::new(),
             children,
         };
@@ -2294,6 +2307,7 @@ fn layout_flex(
         image: None,
         sticky: None,
         transform: None,
+        opacity: 1.0,
         text: Vec::new(),
         children,
     }

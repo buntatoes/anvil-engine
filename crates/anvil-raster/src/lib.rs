@@ -21,7 +21,9 @@
 //! into a layer buffer and resampled with bilinear filtering, so its edges
 //! are smoothed. Clips inside the layer turn with it; clips from outside it
 //! stay screen-aligned. A transform that cannot be inverted draws nothing.
-//! Fixed boxes inside a transformed box move with it.
+//! Fixed boxes inside a transformed box move with it. An opacity layer is
+//! drawn the same way with no transform and blended at its opacity; at 0 it
+//! draws nothing.
 //!
 //! Text on Windows tries Win32 GDI in `font` and, if that returns false, the
 //! built-in 5x7 bitmap. Text on Linux loads DejaVu Sans or Liberation Sans
@@ -1504,6 +1506,18 @@ fn paint_layer(
         LayerEffect::Transform(m) => {
             paint_mapped_layer(fb, list, layer, m, 1.0, next_layer, ctx);
         }
+        LayerEffect::Opacity(opacity) => {
+            let opacity = if opacity.is_nan() { 1.0 } else { opacity };
+            paint_mapped_layer(
+                fb,
+                list,
+                layer,
+                Transform2D::IDENTITY,
+                opacity,
+                next_layer,
+                ctx,
+            );
+        }
     }
 }
 
@@ -2844,5 +2858,72 @@ mod tests {
                 "{transform}"
             );
         }
+    }
+
+    #[test]
+    fn opacity_blends_the_box_as_one_group() {
+        // Two overlapping red boxes in a half-opaque parent: the overlap
+        // matches the rest, and a zero-opacity box draws nothing.
+        let list = page_list(
+            "<style>html, body, div { margin: 0; padding: 0; }
+             #group { opacity: 0.5; height: 20px; }
+             #a { width: 20px; height: 20px; background: #ff0000; }
+             #b { position: absolute; left: 10px; top: 0; width: 20px; height: 20px;
+                  background: #ff0000; }
+             #gone { opacity: 0; width: 20px; height: 20px; background: #0000ff; }
+             </style><div id=\"group\"><div id=\"a\"></div><div id=\"b\"></div></div>
+             <div id=\"gone\"></div>",
+            40.0,
+        );
+        let fb = rasterize(&list, 40, 60, 0.0);
+        let pink = Color {
+            r: 255,
+            g: 128,
+            b: 128,
+            a: 255,
+        };
+        assert_eq!(fb.pixel(5, 5), Some(pink));
+        assert_eq!(fb.pixel(15, 5), Some(pink));
+        assert_eq!(fb.pixel(25, 19), Some(pink));
+        assert_eq!(fb.pixel(35, 5), Some(Color::WHITE));
+        assert_eq!(fb.pixel(5, 25), Some(Color::WHITE));
+        assert_eq!(
+            rasterize_parallel(&list, 40, 300, 0.0).pixel(15, 5),
+            Some(pink)
+        );
+    }
+
+    #[test]
+    fn a_frame_loop_moves_a_transition_across_the_canvas() {
+        use anvil_dom::parse_html;
+        use anvil_layout::layout_document;
+        use anvil_paint::paint;
+        use anvil_style::{Animator, ManualClock, compute_styles_animated, parse_css};
+
+        let mut doc = parse_html(
+            "<style>html, body, div { margin: 0; padding: 0; }
+             #box { width: 10px; height: 10px; background: #ff0000;
+                    transition: transform 200ms linear; }</style><div id=\"box\"></div>",
+        );
+        let sheet = parse_css(&doc.embedded_css());
+        let clock = ManualClock::new();
+        let mut animator = Animator::new();
+        let draw = |doc: &anvil_dom::Document, animator: &mut Animator| {
+            let more = animator.tick_clock(&clock);
+            let styles = compute_styles_animated(doc, &sheet, 60.0, 20.0, animator);
+            let fb = rasterize(&paint(&layout_document(doc, &styles, 60.0)), 60, 20, 0.0);
+            let left = (0..60).find(|&x| fb.pixel(x, 5) == Some(RED));
+            (more || animator.is_animating(), left)
+        };
+        assert_eq!(draw(&doc, &mut animator), (false, Some(0)));
+        let id = doc.get_element_by_id("box").unwrap();
+        doc.set_attribute(id, "style", "transform: translateX(40px)");
+        assert_eq!(draw(&doc, &mut animator), (true, Some(0)));
+        clock.advance(50.0);
+        assert_eq!(draw(&doc, &mut animator), (true, Some(10)));
+        clock.advance(100.0);
+        assert_eq!(draw(&doc, &mut animator), (true, Some(30)));
+        clock.advance(50.0);
+        assert_eq!(draw(&doc, &mut animator), (false, Some(40)));
     }
 }

@@ -17,8 +17,9 @@
 //! A sticky box against the viewport also adds a [`Layer`] over its range,
 //! so the rasterizer can move it for the scroll position. A transformed box
 //! adds a transform layer the same way; items inside it keep their
-//! untransformed page coordinates. When one box has both, the sticky layer
-//! is the outer one.
+//! untransformed page coordinates. A box with `opacity` below 1 adds an
+//! opacity layer. When one box has several, the sticky layer is outermost,
+//! then the transform, then the opacity.
 //!
 //! [`DisplayList::scaled`] multiplies lengths for zoom. Callers use 50%–250%
 //! (`0.5`–`2.5`). The clamp inside that method is wider (`0.25`–`4.0`).
@@ -151,6 +152,9 @@ pub enum LayerEffect {
     /// layers. Clips inside the range are mapped with it; clips outside it
     /// stay screen-aligned.
     Transform(Transform2D),
+    /// Draw the range as one group, then blend it at this opacity in
+    /// `0..1`, so overlapping items inside do not show through each other.
+    Opacity(f32),
 }
 
 impl Layer {
@@ -181,6 +185,7 @@ impl Layer {
                 })
             }
             LayerEffect::Transform(m) => LayerEffect::Transform(m.scaled(s)),
+            LayerEffect::Opacity(o) => LayerEffect::Opacity(o),
         };
         Self { effect, ..*self }
     }
@@ -516,6 +521,7 @@ fn walk(
         let effects = [
             tree.sticky.map(LayerEffect::Sticky),
             tree.transform.map(LayerEffect::Transform),
+            (tree.opacity < 1.0).then_some(LayerEffect::Opacity(tree.opacity.max(0.0))),
         ];
         for effect in effects.into_iter().flatten() {
             let layer = Layer {
@@ -612,6 +618,7 @@ mod tests {
             image: None,
             sticky: None,
             transform: None,
+            opacity: 1.0,
             text: vec![TextRun {
                 node: NodeId::from_raw(2),
                 text: "Hi".to_string(),
