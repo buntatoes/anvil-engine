@@ -53,6 +53,35 @@ Not supported, or different:
 
 Limits: a turn spends at most 100,000 steps. Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 64 timers and 8,192 queued microtasks are kept at once. Scripts that use the event loop always run on the Rust interpreter. The numeric compiler rejects them.
 
+## CSS support
+
+The crate docs list every property. These are the newer parts and their limits.
+
+### Grid
+
+- Supported: `grid-template-columns` and `grid-template-rows` with `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()`; `grid-auto-rows`; `grid-column`, `grid-row`, their `-start` / `-end` longhands, and numeric `grid-area`, with line numbers, negative lines, and `span N`; sparse row-by-row auto-placement that flows around spanning items; `align-items: center` and `end` inside grid areas.
+- Not supported: named lines, `grid-template-areas` and named `grid-area`, `grid-auto-flow`, `grid-auto-columns`, `auto-fill` / `auto-fit`, `subgrid`, and implicit tracks before line 1 (such an item starts at line 1). Lines past 100 are clamped. An `auto` column acts as `1fr`.
+
+### `ch`
+
+- Supported on `width`, `height`, `max-width`, and the offsets. One `ch` is the advance of `0` in the system font when anvil-ttf loads one (Windows); otherwise it is half the font size, the advance layout uses for every character.
+- Not supported: `ch` in margin, padding, border, `gap`, `font-size`, or `calc()`.
+
+### `position: sticky`
+
+- Supported: `top`, `right`, `bottom`, and `left` (`px`, `%`, and the other length units) against the viewport or the nearest ancestor with hidden overflow, bounded by the parent's content box. Viewport stickiness is applied at draw time for the scroll position, in every raster path and at every zoom; `hit_test_scrolled` finds boxes where they are drawn. `top` wins over `bottom` and `left` over `right`.
+- Not supported: scrolling overflow containers (`overflow: auto` and `scroll` clip but do not scroll, so a sticky box inside one is placed once) and horizontal page scrolling.
+
+### Transforms
+
+- Supported: `transform` with up to 8 of `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`, `scaleY()`, `rotate()`, `skew()`, `skewX()`, `skewY()`, and `matrix()`; `transform-origin` with keywords, lengths, and percentages. Painting and `hit_test` use the transformed shape. Moves and even scales draw directly; other transforms are resampled with smoothed edges. A box's own clip turns with it; clips from its ancestors stay screen-aligned. A transform that cannot be inverted draws nothing and is never hit.
+- Not supported: 3D functions, `perspective`, `transform-style`, `transform-box`, the standalone `translate`, `rotate`, and `scale` properties, and `calc()` inside a function. Transforms do not change layout or scrollable size, and they do not become the containing block for fixed or absolute descendants (those are still drawn through the transform). Inline boxes are not transformed. A rotated or skewed layer is drawn into a buffer of at most 2048 pixels per side.
+
+### Opacity, transitions, and animations
+
+- Supported: `opacity` (one group per box); `transition` and its longhands; `animation` and its longhands with `@keyframes`, iteration counts including `infinite`, all four directions, and all four fill modes; `ease`, `linear`, `ease-in`, `ease-out`, `ease-in-out`, `cubic-bezier()`, `steps()`, `step-start`, and `step-end`. Lengths, colors, opacity, and transforms blend, along with margins, padding, `border-radius`, `font-size`, and `gap`. They run through `compute_styles_animated` with an `Animator`, whose `tick(now_ms)` takes the time from any clock and says whether another frame is needed.
+- Not supported: transition and animation events, `animation-play-state`, `animation-composition`, `transition-behavior`, shortened reverse transitions, and blending `auto` with a length. `compute_styles` and the other plain cascade functions do not animate. At most 8 transitions and 4 animations per element.
+
 ## Build
 
 Clone this repository, `anvil-browser`, and the libraries below as sibling directories.
