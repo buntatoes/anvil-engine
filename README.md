@@ -26,6 +26,33 @@ There are no crates.io dependencies.
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
 
+## Scripts
+
+`anvil-script` runs timers and promises on its own event loop. After each task the whole microtask queue is drained. Timers fire by due time, then in the order they were set, on a virtual clock that does not follow wall time. A timer set while a timer callback itself runs waits at least 4 ms. Timers set from the microtasks that callback queues, or after an `await` in an async timer callback, keep the delay they ask for.
+
+Supported:
+
+- `new Promise`, `then`, `catch`, `finally`, and `Promise.resolve`, `reject`, `all`, `allSettled`, `race`, `any`
+- A promise resolved with another promise follows it. A class instance with a `then` method is called like one
+- A rejection with no handler is counted (`unhandled_rejections()`) and does not stop the page
+- `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`. `requestAnimationFrame` runs as a timer
+- `async function`, async arrows (also called in place, as in `(async () => { ... })()`), async callbacks passed to `then`, timers, and `queueMicrotask`
+- `await` suspends the async function. It resumes from a microtask, so code after the call runs first. This works inside `if`, `while`, `for`, `for...of`, blocks, and `try`/`catch`/`finally`
+- `for await...of` over an array of values and promises
+- Overlapping calls of one async function keep their own parameters and locals
+- An async call that is not awaited, from the script or from inside another async function, still runs to its end
+
+Not supported, or different:
+
+- Async generators, and `for await...of` over anything but an array
+- Objects with a `then` property that are not class instances are plain values
+- An `await` in a `switch`, a `do...while`, a loop condition, or at the top level of a script waits in place. It runs the event loop until the promise settles instead of yielding
+- `async` class methods return a promise, but their awaits wait in place
+- A callback created inside an async function gets a copy of that function's locals, not a live link
+- No `unhandledrejection` event
+
+Limits: a turn spends at most 100,000 steps. Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 64 timers and 8,192 queued microtasks are kept at once. Scripts that use the event loop always run on the Rust interpreter. The numeric compiler rejects them.
+
 ## Build
 
 Clone this repository, `anvil-browser`, and the libraries below as sibling directories.
