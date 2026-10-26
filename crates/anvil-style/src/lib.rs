@@ -927,13 +927,74 @@ pub fn parse_css(input: &str) -> Stylesheet {
     sheet
 }
 
+/// Characters of a style sheet that are outside quoted strings, with
+/// their byte offsets.
+///
+/// Quotes and everything inside them are skipped, and so is a backslash
+/// with the character it escapes, inside or outside a string. A string
+/// ends at its closing quote, at an unescaped newline, or at the end of the
+/// input, as in CSS syntax. [`Unquoted::in_string`] says whether the input
+/// ended inside a string.
+pub(crate) struct Unquoted<'a> {
+    chars: std::str::CharIndices<'a>,
+    quote: Option<char>,
+}
+
+impl<'a> Unquoted<'a> {
+    pub(crate) fn new(src: &'a str) -> Self {
+        Unquoted {
+            chars: src.char_indices(),
+            quote: None,
+        }
+    }
+
+    /// True while the scan is inside a string.
+    pub(crate) fn in_string(&self) -> bool {
+        self.quote.is_some()
+    }
+}
+
+impl Iterator for Unquoted<'_> {
+    type Item = (usize, char);
+
+    fn next(&mut self) -> Option<(usize, char)> {
+        loop {
+            let (idx, ch) = self.chars.next()?;
+            match self.quote {
+                Some(quote) => {
+                    if ch == '\\' {
+                        self.chars.next();
+                    } else if ch == quote || ch == '\n' {
+                        self.quote = None;
+                    }
+                }
+                None => match ch {
+                    '\\' => {
+                        self.chars.next();
+                    }
+                    '"' | '\'' => self.quote = Some(ch),
+                    _ => return Some((idx, ch)),
+                },
+            }
+        }
+    }
+}
+
+/// Byte index of the first `wanted` outside strings, or `None`.
+pub(crate) fn find_unquoted(src: &str, wanted: char) -> Option<usize> {
+    Unquoted::new(src)
+        .find(|&(_, ch)| ch == wanted)
+        .map(|(idx, _)| idx)
+}
+
 /// Index of the `}` that closes a body whose opening `{` was already consumed.
 ///
-/// Nested braces are counted. If the body never closes, the length is returned
+/// Nested braces are counted. Braces inside strings or escaped with a
+/// backslash do not count. If the body never closes, the length is returned
 /// and the caller treats the rest as the body.
-fn find_matching_brace(src: &str) -> usize {
+pub(crate) fn find_matching_brace(src: &str) -> usize {
     let mut depth = 1usize;
-    for (idx, ch) in src.char_indices() {
+    for (idx, ch) in Unquoted::new(src) {
         match ch {
             '{' => depth += 1,
             '}' => {
@@ -955,7 +1016,15 @@ fn find_matching_brace(src: &str) -> usize {
 /// with `@` and is not `@media` or `@keyframes` is dropped, body included.
 /// A rule whose selector list has an invalid selector is dropped too.
 fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
-    while let Some(open) = rest.find('{') {
+    while let Some(open) = find_unquoted(rest, '{') {
+        // An at-rule such as `@import` or `@charset` can end at `;` with no
+        // block. Skip it so it does not swallow the rule after it.
+        if rest.trim_start().starts_with('@') {
+            if let Some(semi) = find_unquoted(&rest[..open], ';') {
+                rest = &rest[semi + 1..];
+                continue;
+            }
+        }
         let selector_src = rest[..open].trim();
         rest = &rest[open + 1..];
         let close = find_matching_brace(rest);
@@ -2802,14 +2871,17 @@ fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
 
 /// Parse `name: value` pairs separated by `;`.
 ///
+/// Comments are ignored. A `;` inside a string or inside parentheses, as in
+/// `url(data:image/png;base64,...)`, does not end the declaration.
 /// Names are owned and lowercased. Values are owned and trimmed. A trailing
 /// `!important` (any case, with optional space after the `!`) is taken off
 /// the value and sets [`Declaration::important`]. A pair with an empty name,
 /// or with an empty value once the flag is gone, is dropped. `source` is
 /// borrowed.
 pub fn parse_declarations(source: &str) -> Vec<Declaration> {
-    source
-        .split(';')
+    let source = strip_comments(source);
+    split_declarations(&source)
+        .into_iter()
         .filter_map(|part| {
             let (name, value) = part.split_once(':')?;
             let name = name.trim().to_ascii_lowercase();
@@ -2827,6 +2899,26 @@ pub fn parse_declarations(source: &str) -> Vec<Declaration> {
         .collect()
 }
 
+/// Split `source` on `;` outside strings, parentheses, and brackets.
+fn split_declarations(source: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (idx, ch) in Unquoted::new(source) {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => {
+                parts.push(&source[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
 /// Split a trailing `!important` off `value`.
 ///
 /// Only a `!` outside quotes and parentheses counts, so text such as
@@ -2836,45 +2928,46 @@ pub fn parse_declarations(source: &str) -> Vec<Declaration> {
 /// returned value is trimmed.
 fn split_important(value: &str) -> (&str, bool) {
     let mut bang = None;
-    let mut quote = None;
     let mut depth = 0usize;
-    let mut chars = value.char_indices();
-    while let Some((idx, ch)) = chars.next() {
-        match quote {
-            Some(q) => {
-                if ch == '\\' {
-                    chars.next();
-                } else if ch == q {
-                    quote = None;
-                }
-            }
-            None => match ch {
-                '"' | '\'' => quote = Some(ch),
-                '\\' => {
-                    chars.next();
-                }
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                '!' if depth == 0 => bang = Some(idx),
-                _ => {}
-            },
+    let mut scan = Unquoted::new(value);
+    for (idx, ch) in scan.by_ref() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '!' if depth == 0 => bang = Some(idx),
+            _ => {}
         }
     }
     let Some(bang) = bang else {
         return (value, false);
     };
-    if quote.is_some() || !value[bang + 1..].trim().eq_ignore_ascii_case("important") {
+    if scan.in_string() || !value[bang + 1..].trim().eq_ignore_ascii_case("important") {
         return (value, false);
     }
     (value[..bang].trim(), true)
 }
 
 /// Copy `input` with `/* ... */` comments replaced by one space.
-/// An unclosed comment runs to the end of the string. The result is owned.
+///
+/// `/*` inside a quoted string is kept as text. Strings follow the same
+/// rules as [`Unquoted`]. An unclosed comment runs to the end of the string.
+/// The result is owned.
 fn strip_comments(input: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
+    let mut quote: Option<char> = None;
     while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if ch == q || ch == '\n' {
+                quote = None;
+            }
+            continue;
+        }
         if ch == '/' && chars.peek() == Some(&'*') {
             chars.next();
             while let Some(inner) = chars.next() {
@@ -2884,8 +2977,17 @@ fn strip_comments(input: &str) -> String {
                 }
             }
             out.push(' ');
-        } else {
-            out.push(ch);
+            continue;
+        }
+        out.push(ch);
+        match ch {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '"' | '\'' => quote = Some(ch),
+            _ => {}
         }
     }
     out

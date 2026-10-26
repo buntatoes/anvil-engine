@@ -7,7 +7,7 @@
 
 use crate::{
     Color, ComputedStyle, Declaration, Display, Edge, Size, TransformFn, TransformList,
-    apply_declaration, parse_declarations,
+    apply_declaration, find_matching_brace, find_unquoted, parse_declarations,
 };
 use anvil_dom::NodeId;
 use std::cell::Cell;
@@ -857,10 +857,10 @@ pub(crate) fn parse_keyframes(prelude: &str, body: &str) -> Option<KeyframesRule
     }
     let mut frames = Vec::new();
     let mut rest = body;
-    while let Some(open) = rest.find('{') {
+    while let Some(open) = find_unquoted(rest, '{') {
         let selector = &rest[..open];
         let after = &rest[open + 1..];
-        let close = after.find('}').unwrap_or(after.len());
+        let close = find_matching_brace(after);
         // Important declarations inside a keyframe are ignored.
         let declarations: Vec<_> = parse_declarations(&after[..close])
             .into_iter()
