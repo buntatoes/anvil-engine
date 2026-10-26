@@ -340,6 +340,35 @@ mod vm_request {
         bytes.extend_from_slice(&call_depth_limit.to_le_bytes());
         bytes
     }
+
+    /// A Configure request that also sets the yield interval: the run pauses
+    /// every `yield_interval` instructions and returns the host-call status so
+    /// the caller can resume it. A yield interval of 0 turns pausing off.
+    pub fn configure_with_yield(
+        step_budget: u32,
+        script_size_limit: u32,
+        heap_byte_budget: u32,
+        call_depth_limit: u32,
+        yield_interval: u32,
+    ) -> Vec<u8> {
+        let mut bytes = configure(
+            step_budget,
+            script_size_limit,
+            heap_byte_budget,
+            call_depth_limit,
+        );
+        bytes.extend_from_slice(&yield_interval.to_le_bytes());
+        bytes
+    }
+
+    /// Request op: continue a run that paused at a yield.
+    pub const OP_RESUME: u32 = 3;
+
+    /// A Resume request. It carries no payload; the paused run's state is on
+    /// the context already.
+    pub fn resume() -> Vec<u8> {
+        header(OP_RESUME, 0, super::DEFAULT_OUT_CAP)
+    }
 }
 
 /// Out-buffer size a request asks for by default: the whole telemetry struct.
@@ -705,6 +734,50 @@ pub fn eval_cpp_vm_request_depth(
     let _ = runtime.try_owned_vm(&configure);
     let run = vm_request::run(trimmed.as_bytes());
     match runtime.try_owned_vm(&run) {
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
+    }
+}
+
+/// Run `source` but ask the VM to pause every `yield_interval` instructions,
+/// then drive it to the end with Resume requests. The frame stack, registers
+/// and step count stay on the context across every pause, so the final result
+/// must match an unbroken run. This exercises stop and resume with no native
+/// stack held between slices.
+pub fn eval_cpp_vm_request_resumed(
+    yield_interval: u32,
+    step_budget: u32,
+    source: &str,
+) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let mut runtime = ScriptRuntime::new();
+    let configure = vm_request::configure_with_yield(step_budget, 0, 0, 0, yield_interval);
+    let _ = runtime.try_owned_vm(&configure);
+    let run = vm_request::run(trimmed.as_bytes());
+    let mut outcome = runtime.try_owned_vm(&run);
+    // A pause comes back as Stopped with code 3; send Resume until the run
+    // finishes or stops for a real reason. The bound keeps a stuck test from
+    // looping forever.
+    let resume = vm_request::resume();
+    for _ in 0..10_000_000 {
+        match outcome {
+            VmRun::Stopped(ref error) if error.code == 3 => {
+                outcome = runtime.try_owned_vm(&resume);
+            }
+            _ => break,
+        }
+    }
+    match outcome {
         VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
         VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
         VmRun::Rejected(None) => Err(VmError {
@@ -3286,10 +3359,11 @@ impl ScriptRuntime {
             match code {
                 1 => VmRun::Value(result, Box::new(telemetry)),
                 2 => VmRun::Stopped(reason()),
-                // Reserved for host calls, which aren't supported yet.
+                // The run paused at a yield. Code 3 lets the caller tell a
+                // pause from a real stop and send a Resume request to continue.
                 3 => VmRun::Stopped(VmError {
                     code: 3,
-                    message: "stopped for a host call".to_string(),
+                    message: "paused at a yield".to_string(),
                 }),
                 // The out buffer was too small; nothing was written.
                 4 => VmRun::Rejected(Some(VmError {

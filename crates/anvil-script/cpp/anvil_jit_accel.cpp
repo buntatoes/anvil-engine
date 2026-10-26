@@ -13,9 +13,9 @@ namespace anvil_vm {
 namespace {
 
 // Status codes returned by anvil_cpp_vm_run_script. 0 refused, 1 ran, 2
-// stopped at a limit. A request (below) can also return 3 (stopped for a
-// host call, reserved for later use) and 4 (the caller's out buffer
-// was too small, so nothing was written).
+// stopped at a limit. A request (below) can also return 3 (paused at a yield,
+// so the caller can resume it, and reused later for host calls) and 4 (the
+// caller's out buffer was too small, so nothing was written).
 constexpr u32 VM_RUN_REFUSED       = 0u;
 constexpr u32 VM_RUN_OK            = 1u;
 constexpr u32 VM_RUN_STOPPED       = 2u;
@@ -28,6 +28,7 @@ constexpr u32 VM_RUN_BUFFER_SMALL  = 4u;
 constexpr u32 AVK_HEADER_BYTES = 16u;
 constexpr u32 AVK_OP_RUN       = 1u;
 constexpr u32 AVK_OP_CONFIGURE = 2u;
+constexpr u32 AVK_OP_RESUME    = 3u;
 
 inline bool has_request_magic(const char* s, u32 n) noexcept {
     return s && n >= 4u && s[0] == 'A' && s[1] == 'V' && s[2] == 'K' && s[3] == '1';
@@ -211,6 +212,9 @@ void AnvilVmContext::init() noexcept {
     global_count = 0u;
     ensure_globals(INIT_GLOBAL_TABLE);
     frame_count = 0u;
+    paused = false;
+    resume_pc = 0u;
+    resume_reg_base = 0u;
     steps_executed = 0u;
     hot_loops_accelerated = 0u;
     native_compilations = 0u;
@@ -345,18 +349,39 @@ void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
 }
 
 AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
-    f64 native_out = 0.0;
-    if (anvil_jit_try_run(this, entry_pc, &native_out)) {
-        ++native_compilations;
-        return AnvilValue::make_number(native_out);
+    // The numeric JIT runs a whole program in one call and cannot pause, so it
+    // is only used when no yield is asked for.
+    if (yield_interval == 0u) {
+        f64 native_out = 0.0;
+        if (anvil_jit_try_run(this, entry_pc, &native_out)) {
+            ++native_compilations;
+            return AnvilValue::make_number(native_out);
+        }
     }
 
-    u32 pc = entry_pc;
-    u32 reg_base = 0u;
     frame_count = 0u;
+    return run_loop(entry_pc, 0u);
+}
 
+AnvilValue AnvilVmContext::resume() noexcept {
+    paused = false;
+    return run_loop(resume_pc, resume_reg_base);
+}
+
+AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
     const u32 step_limit_now = effective_step_limit();
+    u32 slice = 0u;
     while (pc < program.code_len) {
+        // Pause at a yield boundary: save where to continue and hand control
+        // back. The frame stack, registers and step count all stay on the
+        // context, so resume() picks up with no native stack in use.
+        if (yield_interval != 0u && slice >= yield_interval) {
+            paused = true;
+            resume_pc = pc;
+            resume_reg_base = reg_base;
+            return AnvilValue::make_undefined();
+        }
+        ++slice;
         if (++steps_executed > step_limit_now) {
             fail_limit(VM_STOP_STEPS, "step", step_limit_now, "steps");
             return AnvilValue::make_undefined();
@@ -998,6 +1023,9 @@ static u32 run_script_text(
     if (numeric_result_out) {
         *numeric_result_out = res.as_number();
     }
+    if (ctx.paused) {
+        return anvil_vm::VM_RUN_HOST_CALL;
+    }
     return ctx.aborted ? anvil_vm::VM_RUN_STOPPED : anvil_vm::VM_RUN_OK;
 }
 
@@ -1052,9 +1080,34 @@ static u32 run_request(
             if (depth != 0u) {
                 ctx.call_depth_limit = depth;
             }
+            // The yield interval is set directly when present: a value of 0
+            // turns pausing off, so it is not treated as "leave unchanged".
+            if (len >= pos + 20u) {
+                ctx.yield_interval = anvil_vm::read_u32_le(src + pos + 16u);
+            }
         }
         ctx.fill_telemetry(telemetry_out);
         return anvil_vm::VM_RUN_OK;
+    }
+    if (op == anvil_vm::AVK_OP_RESUME) {
+        // Continue a run that paused at a yield. The context still holds the
+        // program, frames and registers, so nothing is compiled or reset here.
+        if (!ctx.paused) {
+            ctx.fail(anvil_vm::VM_REFUSE_UNSUPPORTED, "resume without a paused run");
+            ctx.fill_telemetry(telemetry_out);
+            return anvil_vm::VM_RUN_REFUSED;
+        }
+        const anvil_vm::AnvilValue res = ctx.resume();
+        if (telemetry_out) {
+            ctx.fill_telemetry(telemetry_out);
+        }
+        if (numeric_result_out) {
+            *numeric_result_out = res.as_number();
+        }
+        if (ctx.paused) {
+            return anvil_vm::VM_RUN_HOST_CALL;
+        }
+        return ctx.aborted ? anvil_vm::VM_RUN_STOPPED : anvil_vm::VM_RUN_OK;
     }
     ctx.fail(anvil_vm::VM_REFUSE_UNSUPPORTED, "unsupported request op");
     ctx.fill_telemetry(telemetry_out);
@@ -1078,7 +1131,15 @@ u32 anvil_cpp_vm_run_script(
         return 0u;
     }
     auto& ctx = *static_cast<anvil_vm::AnvilVmContext*>(context_memory);
-    ctx.init();
+    // A resume request continues a paused run, so init() must not run: it would
+    // reset the arena and throw away the program, frames and registers. Every
+    // other request starts from a clean context.
+    const bool is_resume = anvil_vm::has_request_magic(source_ptr, source_len) &&
+                           source_len >= anvil_vm::AVK_HEADER_BYTES &&
+                           anvil_vm::read_u32_le(source_ptr + 4) == anvil_vm::AVK_OP_RESUME;
+    if (!is_resume) {
+        ctx.init();
+    }
     if (anvil_vm::has_request_magic(source_ptr, source_len)) {
         return run_request(
             ctx, compiler_memory, source_ptr, source_len, telemetry_out, numeric_result_out

@@ -498,3 +498,69 @@ fn a_raised_call_depth_lets_a_deeper_recursion_run() {
         anvil_script::eval_cpp_vm_request_depth(12000, 5_000_000, source).expect("runs");
     assert_eq!(value, 11000.0);
 }
+
+// ---- Stop and resume -----------------------------------------------------
+
+/// A run paused at a yield and driven to the end with Resume requests gives the
+/// same answer as an unbroken run, across many yield intervals. Interval 1
+/// pauses before every instruction, so this covers stopping at any instruction.
+#[test]
+fn a_paused_run_resumes_to_the_same_result() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let programs: [(&str, f64); 3] = [
+        (
+            "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(20);",
+            6765.0,
+        ),
+        (
+            "let s = 0; let i = 0; while (i < 500) { s = s + i; i = i + 1; } s;",
+            124750.0,
+        ),
+        (
+            "function rec(n) { if (n <= 0) { return 0; } return rec(n - 1) + 1; } rec(300);",
+            300.0,
+        ),
+    ];
+    for (source, expected) in programs {
+        let (direct, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, source)
+            .expect("the unbroken run");
+        assert_eq!(direct, expected);
+        for yield_interval in [1u32, 2, 3, 5, 7, 13, 31, 97, 500] {
+            let (resumed, _) =
+                anvil_script::eval_cpp_vm_request_resumed(yield_interval, 5_000_000, source)
+                    .expect("the resumed run");
+            assert_eq!(
+                resumed, expected,
+                "yield interval {yield_interval} for `{source}`"
+            );
+        }
+    }
+}
+
+/// Seeded random stop points: the yield interval is drawn each round, and every
+/// resumed run matches the unbroken result. The run holds no native stack
+/// between slices, so resuming from the heap state is enough.
+#[test]
+fn seeded_random_stop_points_resume_to_the_same_result() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source =
+        "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(22);";
+    let (expected, _) =
+        anvil_script::eval_cpp_vm_request_configured(5_000_000, source).expect("the unbroken run");
+    assert_eq!(expected, 17711.0);
+    let mut state: u64 = 0x00C0_FFEE_D15E_A5E5;
+    for _ in 0..64 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let yield_interval = ((state >> 33) as u32 % 200) + 1;
+        let (resumed, _) =
+            anvil_script::eval_cpp_vm_request_resumed(yield_interval, 5_000_000, source)
+                .expect("the resumed run");
+        assert_eq!(resumed, expected, "yield interval {yield_interval}");
+    }
+}

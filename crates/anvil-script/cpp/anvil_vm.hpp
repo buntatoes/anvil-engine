@@ -1134,6 +1134,18 @@ struct AnvilVmContext {
     u32 heap_byte_budget;
     u32 call_depth_limit;
 
+    // Cooperative yield for stop and resume. When yield_interval is not zero a
+    // run pauses every that-many instructions and hands control back with the
+    // host-call status, so a caller can stop a run and resume it later with no
+    // native stack in use. 0 means the run never pauses. paused says the last
+    // run stopped at a yield rather than finishing; resume_pc and
+    // resume_reg_base are where resume() continues. yield_interval is a
+    // Configure setting and is kept across runs; init() clears the rest.
+    u32 yield_interval;
+    bool paused;
+    u32 resume_pc;
+    u32 resume_reg_base;
+
     // Steps this run may take before it stops: the configured budget, or the
     // built-in default when none was set.
     u32 effective_step_limit() const noexcept {
@@ -1190,6 +1202,13 @@ struct AnvilVmContext {
     // Record a stop for a store that hit a limit. False when the run stops.
     bool store_ok(StoreResult stored) noexcept;
     AnvilValue execute(u32 entry_pc = 0u) noexcept;
+    // Continue a run that paused at a yield, from the saved pc and register
+    // base, with the frame stack left as it was. The caller must not call
+    // init() first, so the arena, program, registers and frames all survive.
+    AnvilValue resume() noexcept;
+    // The shared instruction loop, entered fresh by execute() and continued by
+    // resume(). Returns the result, or undefined when it pauses at a yield.
+    AnvilValue run_loop(u32 pc, u32 reg_base) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
     void fill_exports(AnvilVmTelemetryC* out) const noexcept;
 };
