@@ -1194,6 +1194,23 @@ struct AnvilCompiler {
                 return compile_function_literal(true, false, sym);
             }
 
+            // Global isNaN / isFinite: coerce the one argument to a number and
+            // test it. Only built-in when the name is not shadowed by a local
+            // or a function declared in this script.
+            if ((match_kw(&src[id_tok.offset], id_tok.length, "isNaN", 5) ||
+                 match_kw(&src[id_tok.offset], id_tok.length, "isFinite", 8)) &&
+                find_local(sym) < 0 && find_function(sym) == NO_SLOT &&
+                peek().kind == TokenKind::LParen) {
+                const u8 pred_op =
+                    match_kw(&src[id_tok.offset], id_tok.length, "isNaN", 5) ? 4u : 5u;
+                expect(TokenKind::LParen);
+                const u16 arg_reg = compile_expr();
+                expect(TokenKind::RParen);
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallPred, dst, pred_op, arg_reg));
+                return dst;
+            }
+
             // Built-in `Math.<op>(...)` intrinsics and `Math.<CONST>`.
             if (match_kw(&src[id_tok.offset], id_tok.length, "Math", 4) && match(TokenKind::Dot)) {
                 const Token m_tok = advance();
@@ -1285,6 +1302,28 @@ struct AnvilCompiler {
                 reject_name(VM_REFUSE_UNSUPPORTED, "unsupported Math function", m_tok);
                 const u16 dst = alloc_reg();
                 emit_load_undefined(dst);
+                return dst;
+            }
+
+            // Built-in `Number.<pred>(arg)` predicates (isInteger, isNaN,
+            // isFinite), each returning a boolean.
+            if (match_kw(&src[id_tok.offset], id_tok.length, "Number", 6) && match(TokenKind::Dot)) {
+                const Token n_tok = advance();
+                u8 pred_op = 0u;
+                if (match_kw(&src[n_tok.offset], n_tok.length, "isInteger", 9)) pred_op = 1u;
+                else if (match_kw(&src[n_tok.offset], n_tok.length, "isNaN", 5)) pred_op = 2u;
+                else if (match_kw(&src[n_tok.offset], n_tok.length, "isFinite", 8)) pred_op = 3u;
+                if (pred_op == 0u) {
+                    reject_name(VM_REFUSE_UNSUPPORTED, "unsupported Number function", n_tok);
+                    const u16 dst = alloc_reg();
+                    emit_load_undefined(dst);
+                    return dst;
+                }
+                expect(TokenKind::LParen);
+                const u16 arg_reg = compile_expr();
+                expect(TokenKind::RParen);
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallPred, dst, pred_op, arg_reg));
                 return dst;
             }
 

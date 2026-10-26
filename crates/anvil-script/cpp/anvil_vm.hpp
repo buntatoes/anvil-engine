@@ -1025,6 +1025,7 @@ enum class AnvilOpcode : u8 {
     LoadFunc     = 46u,  // R[a] = function value for fn_id = imm32
     CallValue    = 47u,  // R[a] = call(R[b], arg_base = c, argc = imm32)
     CallMath2    = 48u,  // R[a] = math2(op = imm32, R[b], R[c])
+    CallPred     = 49u,  // R[a] = predicate(op = b, R[c]) -> bool
 };
 
 struct AnvilInstruction {

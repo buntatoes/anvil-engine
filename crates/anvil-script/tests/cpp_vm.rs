@@ -555,6 +555,45 @@ fn more_math_functions_run_on_the_vm() {
 }
 
 #[test]
+fn number_predicates_run_on_the_vm() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // true is 1.0, false is 0.0 as the returned number.
+    let t = Some(1.0);
+    let f = Some(0.0);
+
+    // Number.isInteger: a finite whole Number only.
+    assert_eq!(cpp("let r = Number.isInteger(5); r;"), t);
+    assert_eq!(cpp("let r = Number.isInteger(5.5); r;"), f);
+    assert_eq!(cpp("let r = Number.isInteger(0 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isInteger(1 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isInteger(-1 * 0); r;"), t);
+
+    // Number.isNaN / Number.isFinite do not coerce: a non-Number is false.
+    assert_eq!(cpp("let r = Number.isNaN(0 / 0); r;"), t);
+    assert_eq!(cpp("let r = Number.isNaN(5); r;"), f);
+    assert_eq!(cpp("let r = Number.isNaN(true); r;"), f);
+    assert_eq!(cpp("let r = Number.isNaN(undefined); r;"), f);
+    assert_eq!(cpp("let r = Number.isFinite(5); r;"), t);
+    assert_eq!(cpp("let r = Number.isFinite(1 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isFinite(0 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isFinite(true); r;"), f);
+
+    // Global isNaN / isFinite coerce their argument to a number first.
+    assert_eq!(cpp("let r = isNaN(0 / 0); r;"), t);
+    assert_eq!(cpp("let r = isNaN(5); r;"), f);
+    assert_eq!(cpp("let r = isNaN(undefined); r;"), t);
+    assert_eq!(cpp("let r = isFinite(5); r;"), t);
+    assert_eq!(cpp("let r = isFinite(1 / 0); r;"), f);
+    assert_eq!(cpp("let r = isFinite(true); r;"), t);
+
+    // A local named isNaN shadows the built-in, so it is left to the
+    // interpreter rather than treated as the predicate.
+    assert_eq!(cpp("let isNaN = 42; isNaN;"), Some(42.0));
+}
+
+#[test]
 fn values_the_vm_cannot_convert_go_to_the_interpreter() {
     if !is_cpp_jit_kernel_active() {
         return;

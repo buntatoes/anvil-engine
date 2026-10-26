@@ -839,6 +839,27 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                 break;
             }
 
+            case AnvilOpcode::CallPred: {
+                const AnvilValue av = R[inst.c];
+                const f64 v = av.as_number();
+                bool out = false;
+                switch (inst.b) {
+                    // Number.isInteger: a Number that is finite and whole.
+                    case 1u: out = av.is_number() && js_is_finite(v) && js_trunc(v) == v; break;
+                    // Number.isNaN: a Number that is NaN (no coercion).
+                    case 2u: out = av.is_number() && js_is_nan(v); break;
+                    // Number.isFinite: a Number that is finite (no coercion).
+                    case 3u: out = av.is_number() && js_is_finite(v); break;
+                    // Global isNaN: coerce to number, then test for NaN.
+                    case 4u: out = js_is_nan(v); break;
+                    // Global isFinite: coerce to number, then test for finite.
+                    case 5u: out = js_is_finite(v); break;
+                    default: break;
+                }
+                R[inst.a] = AnvilValue::make_bool(out);
+                break;
+            }
+
             case AnvilOpcode::LoopHeader: {
                 const u32 lid = inst.a & 63u;
                 ++program.loop_trip_counts[lid];
