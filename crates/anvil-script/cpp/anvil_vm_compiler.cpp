@@ -558,6 +558,69 @@ struct AnvilCompiler {
         ctx->fail_limit(code, what, limit, unit);
     }
 
+    u32 find_function(u32 sym) const noexcept {
+        for (u32 i = 0; i < ctx->heap.function_count && i < MAX_FUNCTIONS; ++i) {
+            if (ctx->heap.functions[i].name_sym == sym) {
+                return i;
+            }
+        }
+        return NO_SLOT;
+    }
+
+    // Make every function the script declares before compiling any code,
+    // so a call may come before the declaration, as in JavaScript. Only
+    // top-level declarations are hoisted this way; one inside a block or a
+    // function has different scope rules and refuses the script.
+    void hoist_functions() noexcept {
+        u32 depth = 0u;
+        for (u32 i = 0u; i < lexer.count && !had_error; ++i) {
+            const Token& t = lexer.tokens[i];
+            if (t.kind == TokenKind::LBrace) {
+                ++depth;
+                continue;
+            }
+            if (t.kind == TokenKind::RBrace) {
+                if (depth > 0u) {
+                    --depth;
+                }
+                continue;
+            }
+            if (t.kind != TokenKind::KwFunction) {
+                continue;
+            }
+            const TokenKind before = i > 0u ? lexer.tokens[i - 1u].kind : TokenKind::Semicolon;
+            if (depth != 0u || (before != TokenKind::Semicolon && before != TokenKind::RBrace)) {
+                const Token& shown = (i + 1u < lexer.count) ? lexer.tokens[i + 1u] : t;
+                reject_name(VM_REFUSE_UNSUPPORTED, "function declared inside a block or function", shown);
+                return;
+            }
+            if (i + 2u >= lexer.count || lexer.tokens[i + 1u].kind != TokenKind::Ident ||
+                lexer.tokens[i + 2u].kind != TokenKind::LParen) {
+                reject_name(VM_REFUSE_UNSUPPORTED, "unsupported function expression", t);
+                return;
+            }
+            const Token& name = lexer.tokens[i + 1u];
+            const u32 sym = token_sym(name);
+            if (had_error) {
+                return;
+            }
+            if (find_function(sym) != NO_SLOT) {
+                reject_name(VM_REFUSE_UNSUPPORTED, "function declared twice", name);
+                return;
+            }
+            u32 arity = 0u;
+            for (u32 j = i + 3u; j < lexer.count && lexer.tokens[j].kind != TokenKind::RParen; ++j) {
+                if (lexer.tokens[j].kind == TokenKind::Ident) {
+                    ++arity;
+                }
+            }
+            if (ctx->heap.alloc_function(sym, arity, 0u, 0u, 0u) == NO_SLOT) {
+                reject_limit(VM_REFUSE_FUNCTIONS, "function", MAX_FUNCTIONS, "functions");
+                return;
+            }
+        }
+    }
+
     u32 new_site(u32 prop_sym) noexcept {
         const u32 site = ctx->ic.allocate_site(prop_sym);
         if (site == NO_SLOT) {
@@ -1137,6 +1200,10 @@ struct AnvilCompiler {
                 return 0u;
             }
             const u32 sym = token_sym(id_tok);
+            if (find_function(sym) != NO_SLOT) {
+                reject_name(VM_REFUSE_UNSUPPORTED, "name used for a variable and a function", id_tok);
+                return 0u;
+            }
             if (!in_function) {
                 // A top-level name lives only in its global slot, so a
                 // function that reads or writes it sees the same value as
@@ -1344,9 +1411,12 @@ struct AnvilCompiler {
 
             const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
             const u32 fn_start_pc = ctx->program.code_len;
-            const u32 fn_id = ctx->heap.alloc_function(fn_sym, arity, 0u, fn_start_pc, 0u);
+            // hoist_functions made the function already; its code starts here.
+            const u32 fn_id = find_function(fn_sym);
             if (fn_id == NO_SLOT) {
-                reject_limit(VM_REFUSE_FUNCTIONS, "function", MAX_FUNCTIONS, "functions");
+                reject_name(VM_REFUSE_SYNTAX, "function not found by the first pass", fn_tok);
+            } else {
+                ctx->heap.functions[fn_id].code_start = fn_start_pc;
             }
 
             compile_statement();
@@ -1461,6 +1531,7 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
         }
         return false;
     }
+    g_compiler.hoist_functions();
 
     u8 last_reg = 0u;
     while (g_compiler.peek().kind != TokenKind::Eof && !g_compiler.had_error) {

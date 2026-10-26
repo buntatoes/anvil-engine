@@ -369,3 +369,46 @@ fn calls_nest_until_the_frame_stack_is_full() {
         vm_error("function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(63);");
     assert_eq!(error.message, "call depth limit reached: 63 nested calls");
 }
+
+#[test]
+fn functions_can_be_called_before_they_are_declared() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(
+        cpp("let r = sq(6); function sq(x) { return x * x; } r;"),
+        Some(36.0)
+    );
+    let even_odd = "function even(n) { if (n === 0) { return 1; } return odd(n - 1); } \
+                    function odd(n) { if (n === 0) { return 0; } return even(n - 1); } \
+                    even(10) + odd(7);";
+    assert_eq!(cpp(even_odd), Some(2.0));
+}
+
+#[test]
+fn function_declarations_the_vm_cannot_scope_are_refused() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let cases = [
+        (
+            "function f() { function g() { return 1; } return g(); } f();",
+            "function declared inside a block or function 'g'",
+        ),
+        (
+            "let r = 0; if (r === 0) { function g() { return 1; } } r;",
+            "function declared inside a block or function 'g'",
+        ),
+        (
+            "function f() { return 1; } function f() { return 2; } f();",
+            "function declared twice 'f'",
+        ),
+        (
+            "let f = 1; function f() { return 2; } f;",
+            "name used for a variable and a function 'f'",
+        ),
+    ];
+    for (source, message) in cases {
+        assert_eq!(vm_error(source).message, message, "{source}");
+    }
+}
