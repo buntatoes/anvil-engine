@@ -411,6 +411,21 @@ struct AnvilLexer {
     }
 };
 
+constexpr u32 NO_DEPTH = 0xFFFFFFFFu;
+
+// Counts one level of block scope for as long as it is in scope.
+struct BlockScope {
+    u32& depth;
+    explicit BlockScope(u32& d) noexcept : depth(d) {
+        ++depth;
+    }
+    ~BlockScope() {
+        --depth;
+    }
+    BlockScope(const BlockScope&) = delete;
+    BlockScope& operator=(const BlockScope&) = delete;
+};
+
 struct LocalBinding {
     u32 name_sym;
     u8 reg;
@@ -437,6 +452,12 @@ struct AnvilCompiler {
     // cannot see names the page defined in other scripts, so any other
     // global name rejects the script.
     bool global_declared[MAX_GLOBALS];
+    // Block depth of each global's declaration, NO_DEPTH before it has one.
+    // A name declared at two depths is one variable shadowing another,
+    // which a single global slot cannot hold.
+    u32 decl_depth[MAX_GLOBALS];
+    // Braces and for-loop headers around the statement being compiled.
+    u32 block_depth;
 
     const Token& peek(u32 ahead = 0u) const noexcept {
         const u32 idx = (cursor + ahead < lexer.count) ? (cursor + ahead) : (lexer.count - 1u);
@@ -1185,6 +1206,7 @@ struct AnvilCompiler {
         }
 
         if (match(TokenKind::LBrace)) {
+            const BlockScope scope(block_depth);
             u8 last_reg = 0u;
             while (peek().kind != TokenKind::RBrace && peek().kind != TokenKind::Eof && !had_error) {
                 last_reg = compile_statement();
@@ -1194,6 +1216,7 @@ struct AnvilCompiler {
         }
 
         if (match(TokenKind::KwLet) || match(TokenKind::KwConst) || match(TokenKind::KwVar)) {
+            const bool is_var = lexer.tokens[cursor - 1u].kind == TokenKind::KwVar;
             const Token id_tok = advance();
             if (id_tok.kind != TokenKind::Ident) {
                 reject_syntax();
@@ -1218,7 +1241,17 @@ struct AnvilCompiler {
                 reject_if_expression_continues();
                 const u16 g_slot = global_slot(sym);
                 if (!had_error && g_slot < MAX_GLOBALS) {
+                    if (decl_depth[g_slot] != NO_DEPTH && decl_depth[g_slot] != block_depth) {
+                        reject_name(VM_REFUSE_UNSUPPORTED, "name declared again in an inner block", id_tok);
+                        return 0u;
+                    }
+                    decl_depth[g_slot] = block_depth;
                     global_declared[g_slot] = true;
+                    // Later scripts see top-level names and `var`s. A
+                    // `let` or `const` in a block is gone after it.
+                    if (block_depth == 0u || is_var) {
+                        ctx->globals[g_slot].exported = true;
+                    }
                 }
                 ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, val_reg, g_slot));
                 match(TokenKind::Semicolon);
@@ -1319,6 +1352,8 @@ struct AnvilCompiler {
         }
 
         if (match(TokenKind::KwFor)) {
+            // A `let` in the header belongs to the loop.
+            const BlockScope scope(block_depth);
             expect(TokenKind::LParen);
             if (!match(TokenKind::Semicolon)) {
                 compile_statement();
@@ -1520,7 +1555,9 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.had_error = false;
     for (u32 i = 0u; i < MAX_GLOBALS; ++i) {
         g_compiler.global_declared[i] = false;
+        g_compiler.decl_depth[i] = NO_DEPTH;
     }
+    g_compiler.block_depth = 0u;
 
     if (!g_compiler.lexer.tokenize(src, len)) {
         const AnvilLexer& lex = g_compiler.lexer;

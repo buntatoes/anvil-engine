@@ -93,6 +93,7 @@ enum VmErrorCode : u32 {
 };
 
 constexpr u32 MAX_ERROR_TEXT = 160u;
+constexpr u32 MAX_EXPORT_BYTES = 4096u;
 
 // The first reason a run stopped or a script was refused, as plain text.
 struct AnvilVmError {
@@ -606,6 +607,8 @@ struct AnvilGlobalBinding {
     u32 name_sym;
     AnvilValue value;
     bool occupied;
+    // Declared at the top level or with `var`, so later scripts see it.
+    bool exported;
 };
 
 struct AnvilCallFrame {
@@ -688,10 +691,16 @@ struct AnvilVmTelemetryC {
     u32 stop_code;
     u32 stop_len;
     char stop_text[MAX_ERROR_TEXT];
+    // Top-level variables later scripts can see, written by fill_exports.
+    // `exports_len` bytes are used; `exports_full` is 1 when they did not fit.
+    u32 exports_len;
+    u32 exports_full;
+    u8 exports[MAX_EXPORT_BYTES];
 };
 
 // The Rust side (`AnvilVmTelemetry` in src/lib.rs) has the same layout.
-static_assert(sizeof(AnvilVmTelemetryC) == 11u * 4u + 8u + MAX_ERROR_TEXT, "telemetry layout");
+static_assert(sizeof(AnvilVmTelemetryC) == 11u * 4u + 8u + MAX_ERROR_TEXT + 8u + MAX_EXPORT_BYTES,
+              "telemetry layout");
 
 struct AnvilVmContext {
     AnvilHeap heap;
@@ -758,6 +767,7 @@ struct AnvilVmContext {
     bool store_ok(StoreResult stored) noexcept;
     AnvilValue execute(u32 entry_pc = 0u) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
+    void fill_exports(AnvilVmTelemetryC* out) const noexcept;
 };
 
 // Compile a numeric program to x86-64 and run it. Returns false when the

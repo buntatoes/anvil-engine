@@ -292,6 +292,10 @@ fn refused_scripts_say_why() {
         ("return 1;", "return outside a function near '1'"),
         ("let s = 'abc", "unterminated string ''abc'"),
         ("let r = 1; }", "unexpected near '}'"),
+        (
+            "let x = 1; { let x = 2; } x;",
+            "name declared again in an inner block 'x'",
+        ),
     ];
     for (source, message) in cases {
         let error = vm_error(source);
@@ -411,4 +415,71 @@ fn function_declarations_the_vm_cannot_scope_are_refused() {
     for (source, message) in cases {
         assert_eq!(vm_error(source).message, message, "{source}");
     }
+}
+
+#[test]
+fn later_scripts_see_what_a_vm_script_declared() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
+    let mut rt = ScriptRuntime::new();
+    rt.eval_script(
+        &mut doc,
+        "let total = 2 + 3; let name = 'a' + 'b'; let flag = total > 4; let nothing = null; \
+         let half = 1 / 2; function twice(x) { return x * 2; }",
+    );
+    assert!(rt.last_script_used_vm());
+    rt.eval_script(
+        &mut doc,
+        "document.getElementById('out').textContent = \
+         total + ' ' + name + ' ' + flag + ' ' + nothing + ' ' + half + ' ' + twice(total);",
+    );
+    let out = doc.get_element_by_id("out").expect("out");
+    assert_eq!(doc.text_content(out), "5 ab true null 0.5 10");
+}
+
+#[test]
+fn objects_in_top_level_variables_leave_the_script_to_the_interpreter() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
+    let mut rt = ScriptRuntime::new();
+    rt.eval_script(&mut doc, "let o = {a: 4}; let list = [1, 2]; let n = o.a;");
+    assert!(!rt.last_script_used_vm());
+    assert_eq!(
+        rt.last_vm_error().map(|error| error.message.as_str()),
+        Some("top-level 'o' holds an object, array or function, which later scripts could not see")
+    );
+    rt.eval_script(
+        &mut doc,
+        "document.getElementById('out').textContent = o.a + list[1] + n;",
+    );
+    let out = doc.get_element_by_id("out").expect("out");
+    assert_eq!(doc.text_content(out), "10");
+}
+
+#[test]
+fn top_level_variables_too_big_to_hand_over_leave_the_script_to_the_interpreter() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
+    let mut rt = ScriptRuntime::new();
+    rt.eval_script(
+        &mut doc,
+        "let s = 'x'; let i = 0; while (i < 12) { s = s + s; i = i + 1; }",
+    );
+    assert!(!rt.last_script_used_vm());
+    assert_eq!(
+        rt.last_vm_error().map(|error| error.message.as_str()),
+        Some("the top-level variables do not fit in 4096 bytes")
+    );
+    rt.eval_script(
+        &mut doc,
+        "document.getElementById('out').textContent = s.length + ' ' + i;",
+    );
+    let out = doc.get_element_by_id("out").expect("out");
+    assert_eq!(doc.text_content(out), "4096 12");
 }

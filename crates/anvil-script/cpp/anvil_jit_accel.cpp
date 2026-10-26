@@ -66,6 +66,7 @@ void AnvilVmContext::init() noexcept {
         globals[i].name_sym = 0u;
         globals[i].value = AnvilValue::make_undefined();
         globals[i].occupied = false;
+        globals[i].exported = false;
     }
     frame_count = 0u;
     steps_executed = 0u;
@@ -95,6 +96,7 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
     globals[slot].name_sym = name_sym;
     globals[slot].value = AnvilValue::make_undefined();
     globals[slot].occupied = true;
+    globals[slot].exported = false;
     return slot;
 }
 
@@ -542,6 +544,101 @@ void AnvilVmContext::fill_telemetry(AnvilVmTelemetryC* out) const noexcept {
     for (u32 i = 0u; i < MAX_ERROR_TEXT; ++i) {
         out->stop_text[i] = i < n ? error.text[i] : '\0';
     }
+    fill_exports(out);
+}
+
+namespace {
+
+// Appends to a fixed export buffer. Once a write does not fit, nothing more
+// is written and `full` stays set.
+struct ExportWriter {
+    u8* bytes;
+    u32 cap;
+    u32 len;
+    bool full;
+
+    bool room(u32 n) noexcept {
+        if (full || n > cap - len) {
+            full = true;
+            return false;
+        }
+        return true;
+    }
+    void put_u8(u8 v) noexcept {
+        if (room(1u)) {
+            bytes[len++] = v;
+        }
+    }
+    void put_u32(u32 v) noexcept {
+        if (room(4u)) {
+            for (u32 i = 0u; i < 4u; ++i) {
+                bytes[len++] = static_cast<u8>(v >> (8u * i));
+            }
+        }
+    }
+    void put_f64(f64 v) noexcept {
+        const u64 bits = __builtin_bit_cast(u64, v);
+        if (room(8u)) {
+            for (u32 i = 0u; i < 8u; ++i) {
+                bytes[len++] = static_cast<u8>(bits >> (8u * i));
+            }
+        }
+    }
+    void put_text(const char* text, u32 n) noexcept {
+        if (!text) {
+            n = 0u;
+        }
+        if (room(n)) {
+            for (u32 i = 0u; i < n; ++i) {
+                bytes[len++] = static_cast<u8>(text[i]);
+            }
+        }
+    }
+};
+
+} // namespace
+
+// Records of the exported globals: kind (u8), name length (u32), name, then
+// for a number or bool an f64 and for a string its length (u32) and bytes.
+// Kinds: 1 number, 2 bool, 3 null, 4 undefined, 5 string, 6 object, array
+// or function (name only). `exports_full` is 1 when they did not all fit.
+void AnvilVmContext::fill_exports(AnvilVmTelemetryC* out) const noexcept {
+    ExportWriter w{out->exports, MAX_EXPORT_BYTES, 0u, false};
+    const u32 count = global_count < MAX_GLOBALS ? global_count : MAX_GLOBALS;
+    for (u32 index = 0u; index < count && !w.full; ++index) {
+        const AnvilGlobalBinding& g = globals[index];
+        if (!g.occupied || !g.exported) {
+            continue;
+        }
+        const AnvilValue v = g.value;
+        u8 kind = 6u;
+        if (v.is_bool()) {
+            kind = 2u;
+        } else if (v.is_number()) {
+            kind = 1u;
+        } else if (v.is_null()) {
+            kind = 3u;
+        } else if (v.is_undefined()) {
+            kind = 4u;
+        } else if (v.is_string()) {
+            kind = 5u;
+        }
+        u32 name_len = 0u;
+        const char* name = heap.get_string_ptr(g.name_sym, &name_len);
+        w.put_u8(kind);
+        w.put_u32(name ? name_len : 0u);
+        w.put_text(name, name_len);
+        if (kind == 1u || kind == 2u) {
+            w.put_f64(v.as_number());
+        } else if (kind == 5u) {
+            u32 text_len = 0u;
+            const char* text = heap.get_string_ptr(v.payload(), &text_len);
+            w.put_u32(text ? text_len : 0u);
+            w.put_text(text, text_len);
+        }
+    }
+    out->exports_full = w.full ? 1u : 0u;
+    out->exports_len = w.full ? 0u : w.len;
 }
 
 } // namespace anvil_vm

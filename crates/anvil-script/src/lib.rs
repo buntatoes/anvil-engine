@@ -122,6 +122,7 @@ pub struct AnvilVmTelemetry {
     pub hot_loops_accelerated: u32,
     pub native_compilations: u32,
     stop: VmStop,
+    exports: VmExports,
 }
 
 impl AnvilVmTelemetry {
@@ -139,11 +140,109 @@ impl AnvilVmTelemetry {
     }
 }
 
+impl AnvilVmTelemetry {
+    /// Top-level variables the run left for later scripts. `Err` names one
+    /// that holds an object, array or function, or says they did not fit.
+    #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+    fn exported_globals(&self) -> Result<Vec<(String, Value)>, String> {
+        if self.exports.full != 0 {
+            return Err(format!(
+                "the top-level variables do not fit in {VM_EXPORT_BYTES} bytes"
+            ));
+        }
+        let len = (self.exports.len as usize).min(VM_EXPORT_BYTES);
+        let mut reader = ExportReader {
+            bytes: &self.exports.bytes[..len],
+        };
+        let broken = || "the VM wrote a broken export record".to_string();
+        let mut out = Vec::new();
+        while !reader.bytes.is_empty() {
+            let kind = reader.take(1).ok_or_else(broken)?[0];
+            let name = reader.text().ok_or_else(broken)?;
+            if name.is_empty() {
+                return Err(broken());
+            }
+            let value = match kind {
+                1 | 2 => {
+                    let raw = reader.take(8).ok_or_else(broken)?;
+                    let mut bits = [0u8; 8];
+                    bits.copy_from_slice(raw);
+                    let number = f64::from_le_bytes(bits);
+                    if kind == 1 {
+                        Value::Number(number)
+                    } else {
+                        Value::Bool(number != 0.0)
+                    }
+                }
+                3 | 4 => Value::Null,
+                5 => Value::Str(reader.text().ok_or_else(broken)?),
+                6 => {
+                    return Err(format!(
+                        "top-level '{name}' holds an object, array or function, \
+                         which later scripts could not see"
+                    ));
+                }
+                _ => return Err(broken()),
+            };
+            out.push((name, value));
+        }
+        Ok(out)
+    }
+}
+
+/// Reads the records in [`VmExports`].
+#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+struct ExportReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ExportReader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if n > self.bytes.len() {
+            return None;
+        }
+        let (head, rest) = self.bytes.split_at(n);
+        self.bytes = rest;
+        Some(head)
+    }
+
+    fn text(&mut self) -> Option<String> {
+        let raw = self.take(4)?;
+        let len = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
+}
+
+/// Size of the export buffer at the end of [`AnvilVmTelemetry`].
+const VM_EXPORT_BYTES: usize = 4096;
+
+/// Top-level variables a C++ VM run left, as records written by
+/// `fill_exports` in `cpp/anvil_jit_accel.cpp`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VmExports {
+    len: u32,
+    full: u32,
+    bytes: [u8; VM_EXPORT_BYTES],
+}
+
+impl Default for VmExports {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            full: 0,
+            bytes: [0; VM_EXPORT_BYTES],
+        }
+    }
+}
+
 /// Length of the reason the C++ VM writes into [`AnvilVmTelemetry`].
 const VM_STOP_TEXT: usize = 160;
 
 // `AnvilVmTelemetryC` in `cpp/anvil_vm.hpp` has the same layout.
-const _: () = assert!(std::mem::size_of::<AnvilVmTelemetry>() == 11 * 4 + 8 + VM_STOP_TEXT);
+const _: () = assert!(
+    std::mem::size_of::<AnvilVmTelemetry>() == 11 * 4 + 8 + VM_STOP_TEXT + 8 + VM_EXPORT_BYTES
+);
 
 /// The stop code and reason at the end of the C++ telemetry struct.
 #[repr(C)]
@@ -408,7 +507,7 @@ pub fn eval_cpp_vm_script_checked(source: &str) -> Result<(f64, AnvilVmTelemetry
         });
     }
     match ScriptRuntime::new().try_owned_vm(trimmed) {
-        VmRun::Value(result, telemetry) => Ok((result, telemetry)),
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
         VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
         VmRun::Rejected(None) => Err(VmError {
             code: 33,
@@ -512,6 +611,7 @@ pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, AnvilVmTelemetry) {
                 hot_loops_accelerated: 1,
                 native_compilations: 0,
                 stop: VmStop::default(),
+                exports: VmExports::default(),
             },
         )
     }
@@ -2879,11 +2979,29 @@ impl ScriptRuntime {
             // or stops at a limit runs again from the start on the Rust
             // interpreter. The reason is kept for last_vm_error.
             match self.try_owned_vm(&cleaned) {
-                VmRun::Value(number, _) => {
-                    self.last_script_used_vm = true;
-                    self.last_vm_number = Some(number);
-                    return;
-                }
+                VmRun::Value(number, telemetry) => match telemetry.exported_globals() {
+                    Ok(globals) => {
+                        self.last_script_used_vm = true;
+                        self.last_vm_number = Some(number);
+                        // Later scripts see the top-level variables and the
+                        // functions this one declared.
+                        for (name, value) in globals {
+                            self.set_var(&name, value);
+                        }
+                        for stmt in split_statements(&cleaned) {
+                            let s = stmt.trim_start();
+                            if s.starts_with("function ") {
+                                self.exec_statement(doc, s);
+                            }
+                        }
+                        return;
+                    }
+                    // Later scripts could not see what this one declared,
+                    // so it runs on the Rust interpreter.
+                    Err(message) => {
+                        self.last_vm_error = Some(VmError { code: 33, message });
+                    }
+                },
                 VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => {
                     self.last_vm_error = Some(error);
                 }
@@ -2972,7 +3090,7 @@ impl ScriptRuntime {
                 })
             };
             match code {
-                1 => VmRun::Value(result, telemetry),
+                1 => VmRun::Value(result, Box::new(telemetry)),
                 2 => VmRun::Stopped(reason()),
                 _ => VmRun::Rejected(Some(reason())),
             }
@@ -7680,7 +7798,7 @@ fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str
 #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
 enum VmRun {
     /// The compiler accepted the script and execution finished.
-    Value(f64, AnvilVmTelemetry),
+    Value(f64, Box<AnvilVmTelemetry>),
     /// The compiler accepted the script and a limit stopped it.
     Stopped(VmError),
     /// The compiler rejected the script, or the VM is not linked (`None`).
