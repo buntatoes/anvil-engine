@@ -228,9 +228,10 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
     u32 reg_base = 0u;
     frame_count = 0u;
 
+    const u32 step_limit_now = effective_step_limit();
     while (pc < program.code_len) {
-        if (++steps_executed > MAX_VM_STEPS) {
-            fail_limit(VM_STOP_STEPS, "step", MAX_VM_STEPS, "steps");
+        if (++steps_executed > step_limit_now) {
+            fail_limit(VM_STOP_STEPS, "step", step_limit_now, "steps");
             return AnvilValue::make_undefined();
         }
 
@@ -848,6 +849,11 @@ static u32 run_script_text(
         ctx.fill_telemetry(telemetry_out);
         return anvil_vm::VM_RUN_REFUSED;
     }
+    if (ctx.script_size_limit != 0u && script_len > ctx.script_size_limit) {
+        ctx.fail_limit(anvil_vm::VM_REFUSE_CODE_SIZE, "script size", ctx.script_size_limit, "bytes");
+        ctx.fill_telemetry(telemetry_out);
+        return anvil_vm::VM_RUN_REFUSED;
+    }
     ctx.host_set_text = g_text_host_fn;
     ctx.host = g_text_host;
     if (!anvil_vm::compile_js_to_bytecode(ctx, compiler_memory, script, script_len)) {
@@ -895,7 +901,30 @@ static u32 run_request(
             ctx, compiler_memory, src + pos, len - pos, telemetry_out, numeric_result_out
         );
     }
-    // Any other op is not supported yet.
+    if (op == anvil_vm::AVK_OP_CONFIGURE) {
+        // The payload is four u32 limits. A zero leaves that limit as it was.
+        // The settings stay on the context for the runs that follow.
+        if (len >= pos + 16u) {
+            const u32 step = anvil_vm::read_u32_le(src + pos);
+            const u32 script_size = anvil_vm::read_u32_le(src + pos + 4u);
+            const u32 heap = anvil_vm::read_u32_le(src + pos + 8u);
+            const u32 depth = anvil_vm::read_u32_le(src + pos + 12u);
+            if (step != 0u) {
+                ctx.step_limit = step;
+            }
+            if (script_size != 0u) {
+                ctx.script_size_limit = script_size;
+            }
+            if (heap != 0u) {
+                ctx.heap_byte_budget = heap;
+            }
+            if (depth != 0u) {
+                ctx.call_depth_limit = depth;
+            }
+        }
+        ctx.fill_telemetry(telemetry_out);
+        return anvil_vm::VM_RUN_OK;
+    }
     ctx.fail(anvil_vm::VM_REFUSE_UNSUPPORTED, "unsupported request op");
     ctx.fill_telemetry(telemetry_out);
     return anvil_vm::VM_RUN_REFUSED;

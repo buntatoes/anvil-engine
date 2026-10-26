@@ -321,6 +321,25 @@ mod vm_request {
     pub fn run(source: &[u8]) -> Vec<u8> {
         run_with_cap(source, super::DEFAULT_OUT_CAP)
     }
+
+    /// Request op: set the limits that later runs on the same context use.
+    pub const OP_CONFIGURE: u32 = 2;
+
+    /// A Configure request. Each limit is a byte count or a step count; a
+    /// zero leaves that limit as it was.
+    pub fn configure(
+        step_budget: u32,
+        script_size_limit: u32,
+        heap_byte_budget: u32,
+        call_depth_limit: u32,
+    ) -> Vec<u8> {
+        let mut bytes = header(OP_CONFIGURE, 0, super::DEFAULT_OUT_CAP);
+        bytes.extend_from_slice(&step_budget.to_le_bytes());
+        bytes.extend_from_slice(&script_size_limit.to_le_bytes());
+        bytes.extend_from_slice(&heap_byte_budget.to_le_bytes());
+        bytes.extend_from_slice(&call_depth_limit.to_le_bytes());
+        bytes
+    }
 }
 
 /// Out-buffer size a request asks for by default: the whole telemetry struct.
@@ -565,6 +584,34 @@ pub fn eval_cpp_vm_request(source: &str, out_cap: u32) -> Result<(f64, AnvilVmTe
     }
     let request = vm_request::run_with_cap(trimmed.as_bytes(), out_cap);
     match ScriptRuntime::new().try_owned_vm(&request) {
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
+    }
+}
+
+/// Set a step budget for this run, then run `source` through the request
+/// protocol. The budget replaces the built-in default for the run. A budget a
+/// run goes past stops it with that budget in the reason.
+pub fn eval_cpp_vm_request_configured(
+    step_budget: u32,
+    source: &str,
+) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let mut runtime = ScriptRuntime::new();
+    let configure = vm_request::configure(step_budget, 0, 0, 0);
+    let _ = runtime.try_owned_vm(&configure);
+    let run = vm_request::run(trimmed.as_bytes());
+    match runtime.try_owned_vm(&run) {
         VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
         VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
         VmRun::Rejected(None) => Err(VmError {

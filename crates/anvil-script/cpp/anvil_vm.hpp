@@ -887,6 +887,22 @@ struct AnvilVmContext {
     u32 host_id_count;
     void (*host_set_text)(void* host, const char* id, u32 len, double value);
     void* host;
+    // Limits a Configure request set for this context. 0 means "use the
+    // built-in default". They are kept across runs (init() does not clear
+    // them), so a Configure call applies to the Run calls that follow on the
+    // same context. step_limit and script_size_limit take effect now; the
+    // heap and call-depth budgets are stored here for the heap and the frame
+    // stack to use as they grow.
+    u32 step_limit;
+    u32 script_size_limit;
+    u32 heap_byte_budget;
+    u32 call_depth_limit;
+
+    // Steps this run may take before it stops: the configured budget, or the
+    // built-in default when none was set.
+    u32 effective_step_limit() const noexcept {
+        return step_limit != 0u ? step_limit : MAX_VM_STEPS;
+    }
 
     void init() noexcept;
     // NO_GLOBAL when all global slots are taken.

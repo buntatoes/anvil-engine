@@ -95,3 +95,27 @@ fn seeded_random_request_headers_never_crash() {
         let _ = eval_cpp_vm_script(&source);
     }
 }
+
+#[test]
+fn a_configured_step_budget_stops_a_run_sooner() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let error = anvil_script::eval_cpp_vm_request_configured(
+        1000,
+        "let i = 0; while (i < 1000000) { i = i + 1; } i;",
+    )
+    .unwrap_err();
+    assert_eq!(error.message, "step limit reached: 1000 steps");
+}
+
+#[test]
+fn a_configured_budget_leaves_work_under_it_alone() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (value, _) =
+        anvil_script::eval_cpp_vm_request_configured(100000, "let a = 2; let b = a * 3; b;")
+            .expect("runs");
+    assert_eq!(value, 6.0);
+}
