@@ -383,21 +383,23 @@ fn walk(
         items.push(DisplayItem::PushFixed);
     }
     let layer_start = items.len();
-    if let Some(shadow) = tree.box_shadow {
-        if tree.rect.width > 0.0 && tree.rect.height > 0.0 && shadow.color.a > 0 {
-            items.push(DisplayItem::BoxShadow {
-                x: tree.rect.x,
-                y: tree.rect.y,
-                width: tree.rect.width,
-                height: tree.rect.height,
-                offset_x: shadow.offset_x,
-                offset_y: shadow.offset_y,
-                blur_radius: shadow.blur_radius,
-                spread_radius: shadow.spread_radius,
-                radius: tree.border_radius,
-                color: shadow.color,
-            });
-        }
+    if let Some(shadow) = tree.box_shadow
+        && tree.rect.width > 0.0
+        && tree.rect.height > 0.0
+        && shadow.color.a > 0
+    {
+        items.push(DisplayItem::BoxShadow {
+            x: tree.rect.x,
+            y: tree.rect.y,
+            width: tree.rect.width,
+            height: tree.rect.height,
+            offset_x: shadow.offset_x,
+            offset_y: shadow.offset_y,
+            blur_radius: shadow.blur_radius,
+            spread_radius: shadow.spread_radius,
+            radius: tree.border_radius,
+            color: shadow.color,
+        });
     }
     if let Some(grad) = tree.background_gradient {
         if tree.rect.width > 0.0 && tree.rect.height > 0.0 {
@@ -446,16 +448,17 @@ fn walk(
             });
         }
     } else {
-        if let Some(color) = tree.background {
-            if tree.rect.width > 0.0 && tree.rect.height > 0.0 {
-                items.push(DisplayItem::Rect {
-                    x: tree.rect.x,
-                    y: tree.rect.y,
-                    width: tree.rect.width,
-                    height: tree.rect.height,
-                    color,
-                });
-            }
+        if let Some(color) = tree.background
+            && tree.rect.width > 0.0
+            && tree.rect.height > 0.0
+        {
+            items.push(DisplayItem::Rect {
+                x: tree.rect.x,
+                y: tree.rect.y,
+                width: tree.rect.width,
+                height: tree.rect.height,
+                color,
+            });
         }
         paint_borders(tree, items);
     }

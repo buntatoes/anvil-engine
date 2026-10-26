@@ -562,10 +562,10 @@ pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
                     .iter()
                     .position(|byte| *byte == 0)
                     .unwrap_or(name.len());
-                if let Ok(text) = std::str::from_utf8(&name[..end]) {
-                    if !text.is_empty() {
-                        bindings.push((text.to_string(), value));
-                    }
+                if let Ok(text) = std::str::from_utf8(&name[..end])
+                    && !text.is_empty()
+                {
+                    bindings.push((text.to_string(), value));
                 }
             }
         }
@@ -3156,11 +3156,11 @@ impl ScriptRuntime {
             if let Some((lhs, rhs)) = split_assignment(stripped) {
                 let lhs = lhs.trim();
                 let rhs = rhs.trim();
-                if lhs == "document.title" {
-                    if let Some(Value::Str(s)) = self.try_fold_constant_expr(rhs) {
-                        ops.push(CompiledOp::SetTitleConst(s));
-                        continue;
-                    }
+                if lhs == "document.title"
+                    && let Some(Value::Str(s)) = self.try_fold_constant_expr(rhs)
+                {
+                    ops.push(CompiledOp::SetTitleConst(s));
+                    continue;
                 }
                 if is_decl && is_identifier(lhs) {
                     if let Some(const_val) = self.try_fold_constant_expr(rhs) {
@@ -3208,17 +3208,14 @@ impl ScriptRuntime {
             ("/", 3u32),
             ("%", 4u32),
         ] {
-            if let Some((l_str, r_str)) = split_top_level_op(e, op_str) {
-                if !l_str.trim().is_empty() {
-                    if let (Ok(l_num), Ok(r_num)) =
-                        (l_str.trim().parse::<f64>(), r_str.trim().parse::<f64>())
-                    {
-                        let folded = eval_jit_binary_op(opcode, l_num, r_num);
-                        self.jit_stats.folded_constants =
-                            self.jit_stats.folded_constants.saturating_add(1);
-                        return Some(Value::Number(folded));
-                    }
-                }
+            if let Some((l_str, r_str)) = split_top_level_op(e, op_str)
+                && !l_str.trim().is_empty()
+                && let (Ok(l_num), Ok(r_num)) =
+                    (l_str.trim().parse::<f64>(), r_str.trim().parse::<f64>())
+            {
+                let folded = eval_jit_binary_op(opcode, l_num, r_num);
+                self.jit_stats.folded_constants = self.jit_stats.folded_constants.saturating_add(1);
+                return Some(Value::Number(folded));
             }
         }
         None
@@ -3421,62 +3418,62 @@ impl ScriptRuntime {
 
         if let Some(rest) = stmt.strip_prefix("try") {
             let rest_trimmed = rest.trim_start();
-            if rest_trimmed.starts_with('{') {
-                if let Some((try_body, after_try)) = extract_first_brace_block(rest_trimmed) {
-                    let reason_before = self.abort_reason.clone();
-                    self.eval_script(doc, &try_body);
-                    let mut had_err = self.thrown_error.take();
-                    if had_err.is_none() && self.aborted && self.steps <= MAX_EXECUTION_STEPS {
-                        // A limit other than the step budget becomes an
-                        // error the catch block sees. The turn goes on, so
-                        // the reason is not kept.
-                        self.aborted = false;
-                        self.abort_reason = reason_before;
-                        had_err = Some(Value::Str("Error".to_string()));
-                    }
-                    let mut rem = after_try.trim();
-                    if let Some(catch_rest) = rem.strip_prefix("catch") {
-                        let catch_rest = catch_rest.trim_start();
-                        let (catch_param, catch_body_src) = if catch_rest.starts_with('(') {
-                            if let Some((p, r)) = extract_paren_group(catch_rest) {
-                                (p.trim().to_string(), r)
-                            } else {
-                                (String::new(), catch_rest)
-                            }
+            if rest_trimmed.starts_with('{')
+                && let Some((try_body, after_try)) = extract_first_brace_block(rest_trimmed)
+            {
+                let reason_before = self.abort_reason.clone();
+                self.eval_script(doc, &try_body);
+                let mut had_err = self.thrown_error.take();
+                if had_err.is_none() && self.aborted && self.steps <= MAX_EXECUTION_STEPS {
+                    // A limit other than the step budget becomes an
+                    // error the catch block sees. The turn goes on, so
+                    // the reason is not kept.
+                    self.aborted = false;
+                    self.abort_reason = reason_before;
+                    had_err = Some(Value::Str("Error".to_string()));
+                }
+                let mut rem = after_try.trim();
+                if let Some(catch_rest) = rem.strip_prefix("catch") {
+                    let catch_rest = catch_rest.trim_start();
+                    let (catch_param, catch_body_src) = if catch_rest.starts_with('(') {
+                        if let Some((p, r)) = extract_paren_group(catch_rest) {
+                            (p.trim().to_string(), r)
                         } else {
                             (String::new(), catch_rest)
-                        };
-                        if let Some((catch_body, after_catch)) =
-                            extract_first_brace_block(catch_body_src)
-                        {
-                            rem = after_catch.trim();
-                            if let Some(err_val) = had_err.take() {
-                                if !catch_param.is_empty() {
-                                    self.set_var(&catch_param, err_val);
-                                }
-                                self.eval_script(doc, &catch_body);
+                        }
+                    } else {
+                        (String::new(), catch_rest)
+                    };
+                    if let Some((catch_body, after_catch)) =
+                        extract_first_brace_block(catch_body_src)
+                    {
+                        rem = after_catch.trim();
+                        if let Some(err_val) = had_err.take() {
+                            if !catch_param.is_empty() {
+                                self.set_var(&catch_param, err_val);
                             }
+                            self.eval_script(doc, &catch_body);
                         }
                     }
-                    if let Some(finally_rest) = rem.strip_prefix("finally") {
-                        if let Some((finally_body, _)) = extract_first_brace_block(finally_rest) {
-                            let saved_return = self.return_value.take();
-                            let saved_throw = self.thrown_error.take().or(had_err.take());
-                            self.eval_script(doc, &finally_body);
-                            if self.return_value.is_none() {
-                                self.return_value = saved_return;
-                            }
-                            if self.thrown_error.is_none() {
-                                self.thrown_error = saved_throw;
-                            }
-                            return;
-                        }
+                }
+                if let Some(finally_rest) = rem.strip_prefix("finally")
+                    && let Some((finally_body, _)) = extract_first_brace_block(finally_rest)
+                {
+                    let saved_return = self.return_value.take();
+                    let saved_throw = self.thrown_error.take().or(had_err.take());
+                    self.eval_script(doc, &finally_body);
+                    if self.return_value.is_none() {
+                        self.return_value = saved_return;
                     }
-                    if let Some(unhandled) = had_err {
-                        self.thrown_error = Some(unhandled);
+                    if self.thrown_error.is_none() {
+                        self.thrown_error = saved_throw;
                     }
                     return;
                 }
+                if let Some(unhandled) = had_err {
+                    self.thrown_error = Some(unhandled);
+                }
+                return;
             }
         }
 
@@ -3507,51 +3504,50 @@ impl ScriptRuntime {
 
         if let Some(rest) = stmt.strip_prefix("switch") {
             let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                if let Some((disc_str, after_disc)) = extract_paren_group(rest) {
-                    if let Some((switch_body, _)) = extract_first_brace_block(after_disc) {
-                        let disc_val = self.eval_expr(doc, &disc_str);
-                        let clauses = parse_switch_clauses(&switch_body);
-                        let mut matched_idx: Option<usize> = None;
-                        let mut default_idx: Option<usize> = None;
-                        for (idx, (case_expr_opt, _)) in clauses.iter().enumerate() {
-                            if let Some(case_expr) = case_expr_opt {
-                                let case_val = self.eval_expr(doc, case_expr);
-                                if values_equal(&disc_val, &case_val, doc) {
-                                    matched_idx = Some(idx);
-                                    break;
-                                }
-                            } else if default_idx.is_none() {
-                                default_idx = Some(idx);
-                            }
+            if rest.starts_with('(')
+                && let Some((disc_str, after_disc)) = extract_paren_group(rest)
+                && let Some((switch_body, _)) = extract_first_brace_block(after_disc)
+            {
+                let disc_val = self.eval_expr(doc, &disc_str);
+                let clauses = parse_switch_clauses(&switch_body);
+                let mut matched_idx: Option<usize> = None;
+                let mut default_idx: Option<usize> = None;
+                for (idx, (case_expr_opt, _)) in clauses.iter().enumerate() {
+                    if let Some(case_expr) = case_expr_opt {
+                        let case_val = self.eval_expr(doc, case_expr);
+                        if values_equal(&disc_val, &case_val, doc) {
+                            matched_idx = Some(idx);
+                            break;
                         }
-                        if let Some(start_idx) = matched_idx.or(default_idx) {
-                            for (_, stmts) in &clauses[start_idx..] {
-                                for s in stmts {
-                                    if self.aborted
-                                        || self.return_value.is_some()
-                                        || self.thrown_error.is_some()
-                                        || self.loop_break
-                                        || self.loop_continue
-                                    {
-                                        break;
-                                    }
-                                    self.exec_statement(doc, s);
-                                }
-                                if self.aborted
-                                    || self.return_value.is_some()
-                                    || self.thrown_error.is_some()
-                                    || self.loop_break
-                                    || self.loop_continue
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        self.loop_break = false;
-                        return;
+                    } else if default_idx.is_none() {
+                        default_idx = Some(idx);
                     }
                 }
+                if let Some(start_idx) = matched_idx.or(default_idx) {
+                    for (_, stmts) in &clauses[start_idx..] {
+                        for s in stmts {
+                            if self.aborted
+                                || self.return_value.is_some()
+                                || self.thrown_error.is_some()
+                                || self.loop_break
+                                || self.loop_continue
+                            {
+                                break;
+                            }
+                            self.exec_statement(doc, s);
+                        }
+                        if self.aborted
+                            || self.return_value.is_some()
+                            || self.thrown_error.is_some()
+                            || self.loop_break
+                            || self.loop_continue
+                        {
+                            break;
+                        }
+                    }
+                }
+                self.loop_break = false;
+                return;
             }
         }
 
@@ -3561,25 +3557,25 @@ impl ScriptRuntime {
         }
 
         if let Some(rest) = stmt.strip_prefix("function ") {
-            if let Some((sig, body)) = split_brace_block(rest) {
-                if let Some((name, params_raw)) = sig.split_once('(') {
-                    let name = name.trim().to_string();
-                    let params_str = params_raw.trim().trim_end_matches(')');
-                    let params: Vec<String> = params_str
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect();
-                    if !name.is_empty() {
-                        if let Some((_, existing_params, existing_body)) =
-                            self.functions.iter_mut().find(|(n, _, _)| n == &name)
-                        {
-                            *existing_params = params;
-                            *existing_body = body;
-                        } else {
-                            self.functions.push((name, params, body));
-                        }
+            if let Some((sig, body)) = split_brace_block(rest)
+                && let Some((name, params_raw)) = sig.split_once('(')
+            {
+                let name = name.trim().to_string();
+                let params_str = params_raw.trim().trim_end_matches(')');
+                let params: Vec<String> = params_str
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                if !name.is_empty() {
+                    if let Some((_, existing_params, existing_body)) =
+                        self.functions.iter_mut().find(|(n, _, _)| n == &name)
+                    {
+                        *existing_params = params;
+                        *existing_body = body;
+                    } else {
+                        self.functions.push((name, params, body));
                     }
                 }
             }
@@ -3588,176 +3584,166 @@ impl ScriptRuntime {
 
         if let Some(rest) = stmt.strip_prefix("while") {
             let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
-                    if let Some((loop_body, _)) = extract_first_brace_block(after_cond) {
-                        if self.try_native_page_loop(doc, stmt)
-                            || self.try_native_numeric_loop(stmt)
-                        {
-                            return;
-                        }
-                        // Each pass spends a step, so the step budget ends
-                        // a loop that does not.
-                        while self.consume_step() {
-                            if self.return_value.is_some()
-                                || self.thrown_error.is_some()
-                                || !self.eval_expr(doc, &cond_str).is_truthy()
-                            {
-                                break;
-                            }
-                            self.eval_script(doc, &loop_body);
-                            if self.loop_break {
-                                self.loop_break = false;
-                                break;
-                            }
-                            if self.loop_continue {
-                                self.loop_continue = false;
-                            }
-                        }
-                        return;
+            if rest.starts_with('(')
+                && let Some((cond_str, after_cond)) = extract_paren_group(rest)
+                && let Some((loop_body, _)) = extract_first_brace_block(after_cond)
+            {
+                if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
+                    return;
+                }
+                // Each pass spends a step, so the step budget ends
+                // a loop that does not.
+                while self.consume_step() {
+                    if self.return_value.is_some()
+                        || self.thrown_error.is_some()
+                        || !self.eval_expr(doc, &cond_str).is_truthy()
+                    {
+                        break;
+                    }
+                    self.eval_script(doc, &loop_body);
+                    if self.loop_break {
+                        self.loop_break = false;
+                        break;
+                    }
+                    if self.loop_continue {
+                        self.loop_continue = false;
                     }
                 }
+                return;
             }
         }
 
         if let Some(rest) = stmt.strip_prefix("for") {
             let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                if let Some((header_str, after_header)) = extract_paren_group(rest) {
-                    if let Some((loop_body, _)) = extract_first_brace_block(after_header) {
-                        let parts: Vec<&str> = header_str.splitn(3, ';').collect();
-                        if parts.len() == 3 {
-                            if self.try_native_page_loop(doc, stmt)
-                                || self.try_native_numeric_loop(stmt)
-                            {
-                                return;
-                            }
-                            self.exec_statement(doc, parts[0]);
-                            while self.consume_step() {
-                                if self.return_value.is_some() || self.thrown_error.is_some() {
-                                    break;
-                                }
-                                if !parts[1].trim().is_empty()
-                                    && !self.eval_expr(doc, parts[1]).is_truthy()
-                                {
-                                    break;
-                                }
-                                self.eval_script(doc, &loop_body);
-                                if self.loop_break {
-                                    self.loop_break = false;
-                                    break;
-                                }
-                                if self.loop_continue {
-                                    self.loop_continue = false;
-                                }
-                                self.exec_statement(doc, parts[2]);
-                            }
-                            return;
+            if rest.starts_with('(')
+                && let Some((header_str, after_header)) = extract_paren_group(rest)
+                && let Some((loop_body, _)) = extract_first_brace_block(after_header)
+            {
+                let parts: Vec<&str> = header_str.splitn(3, ';').collect();
+                if parts.len() == 3 {
+                    if self.try_native_page_loop(doc, stmt) || self.try_native_numeric_loop(stmt) {
+                        return;
+                    }
+                    self.exec_statement(doc, parts[0]);
+                    while self.consume_step() {
+                        if self.return_value.is_some() || self.thrown_error.is_some() {
+                            break;
                         }
-                        if let Some((lhs_raw, rhs_raw)) = split_for_of_or_in(&header_str, " of ") {
-                            let binding = lhs_raw
-                                .trim()
-                                .strip_prefix("let ")
-                                .or_else(|| lhs_raw.trim().strip_prefix("const "))
-                                .or_else(|| lhs_raw.trim().strip_prefix("var "))
-                                .unwrap_or(lhs_raw.trim())
-                                .trim();
-                            let iterable = self.eval_expr(doc, rhs_raw.trim());
-                            let items: Vec<Value> = match iterable {
-                                Value::Array(v) => v,
-                                Value::Json(JsonValue::Array(v)) => {
-                                    v.into_iter().map(Value::from_json_value).collect()
-                                }
-                                Value::Str(s) => {
-                                    s.chars().map(|c| Value::Str(c.to_string())).collect()
-                                }
-                                _ => Vec::new(),
-                            };
-                            for item in items {
-                                if !self.consume_step()
-                                    || self.return_value.is_some()
-                                    || self.thrown_error.is_some()
-                                {
-                                    break;
-                                }
-                                self.bind_pattern(doc, binding, item);
-                                self.eval_script(doc, &loop_body);
-                                if self.loop_break {
-                                    self.loop_break = false;
-                                    break;
-                                }
-                                if self.loop_continue {
-                                    self.loop_continue = false;
-                                }
-                            }
-                            return;
+                        if !parts[1].trim().is_empty() && !self.eval_expr(doc, parts[1]).is_truthy()
+                        {
+                            break;
                         }
-                        if let Some((lhs_raw, rhs_raw)) = split_for_of_or_in(&header_str, " in ") {
-                            let binding = lhs_raw
-                                .trim()
-                                .strip_prefix("let ")
-                                .or_else(|| lhs_raw.trim().strip_prefix("const "))
-                                .or_else(|| lhs_raw.trim().strip_prefix("var "))
-                                .unwrap_or(lhs_raw.trim())
-                                .trim();
-                            let target = self.eval_expr(doc, rhs_raw.trim());
-                            let keys: Vec<Value> = match target {
-                                Value::Json(JsonValue::Object(entries)) => {
-                                    entries.into_iter().map(|(k, _)| Value::Str(k)).collect()
-                                }
-                                Value::Array(items) => (0..items.len())
-                                    .map(|i| Value::Str(i.to_string()))
-                                    .collect(),
-                                Value::Json(JsonValue::Array(items)) => (0..items.len())
-                                    .map(|i| Value::Str(i.to_string()))
-                                    .collect(),
-                                _ => Vec::new(),
-                            };
-                            for key in keys {
-                                if !self.consume_step()
-                                    || self.return_value.is_some()
-                                    || self.thrown_error.is_some()
-                                {
-                                    break;
-                                }
-                                self.bind_pattern(doc, binding, key);
-                                self.eval_script(doc, &loop_body);
-                                if self.loop_break {
-                                    self.loop_break = false;
-                                    break;
-                                }
-                                if self.loop_continue {
-                                    self.loop_continue = false;
-                                }
-                            }
-                            return;
+                        self.eval_script(doc, &loop_body);
+                        if self.loop_break {
+                            self.loop_break = false;
+                            break;
+                        }
+                        if self.loop_continue {
+                            self.loop_continue = false;
+                        }
+                        self.exec_statement(doc, parts[2]);
+                    }
+                    return;
+                }
+                if let Some((lhs_raw, rhs_raw)) = split_for_of_or_in(&header_str, " of ") {
+                    let binding = lhs_raw
+                        .trim()
+                        .strip_prefix("let ")
+                        .or_else(|| lhs_raw.trim().strip_prefix("const "))
+                        .or_else(|| lhs_raw.trim().strip_prefix("var "))
+                        .unwrap_or(lhs_raw.trim())
+                        .trim();
+                    let iterable = self.eval_expr(doc, rhs_raw.trim());
+                    let items: Vec<Value> = match iterable {
+                        Value::Array(v) => v,
+                        Value::Json(JsonValue::Array(v)) => {
+                            v.into_iter().map(Value::from_json_value).collect()
+                        }
+                        Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+                        _ => Vec::new(),
+                    };
+                    for item in items {
+                        if !self.consume_step()
+                            || self.return_value.is_some()
+                            || self.thrown_error.is_some()
+                        {
+                            break;
+                        }
+                        self.bind_pattern(doc, binding, item);
+                        self.eval_script(doc, &loop_body);
+                        if self.loop_break {
+                            self.loop_break = false;
+                            break;
+                        }
+                        if self.loop_continue {
+                            self.loop_continue = false;
                         }
                     }
+                    return;
+                }
+                if let Some((lhs_raw, rhs_raw)) = split_for_of_or_in(&header_str, " in ") {
+                    let binding = lhs_raw
+                        .trim()
+                        .strip_prefix("let ")
+                        .or_else(|| lhs_raw.trim().strip_prefix("const "))
+                        .or_else(|| lhs_raw.trim().strip_prefix("var "))
+                        .unwrap_or(lhs_raw.trim())
+                        .trim();
+                    let target = self.eval_expr(doc, rhs_raw.trim());
+                    let keys: Vec<Value> = match target {
+                        Value::Json(JsonValue::Object(entries)) => {
+                            entries.into_iter().map(|(k, _)| Value::Str(k)).collect()
+                        }
+                        Value::Array(items) => (0..items.len())
+                            .map(|i| Value::Str(i.to_string()))
+                            .collect(),
+                        Value::Json(JsonValue::Array(items)) => (0..items.len())
+                            .map(|i| Value::Str(i.to_string()))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for key in keys {
+                        if !self.consume_step()
+                            || self.return_value.is_some()
+                            || self.thrown_error.is_some()
+                        {
+                            break;
+                        }
+                        self.bind_pattern(doc, binding, key);
+                        self.eval_script(doc, &loop_body);
+                        if self.loop_break {
+                            self.loop_break = false;
+                            break;
+                        }
+                        if self.loop_continue {
+                            self.loop_continue = false;
+                        }
+                    }
+                    return;
                 }
             }
         }
 
         if let Some(rest) = stmt.strip_prefix("if") {
             let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
-                    if let Some((then_body, after_then)) = extract_first_brace_block(after_cond) {
-                        let cond_val = self.eval_expr(doc, &cond_str);
-                        if cond_val.is_truthy() {
-                            self.eval_script(doc, &then_body);
+            if rest.starts_with('(')
+                && let Some((cond_str, after_cond)) = extract_paren_group(rest)
+                && let Some((then_body, after_then)) = extract_first_brace_block(after_cond)
+            {
+                let cond_val = self.eval_expr(doc, &cond_str);
+                if cond_val.is_truthy() {
+                    self.eval_script(doc, &then_body);
+                } else {
+                    let after_then = after_then.trim();
+                    if let Some(else_rest) = after_then.strip_prefix("else") {
+                        if let Some((else_body, _)) = extract_first_brace_block(else_rest) {
+                            self.eval_script(doc, &else_body);
                         } else {
-                            let after_then = after_then.trim();
-                            if let Some(else_rest) = after_then.strip_prefix("else") {
-                                if let Some((else_body, _)) = extract_first_brace_block(else_rest) {
-                                    self.eval_script(doc, &else_body);
-                                } else {
-                                    self.exec_statement(doc, else_rest);
-                                }
-                            }
+                            self.exec_statement(doc, else_rest);
                         }
-                        return;
                     }
                 }
+                return;
             }
         }
 
@@ -3895,23 +3881,22 @@ impl ScriptRuntime {
                     }
                     return;
                 }
-                if let Some(rest_fn) = rhs_eff.strip_prefix("function") {
-                    if let Some((sig, body)) = split_brace_block(rest_fn) {
-                        if let Some((_, params_raw)) = sig.split_once('(') {
-                            let params_str = params_raw.trim().trim_end_matches(')');
-                            let params: Vec<String> = params_str
-                                .split(',')
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(String::from)
-                                .collect();
-                            self.functions.push((lhs_trimmed.to_string(), params, body));
-                            if rhs_async && !self.async_functions.iter().any(|n| n == lhs_trimmed) {
-                                self.async_functions.push(lhs_trimmed.to_string());
-                            }
-                            return;
-                        }
+                if let Some(rest_fn) = rhs_eff.strip_prefix("function")
+                    && let Some((sig, body)) = split_brace_block(rest_fn)
+                    && let Some((_, params_raw)) = sig.split_once('(')
+                {
+                    let params_str = params_raw.trim().trim_end_matches(')');
+                    let params: Vec<String> = params_str
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    self.functions.push((lhs_trimmed.to_string(), params, body));
+                    if rhs_async && !self.async_functions.iter().any(|n| n == lhs_trimmed) {
+                        self.async_functions.push(lhs_trimmed.to_string());
                     }
+                    return;
                 }
             }
             let value = self.eval_expr(doc, rhs_trimmed);
@@ -3952,10 +3937,10 @@ impl ScriptRuntime {
                     Value::Element(id) => self.read_element_prop(doc, *id, src_key),
                     _ => Value::Null,
                 };
-                if matches!(extracted, Value::Null) {
-                    if let Some(def) = default_expr {
-                        extracted = self.eval_expr(doc, def);
-                    }
+                if matches!(extracted, Value::Null)
+                    && let Some(def) = default_expr
+                {
+                    extracted = self.eval_expr(doc, def);
                 }
                 self.set_var(var_name, extracted);
             }
@@ -3978,10 +3963,10 @@ impl ScriptRuntime {
                     continue;
                 }
                 let mut item_val = items.get(idx).cloned().unwrap_or(Value::Null);
-                if matches!(item_val, Value::Null) {
-                    if let Some(def) = default_expr {
-                        item_val = self.eval_expr(doc, def);
-                    }
+                if matches!(item_val, Value::Null)
+                    && let Some(def) = default_expr
+                {
+                    item_val = self.eval_expr(doc, def);
                 }
                 self.set_var(var_name, item_val);
             }
@@ -4007,40 +3992,39 @@ impl ScriptRuntime {
             return;
         }
 
-        if lhs.ends_with(']') {
-            if let Some(open) = lhs.rfind('[') {
-                if open > 0 {
-                    let target_ident = lhs[..open].trim();
-                    let idx_expr = &lhs[open + 1..lhs.len() - 1];
-                    let idx_val = self.eval_expr(doc, idx_expr);
-                    if is_identifier(target_ident) {
-                        if let Some(existing) = self.get_var(target_ident).cloned() {
-                            match existing {
-                                Value::Array(mut items) => {
-                                    if let Some(n) = idx_val.as_number() {
-                                        let i = n.max(0.0) as usize;
-                                        if i < items.len() {
-                                            items[i] = value;
-                                        } else if self.array_fits(i + 1) {
-                                            items.resize(i, Value::Null);
-                                            items.push(value);
-                                        } else {
-                                            return;
-                                        }
-                                        self.set_var(target_ident, Value::Array(items));
-                                    }
-                                    return;
-                                }
-                                Value::Json(mut jobj) => {
-                                    let key = idx_val.as_string(doc);
-                                    jobj.insert(&key, value.to_json_value(doc));
-                                    self.set_var(target_ident, Value::Json(jobj));
-                                    return;
-                                }
-                                _ => {}
+        if lhs.ends_with(']')
+            && let Some(open) = lhs.rfind('[')
+            && open > 0
+        {
+            let target_ident = lhs[..open].trim();
+            let idx_expr = &lhs[open + 1..lhs.len() - 1];
+            let idx_val = self.eval_expr(doc, idx_expr);
+            if is_identifier(target_ident)
+                && let Some(existing) = self.get_var(target_ident).cloned()
+            {
+                match existing {
+                    Value::Array(mut items) => {
+                        if let Some(n) = idx_val.as_number() {
+                            let i = n.max(0.0) as usize;
+                            if i < items.len() {
+                                items[i] = value;
+                            } else if self.array_fits(i + 1) {
+                                items.resize(i, Value::Null);
+                                items.push(value);
+                            } else {
+                                return;
                             }
+                            self.set_var(target_ident, Value::Array(items));
                         }
+                        return;
                     }
+                    Value::Json(mut jobj) => {
+                        let key = idx_val.as_string(doc);
+                        jobj.insert(&key, value.to_json_value(doc));
+                        self.set_var(target_ident, Value::Json(jobj));
+                        return;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -4121,13 +4105,13 @@ impl ScriptRuntime {
                 }
                 return;
             }
-            if is_identifier(obj_expr.trim()) {
-                if let Some(Value::Json(mut jobj)) = self.get_var(obj_expr.trim()).cloned() {
-                    let jval = value.to_json_value(doc);
-                    jobj.insert(prop.trim(), jval);
-                    self.set_var(obj_expr.trim(), Value::Json(jobj));
-                    return;
-                }
+            if is_identifier(obj_expr.trim())
+                && let Some(Value::Json(mut jobj)) = self.get_var(obj_expr.trim()).cloned()
+            {
+                let jval = value.to_json_value(doc);
+                jobj.insert(prop.trim(), jval);
+                self.set_var(obj_expr.trim(), Value::Json(jobj));
+                return;
             }
         }
 
@@ -4145,12 +4129,12 @@ impl ScriptRuntime {
             return Value::Null;
         }
 
-        if expr.starts_with('(') && expr.ends_with(')') {
-            if let Some((inner, rem)) = extract_paren_group(expr) {
-                if rem.trim().is_empty() {
-                    return self.eval_expr(doc, &inner);
-                }
-            }
+        if expr.starts_with('(')
+            && expr.ends_with(')')
+            && let Some((inner, rem)) = extract_paren_group(expr)
+            && rem.trim().is_empty()
+        {
+            return self.eval_expr(doc, &inner);
         }
 
         if expr.starts_with('[') && expr.ends_with(']') {
@@ -4231,20 +4215,20 @@ impl ScriptRuntime {
             return Value::Str(ty.to_string());
         }
 
-        if let Some(rest) = expr.strip_prefix('!') {
-            if !rest.starts_with('=') {
-                let v = self.eval_expr(doc, rest.trim());
-                return Value::Bool(!v.is_truthy());
-            }
+        if let Some(rest) = expr.strip_prefix('!')
+            && !rest.starts_with('=')
+        {
+            let v = self.eval_expr(doc, rest.trim());
+            return Value::Bool(!v.is_truthy());
         }
 
-        if let Some((cond_s, branches_s)) = split_top_level_op(expr, "?") {
-            if let Some((then_s, else_s)) = split_top_level_op(branches_s, ":") {
-                if self.eval_expr(doc, cond_s).is_truthy() {
-                    return self.eval_expr(doc, then_s);
-                } else {
-                    return self.eval_expr(doc, else_s);
-                }
+        if let Some((cond_s, branches_s)) = split_top_level_op(expr, "?")
+            && let Some((then_s, else_s)) = split_top_level_op(branches_s, ":")
+        {
+            if self.eval_expr(doc, cond_s).is_truthy() {
+                return self.eval_expr(doc, then_s);
+            } else {
+                return self.eval_expr(doc, else_s);
             }
         }
 
@@ -4404,50 +4388,49 @@ impl ScriptRuntime {
             return self.await_value(doc, awaited);
         }
 
-        if expr.ends_with(')') {
-            if let Some(open) = find_call_open_paren(expr) {
-                let callee = expr[..open].trim();
-                let args_src = &expr[open + 1..expr.len() - 1];
-                return self.eval_call(doc, callee, args_src);
-            }
+        if expr.ends_with(')')
+            && let Some(open) = find_call_open_paren(expr)
+        {
+            let callee = expr[..open].trim();
+            let args_src = &expr[open + 1..expr.len() - 1];
+            return self.eval_call(doc, callee, args_src);
         }
 
-        if expr.ends_with(']') {
-            if let Some(open) = expr.rfind('[') {
-                if open > 0 {
-                    let target_expr = expr[..open].trim();
-                    let idx_expr = &expr[open + 1..expr.len() - 1];
-                    let target = self.eval_expr(doc, target_expr);
-                    let idx_val = self.eval_expr(doc, idx_expr);
-                    match target {
-                        Value::Array(items) => {
-                            if let Some(i) = idx_val.as_number() {
-                                return items
-                                    .get(i.max(0.0) as usize)
-                                    .cloned()
-                                    .unwrap_or(Value::Null);
-                            }
-                        }
-                        Value::Json(JsonValue::Array(items)) => {
-                            if let Some(i) = idx_val.as_number() {
-                                return items
-                                    .get(i.max(0.0) as usize)
-                                    .cloned()
-                                    .map(Value::from_json_value)
-                                    .unwrap_or(Value::Null);
-                            }
-                        }
-                        Value::Json(jobj) => {
-                            let key = idx_val.as_string(doc);
-                            return jobj
-                                .get(&key)
-                                .cloned()
-                                .map(Value::from_json_value)
-                                .unwrap_or(Value::Null);
-                        }
-                        _ => {}
+        if expr.ends_with(']')
+            && let Some(open) = expr.rfind('[')
+            && open > 0
+        {
+            let target_expr = expr[..open].trim();
+            let idx_expr = &expr[open + 1..expr.len() - 1];
+            let target = self.eval_expr(doc, target_expr);
+            let idx_val = self.eval_expr(doc, idx_expr);
+            match target {
+                Value::Array(items) => {
+                    if let Some(i) = idx_val.as_number() {
+                        return items
+                            .get(i.max(0.0) as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null);
                     }
                 }
+                Value::Json(JsonValue::Array(items)) => {
+                    if let Some(i) = idx_val.as_number() {
+                        return items
+                            .get(i.max(0.0) as usize)
+                            .cloned()
+                            .map(Value::from_json_value)
+                            .unwrap_or(Value::Null);
+                    }
+                }
+                Value::Json(jobj) => {
+                    let key = idx_val.as_string(doc);
+                    return jobj
+                        .get(&key)
+                        .cloned()
+                        .map(Value::from_json_value)
+                        .unwrap_or(Value::Null);
+                }
+                _ => {}
             }
         }
 
@@ -4528,10 +4511,9 @@ impl ScriptRuntime {
         if let Some(stripped_win) = expr
             .strip_prefix("window.")
             .or_else(|| expr.strip_prefix("globalThis."))
+            && let Some(val) = self.get_var(stripped_win.trim())
         {
-            if let Some(val) = self.get_var(stripped_win.trim()) {
-                return val.clone();
-            }
+            return val.clone();
         }
 
         Value::Null
@@ -4625,14 +4607,14 @@ impl ScriptRuntime {
             }
             "Object" | "Map" | "Set" => Value::Json(JsonValue::empty_object()),
             "Array" => {
-                if args.len() == 1 {
-                    if let Some(n) = self.eval_expr(doc, &args[0]).as_number() {
-                        let count = n.max(0.0) as usize;
-                        if !self.array_fits(count) {
-                            return Value::Null;
-                        }
-                        return Value::Array(vec![Value::Null; count]);
+                if args.len() == 1
+                    && let Some(n) = self.eval_expr(doc, &args[0]).as_number()
+                {
+                    let count = n.max(0.0) as usize;
+                    if !self.array_fits(count) {
+                        return Value::Null;
                     }
+                    return Value::Array(vec![Value::Null; count]);
                 }
                 if !self.array_fits(args.len()) {
                     return Value::Null;
@@ -4799,15 +4781,15 @@ impl ScriptRuntime {
                     .get(2)
                     .and_then(|a| self.eval_expr(doc, a).as_number())
                     .map(|n| n.max(0.0) as usize);
-                if let Some(len) = len_opt {
-                    if !self.array_fits(len) {
-                        return Value::Null;
-                    }
+                if let Some(len) = len_opt
+                    && !self.array_fits(len)
+                {
+                    return Value::Null;
                 }
-                if let Value::Number(n) = first_val {
-                    if !self.array_fits(n.max(0.0) as usize) {
-                        return Value::Null;
-                    }
+                if let Value::Number(n) = first_val
+                    && !self.array_fits(n.max(0.0) as usize)
+                {
+                    return Value::Null;
                 }
                 self.construct_typed_array(callee, first_val, offset, len_opt)
             }
@@ -4884,12 +4866,11 @@ impl ScriptRuntime {
                     .unwrap_or_default();
                 let mut obj = JsonValue::empty_object();
                 obj.insert("type", JsonValue::String(ev_type));
-                if let Some(opts) = args.get(1) {
-                    if let Value::Json(jopts) = self.eval_expr(doc, opts) {
-                        if let Some(detail) = jopts.get("detail").cloned() {
-                            obj.insert("detail", detail);
-                        }
-                    }
+                if let Some(opts) = args.get(1)
+                    && let Value::Json(jopts) = self.eval_expr(doc, opts)
+                    && let Some(detail) = jopts.get("detail").cloned()
+                {
+                    obj.insert("detail", detail);
                 }
                 Value::Json(obj)
             }
@@ -5061,56 +5042,47 @@ impl ScriptRuntime {
 
         if callee == "super" {
             let args = split_args(args_src);
-            if let Some(Value::Str(sup_name)) = self.get_var("__super_class").cloned() {
-                if let Some((params, body, next_super)) =
+            if let Some(Value::Str(sup_name)) = self.get_var("__super_class").cloned()
+                && let Some((params, body, next_super)) =
                     self.find_class_method(&sup_name, "constructor")
-                {
-                    return self.invoke_method_body(
-                        doc,
-                        &params,
-                        &body,
-                        &args,
-                        next_super.as_deref(),
-                    );
-                }
+            {
+                return self.invoke_method_body(doc, &params, &body, &args, next_super.as_deref());
             }
             return Value::Null;
         }
 
-        if callee.starts_with('(') && callee.ends_with(')') {
-            if let Some((inner_fn, rem)) = extract_paren_group(callee) {
-                if rem.trim().is_empty() {
-                    let args = split_args(args_src);
-                    // `(async () => { ... })()` runs as an async call, so it
-                    // returns at its first `await` like a named one. It keeps
-                    // a copy of the enclosing async function's locals, the
-                    // same as a callback created there.
-                    let (is_async, rest) = split_async_prefix(inner_fn.trim());
-                    if is_async {
-                        let (params, body) = async_callback_parts(rest);
-                        let values: Vec<Value> =
-                            args.iter().map(|a| self.eval_expr(doc, a)).collect();
-                        let env = self.capture_env(&body);
-                        return self.start_async(doc, &params, values, &body, &env);
-                    }
-                    let (params, body) = extract_multi_param_callback(inner_fn.trim());
-                    return self.invoke_method_body(doc, &params, &body, &args, None);
+        if callee.starts_with('(')
+            && callee.ends_with(')')
+            && let Some((inner_fn, rem)) = extract_paren_group(callee)
+        {
+            if rem.trim().is_empty() {
+                let args = split_args(args_src);
+                // `(async () => { ... })()` runs as an async call, so it
+                // returns at its first `await` like a named one. It keeps
+                // a copy of the enclosing async function's locals, the
+                // same as a callback created there.
+                let (is_async, rest) = split_async_prefix(inner_fn.trim());
+                if is_async {
+                    let (params, body) = async_callback_parts(rest);
+                    let values: Vec<Value> = args.iter().map(|a| self.eval_expr(doc, a)).collect();
+                    let env = self.capture_env(&body);
+                    return self.start_async(doc, &params, values, &body, &env);
                 }
+                let (params, body) = extract_multi_param_callback(inner_fn.trim());
+                return self.invoke_method_body(doc, &params, &body, &args, None);
+            }
 
-                if let Some(Value::Str(marker)) = self.get_var(callee).cloned() {
-                    if let Some(rest) = marker.strip_prefix("__wasm_fn:") {
-                        if let Some((inst_str, fn_name)) = rest.split_once(':') {
-                            if let Ok(inst_id) = inst_str.parse::<usize>() {
-                                let args = split_args(args_src);
-                                let args_f64: Vec<f64> = args
-                                    .iter()
-                                    .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
-                                    .collect();
-                                return self.call_wasm_instance_export(inst_id, fn_name, &args_f64);
-                            }
-                        }
-                    }
-                }
+            if let Some(Value::Str(marker)) = self.get_var(callee).cloned()
+                && let Some(rest) = marker.strip_prefix("__wasm_fn:")
+                && let Some((inst_str, fn_name)) = rest.split_once(':')
+                && let Ok(inst_id) = inst_str.parse::<usize>()
+            {
+                let args = split_args(args_src);
+                let args_f64: Vec<f64> = args
+                    .iter()
+                    .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
+                    .collect();
+                return self.call_wasm_instance_export(inst_id, fn_name, &args_f64);
             }
         }
 
@@ -5231,42 +5203,40 @@ impl ScriptRuntime {
             }
             "Object.keys" => {
                 let args = split_args(args_src);
-                if let Some(first) = args.first() {
-                    if let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first) {
-                        return Value::Array(
-                            entries.into_iter().map(|(k, _)| Value::Str(k)).collect(),
-                        );
-                    }
+                if let Some(first) = args.first()
+                    && let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first)
+                {
+                    return Value::Array(entries.into_iter().map(|(k, _)| Value::Str(k)).collect());
                 }
                 return Value::Array(Vec::new());
             }
             "Object.values" => {
                 let args = split_args(args_src);
-                if let Some(first) = args.first() {
-                    if let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first) {
-                        return Value::Array(
-                            entries
-                                .into_iter()
-                                .map(|(_, v)| Value::from_json_value(v))
-                                .collect(),
-                        );
-                    }
+                if let Some(first) = args.first()
+                    && let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first)
+                {
+                    return Value::Array(
+                        entries
+                            .into_iter()
+                            .map(|(_, v)| Value::from_json_value(v))
+                            .collect(),
+                    );
                 }
                 return Value::Array(Vec::new());
             }
             "Object.entries" => {
                 let args = split_args(args_src);
-                if let Some(first) = args.first() {
-                    if let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first) {
-                        return Value::Array(
-                            entries
-                                .into_iter()
-                                .map(|(k, v)| {
-                                    Value::Array(vec![Value::Str(k), Value::from_json_value(v)])
-                                })
-                                .collect(),
-                        );
-                    }
+                if let Some(first) = args.first()
+                    && let Value::Json(JsonValue::Object(entries)) = self.eval_expr(doc, first)
+                {
+                    return Value::Array(
+                        entries
+                            .into_iter()
+                            .map(|(k, v)| {
+                                Value::Array(vec![Value::Str(k), Value::from_json_value(v)])
+                            })
+                            .collect(),
+                    );
                 }
                 return Value::Array(Vec::new());
             }
@@ -5282,26 +5252,26 @@ impl ScriptRuntime {
                     }
                 }
                 let out = Value::Json(merged);
-                if let Some(ident) = target_ident {
-                    if is_identifier(&ident) {
-                        self.set_var(&ident, out.clone());
-                    }
+                if let Some(ident) = target_ident
+                    && is_identifier(&ident)
+                {
+                    self.set_var(&ident, out.clone());
                 }
                 return out;
             }
             "Object.fromEntries" => {
                 let args = split_args(args_src);
                 let mut obj = JsonValue::empty_object();
-                if let Some(first) = args.first() {
-                    if let Value::Array(rows) = self.eval_expr(doc, first) {
-                        for row in rows {
-                            if let Value::Array(pair) = row {
-                                if pair.len() >= 2 {
-                                    let k = pair[0].as_string(doc);
-                                    let v = pair[1].to_json_value(doc);
-                                    obj.insert(&k, v);
-                                }
-                            }
+                if let Some(first) = args.first()
+                    && let Value::Array(rows) = self.eval_expr(doc, first)
+                {
+                    for row in rows {
+                        if let Value::Array(pair) = row
+                            && pair.len() >= 2
+                        {
+                            let k = pair[0].as_string(doc);
+                            let v = pair[1].to_json_value(doc);
+                            obj.insert(&k, v);
                         }
                     }
                 }
@@ -5334,10 +5304,10 @@ impl ScriptRuntime {
                 let args = split_args(args_src);
                 let mut out = String::new();
                 for arg in &args {
-                    if let Some(code) = self.eval_expr(doc, arg).as_number() {
-                        if let Some(ch) = char::from_u32(code.max(0.0) as u32) {
-                            out.push(ch);
-                        }
+                    if let Some(code) = self.eval_expr(doc, arg).as_number()
+                        && let Some(ch) = char::from_u32(code.max(0.0) as u32)
+                    {
+                        out.push(ch);
                     }
                 }
                 return Value::Str(out);
@@ -5363,11 +5333,11 @@ impl ScriptRuntime {
             }
             "Object.hasOwn" => {
                 let args = split_args(args_src);
-                if args.len() >= 2 {
-                    if let Value::Json(jobj) = self.eval_expr(doc, &args[0]) {
-                        let key = self.eval_expr(doc, &args[1]).as_string(doc);
-                        return Value::Bool(jobj.get(&key).is_some());
-                    }
+                if args.len() >= 2
+                    && let Value::Json(jobj) = self.eval_expr(doc, &args[0])
+                {
+                    let key = self.eval_expr(doc, &args[1]).as_string(doc);
+                    return Value::Bool(jobj.get(&key).is_some());
                 }
                 return Value::Bool(false);
             }
@@ -5435,17 +5405,17 @@ impl ScriptRuntime {
             "getComputedStyle" => {
                 let args = split_args(args_src);
                 let mut obj = JsonValue::empty_object();
-                if let Some(first) = args.first() {
-                    if let Value::Element(id) = self.eval_expr(doc, first) {
-                        let inline = doc.get(id).data().attr("style").unwrap_or("");
-                        for part in inline.split(';') {
-                            if let Some((k, v)) = part.split_once(':') {
-                                let k = k.trim().to_ascii_lowercase();
-                                let v = v.trim().to_string();
-                                if !k.is_empty() {
-                                    obj.insert(&k, JsonValue::String(v.clone()));
-                                    obj.insert(kebab_to_camel(&k), JsonValue::String(v));
-                                }
+                if let Some(first) = args.first()
+                    && let Value::Element(id) = self.eval_expr(doc, first)
+                {
+                    let inline = doc.get(id).data().attr("style").unwrap_or("");
+                    for part in inline.split(';') {
+                        if let Some((k, v)) = part.split_once(':') {
+                            let k = k.trim().to_ascii_lowercase();
+                            let v = v.trim().to_string();
+                            if !k.is_empty() {
+                                obj.insert(&k, JsonValue::String(v.clone()));
+                                obj.insert(kebab_to_camel(&k), JsonValue::String(v));
                             }
                         }
                     }
@@ -5497,39 +5467,39 @@ impl ScriptRuntime {
         if callee == "setTimeout" || callee == "setInterval" || callee == "requestAnimationFrame" {
             let args = split_args(args_src);
             let mut new_id = 0u64;
-            if let Some(first) = args.first() {
-                if self.timers.len() < MAX_TIMERS {
-                    let (body, env, is_async) = self.deferred_callback(first);
-                    let mut delay = args
-                        .get(1)
-                        .and_then(|d| self.eval_expr(doc, d).as_number())
-                        .unwrap_or(0.0)
-                        .max(0.0) as u64;
-                    // Clamp a nested timer to 4 ms, as a browser does, so a
-                    // zero-delay timer that reschedules itself still advances
-                    // the clock and keeps a fair order with other timers.
-                    if self.timer_depth > 0 && delay < 4 {
-                        delay = 4;
-                    }
-                    let period = if callee == "setInterval" {
-                        Some(delay.max(1))
-                    } else {
-                        None
-                    };
-                    new_id = self.alloc_timer_id();
-                    let seq = self.alloc_seq();
-                    let due = self.clock_ms.saturating_add(delay);
-                    self.timers.push(Timer {
-                        id: new_id,
-                        seq,
-                        due,
-                        body,
-                        env,
-                        is_async,
-                        period,
-                        cleared: false,
-                    });
+            if let Some(first) = args.first()
+                && self.timers.len() < MAX_TIMERS
+            {
+                let (body, env, is_async) = self.deferred_callback(first);
+                let mut delay = args
+                    .get(1)
+                    .and_then(|d| self.eval_expr(doc, d).as_number())
+                    .unwrap_or(0.0)
+                    .max(0.0) as u64;
+                // Clamp a nested timer to 4 ms, as a browser does, so a
+                // zero-delay timer that reschedules itself still advances
+                // the clock and keeps a fair order with other timers.
+                if self.timer_depth > 0 && delay < 4 {
+                    delay = 4;
                 }
+                let period = if callee == "setInterval" {
+                    Some(delay.max(1))
+                } else {
+                    None
+                };
+                new_id = self.alloc_timer_id();
+                let seq = self.alloc_seq();
+                let due = self.clock_ms.saturating_add(delay);
+                self.timers.push(Timer {
+                    id: new_id,
+                    seq,
+                    due,
+                    body,
+                    env,
+                    is_async,
+                    period,
+                    cleared: false,
+                });
             }
             return Value::Number(new_id as f64);
         }
@@ -5734,50 +5704,50 @@ impl ScriptRuntime {
                     .unwrap_or(el_expr_raw.trim())
                     .trim();
                 let sub_trimmed = sub_obj.trim();
-                if sub_trimmed == "classList" {
-                    if let Value::Element(id) = self.eval_expr(doc, el_expr) {
-                        let args = split_args(args_src);
-                        let cls = args
-                            .first()
-                            .map(|a| self.eval_expr(doc, a).as_string(doc))
-                            .unwrap_or_default();
-                        return match method {
-                            "add" => {
-                                doc.add_class(id, &cls);
-                                Value::Null
-                            }
-                            "remove" => {
-                                doc.remove_class(id, &cls);
-                                Value::Null
-                            }
-                            "toggle" => Value::Bool(doc.toggle_class(id, &cls)),
-                            "contains" => Value::Bool(doc.get(id).data().has_class(&cls)),
-                            _ => Value::Null,
-                        };
-                    }
+                if sub_trimmed == "classList"
+                    && let Value::Element(id) = self.eval_expr(doc, el_expr)
+                {
+                    let args = split_args(args_src);
+                    let cls = args
+                        .first()
+                        .map(|a| self.eval_expr(doc, a).as_string(doc))
+                        .unwrap_or_default();
+                    return match method {
+                        "add" => {
+                            doc.add_class(id, &cls);
+                            Value::Null
+                        }
+                        "remove" => {
+                            doc.remove_class(id, &cls);
+                            Value::Null
+                        }
+                        "toggle" => Value::Bool(doc.toggle_class(id, &cls)),
+                        "contains" => Value::Bool(doc.get(id).data().has_class(&cls)),
+                        _ => Value::Null,
+                    };
                 }
-                if sub_trimmed == "style" {
-                    if let Value::Element(id) = self.eval_expr(doc, el_expr) {
-                        let args = split_args(args_src);
-                        let prop = args
-                            .first()
-                            .map(|a| camel_to_kebab(&self.eval_expr(doc, a).as_string(doc)))
-                            .unwrap_or_default();
-                        return match method {
-                            "setProperty" if args.len() >= 2 => {
-                                let val = self.eval_expr(doc, &args[1]).as_string(doc);
-                                update_inline_style(doc, id, &prop, &val);
-                                Value::Null
-                            }
-                            "getPropertyValue" => Value::Str(read_inline_style(doc, id, &prop)),
-                            "removeProperty" => {
-                                let prev = read_inline_style(doc, id, &prop);
-                                remove_inline_style_prop(doc, id, &prop);
-                                Value::Str(prev)
-                            }
-                            _ => Value::Null,
-                        };
-                    }
+                if sub_trimmed == "style"
+                    && let Value::Element(id) = self.eval_expr(doc, el_expr)
+                {
+                    let args = split_args(args_src);
+                    let prop = args
+                        .first()
+                        .map(|a| camel_to_kebab(&self.eval_expr(doc, a).as_string(doc)))
+                        .unwrap_or_default();
+                    return match method {
+                        "setProperty" if args.len() >= 2 => {
+                            let val = self.eval_expr(doc, &args[1]).as_string(doc);
+                            update_inline_style(doc, id, &prop, &val);
+                            Value::Null
+                        }
+                        "getPropertyValue" => Value::Str(read_inline_style(doc, id, &prop)),
+                        "removeProperty" => {
+                            let prev = read_inline_style(doc, id, &prop);
+                            remove_inline_style_prop(doc, id, &prop);
+                            Value::Str(prev)
+                        }
+                        _ => Value::Null,
+                    };
                 }
             }
 
@@ -5906,55 +5876,55 @@ impl ScriptRuntime {
                 };
             }
 
-            if is_identifier(obj_expr) {
-                if let Some(Value::Array(mut items)) = self.get_var(obj_expr).cloned() {
-                    let args = split_args(args_src);
-                    match method {
-                        "push" => {
-                            if !self.array_fits(items.len().saturating_add(args.len())) {
-                                return Value::Null;
-                            }
-                            for arg in &args {
-                                items.push(self.eval_expr(doc, arg));
-                            }
-                            let len = items.len();
-                            self.set_var(obj_expr, Value::Array(items));
-                            return Value::Number(len as f64);
+            if is_identifier(obj_expr)
+                && let Some(Value::Array(mut items)) = self.get_var(obj_expr).cloned()
+            {
+                let args = split_args(args_src);
+                match method {
+                    "push" => {
+                        if !self.array_fits(items.len().saturating_add(args.len())) {
+                            return Value::Null;
                         }
-                        "pop" => {
-                            let popped = items.pop().unwrap_or(Value::Null);
-                            self.set_var(obj_expr, Value::Array(items));
-                            return popped;
+                        for arg in &args {
+                            items.push(self.eval_expr(doc, arg));
                         }
-                        "shift" => {
-                            let shifted = if items.is_empty() {
-                                Value::Null
-                            } else {
-                                items.remove(0)
-                            };
-                            self.set_var(obj_expr, Value::Array(items));
-                            return shifted;
-                        }
-                        "unshift" => {
-                            if !self.array_fits(items.len().saturating_add(args.len())) {
-                                return Value::Null;
-                            }
-                            for (idx, arg) in args.iter().enumerate() {
-                                let val = self.eval_expr(doc, arg);
-                                items.insert(idx, val);
-                            }
-                            let len = items.len();
-                            self.set_var(obj_expr, Value::Array(items));
-                            return Value::Number(len as f64);
-                        }
-                        "reverse" => {
-                            items.reverse();
-                            let out = Value::Array(items.clone());
-                            self.set_var(obj_expr, Value::Array(items));
-                            return out;
-                        }
-                        _ => {}
+                        let len = items.len();
+                        self.set_var(obj_expr, Value::Array(items));
+                        return Value::Number(len as f64);
                     }
+                    "pop" => {
+                        let popped = items.pop().unwrap_or(Value::Null);
+                        self.set_var(obj_expr, Value::Array(items));
+                        return popped;
+                    }
+                    "shift" => {
+                        let shifted = if items.is_empty() {
+                            Value::Null
+                        } else {
+                            items.remove(0)
+                        };
+                        self.set_var(obj_expr, Value::Array(items));
+                        return shifted;
+                    }
+                    "unshift" => {
+                        if !self.array_fits(items.len().saturating_add(args.len())) {
+                            return Value::Null;
+                        }
+                        for (idx, arg) in args.iter().enumerate() {
+                            let val = self.eval_expr(doc, arg);
+                            items.insert(idx, val);
+                        }
+                        let len = items.len();
+                        self.set_var(obj_expr, Value::Array(items));
+                        return Value::Number(len as f64);
+                    }
+                    "reverse" => {
+                        items.reverse();
+                        let out = Value::Array(items.clone());
+                        self.set_var(obj_expr, Value::Array(items));
+                        return out;
+                    }
+                    _ => {}
                 }
             }
 
@@ -6297,40 +6267,38 @@ impl ScriptRuntime {
                         .get("__class")
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
-                    {
-                        if let Some((params, body, sup_class)) =
+                        && let Some((params, body, sup_class)) =
                             self.find_class_method(&class_name, method)
-                        {
-                            let args = split_args(args_src);
-                            let is_async = self.class_method_is_async(&class_name, method);
-                            let prev_this = self.get_var("this").cloned();
-                            self.set_var("this", Value::Json(jval));
-                            let mut out = self.invoke_method_body(
-                                doc,
-                                &params,
-                                &body,
-                                &args,
-                                sup_class.as_deref(),
-                            );
-                            if is_async {
-                                // An async method's awaits wait in place, so its
-                                // promise is already settled when it returns.
-                                let id = match self.thrown_error.take() {
-                                    Some(err) => self.new_rejected(err),
-                                    None => self.new_resolved(out),
-                                };
-                                out = self.make_promise_value(id);
-                            }
-                            if is_identifier(obj_expr) {
-                                if let Some(updated_this) = self.get_var("this").cloned() {
-                                    self.set_var(obj_expr, updated_this);
-                                }
-                            }
-                            if let Some(old) = prev_this {
-                                self.set_var("this", old);
-                            }
-                            return out;
+                    {
+                        let args = split_args(args_src);
+                        let is_async = self.class_method_is_async(&class_name, method);
+                        let prev_this = self.get_var("this").cloned();
+                        self.set_var("this", Value::Json(jval));
+                        let mut out = self.invoke_method_body(
+                            doc,
+                            &params,
+                            &body,
+                            &args,
+                            sup_class.as_deref(),
+                        );
+                        if is_async {
+                            // An async method's awaits wait in place, so its
+                            // promise is already settled when it returns.
+                            let id = match self.thrown_error.take() {
+                                Some(err) => self.new_rejected(err),
+                                None => self.new_resolved(out),
+                            };
+                            out = self.make_promise_value(id);
                         }
+                        if is_identifier(obj_expr)
+                            && let Some(updated_this) = self.get_var("this").cloned()
+                        {
+                            self.set_var(obj_expr, updated_this);
+                        }
+                        if let Some(old) = prev_this {
+                            self.set_var("this", old);
+                        }
+                        return out;
                     }
                     if let Some(JsonValue::Number(inst_id_f)) = jval.get("__anvil_wasm_exports") {
                         let inst_id = *inst_id_f as usize;
@@ -6684,19 +6652,17 @@ impl ScriptRuntime {
             return self.invoke_method_body(doc, &params, &body, &args, None);
         }
 
-        if let Some(Value::Str(marker)) = self.get_var(callee).cloned() {
-            if let Some(rest) = marker.strip_prefix("__wasm_fn:") {
-                if let Some((inst_str, fn_name)) = rest.split_once(':') {
-                    if let Ok(inst_id) = inst_str.parse::<usize>() {
-                        let args = split_args(args_src);
-                        let args_f64: Vec<f64> = args
-                            .iter()
-                            .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
-                            .collect();
-                        return self.call_wasm_instance_export(inst_id, fn_name, &args_f64);
-                    }
-                }
-            }
+        if let Some(Value::Str(marker)) = self.get_var(callee).cloned()
+            && let Some(rest) = marker.strip_prefix("__wasm_fn:")
+            && let Some((inst_str, fn_name)) = rest.split_once(':')
+            && let Ok(inst_id) = inst_str.parse::<usize>()
+        {
+            let args = split_args(args_src);
+            let args_f64: Vec<f64> = args
+                .iter()
+                .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
+                .collect();
+            return self.call_wasm_instance_export(inst_id, fn_name, &args_f64);
         }
 
         Value::Null
@@ -7649,13 +7615,13 @@ fn parse_switch_clauses(switch_body: &str) -> Vec<(Option<String>, Vec<String>)>
     for raw_stmt in split_statements(switch_body) {
         let mut s = raw_stmt.trim();
         while !s.is_empty() {
-            if let Some(after_case) = s.strip_prefix("case ") {
-                if let Some(colon) = after_case.find(':') {
-                    let case_expr = after_case[..colon].trim().to_string();
-                    clauses.push((Some(case_expr), Vec::new()));
-                    s = after_case[colon + 1..].trim();
-                    continue;
-                }
+            if let Some(after_case) = s.strip_prefix("case ")
+                && let Some(colon) = after_case.find(':')
+            {
+                let case_expr = after_case[..colon].trim().to_string();
+                clauses.push((Some(case_expr), Vec::new()));
+                s = after_case[colon + 1..].trim();
+                continue;
             }
             if let Some(after_def) = s.strip_prefix("default") {
                 let after_def = after_def.trim_start();
@@ -8182,10 +8148,10 @@ fn update_inline_style(doc: &mut Document, id: NodeId, prop: &str, value: &str) 
 fn read_inline_style(doc: &Document, id: NodeId, prop: &str) -> String {
     let existing = doc.get(id).data().attr("style").unwrap_or("");
     for part in existing.split(';') {
-        if let Some((k, v)) = part.split_once(':') {
-            if k.trim().eq_ignore_ascii_case(prop) {
-                return v.trim().to_string();
-            }
+        if let Some((k, v)) = part.split_once(':')
+            && k.trim().eq_ignore_ascii_case(prop)
+        {
+            return v.trim().to_string();
         }
     }
     String::new()
@@ -8304,14 +8270,14 @@ pub fn script_runs_here(source: &str) -> bool {
 /// Console text for an uncaught throw: `Name: message` for an error
 /// object, the value as text otherwise.
 fn thrown_text(error: &Value, doc: &Document) -> String {
-    if let Value::Json(obj) = error {
-        if let Some(JsonValue::String(message)) = obj.get("message") {
-            let name = match obj.get("name") {
-                Some(JsonValue::String(name)) => name.as_str(),
-                _ => "Error",
-            };
-            return format!("{name}: {message}");
-        }
+    if let Value::Json(obj) = error
+        && let Some(JsonValue::String(message)) = obj.get("message")
+    {
+        let name = match obj.get("name") {
+            Some(JsonValue::String(name)) => name.as_str(),
+            _ => "Error",
+        };
+        return format!("{name}: {message}");
     }
     error.as_string(doc)
 }
@@ -8651,34 +8617,33 @@ fn split_top_level_op<'a>(input: &'a str, op: &str) -> Option<(&'a str, &'a str)
                     idx += 1;
                     continue;
                 }
-                if op == "-" && idx > 0 {
-                    if let Some(&prev_b) =
+                if op == "-"
+                    && idx > 0
+                    && let Some(&prev_b) =
                         bytes[..idx].iter().rev().find(|b| !b.is_ascii_whitespace())
-                    {
-                        if matches!(
-                            prev_b,
-                            b'+' | b'-'
-                                | b'*'
-                                | b'/'
-                                | b'%'
-                                | b'='
-                                | b'!'
-                                | b'<'
-                                | b'>'
-                                | b'&'
-                                | b'|'
-                                | b'^'
-                                | b'?'
-                                | b':'
-                                | b','
-                                | b'('
-                                | b'['
-                                | b'{'
-                        ) {
-                            idx += 1;
-                            continue;
-                        }
-                    }
+                    && matches!(
+                        prev_b,
+                        b'+' | b'-'
+                            | b'*'
+                            | b'/'
+                            | b'%'
+                            | b'='
+                            | b'!'
+                            | b'<'
+                            | b'>'
+                            | b'&'
+                            | b'|'
+                            | b'^'
+                            | b'?'
+                            | b':'
+                            | b','
+                            | b'('
+                            | b'['
+                            | b'{'
+                    )
+                {
+                    idx += 1;
+                    continue;
                 }
                 if op == "*"
                     && (bytes.get(idx + 1) == Some(&b'*')
@@ -8861,17 +8826,17 @@ fn decode_wasm_text_bytes(s: &str) -> Vec<u8> {
     }
     let trimmed = s.trim();
     if trimmed.len() >= 16
-        && trimmed.len() % 2 == 0
+        && trimmed.len().is_multiple_of(2)
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
     {
         let mut out = Vec::with_capacity(trimmed.len() / 2);
         let bytes = trimmed.as_bytes();
         let mut idx = 0usize;
         while idx + 1 < bytes.len() {
-            if let Ok(hex_str) = std::str::from_utf8(&bytes[idx..idx + 2]) {
-                if let Ok(b) = u8::from_str_radix(hex_str, 16) {
-                    out.push(b);
-                }
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[idx..idx + 2])
+                && let Ok(b) = u8::from_str_radix(hex_str, 16)
+            {
+                out.push(b);
             }
             idx += 2;
         }

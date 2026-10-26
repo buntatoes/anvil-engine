@@ -397,10 +397,10 @@ impl GlyphLruCache {
         if cost > self.budget_bytes || self.budget_bytes == 0 {
             return;
         }
-        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
-            if let Some((_, old)) = self.entries.remove(pos) {
-                self.used_bytes = self.used_bytes.saturating_sub(old.byte_len());
-            }
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key)
+            && let Some((_, old)) = self.entries.remove(pos)
+        {
+            self.used_bytes = self.used_bytes.saturating_sub(old.byte_len());
         }
         while self.used_bytes + cost > self.budget_bytes
             || self.entries.len() >= MAX_GLYPH_CACHE_ENTRIES
@@ -460,10 +460,10 @@ fn cached_rasterize_glyph(
         size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
         subpixel: false,
     };
-    if let Ok(mut guard) = GLYPH_CACHE.lock() {
-        if let Some(CachedGlyph::Gray(bmp)) = guard.get(&key) {
-            return Some(bmp);
-        }
+    if let Ok(mut guard) = GLYPH_CACHE.lock()
+        && let Some(CachedGlyph::Gray(bmp)) = guard.get(&key)
+    {
+        return Some(bmp);
     }
     let bmp = font.rasterize_glyph(ch, font_size)?;
     if let Ok(mut guard) = GLYPH_CACHE.lock() {
@@ -486,10 +486,10 @@ fn cached_rasterize_subpixel_glyph(
         size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
         subpixel: true,
     };
-    if let Ok(mut guard) = GLYPH_CACHE.lock() {
-        if let Some(CachedGlyph::Subpixel(bmp)) = guard.get(&key) {
-            return Some(bmp);
-        }
+    if let Ok(mut guard) = GLYPH_CACHE.lock()
+        && let Some(CachedGlyph::Subpixel(bmp)) = guard.get(&key)
+    {
+        return Some(bmp);
     }
     let bmp = font.rasterize_glyph_subpixel_lcd(ch, font_size)?;
     if let Ok(mut guard) = GLYPH_CACHE.lock() {
@@ -741,10 +741,10 @@ impl Framebuffer {
         if x < 0 || y < 0 || color.a == 0 {
             return;
         }
-        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last() {
-            if x < cx0 || x >= cx1 || y < cy0 || y >= cy1 {
-                return;
-            }
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last()
+            && (x < cx0 || x >= cx1 || y < cy0 || y >= cy1)
+        {
+            return;
         }
         let (x, y) = (x as u32, y as u32);
         if x >= self.width || y >= self.height {
@@ -968,10 +968,9 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) {
-                    if with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok() {
-                        return;
-                    }
+                ) && with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok()
+                {
+                    return;
                 }
             } else if border_width > 0.0
                 && fill_color.a == 255
@@ -1019,15 +1018,13 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) {
-                    if with_thread_compositor(|comp| {
-                        comp.box_shadow(&mut target, &outer_desc)
-                            .and_then(|()| comp.box_shadow(&mut target, &inner_desc))
-                    })
-                    .is_ok()
-                    {
-                        return;
-                    }
+                ) && with_thread_compositor(|comp| {
+                    comp.box_shadow(&mut target, &outer_desc)
+                        .and_then(|()| comp.box_shadow(&mut target, &inner_desc))
+                })
+                .is_ok()
+                {
+                    return;
                 }
             }
         }
@@ -1167,10 +1164,9 @@ impl Framebuffer {
                 self.width,
                 self.height,
                 (self.width as usize) * 4,
-            ) {
-                if with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok() {
-                    return;
-                }
+            ) && with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok()
+            {
+                return;
             }
         }
         let quad = anvil_gpu::GpuQuad::box_shadow(
@@ -1322,11 +1318,10 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) {
-                    if with_thread_compositor(|comp| comp.fill_gradient(&mut target, &desc)).is_ok()
-                    {
-                        return;
-                    }
+                ) && with_thread_compositor(|comp| comp.fill_gradient(&mut target, &desc))
+                    .is_ok()
+                {
+                    return;
                 }
             }
         }
@@ -1877,7 +1872,12 @@ impl Framebuffer {
     /// Convert top-down RGBA scanlines into top-down BGRA scanlines for X11 (`ZPixmap` 32-bit).
     pub fn to_bgra_top_down(&self) -> Vec<u8> {
         let mut out = vec![0_u8; self.pixels.len()];
-        for (dst, src) in out.chunks_exact_mut(4).zip(self.pixels.chunks_exact(4)) {
+        for (dst, src) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.pixels.as_chunks::<4>().0)
+        {
             dst[0] = src[2];
             dst[1] = src[1];
             dst[2] = src[0];
@@ -1892,7 +1892,7 @@ impl Framebuffer {
         let mut out =
             Vec::with_capacity(header.len() + (self.width as usize) * (self.height as usize) * 3);
         out.extend_from_slice(header.as_bytes());
-        for chunk in self.pixels.chunks_exact(4) {
+        for chunk in self.pixels.as_chunks::<4>().0 {
             out.push(chunk[0]);
             out.push(chunk[1]);
             out.push(chunk[2]);
@@ -2707,19 +2707,17 @@ pub fn rasterize_incremental(
                 fixed_next = fixed_next.saturating_sub(1);
             }
             if p_item != n_item {
-                if let Some(item) = p_item {
-                    if let Some((x, y, w, h)) =
+                if let Some(item) = p_item
+                    && let Some((x, y, w, h)) =
                         item_screen_bounds(item, prev_scroll_y, fixed_prev > 0)
-                    {
-                        grid.mark_rect(x, y, w, h);
-                    }
+                {
+                    grid.mark_rect(x, y, w, h);
                 }
-                if let Some(item) = n_item {
-                    if let Some((x, y, w, h)) =
+                if let Some(item) = n_item
+                    && let Some((x, y, w, h)) =
                         item_screen_bounds(item, next_scroll_y, fixed_next > 0)
-                    {
-                        grid.mark_rect(x, y, w, h);
-                    }
+                {
+                    grid.mark_rect(x, y, w, h);
                 }
             }
         }
@@ -2869,10 +2867,10 @@ fn linux_system_ttf_font() -> Option<&'static TtfFont> {
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
             ];
             for path in CANDIDATES {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(font) = TtfFont::parse(&bytes) {
-                        return Some(font);
-                    }
+                if let Ok(bytes) = std::fs::read(path)
+                    && let Ok(font) = TtfFont::parse(&bytes)
+                {
+                    return Some(font);
                 }
             }
             None

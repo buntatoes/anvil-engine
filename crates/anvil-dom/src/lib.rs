@@ -665,11 +665,11 @@ impl Document {
     /// Previous children stay allocated with `parent` cleared. A missing `id`
     /// is a no-op. `text` is copied.
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
-        if let Some(node) = self.nodes.get_mut(id.index()) {
-            if let NodeData::Text(slot) = &mut node.data {
-                *slot = text.to_string();
-                return;
-            }
+        if let Some(node) = self.nodes.get_mut(id.index())
+            && let NodeData::Text(slot) = &mut node.data
+        {
+            *slot = text.to_string();
+            return;
         }
         if self.nodes.get(id.index()).is_none() {
             return;
@@ -1459,13 +1459,11 @@ impl Document {
                 rel.split_ascii_whitespace()
                     .any(|token| token.eq_ignore_ascii_case("stylesheet"))
             });
-            if is_stylesheet {
-                if let Some(href) = data.attr("href") {
-                    let href = href.trim();
-                    if !href.is_empty() {
-                        let integrity = data.attr("integrity").map(|s| s.trim().to_string());
-                        out.push((href.to_string(), integrity));
-                    }
+            if is_stylesheet && let Some(href) = data.attr("href") {
+                let href = href.trim();
+                if !href.is_empty() {
+                    let integrity = data.attr("integrity").map(|s| s.trim().to_string());
+                    out.push((href.to_string(), integrity));
                 }
             }
         }
@@ -1479,13 +1477,14 @@ impl Document {
     /// the integrity string is present, then passes the body to `anvil-script`.
     fn collect_external_scripts(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
-        if data.tag() == Some("script") && is_javascript_type(data.attr("type")) {
-            if let Some(src) = data.attr("src") {
-                let src = src.trim();
-                if !src.is_empty() {
-                    let integrity = data.attr("integrity").map(|s| s.trim().to_string());
-                    out.push((src.to_string(), integrity));
-                }
+        if data.tag() == Some("script")
+            && is_javascript_type(data.attr("type"))
+            && let Some(src) = data.attr("src")
+        {
+            let src = src.trim();
+            if !src.is_empty() {
+                let integrity = data.attr("integrity").map(|s| s.trim().to_string());
+                out.push((src.to_string(), integrity));
             }
         }
         for child in self.children(id) {
@@ -1522,10 +1521,10 @@ impl Document {
                 break;
             }
             let data = self.get(*child).data();
-            if data.tag() == Some("source") {
-                if let Some(url) = source_url_from(data) {
-                    return Some(url);
-                }
+            if data.tag() == Some("source")
+                && let Some(url) = source_url_from(data)
+            {
+                return Some(url);
             }
         }
         None
@@ -1545,13 +1544,13 @@ impl Document {
             } else {
                 for child in self.children(id) {
                     let cdata = self.get(*child).data();
-                    if cdata.tag() == Some("source") {
-                        if let Some(src) = cdata.attr("src") {
-                            let src = src.trim();
-                            if !src.is_empty() {
-                                out.push((id, src.to_string()));
-                                break;
-                            }
+                    if cdata.tag() == Some("source")
+                        && let Some(src) = cdata.attr("src")
+                    {
+                        let src = src.trim();
+                        if !src.is_empty() {
+                            out.push((id, src.to_string()));
+                            break;
                         }
                     }
                 }
@@ -1571,12 +1570,10 @@ impl Document {
             let is_csp = data
                 .attr("http-equiv")
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("content-security-policy"));
-            if is_csp {
-                if let Some(content) = data.attr("content") {
-                    let trimmed = content.trim();
-                    if !trimmed.is_empty() {
-                        out.push(trimmed.to_string());
-                    }
+            if is_csp && let Some(content) = data.attr("content") {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
                 }
             }
         }
@@ -1882,15 +1879,15 @@ fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
         rem = &after[next_sep..];
     }
 
-    if let Some(t) = tag_req {
-        if !actual_tag.eq_ignore_ascii_case(t) {
-            return false;
-        }
+    if let Some(t) = tag_req
+        && !actual_tag.eq_ignore_ascii_case(t)
+    {
+        return false;
     }
-    if let Some(req_id) = id_req {
-        if data.id() != Some(req_id) {
-            return false;
-        }
+    if let Some(req_id) = id_req
+        && data.id() != Some(req_id)
+    {
+        return false;
     }
     for cls in classes_req {
         if !data.has_class(cls) {
@@ -1924,15 +1921,15 @@ fn _legacy_matches_simple_selector(data: &NodeData, selector: &str) -> bool {
 
 fn image_url_from(data: &NodeData) -> Option<String> {
     let src = data.attr("src").unwrap_or("").trim();
-    if let Some(url) = usable_image_url(src) {
-        if !url.starts_with("data:") {
-            return Some(url);
-        }
+    if let Some(url) = usable_image_url(src)
+        && !url.starts_with("data:")
+    {
+        return Some(url);
     }
-    if let Some(set) = data.attr("srcset") {
-        if let Some(url) = first_srcset_url(set) {
-            return Some(url);
-        }
+    if let Some(set) = data.attr("srcset")
+        && let Some(url) = first_srcset_url(set)
+    {
+        return Some(url);
     }
     for name in ["data-src", "data-lazy-src", "data-original"] {
         if let Some(lazy) = data.attr(name) {
@@ -1947,10 +1944,10 @@ fn image_url_from(data: &NodeData) -> Option<String> {
 }
 
 fn source_url_from(data: &NodeData) -> Option<String> {
-    if let Some(set) = data.attr("srcset") {
-        if let Some(url) = first_srcset_url(set) {
-            return Some(url);
-        }
+    if let Some(set) = data.attr("srcset")
+        && let Some(url) = first_srcset_url(set)
+    {
+        return Some(url);
     }
     data.attr("src").and_then(usable_image_url)
 }
@@ -1958,10 +1955,10 @@ fn source_url_from(data: &NodeData) -> Option<String> {
 fn first_srcset_url(srcset: &str) -> Option<String> {
     for part in srcset.split(',') {
         let url = part.split_whitespace().next().unwrap_or("");
-        if let Some(url) = usable_image_url(url) {
-            if !url.starts_with("data:") {
-                return Some(url);
-            }
+        if let Some(url) = usable_image_url(url)
+            && !url.starts_with("data:")
+        {
+            return Some(url);
         }
     }
     None

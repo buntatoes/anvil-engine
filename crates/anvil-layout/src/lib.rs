@@ -921,19 +921,19 @@ fn layout_block(
     let mut pending_marker = list_marker;
 
     if is_img && decoded_image.is_none() {
-        if let Some(alt) = data.attr("alt") {
-            if !alt.trim().is_empty() {
-                let segments = vec![Segment {
-                    node: id,
-                    text: format!("[{alt}]"),
-                    font_size: style.font_size,
-                    color: style.color,
-                    underline: false,
-                }];
-                let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width);
-                text.extend(runs);
-                cursor_y += h;
-            }
+        if let Some(alt) = data.attr("alt")
+            && !alt.trim().is_empty()
+        {
+            let segments = vec![Segment {
+                node: id,
+                text: format!("[{alt}]"),
+                font_size: style.font_size,
+                color: style.color,
+                underline: false,
+            }];
+            let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width);
+            text.extend(runs);
+            cursor_y += h;
         }
     } else if is_checkbox {
         let mark = if doc.is_checked(id) { "X" } else { " " };
@@ -1880,10 +1880,10 @@ fn layout_grid(
         if is_skipped(doc, styles, cid) {
             continue;
         }
-        if let NodeData::Text(t) = doc.get(cid).data() {
-            if t.trim().is_empty() {
-                continue;
-            }
+        if let NodeData::Text(t) = doc.get(cid).data()
+            && t.trim().is_empty()
+        {
+            continue;
         }
         let cstyle = styles.get(cid);
         if matches!(cstyle.position, Position::Absolute | Position::Fixed) {
@@ -2463,16 +2463,15 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
 /// True when any descendant is `img`, `video`, block, or flex.
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     for child in doc.children(id) {
-        if let NodeData::Element { tag, .. } = doc.get(*child).data() {
-            if tag == "img"
+        if let NodeData::Element { tag, .. } = doc.get(*child).data()
+            && (tag == "img"
                 || tag == "video"
                 || matches!(
                     styles.get(*child).display,
                     Display::Block | Display::Flex | Display::Grid
-                )
-            {
-                return true;
-            }
+                ))
+        {
+            return true;
         }
         if contains_block(doc, styles, *child) {
             return true;

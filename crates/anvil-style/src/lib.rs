@@ -1239,11 +1239,11 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
     while let Some(open) = find_unquoted(rest, '{') {
         // An at-rule such as `@import` or `@charset` can end at `;` with no
         // block. Skip it so it does not swallow the rule after it.
-        if rest.trim_start().starts_with('@') {
-            if let Some(semi) = find_unquoted(&rest[..open], ';') {
-                rest = &rest[semi + 1..];
-                continue;
-            }
+        if rest.trim_start().starts_with('@')
+            && let Some(semi) = find_unquoted(&rest[..open], ';')
+        {
+            rest = &rest[semi + 1..];
+            continue;
         }
         let selector_src = rest[..open].trim();
         rest = &rest[open + 1..];
@@ -1648,10 +1648,10 @@ fn apply_author(
     let (sheet, viewport_width, root_font_px) = (cx.sheet, cx.viewport_width, cx.root_font_px);
     let mut matched = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
-        if let Some(mq) = &rule.media {
-            if !mq.matches(viewport_width) {
-                continue;
-            }
+        if let Some(mq) = &rule.media
+            && !mq.matches(viewport_width)
+        {
+            continue;
         }
         let specificity = rule
             .selectors
@@ -2138,10 +2138,10 @@ fn apply_declaration(
             };
         }
         "flex-grow" => {
-            if let Ok(grow) = value.parse::<f32>() {
-                if grow.is_finite() {
-                    style.flex_grow = grow.max(0.0);
-                }
+            if let Ok(grow) = value.parse::<f32>()
+                && grow.is_finite()
+            {
+                style.flex_grow = grow.max(0.0);
             }
         }
         "justify-content" => {
@@ -2556,10 +2556,9 @@ fn parse_border_side(value: &str) -> Option<(f32, Option<Color>)> {
         } else if !matches!(
             token.to_ascii_lowercase().as_str(),
             "solid" | "dashed" | "dotted" | "double"
-        ) {
-            if let Some(c) = Color::parse(token) {
-                color = Some(c);
-            }
+        ) && let Some(c) = Color::parse(token)
+        {
+            color = Some(c);
         }
     }
     Some((width?, color))

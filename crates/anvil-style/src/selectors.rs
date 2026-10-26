@@ -1261,14 +1261,14 @@ impl DocIndex {
                 let (bits, above) = slots
                     .get(node.index())
                     .map_or((0, 0), |slot| (slot.bits, slot.above));
-                if let Some(slot) = slots.get_mut(child.index()) {
-                    if slot.enter == NONE {
-                        slot.enter = order;
-                        slot.bits = element_bits(doc.get(child).data());
-                        slot.above = above | bits;
-                        order += 1;
-                        stack.push((child, 0));
-                    }
+                if let Some(slot) = slots.get_mut(child.index())
+                    && slot.enter == NONE
+                {
+                    slot.enter = order;
+                    slot.bits = element_bits(doc.get(child).data());
+                    slot.above = above | bits;
+                    order += 1;
+                    stack.push((child, 0));
                 }
             } else {
                 if let Some(slot) = slots.get_mut(node.index()) {

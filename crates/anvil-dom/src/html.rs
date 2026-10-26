@@ -119,11 +119,11 @@ pub fn parse_html(input: &str) -> Document {
                     } else {
                         decoded
                     };
-                    if let Some(text) = normalize_text(&prepared) {
-                        if doc.node_count() < MAX_DOM_NODES {
-                            let text_id = doc.create_text(&text);
-                            doc.append(id, text_id).expect("new text node");
-                        }
+                    if let Some(text) = normalize_text(&prepared)
+                        && doc.node_count() < MAX_DOM_NODES
+                    {
+                        let text_id = doc.create_text(&text);
+                        doc.append(id, text_id).expect("new text node");
                     }
                     index = next;
                 }
@@ -148,11 +148,11 @@ pub fn parse_html(input: &str) -> Document {
         }
         let decoded = decode_entities(&input[start..index]);
         let parent = *stack.last().unwrap_or(&doc.body());
-        if let Some(text) = text_for_parent(&doc, parent, &decoded) {
-            if doc.node_count() < MAX_DOM_NODES {
-                let text_id = doc.create_text(&text);
-                doc.append(parent, text_id).expect("new text node");
-            }
+        if let Some(text) = text_for_parent(&doc, parent, &decoded)
+            && doc.node_count() < MAX_DOM_NODES
+        {
+            let text_id = doc.create_text(&text);
+            doc.append(parent, text_id).expect("new text node");
         }
     }
 
@@ -180,10 +180,10 @@ fn is_void(tag: &str) -> bool {
 fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &str) {
     match new_tag {
         "td" | "th" => {
-            if let Some(&top) = stack.last() {
-                if matches!(doc.get(top).data().tag(), Some("td" | "th")) {
-                    stack.pop();
-                }
+            if let Some(&top) = stack.last()
+                && matches!(doc.get(top).data().tag(), Some("td" | "th"))
+            {
+                stack.pop();
             }
         }
         "tr" => {
@@ -209,10 +209,10 @@ fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &s
             }
         }
         "option" => {
-            if let Some(&top) = stack.last() {
-                if doc.get(top).data().tag() == Some("option") {
-                    stack.pop();
-                }
+            if let Some(&top) = stack.last()
+                && doc.get(top).data().tag() == Some("option")
+            {
+                stack.pop();
             }
         }
         _ => {}
@@ -224,12 +224,11 @@ fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &s
 /// An empty stack falls back to `body`. The returned id is copied from `stack`
 /// or from the document skeleton. It is not a newly allocated node.
 fn placement_parent(doc: &Document, stack: &[NodeId], tag: &str) -> NodeId {
-    if HEAD_TAGS.contains(&tag) {
-        if let Some(top) = stack.last() {
-            if *top == doc.body() || doc.get(*top).data().tag() == Some("html") {
-                return doc.head();
-            }
-        }
+    if HEAD_TAGS.contains(&tag)
+        && let Some(top) = stack.last()
+        && (*top == doc.body() || doc.get(*top).data().tag() == Some("html"))
+    {
+        return doc.head();
     }
     stack.last().copied().unwrap_or_else(|| doc.body())
 }
