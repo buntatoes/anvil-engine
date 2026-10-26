@@ -12,39 +12,63 @@ namespace anvil_vm {
 
 namespace {
 
-inline f64 fast_sqrt(f64 x) noexcept {
-    if (x <= 0.0) {
-        return 0.0;
+// Values whose as_number() is what JavaScript's ToNumber gives.
+inline bool numeric_operand(AnvilValue v) noexcept {
+    return v.is_number() || v.is_bool() || v.is_null() || v.is_undefined();
+}
+
+// Opcodes that read their operands as numbers, and how many they read.
+inline u32 numeric_operands(AnvilOpcode op) noexcept {
+    switch (op) {
+        case AnvilOpcode::Neg:
+            return 1u;
+        case AnvilOpcode::Add:
+        case AnvilOpcode::Sub:
+        case AnvilOpcode::Mul:
+        case AnvilOpcode::Div:
+        case AnvilOpcode::Mod:
+        case AnvilOpcode::BitAnd:
+        case AnvilOpcode::BitOr:
+        case AnvilOpcode::BitXor:
+        case AnvilOpcode::Shl:
+        case AnvilOpcode::Shr:
+        case AnvilOpcode::UShr:
+        case AnvilOpcode::CmpLt:
+        case AnvilOpcode::CmpLe:
+        case AnvilOpcode::CmpGt:
+        case AnvilOpcode::CmpGe:
+            return 2u;
+        default:
+            return 0u;
     }
-    f64 g = x > 1.0 ? x * 0.5 : 1.0;
-    for (int i = 0; i < 10; ++i) {
-        g = 0.5 * (g + x / g);
+}
+
+inline bool truthy(const AnvilHeap& heap, AnvilValue v) noexcept {
+    if (v.is_string()) {
+        u32 len = 0u;
+        heap.get_string_ptr(v.payload(), &len);
+        return len > 0u;
     }
-    return g;
+    return v.is_truthy();
 }
 
-inline f64 fast_floor(f64 x) noexcept {
-    const i64 i = static_cast<i64>(x);
-    const f64 d = static_cast<f64>(i);
-    return (x < d) ? (d - 1.0) : d;
-}
-
-inline f64 fast_ceil(f64 x) noexcept {
-    const i64 i = static_cast<i64>(x);
-    const f64 d = static_cast<f64>(i);
-    return (x > d) ? (d + 1.0) : d;
-}
-
-inline f64 fast_round(f64 x) noexcept {
-    return x >= 0.0 ? fast_floor(x + 0.5) : fast_ceil(x - 0.5);
+// An index the VM's arrays can hold: whole, 0 or more and below 2^31.
+inline i32 array_index(f64 v) noexcept {
+    if (!(v >= 0.0 && v < 2147483648.0)) {
+        return -1;
+    }
+    const i32 i = static_cast<i32>(v);
+    return static_cast<f64>(i) == v ? i : -1;
 }
 
 bool values_strictly_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b) noexcept {
-    if (a.bits == b.bits) {
-        return true;
-    }
+    // Numbers compare as doubles first, so NaN is not equal to itself and
+    // 0 equals -0.
     if (a.is_number() && b.is_number()) {
         return a.as_number() == b.as_number();
+    }
+    if (a.bits == b.bits) {
+        return true;
     }
     if (a.is_string() && b.is_string()) {
         return heap.string_equals(a.payload(), b.payload());
@@ -119,8 +143,10 @@ bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
         case StoreResult::ArrayStorageFull:
             fail_limit(VM_STOP_ARRAY_STORAGE, "array storage", MAX_ARRAY_ELEMENTS, "elements");
             return false;
-        case StoreResult::Ok:
         case StoreResult::NotStored:
+            fail(VM_STOP_UNSUPPORTED, "property write on a value that is not an object");
+            return false;
+        case StoreResult::Ok:
             break;
     }
     return true;
@@ -159,6 +185,17 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
         const AnvilInstruction inst = program.code[pc++];
         AnvilValue* R = &registers[reg_base];
+
+        // Strings and objects in arithmetic or ordering need conversions
+        // the VM does not make, apart from joining two strings with +.
+        // The script runs on the Rust interpreter instead.
+        const u32 operands = numeric_operands(inst.op);
+        if (operands != 0u &&
+            (!numeric_operand(R[inst.b]) || (operands == 2u && !numeric_operand(R[inst.c]))) &&
+            !(inst.op == AnvilOpcode::Add && R[inst.b].is_string() && R[inst.c].is_string())) {
+            fail(VM_STOP_UNSUPPORTED, "arithmetic or comparison on a string or object");
+            return AnvilValue::make_undefined();
+        }
 
         switch (inst.op) {
             case AnvilOpcode::Nop:
@@ -232,7 +269,9 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 const AnvilValue rhs = R[inst.c];
                 if (lhs.is_smi() && rhs.is_smi()) {
                     const i64 prod = static_cast<i64>(lhs.as_smi()) * static_cast<i64>(rhs.as_smi());
-                    if (prod >= -1073741824LL && prod <= 1073741823LL) {
+                    // A zero product with a negative factor is -0.
+                    const bool negative_zero = prod == 0 && (lhs.as_smi() < 0 || rhs.as_smi() < 0);
+                    if (!negative_zero && prod >= -1073741824LL && prod <= 1073741823LL) {
                         R[inst.a] = AnvilValue::make_smi(static_cast<i32>(prod));
                         break;
                     }
@@ -241,64 +280,55 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 break;
             }
 
-            case AnvilOpcode::Div: {
-                const f64 denom = R[inst.c].as_number();
-                R[inst.a] = AnvilValue::make_number(denom == 0.0 ? 0.0 : (R[inst.b].as_number() / denom));
+            case AnvilOpcode::Div:
+                R[inst.a] = AnvilValue::make_number(R[inst.b].as_number() / R[inst.c].as_number());
                 break;
-            }
 
-            case AnvilOpcode::Mod: {
-                const i64 r_int = static_cast<i64>(R[inst.c].as_number());
-                if (r_int == 0) {
-                    R[inst.a] = AnvilValue::make_smi(0);
-                } else {
-                    const i64 l_int = static_cast<i64>(R[inst.b].as_number());
-                    R[inst.a] = AnvilValue::make_number(static_cast<f64>(l_int % r_int));
-                }
+            case AnvilOpcode::Mod:
+                R[inst.a] = AnvilValue::make_number(js_remainder(R[inst.b].as_number(), R[inst.c].as_number()));
                 break;
-            }
 
             case AnvilOpcode::Neg:
                 R[inst.a] = AnvilValue::make_number(-R[inst.b].as_number());
                 break;
 
             case AnvilOpcode::Not:
-                R[inst.a] = AnvilValue::make_bool(!R[inst.b].is_truthy());
+                R[inst.a] = AnvilValue::make_bool(!truthy(heap, R[inst.b]));
                 break;
 
             case AnvilOpcode::BitAnd:
                 R[inst.a] = AnvilValue::make_smi(
-                    static_cast<i32>(R[inst.b].as_number()) & static_cast<i32>(R[inst.c].as_number())
+                    js_to_int32(R[inst.b].as_number()) & js_to_int32(R[inst.c].as_number())
                 );
                 break;
 
             case AnvilOpcode::BitOr:
                 R[inst.a] = AnvilValue::make_smi(
-                    static_cast<i32>(R[inst.b].as_number()) | static_cast<i32>(R[inst.c].as_number())
+                    js_to_int32(R[inst.b].as_number()) | js_to_int32(R[inst.c].as_number())
                 );
                 break;
 
             case AnvilOpcode::BitXor:
                 R[inst.a] = AnvilValue::make_smi(
-                    static_cast<i32>(R[inst.b].as_number()) ^ static_cast<i32>(R[inst.c].as_number())
+                    js_to_int32(R[inst.b].as_number()) ^ js_to_int32(R[inst.c].as_number())
                 );
                 break;
 
             case AnvilOpcode::Shl: {
-                const i32 s = static_cast<i32>(R[inst.c].as_number()) & 31;
-                R[inst.a] = AnvilValue::make_smi(static_cast<i32>(R[inst.b].as_number()) << s);
+                const i32 s = js_to_int32(R[inst.c].as_number()) & 31;
+                R[inst.a] = AnvilValue::make_smi(js_to_int32(R[inst.b].as_number()) << s);
                 break;
             }
 
             case AnvilOpcode::Shr: {
-                const i32 s = static_cast<i32>(R[inst.c].as_number()) & 31;
-                R[inst.a] = AnvilValue::make_smi(static_cast<i32>(R[inst.b].as_number()) >> s);
+                const i32 s = js_to_int32(R[inst.c].as_number()) & 31;
+                R[inst.a] = AnvilValue::make_smi(js_to_int32(R[inst.b].as_number()) >> s);
                 break;
             }
 
             case AnvilOpcode::UShr: {
-                const u32 s = static_cast<u32>(R[inst.c].as_number()) & 31u;
-                const u32 u = static_cast<u32>(static_cast<i32>(R[inst.b].as_number())) >> s;
+                const u32 s = js_to_uint32(R[inst.c].as_number()) & 31u;
+                const u32 u = js_to_uint32(R[inst.b].as_number()) >> s;
                 R[inst.a] = AnvilValue::make_number(static_cast<f64>(u));
                 break;
             }
@@ -332,13 +362,13 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 break;
 
             case AnvilOpcode::JumpIfFalse:
-                if (!R[inst.a].is_truthy()) {
+                if (!truthy(heap, R[inst.a])) {
                     pc = inst.imm16();
                 }
                 break;
 
             case AnvilOpcode::JumpIfTrue:
-                if (R[inst.a].is_truthy()) {
+                if (truthy(heap, R[inst.a])) {
                     pc = inst.imm16();
                 }
                 break;
@@ -395,6 +425,10 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
             case AnvilOpcode::GetPropIC: {
                 const u32 site_id = inst.c;
                 const u32 prop_sym = (site_id < ic.site_count) ? ic.sites[site_id].prop_sym : 0u;
+                if (!R[inst.b].is_object() && !R[inst.b].is_array()) {
+                    fail(VM_STOP_UNSUPPORTED, "property read on a value that is not an object or array");
+                    return AnvilValue::make_undefined();
+                }
                 R[inst.a] = ic.load_property_ic(heap, site_id, R[inst.b], prop_sym);
                 break;
             }
@@ -411,19 +445,23 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::GetElem: {
                 const AnvilValue recv = R[inst.b];
-                const i32 idx = static_cast<i32>(R[inst.c].as_number());
-                if (recv.is_array()) {
-                    R[inst.a] = heap.get_array_elem(recv.payload(), idx);
-                } else {
-                    R[inst.a] = AnvilValue::make_undefined();
+                if (!recv.is_array() || !R[inst.c].is_number()) {
+                    fail(VM_STOP_UNSUPPORTED, "element read the VM does not run");
+                    return AnvilValue::make_undefined();
                 }
+                // A fraction or a negative index reads no element.
+                R[inst.a] = heap.get_array_elem(recv.payload(), array_index(R[inst.c].as_number()));
                 break;
             }
 
             case AnvilOpcode::SetElem: {
                 const AnvilValue recv = R[inst.a];
-                const i32 idx = static_cast<i32>(R[inst.b].as_number());
-                if (recv.is_array()) {
+                const i32 idx = R[inst.b].is_number() ? array_index(R[inst.b].as_number()) : -1;
+                if (!recv.is_array() || idx < 0) {
+                    fail(VM_STOP_UNSUPPORTED, "element write the VM does not run");
+                    return AnvilValue::make_undefined();
+                }
+                {
                     StoreResult stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
                     if (stored == StoreResult::ArrayStorageFull) {
                         reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
@@ -438,7 +476,11 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::ArrayPush: {
                 const AnvilValue recv = R[inst.a];
-                if (recv.is_array()) {
+                if (!recv.is_array()) {
+                    fail(VM_STOP_UNSUPPORTED, "push on a value that is not an array");
+                    return AnvilValue::make_undefined();
+                }
+                {
                     StoreResult stored = heap.push_array_elem(recv.payload(), R[inst.b]);
                     if (stored == StoreResult::ArrayStorageFull) {
                         reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
@@ -481,11 +523,11 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 const f64 v = R[inst.c].as_number();
                 f64 out = v;
                 switch (inst.b) {
-                    case 1u: out = v < 0.0 ? -v : v; break;
-                    case 2u: out = fast_floor(v); break;
-                    case 3u: out = fast_ceil(v); break;
-                    case 4u: out = fast_round(v); break;
-                    case 5u: out = fast_sqrt(v); break;
+                    case 1u: out = js_abs(v); break;
+                    case 2u: out = js_floor(v); break;
+                    case 3u: out = js_ceil(v); break;
+                    case 4u: out = js_round(v); break;
+                    case 5u: out = js_sqrt(v); break;
                     default: break;
                 }
                 R[inst.a] = AnvilValue::make_number(out);
@@ -662,24 +704,29 @@ f64 anvil_cpp_jit_eval_binary(u32 opcode, f64 lhs, f64 rhs) noexcept {
             return lhs * rhs;
         case 3u:
             return rhs == 0.0 ? 0.0 : (lhs / rhs);
+        // These follow the interpreter's own fallback, which uses Rust's
+        // saturating `as` casts.
         case 4u: {
-            if (rhs == 0.0) {
+            const i64 r_int = anvil_vm::sat_i64(rhs);
+            if (r_int == 0) {
                 return 0.0;
             }
-            const i64 l_int = static_cast<i64>(lhs);
-            const i64 r_int = static_cast<i64>(rhs);
-            return r_int == 0 ? 0.0 : static_cast<f64>(l_int % r_int);
+            const i64 l_int = anvil_vm::sat_i64(lhs);
+            if (r_int == -1) {
+                return 0.0;
+            }
+            return static_cast<f64>(l_int % r_int);
         }
         case 5u:
-            return static_cast<f64>(static_cast<i32>(lhs) & static_cast<i32>(rhs));
+            return static_cast<f64>(anvil_vm::sat_i32(lhs) & anvil_vm::sat_i32(rhs));
         case 6u:
-            return static_cast<f64>(static_cast<i32>(lhs) | static_cast<i32>(rhs));
+            return static_cast<f64>(anvil_vm::sat_i32(lhs) | anvil_vm::sat_i32(rhs));
         case 7u:
-            return static_cast<f64>(static_cast<i32>(lhs) ^ static_cast<i32>(rhs));
+            return static_cast<f64>(anvil_vm::sat_i32(lhs) ^ anvil_vm::sat_i32(rhs));
         case 8u:
-            return static_cast<f64>(static_cast<i32>(lhs) << (static_cast<i32>(rhs) & 31));
+            return static_cast<f64>(static_cast<i32>(static_cast<u32>(anvil_vm::sat_i32(lhs)) << (anvil_vm::sat_i32(rhs) & 31)));
         case 9u:
-            return static_cast<f64>(static_cast<i32>(lhs) >> (static_cast<i32>(rhs) & 31));
+            return static_cast<f64>(anvil_vm::sat_i32(lhs) >> (anvil_vm::sat_i32(rhs) & 31));
         default:
             return 0.0;
     }

@@ -483,3 +483,104 @@ fn top_level_variables_too_big_to_hand_over_leave_the_script_to_the_interpreter(
     let out = doc.get_element_by_id("out").expect("out");
     assert_eq!(doc.text_content(out), "4096 12");
 }
+
+#[test]
+fn undefined_is_a_value_of_its_own() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let cases = [
+        ("let u; let r = 0; if (u === undefined) { r = 1; } r;", 1.0),
+        ("let u; let r = 0; if (u === null) { r = 1; } r;", 0.0),
+        (
+            "function f(a, b) { if (b === undefined) { return a; } return a + b; } f(4);",
+            4.0,
+        ),
+        (
+            "function f() { return; } let r = 0; if (f() === undefined) { r = 1; } r;",
+            1.0,
+        ),
+        (
+            "function f() { let x = 1; } let r = 0; if (f() === undefined) { r = 1; } r;",
+            1.0,
+        ),
+    ];
+    for (source, want) in cases {
+        assert_eq!(cpp(source), Some(want), "{source}");
+    }
+    let nan = cpp("let u; let r = u + 1; r;").expect("ran");
+    assert!(nan.is_nan());
+}
+
+#[test]
+fn numbers_follow_javascript() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Each runs once through objects, which keeps it off the native loops,
+    // and once as plain numbers.
+    let cases = [
+        ("1 / 0", f64::INFINITY),
+        ("-1 / 0", f64::NEG_INFINITY),
+        ("7 % 3", 1.0),
+        ("-7 % 3", -1.0),
+        ("5.5 % 2", 1.5),
+        ("4294967296 | 0", 0.0),
+        ("4294967297 | 0", 1.0),
+        ("-1 >>> 0", 4294967295.0),
+        ("1 << 31", -2147483648.0),
+        ("Math.floor(-2.5)", -3.0),
+        ("Math.round(2.5)", 3.0),
+        ("Math.round(-2.5)", -2.0),
+        ("Math.sqrt(10000000000)", 100000.0),
+        ("Math.floor(100000000000000000000)", 1e20),
+    ];
+    for (expr, want) in cases {
+        let plain = format!("let r = {expr}; r;");
+        assert_eq!(cpp(&plain), Some(want), "{plain}");
+        let boxed = format!("let o = {{v: 0}}; o.v = {expr}; o.v;");
+        assert_eq!(cpp(&boxed), Some(want), "{boxed}");
+    }
+    let neg_zero = cpp("let z = -1 * 0; z;").expect("ran");
+    assert!(neg_zero == 0.0 && neg_zero.is_sign_negative());
+    assert!(cpp("let r = 0 / 0; r;").expect("ran").is_nan());
+    assert!(cpp("let r = 5 % 0; r;").expect("ran").is_nan());
+    assert_eq!(
+        cpp("let n = 0 / 0; let r = 0; if (n === n) { r = 1; } r;"),
+        Some(0.0)
+    );
+    assert_eq!(
+        cpp("let t = true; let r = 0; if (t === 1) { r = 1; } r;"),
+        Some(0.0)
+    );
+    assert_eq!(
+        cpp("let s = ''; let r = 0; if (s) { r = 1; } r;"),
+        Some(0.0)
+    );
+}
+
+#[test]
+fn values_the_vm_cannot_convert_go_to_the_interpreter() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    for source in [
+        "let s = 'a'; let r = s + 1; 1;",
+        "let s = 'a'; let r = s < 'b'; 1;",
+        "let s = 'abc'; let n = s.length; n;",
+        "let o = {a: 1}; let k = 'a'; let v = o[k]; 1;",
+        "let a = [1]; a[-1] = 2; 1;",
+        "let a = [1]; a[0.5] = 2; 1;",
+        "let n = 1; n.x = 2; 1;",
+    ] {
+        let error = vm_error(source);
+        assert_eq!(error.code, 10, "{source}: {}", error.message);
+    }
+    let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
+    let mut rt = ScriptRuntime::new();
+    rt.eval_script(&mut doc, "let s = 'abc'; let n = s.length + 1;");
+    assert!(!rt.last_script_used_vm());
+    rt.eval_script(&mut doc, "document.getElementById('out').textContent = n;");
+    let out = doc.get_element_by_id("out").expect("out");
+    assert_eq!(doc.text_content(out), "4");
+}

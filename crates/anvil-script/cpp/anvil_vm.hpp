@@ -197,6 +197,161 @@ inline f64 bits_to_f64(u64 b) noexcept {
     return conv.d;
 }
 
+// Number helpers shared by the interpreter and the native loops. Casting a
+// double that is NaN or out of range to an integer is undefined in C++, so
+// every conversion goes through these.
+
+constexpr f64 TWO_POW_52 = 4503599627370496.0;
+constexpr f64 TWO_POW_32 = 4294967296.0;
+
+inline bool js_is_nan(f64 v) noexcept {
+    return v != v;
+}
+
+inline bool js_is_finite(f64 v) noexcept {
+    return v == v && v - v == 0.0;
+}
+
+inline f64 js_abs(f64 v) noexcept {
+    return v < 0.0 ? -v : (v == 0.0 ? 0.0 : v);
+}
+
+// Math.floor. Doubles of magnitude 2^52 and up are already whole.
+inline f64 js_floor(f64 v) noexcept {
+    if (!(js_abs(v) < TWO_POW_52)) {
+        return v;
+    }
+    const f64 t = static_cast<f64>(static_cast<i64>(v));
+    const f64 r = (v < t) ? t - 1.0 : t;
+    return (r == 0.0 && (v < 0.0 || (f64_to_bits(v) >> 63) != 0u)) ? -0.0 : r;
+}
+
+inline f64 js_ceil(f64 v) noexcept {
+    if (!(js_abs(v) < TWO_POW_52)) {
+        return v;
+    }
+    const f64 t = static_cast<f64>(static_cast<i64>(v));
+    const f64 r = (v > t) ? t + 1.0 : t;
+    return (r == 0.0 && (v < 0.0 || (f64_to_bits(v) >> 63) != 0u)) ? -0.0 : r;
+}
+
+// Math.round: halves round up, and -0.5 up to -0 gives -0.
+inline f64 js_round(f64 v) noexcept {
+    if (!(js_abs(v) < TWO_POW_52)) {
+        return v;
+    }
+    f64 r = js_floor(v);
+    if (v - r >= 0.5) {
+        r += 1.0;
+    }
+    return (r == 0.0 && (v < 0.0 || (f64_to_bits(v) >> 63) != 0u)) ? -0.0 : r;
+}
+
+inline f64 js_sqrt(f64 v) noexcept {
+    if (js_is_nan(v) || v < 0.0) {
+        return bits_to_f64(0x7FF8000000000000ULL);
+    }
+    if (v == 0.0 || !js_is_finite(v)) {
+        return v;
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_sqrt(v);
+#else
+    // Scale into [0.5, 2) by powers of four, run Newton, scale back.
+    f64 x = v;
+    f64 scale = 1.0;
+    while (x > 2.0) {
+        x *= 0.25;
+        scale *= 2.0;
+    }
+    while (x < 0.5) {
+        x *= 4.0;
+        scale *= 0.5;
+    }
+    f64 g = 1.0;
+    for (int i = 0; i < 8; ++i) {
+        g = 0.5 * (g + x / g);
+    }
+    return g * scale;
+#endif
+}
+
+// ToInt32: whole part modulo 2^32, as a signed value. NaN and infinities
+// give 0.
+inline i32 js_to_int32(f64 v) noexcept {
+    if (!js_is_finite(v)) {
+        return 0;
+    }
+    const f64 t = v < 0.0 ? -js_floor(-v) : js_floor(v);
+    const f64 q = t / TWO_POW_32;
+    // q is whole from 2^52 up, so t is then a multiple of 2^32.
+    if (!(js_abs(q) < TWO_POW_52)) {
+        return 0;
+    }
+    f64 r = t - js_floor(q) * TWO_POW_32;
+    if (r < 0.0) {
+        r += TWO_POW_32;
+    }
+    const u32 u = r < TWO_POW_32 ? static_cast<u32>(r) : 0u;
+    return static_cast<i32>(u);
+}
+
+inline u32 js_to_uint32(f64 v) noexcept {
+    return static_cast<u32>(js_to_int32(v));
+}
+
+// The % operator: the sign follows the dividend, as in JavaScript. Each
+// subtraction of a power-of-two multiple of the divisor is exact.
+inline f64 js_remainder(f64 x, f64 y) noexcept {
+    if (js_is_nan(x) || js_is_nan(y) || !js_is_finite(x) || y == 0.0) {
+        return bits_to_f64(0x7FF8000000000000ULL);
+    }
+    if (!js_is_finite(y) || x == 0.0) {
+        return x;
+    }
+    const bool negative = x < 0.0;
+    f64 r = negative ? -x : x;
+    const f64 d = y < 0.0 ? -y : y;
+    while (r >= d) {
+        f64 t = d;
+        while (t <= r * 0.5) {
+            t *= 2.0;
+        }
+        r -= t;
+    }
+    if (r == 0.0) {
+        return negative ? -0.0 : 0.0;
+    }
+    return negative ? -r : r;
+}
+
+// Saturating casts with the results Rust's `as` gives, NaN to 0.
+inline i64 sat_i64(f64 v) noexcept {
+    if (js_is_nan(v)) {
+        return 0;
+    }
+    if (v >= 9223372036854775807.0) {
+        return 9223372036854775807LL;
+    }
+    if (v <= -9223372036854775808.0) {
+        return -9223372036854775807LL - 1LL;
+    }
+    return static_cast<i64>(v);
+}
+
+inline i32 sat_i32(f64 v) noexcept {
+    if (js_is_nan(v)) {
+        return 0;
+    }
+    if (v >= 2147483647.0) {
+        return 2147483647;
+    }
+    if (v <= -2147483648.0) {
+        return -2147483647 - 1;
+    }
+    return static_cast<i32>(v);
+}
+
 struct AnvilValue {
     u64 bits;
 
@@ -225,15 +380,20 @@ struct AnvilValue {
     }
 
     static AnvilValue make_number(f64 n) noexcept {
-        const i32 as_int = static_cast<i32>(n);
-        if (static_cast<f64>(as_int) == n && as_int >= -1073741824 && as_int <= 1073741823) {
-            return make_smi(as_int);
+        // The range check comes first so the cast is defined, and -0 stays
+        // a double so its sign is kept.
+        if (n >= -1073741824.0 && n <= 1073741823.0 && (n != 0.0 || (f64_to_bits(n) >> 63) == 0u)) {
+            const i32 as_int = static_cast<i32>(n);
+            if (static_cast<f64>(as_int) == n) {
+                return make_smi(as_int);
+            }
         }
-        u64 raw = f64_to_bits(n);
-        if ((raw & NANBOX_TAG_Check) == NANBOX_BASE_MASK && ((raw >> 48) & 0x7ULL) != 0ULL) {
-            raw = NANBOX_BASE_MASK;
+        // Every NaN becomes the one plain NaN, so no NaN the hardware makes
+        // (0 / 0 sets the sign bit) can read back as a tagged value.
+        if (js_is_nan(n)) {
+            return AnvilValue(NANBOX_BASE_MASK);
         }
-        return AnvilValue(raw);
+        return AnvilValue(f64_to_bits(n));
     }
 
     static constexpr AnvilValue make_string(u32 sym_id) noexcept {
@@ -323,6 +483,9 @@ struct AnvilValue {
         }
         if (t == ValueTag::Bool) {
             return payload() != 0u ? 1.0 : 0.0;
+        }
+        if (t == ValueTag::Undefined) {
+            return bits_to_f64(0x7FF8000000000000ULL);
         }
         return 0.0;
     }

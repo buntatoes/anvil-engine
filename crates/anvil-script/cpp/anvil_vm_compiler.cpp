@@ -715,9 +715,14 @@ struct AnvilCompiler {
         return sym;
     }
 
+    void emit_load_undefined(u8 dst) noexcept {
+        const u16 cidx = ctx->program.add_constant(AnvilValue::make_undefined());
+        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+    }
+
     void emit_load_number(u8 dst, f64 n) noexcept {
-        const i32 as_int = static_cast<i32>(n);
-        if (static_cast<f64>(as_int) == n && as_int >= -32768 && as_int <= 32767) {
+        const i32 as_int = (n >= -32768.0 && n <= 32767.0) ? static_cast<i32>(n) : 0x7FFFFFFF;
+        if (static_cast<f64>(as_int) == n) {
             ctx->program.emit(AnvilInstruction::make_abx(
                 AnvilOpcode::LoadSmi,
                 dst,
@@ -882,7 +887,7 @@ struct AnvilCompiler {
                             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
                         }
                     } else {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, slot_r, 0u, 0u));
+                        emit_load_undefined(slot_r);
                     }
                 }
                 const u8 dst = alloc_reg();
@@ -899,6 +904,11 @@ struct AnvilCompiler {
 
             // Variable read (local register or global binding)
             const i32 local_r = find_local(sym);
+            if (local_r < 0 && match_kw(&src[id_tok.offset], id_tok.length, "undefined", 9)) {
+                const u8 dst = alloc_reg();
+                emit_load_undefined(dst);
+                return compile_postfix(dst, sym, -1);
+            }
             u8 base_reg = 0u;
             if (local_r >= 0) {
                 base_reg = static_cast<u8>(local_r);
@@ -1236,7 +1246,7 @@ struct AnvilCompiler {
                     val_reg = compile_expr();
                 } else {
                     val_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, val_reg, 0u, 0u));
+                    emit_load_undefined(val_reg);
                 }
                 reject_if_expression_continues();
                 const u16 g_slot = global_slot(sym);
@@ -1265,7 +1275,7 @@ struct AnvilCompiler {
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, val_reg, 0u));
                 }
             } else {
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, dst, 0u, 0u));
+                emit_load_undefined(dst);
             }
             match(TokenKind::Semicolon);
             return dst;
@@ -1284,7 +1294,7 @@ struct AnvilCompiler {
                 reject_if_expression_continues();
             } else {
                 ret_reg = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, ret_reg, 0u, 0u));
+                emit_load_undefined(ret_reg);
             }
             match(TokenKind::Semicolon);
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, ret_reg, 0u, 0u));
@@ -1456,7 +1466,7 @@ struct AnvilCompiler {
 
             compile_statement();
             const u8 fallthrough_reg = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, fallthrough_reg, 0u, 0u));
+            emit_load_undefined(fallthrough_reg);
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, fallthrough_reg, 0u, 0u));
 
             if (fn_id < MAX_FUNCTIONS) {

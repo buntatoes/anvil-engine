@@ -361,6 +361,23 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
         if (inst.a >= kRegSlots) {
             return false;
         }
+        // Native code keeps every value as a double, so true would read
+        // back as 1. A boolean may only feed the jump right after it.
+        const bool makes_bool = inst.op == AnvilOpcode::LoadTrue || inst.op == AnvilOpcode::LoadFalse ||
+                                inst.op == AnvilOpcode::Not || inst.op == AnvilOpcode::CmpEq ||
+                                inst.op == AnvilOpcode::CmpNe || inst.op == AnvilOpcode::CmpLt ||
+                                inst.op == AnvilOpcode::CmpLe || inst.op == AnvilOpcode::CmpGt ||
+                                inst.op == AnvilOpcode::CmpGe;
+        if (makes_bool) {
+            if (i + 1u >= program.code_len) {
+                return false;
+            }
+            const AnvilInstruction next = program.code[i + 1u];
+            const bool jump = next.op == AnvilOpcode::JumpIfFalse || next.op == AnvilOpcode::JumpIfTrue;
+            if (!jump || next.a != inst.a) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -400,19 +417,11 @@ void loop_header(AnvilVmContext* ctx, u32 lid) noexcept {
 }
 
 double num_div(double lhs, double rhs) noexcept {
-    return rhs == 0.0 ? 0.0 : (lhs / rhs);
+    return lhs / rhs;
 }
 
 double num_mod(double lhs, double rhs) noexcept {
-    if (rhs == 0.0) {
-        return 0.0;
-    }
-    const i64 l = static_cast<i64>(lhs);
-    const i64 r = static_cast<i64>(rhs);
-    if (r == 0) {
-        return 0.0;
-    }
-    return static_cast<double>(l % r);
+    return js_remainder(lhs, rhs);
 }
 
 double num_neg(double v) noexcept { return -v; }
@@ -423,33 +432,30 @@ double num_not(double v) noexcept {
 }
 
 double bit_and(double lhs, double rhs) noexcept {
-    const i32 l = static_cast<i32>(lhs);
-    const i32 r = static_cast<i32>(rhs);
-    return static_cast<double>(l & r);
+    return static_cast<double>(js_to_int32(lhs) & js_to_int32(rhs));
 }
 
 double bit_or(double lhs, double rhs) noexcept {
-    return static_cast<double>(static_cast<i32>(lhs) | static_cast<i32>(rhs));
+    return static_cast<double>(js_to_int32(lhs) | js_to_int32(rhs));
 }
 
 double bit_xor(double lhs, double rhs) noexcept {
-    return static_cast<double>(static_cast<i32>(lhs) ^ static_cast<i32>(rhs));
+    return static_cast<double>(js_to_int32(lhs) ^ js_to_int32(rhs));
 }
 
 double bit_shl(double lhs, double rhs) noexcept {
-    const u32 s = static_cast<u32>(rhs) & 31u;
-    return static_cast<double>(static_cast<i32>(lhs) << s);
+    const u32 s = js_to_uint32(rhs) & 31u;
+    return static_cast<double>(static_cast<i32>(js_to_uint32(lhs) << s));
 }
 
 double bit_shr(double lhs, double rhs) noexcept {
-    const u32 s = static_cast<u32>(rhs) & 31u;
-    return static_cast<double>(static_cast<i32>(lhs) >> s);
+    const u32 s = js_to_uint32(rhs) & 31u;
+    return static_cast<double>(js_to_int32(lhs) >> s);
 }
 
 double bit_ushr(double lhs, double rhs) noexcept {
-    const u32 s = static_cast<u32>(rhs) & 31u;
-    const u32 u = static_cast<u32>(static_cast<i32>(lhs)) >> s;
-    return static_cast<double>(u);
+    const u32 s = js_to_uint32(rhs) & 31u;
+    return static_cast<double>(js_to_uint32(lhs) >> s);
 }
 
 double cmp_eq(double lhs, double rhs) noexcept { return lhs == rhs ? 1.0 : 0.0; }
@@ -468,40 +474,17 @@ void host_set_text_bridge(AnvilVmContext* ctx, u32 slot, double value) noexcept 
 
 double math_call(u32 op, double v) noexcept {
     switch (op) {
-        case 1u:
-            return v < 0.0 ? -v : v;
-        case 2u: {
-            const i64 i = static_cast<i64>(v);
-            const double d = static_cast<double>(i);
-            return (v < d) ? (d - 1.0) : d;
-        }
-        case 3u: {
-            const i64 i = static_cast<i64>(v);
-            const double d = static_cast<double>(i);
-            return (v > d) ? (d + 1.0) : d;
-        }
-        case 4u:
-            return v >= 0.0 ? (v + 0.5 >= static_cast<double>(static_cast<i64>(v + 0.5))
-                                   ? static_cast<double>(static_cast<i64>(v + 0.5))
-                                   : static_cast<double>(static_cast<i64>(v + 0.5)))
-                            : math_call(3u, v - 0.5);
-        case 5u: {
-            if (v <= 0.0) {
-                return 0.0;
-            }
-            double g = v > 1.0 ? v * 0.5 : 1.0;
-            for (int i = 0; i < 10; ++i) {
-                g = 0.5 * (g + v / g);
-            }
-            return g;
-        }
-        default:
-            return v;
+        case 1u: return js_abs(v);
+        case 2u: return js_floor(v);
+        case 3u: return js_ceil(v);
+        case 4u: return js_round(v);
+        case 5u: return js_sqrt(v);
+        default: return v;
     }
 }
 
 double math_dispatch(double op, double v) noexcept {
-    return math_call(static_cast<u32>(op), v);
+    return math_call(op >= 0.0 && op < 16.0 ? static_cast<u32>(op) : 0u, v);
 }
 
 bool emit_cmp_flags(Asm& as, u8 dst) noexcept {
