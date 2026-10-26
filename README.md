@@ -2,7 +2,7 @@
   <h1>Anvil Engine</h1>
   <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.23.1-ff6b24?style=flat-square" alt="v.23.1" />
+    <img src="https://img.shields.io/badge/release-v.23.2-ff6b24?style=flat-square" alt="v.23.2" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
@@ -11,7 +11,7 @@
   </p>
 </div>
 
-Version 0.23.1. Author: Buntato.
+Version 0.23.2. Author: Buntato.
 
 The source is public, so anyone can read it, audit it, and use it as part of Anvil Browser. It's still proprietary, though, not open source: you can't redistribute it on its own or use it to build a different product. [Anvil Browser](https://github.com/buntatoes/anvil-browser) and the nine companion libraries can be redistributed without it, under their own licenses. See [License](#license).
 
