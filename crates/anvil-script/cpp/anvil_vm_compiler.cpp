@@ -667,7 +667,7 @@ struct AnvilCompiler {
         }
         --loop_depth;
         const LoopJumps& jumps = loops[loop_depth];
-        const u16 break_pc = static_cast<u16>(ctx->program.code_len);
+        const u32 break_pc = ctx->program.code_len;
         for (u32 i = 0u; i < jumps.break_count && i < MAX_LOOP_JUMPS; ++i) {
             if (jumps.breaks[i] < ctx->program.code_len) {
                 ctx->program.code()[jumps.breaks[i]] = AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, break_pc);
@@ -676,7 +676,7 @@ struct AnvilCompiler {
         for (u32 i = 0u; i < jumps.continue_count && i < MAX_LOOP_JUMPS; ++i) {
             if (jumps.continues[i] < ctx->program.code_len) {
                 ctx->program.code()[jumps.continues[i]] =
-                    AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(continue_pc));
+                    AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, continue_pc);
             }
         }
     }
@@ -772,10 +772,10 @@ struct AnvilCompiler {
             reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
-        // The site index rides in a byte-wide instruction operand, so only 256
-        // sites can be addressed until the wider encoding lands. Past that,
-        // refuse with a reason rather than let the index wrap onto another
-        // site and read or write the wrong property.
+        // The instruction operand is now wide enough for far more sites, but the
+        // 256-site cap stays until it is lifted together with
+        // the register and jump caps. Past it, refuse with a reason rather than
+        // address a site the rest of the pipeline is not yet exercised for.
         if (site > 0xFFu) {
             reject_limit(VM_REFUSE_SITES, "inline cache site", 256u, "sites per script");
             return 0u;
@@ -934,7 +934,7 @@ struct AnvilCompiler {
                     AnvilOpcode::SetPropIC,
                     obj_reg,
                     val_reg,
-                    static_cast<u8>(ic_site & 0xFFu)
+                    static_cast<u16>(ic_site)
                 ));
                 if (!match(TokenKind::Comma)) {
                     break;
@@ -1036,7 +1036,7 @@ struct AnvilCompiler {
                     ctx->program.emit(AnvilInstruction::make_abc(
                         AnvilOpcode::Call,
                         dst,
-                        static_cast<u8>(target_fn & 0xFFu),
+                        static_cast<u16>(target_fn),
                         call_base
                     ));
                 }
@@ -1089,7 +1089,7 @@ struct AnvilCompiler {
                         AnvilOpcode::GetPropIC,
                         len_reg,
                         cur,
-                        static_cast<u8>(len_site & 0xFFu)
+                        static_cast<u16>(len_site)
                     ));
                     cur = len_reg;
                     continue;
@@ -1107,7 +1107,7 @@ struct AnvilCompiler {
                         AnvilOpcode::SetPropIC,
                         cur,
                         rhs,
-                        static_cast<u8>(ic_site & 0xFFu)
+                        static_cast<u16>(ic_site)
                     ));
                     cur = rhs;
                     continue;
@@ -1118,7 +1118,7 @@ struct AnvilCompiler {
                     AnvilOpcode::GetPropIC,
                     dst,
                     cur,
-                    static_cast<u8>(ic_site & 0xFFu)
+                    static_cast<u16>(ic_site)
                 ));
                 cur = dst;
                 continue;
@@ -1328,7 +1328,7 @@ struct AnvilCompiler {
             ctx->program.code()[patch_pc] = AnvilInstruction::make_abx(
                 is_and ? AnvilOpcode::JumpIfFalse : AnvilOpcode::JumpIfTrue,
                 dst,
-                static_cast<u16>(ctx->program.code_len)
+                ctx->program.code_len
             );
             lhs = dst;
         }
@@ -1349,14 +1349,14 @@ struct AnvilCompiler {
             ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::JumpIfFalse,
                 cond_or_val,
-                static_cast<u16>(ctx->program.code_len)
+                ctx->program.code_len
             );
             const u8 else_reg = compile_expr();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, else_reg, 0u));
             ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
-                static_cast<u16>(ctx->program.code_len)
+                ctx->program.code_len
             );
             return dst;
         }
@@ -1481,19 +1481,19 @@ struct AnvilCompiler {
                 ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::JumpIfFalse,
                     cond_reg,
-                    static_cast<u16>(ctx->program.code_len)
+                    ctx->program.code_len
                 );
                 last_reg = compile_statement();
                 ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::Jump,
                     0u,
-                    static_cast<u16>(ctx->program.code_len)
+                    ctx->program.code_len
                 );
             } else {
                 ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::JumpIfFalse,
                     cond_reg,
-                    static_cast<u16>(ctx->program.code_len)
+                    ctx->program.code_len
                 );
             }
             return last_reg;
@@ -1531,7 +1531,7 @@ struct AnvilCompiler {
             ctx->program.emit(AnvilInstruction::make_abx(
                 AnvilOpcode::JumpIfTrue,
                 cond_reg,
-                static_cast<u16>(loop_head_pc)
+                loop_head_pc
             ));
             end_loop(cond_pc);
             return body_reg;
@@ -1559,12 +1559,12 @@ struct AnvilCompiler {
             ctx->program.emit(AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
-                static_cast<u16>(loop_head_pc)
+                loop_head_pc
             ));
             ctx->program.code()[jexit_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::JumpIfFalse,
                 cond_reg,
-                static_cast<u16>(ctx->program.code_len)
+                ctx->program.code_len
             );
             end_loop(loop_head_pc);
             return body_reg;
@@ -1607,7 +1607,7 @@ struct AnvilCompiler {
             ctx->program.code()[jbody_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
-                static_cast<u16>(ctx->program.code_len)
+                ctx->program.code_len
             );
             if (!begin_loop()) {
                 return 0u;
@@ -1619,7 +1619,7 @@ struct AnvilCompiler {
                 ctx->program.code()[jexit_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::JumpIfFalse,
                     cond_reg,
-                    static_cast<u16>(ctx->program.code_len)
+                    ctx->program.code_len
                 );
             }
             end_loop(step_pc);
@@ -1689,7 +1689,7 @@ struct AnvilCompiler {
             ctx->program.code()[jskip_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
-                static_cast<u16>(ctx->program.code_len)
+                ctx->program.code_len
             );
 
             // Restore enclosing compiler state.

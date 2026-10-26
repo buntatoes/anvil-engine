@@ -412,7 +412,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                 break;
 
             case AnvilOpcode::LoadConst: {
-                const u16 idx = inst.imm16();
+                const u32 idx = inst.imm32();
                 R[inst.a] = (idx < program.const_len) ? program.constants()[idx] : AnvilValue::make_null();
                 break;
             }
@@ -580,29 +580,29 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                 break;
 
             case AnvilOpcode::Jump:
-                pc = inst.imm16();
+                pc = inst.imm32();
                 break;
 
             case AnvilOpcode::JumpIfFalse:
                 if (!truthy(heap, R[inst.a])) {
-                    pc = inst.imm16();
+                    pc = inst.imm32();
                 }
                 break;
 
             case AnvilOpcode::JumpIfTrue:
                 if (truthy(heap, R[inst.a])) {
-                    pc = inst.imm16();
+                    pc = inst.imm32();
                 }
                 break;
 
             case AnvilOpcode::GetGlobal: {
-                const u16 slot = inst.imm16();
+                const u32 slot = inst.imm32();
                 R[inst.a] = (slot < global_count) ? globals()[slot].value : AnvilValue::make_undefined();
                 break;
             }
 
             case AnvilOpcode::SetGlobal: {
-                const u16 slot = inst.imm16();
+                const u32 slot = inst.imm32();
                 if (slot < global_count) {
                     globals()[slot].value = R[inst.a];
                     globals()[slot].occupied = true;

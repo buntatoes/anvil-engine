@@ -939,30 +939,43 @@ enum class AnvilOpcode : u8 {
 };
 
 struct AnvilInstruction {
+    // Each instruction is a fixed cell. The three register operands are 16 bits
+    // wide, so a function can address far more than 256 registers; the extended
+    // immediate is 32 bits, so jump targets, constant indices and global slots
+    // are not bounded by a program of 65,535 instructions. `pad` keeps `imm`
+    // naturally aligned and is always zero.
     AnvilOpcode op;
-    u8 a;
-    u8 b;
-    u8 c;
+    u8 pad;
+    u16 a;
+    u16 b;
+    u16 c;
+    u32 imm;
 
-    static constexpr AnvilInstruction make_abc(AnvilOpcode op, u8 a, u8 b, u8 c) noexcept {
-        return AnvilInstruction{op, a, b, c};
+    static constexpr AnvilInstruction make_abc(AnvilOpcode op, u16 a, u16 b, u16 c) noexcept {
+        return AnvilInstruction{op, 0u, a, b, c, 0u};
     }
 
-    static constexpr AnvilInstruction make_abx(AnvilOpcode op, u8 a, u16 imm16) noexcept {
-        return AnvilInstruction{
-            op,
-            a,
-            static_cast<u8>((imm16 >> 8) & 0xFFu),
-            static_cast<u8>(imm16 & 0xFFu),
-        };
+    static constexpr AnvilInstruction make_abx(AnvilOpcode op, u16 a, u32 imm) noexcept {
+        return AnvilInstruction{op, 0u, a, 0u, 0u, imm};
     }
 
+    constexpr u32 imm32() const noexcept {
+        return imm;
+    }
+
+    constexpr i32 signed_imm32() const noexcept {
+        return static_cast<i32>(imm);
+    }
+
+    // Narrow views of the extended immediate, kept so code that only needs the
+    // low 16 bits (the numeric JIT, whose programs never exceed the old limits)
+    // reads the same value as before.
     constexpr u16 imm16() const noexcept {
-        return static_cast<u16>((static_cast<u16>(b) << 8) | static_cast<u16>(c));
+        return static_cast<u16>(imm);
     }
 
     constexpr i32 signed_imm16() const noexcept {
-        return static_cast<i32>(static_cast<short>(imm16()));
+        return static_cast<i32>(static_cast<short>(static_cast<u16>(imm)));
     }
 };
 
