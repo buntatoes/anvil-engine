@@ -672,6 +672,136 @@ fn deeply_nested_ifs_compile() {
     assert_eq!(value, 7.0);
 }
 
+/// A nested-if script about 64 KiB of source compiles and runs. The program-size
+/// ceiling and the temporary-freeing allocator together let a chain this deep
+/// through the compiler instead of being refused. The front end is
+/// recursive-descent, so a chain this deep needs more native stack than libtest's
+/// default test thread (2 MiB); real embedders (the host runner, the browser) run
+/// it on a normal stack, so the body runs on a thread sized to match.
+#[test]
+fn a_64_kib_nested_if_script_compiles() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            let depth = 6600;
+            let mut source = String::from("let x = 1; let r = 0; ");
+            for _ in 0..depth {
+                source.push_str("if (x) { ");
+            }
+            source.push_str("r = 9; ");
+            for _ in 0..depth {
+                source.push('}');
+            }
+            source.push_str(" r;");
+            assert!(
+                source.len() >= 64 * 1024,
+                "source is {} bytes",
+                source.len()
+            );
+            let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+                .expect("a 64 KiB nested-if script compiles and runs");
+            assert_eq!(value, 9.0);
+        })
+        .expect("spawn a large-stack thread")
+        .join()
+        .expect("the compile thread does not panic");
+}
+
+/// A source about 1 MiB long compiles and runs rather than being refused for its
+/// size. The bytecode grows in the arena and jump targets are 32-bit, so the
+/// program-size ceiling no longer stops a large but simple source.
+#[test]
+fn a_1_mib_source_compiles() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let repeats = 96_000;
+    let mut source = String::from("let r = 0; ");
+    for _ in 0..repeats {
+        source.push_str("r = r + 1; ");
+    }
+    source.push_str("r;");
+    assert!(
+        source.len() >= 1024 * 1024,
+        "source is {} bytes",
+        source.len()
+    );
+    let (value, _) = anvil_script::eval_cpp_vm_request_tuned(50_000_000, 0, &source)
+        .expect("a 1 MiB source compiles and runs");
+    assert_eq!(value, repeats as f64);
+}
+
+/// Seeded differential against the C++ VM's old compiler front end. The oracle
+/// in `differential_oracle.txt` is each generated script paired with the answer
+/// the old front end gave for it, captured before this change. The new front end
+/// must return the same answer for every one.
+#[test]
+fn differential_against_the_old_front_end() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let oracle = include_str!("differential_oracle.txt");
+    let mut checked = 0usize;
+    for line in oracle.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (answer, script) = line
+            .split_once('\t')
+            .expect("oracle row is answer<TAB>script");
+        let expected: f64 = answer.parse().expect("oracle answer parses");
+        let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, script)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "new compiler refused an oracle script: {} :: {script}",
+                    e.message
+                )
+            });
+        if expected.is_nan() {
+            assert!(
+                value.is_nan(),
+                "old front end gave NaN but new compiler gave {value} for: {script}"
+            );
+        } else {
+            assert_eq!(
+                value, expected,
+                "answer differs from the old front end for: {script}"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 300, "expected 300 differential rows");
+}
+
+/// A run whose frames outgrow its byte budget stops with the heap-limit reason
+/// rather than crashing. A function with many locals recurses deep under a tight
+/// heap budget and a generous step budget, so the register stack, not the step
+/// or depth limit, is what gives out.
+#[test]
+fn a_run_that_outgrows_its_byte_budget_stops() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut locals = String::new();
+    for i in 0..300 {
+        locals.push_str(&format!("let v{i} = n + {i}; "));
+    }
+    let source = format!(
+        "function f(n) {{ {locals} if (n <= 0) {{ return v0; }} return f(n - 1) + v299; }} f(100000);"
+    );
+    let error =
+        anvil_script::eval_cpp_vm_request_tuned(500_000_000, 2 * 1024 * 1024, &source).unwrap_err();
+    assert!(
+        error.message.starts_with("heap limit reached"),
+        "expected a heap-limit stop, got: {}",
+        error.message
+    );
+    assert_eq!(error.code, 11, "heap stop carries the VM_STOP_HEAP code");
+}
+
 /// More than 512 distinct numeric constants in one script.
 /// The constant pool grows in the arena and the constant index is 16-bit, so
 /// this compiles and runs now that the token cap is gone.
