@@ -15,10 +15,12 @@
 //! border, and `gap` still accept only `px` and `0`. `calc()` does not mix
 //! viewport units or `ch`. `display` accepts `block`, `inline`, `inline-block`,
 //! `list-item`, `flow-root`, `flex`, `inline-flex`, `grid`, `inline-grid`,
-//! and `none`. A descendant selector is whitespace between compounds. `>`,
-//! `+`, `~`, attribute selectors, and pseudo-classes are checked for syntax
-//! but never match yet. A rule whose selector list holds an invalid selector
-//! is dropped whole.
+//! and `none`. Selectors take all four combinators, attribute selectors with
+//! every operator and the `i` and `s` flags, `:is()`, `:where()`, `:not()`,
+//! `:has()`, the `nth-*()` family with `of S`, and the structural, link,
+//! form, and language pseudo-classes the document can answer; see
+//! [`Selector`]. A rule whose selector list holds an invalid selector is
+//! dropped whole.
 //!
 //! `transform` keeps up to [`MAX_TRANSFORM_FNS`] 2D functions:
 //! `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`,
@@ -54,13 +56,14 @@ use anvil_dom::{Document, NodeData, NodeId};
 use std::collections::HashMap;
 
 mod animation;
-mod selector_check;
+mod selectors;
 pub use animation::{
     ANIMATABLE, AnimProperty, AnimValue, AnimationDirection, AnimationSpec, Animations, Animator,
     FillMode, FrameClock, Keyframe, KeyframesRule, MAX_ANIMATIONS, MAX_TRANSITIONS, ManualClock,
     MonotonicClock, StepPosition, TimingFunction, TransitionSpec, Transitions, animation_name_hash,
     interpolate, read_value, write_value,
 };
+pub use selectors::{MAX_SELECTOR_COMPOUNDS, MAX_SELECTOR_NESTING, Selector};
 
 /// A parsed style sheet. Rules are owned, in source order, including rules
 /// that came from inside `@media`.
@@ -406,106 +409,6 @@ pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
     pub media: Option<MediaQuery>,
-}
-
-/// One compound in a selector chain: optional tag, id, and classes.
-///
-/// `universal` is `*` with no tag, id, or class. Identifiers are owned.
-/// An empty compound matches nothing.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CompoundSelector {
-    pub universal: bool,
-    pub tag: Option<String>,
-    pub id: Option<String>,
-    pub classes: Vec<String>,
-}
-
-impl CompoundSelector {
-    /// True when the compound has no universal flag, tag, id, or class.
-    fn is_empty(&self) -> bool {
-        !self.universal && self.tag.is_none() && self.id.is_none() && self.classes.is_empty()
-    }
-
-    /// True when `node_id` is an element and every tag, id, and class matches.
-    ///
-    /// `doc` is borrowed. Text and the document node never match. A universal
-    /// compound with no other tests matches every element.
-    fn matches(&self, doc: &Document, node_id: NodeId) -> bool {
-        let data = doc.get(node_id).data();
-        let Some(actual_tag) = data.tag() else {
-            return false;
-        };
-        if let Some(tag) = &self.tag {
-            if actual_tag != tag {
-                return false;
-            }
-        }
-        if let Some(id) = &self.id {
-            if data.id() != Some(id.as_str()) {
-                return false;
-            }
-        }
-        for class_name in &self.classes {
-            if !data.has_class(class_name) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Specificity as `(ids, classes, types)`. A tag contributes one type.
-    /// The universal flag contributes nothing. The class count is cast to `u16`.
-    fn specificity(&self) -> (u16, u16, u16) {
-        let ids = u16::from(self.id.is_some());
-        let classes = self.classes.len() as u16;
-        let tags = u16::from(self.tag.is_some());
-        (ids, classes, tags)
-    }
-}
-
-/// A selector chain. The last compound is the subject. Earlier compounds
-/// must match some ancestor, in order, not necessarily the parent.
-/// `chain` is owned. An empty chain matches nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Selector {
-    pub chain: Vec<CompoundSelector>,
-}
-
-impl Selector {
-    /// True when `node_id` matches the subject and each earlier compound
-    /// matches an ancestor. `doc` is borrowed. An empty chain is false.
-    pub fn matches(&self, doc: &Document, node_id: NodeId) -> bool {
-        let Some((last, ancestors)) = self.chain.split_last() else {
-            return false;
-        };
-        if !last.matches(doc, node_id) {
-            return false;
-        }
-        let mut current = doc.get(node_id).parent();
-        for required in ancestors.iter().rev() {
-            let mut found = None;
-            while let Some(parent_id) = current {
-                if required.matches(doc, parent_id) {
-                    found = doc.get(parent_id).parent();
-                    break;
-                }
-                current = doc.get(parent_id).parent();
-            }
-            if found.is_none() && current.is_none() {
-                return false;
-            }
-            current = found;
-        }
-        true
-    }
-
-    /// Sum of each compound's `(ids, classes, types)`.
-    pub fn specificity(&self) -> (u16, u16, u16) {
-        self.chain.iter().fold((0, 0, 0), |(i, c, t), part| {
-            let (pi, pc, pt) = part.specificity();
-            (i + pi, c + pc, t + pt)
-        })
-    }
 }
 
 /// One CSS declaration. `name` is owned and lowercase. `value` is owned
@@ -1429,11 +1332,14 @@ pub fn compute_styles_parallel(
     let mut styles = vec![ComputedStyle::initial(); total_nodes];
     let html_id = doc.html();
     let mut root_vars = HashMap::new();
+    let index = selectors::DocIndex::build(doc);
+    let matcher = selectors::Matcher::new(doc, Some(&index));
     let mut cx = Cascade {
         sheet,
         viewport_width,
         root_font_px: 16.0,
         animator: None,
+        matcher: &matcher,
     };
     if let NodeData::Element { tag, .. } = doc.get(html_id).data() {
         let html_style = cascade_element(
@@ -1474,6 +1380,7 @@ pub fn compute_styles_parallel(
             *slot = body_style;
         }
         let root_font_px = cx.root_font_px;
+        let index = &index;
         let chunk_size = body_children.len().div_ceil(workers);
         let branch_results: Vec<Vec<(usize, ComputedStyle)>> = std::thread::scope(|s| {
             let mut handles = Vec::new();
@@ -1481,11 +1388,13 @@ pub fn compute_styles_parallel(
                 let body_vars_ref = &body_vars;
                 handles.push(s.spawn(move || {
                     let mut local = Vec::new();
+                    let matcher = selectors::Matcher::new(doc, Some(index));
                     let worker_cx = Cascade {
                         sheet,
                         viewport_width,
                         root_font_px,
                         animator: None,
+                        matcher: &matcher,
                     };
                     for &child_id in chunk {
                         walk_subtree_into(
@@ -1574,11 +1483,14 @@ fn cascade_document(
     let viewport_width = viewport_width.max(0.0);
     let viewport_height = viewport_height.max(0.0);
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
+    let index = selectors::DocIndex::build(doc);
+    let matcher = selectors::Matcher::new(doc, Some(&index));
     let mut cx = Cascade {
         sheet,
         viewport_width,
         root_font_px: 16.0,
         animator,
+        matcher: &matcher,
     };
     walk(
         doc,
@@ -1608,6 +1520,8 @@ struct Cascade<'a> {
     /// Font size of `html` once it is styled; 16 before that.
     root_font_px: f32,
     animator: Option<&'a mut Animator>,
+    /// Selector matching with caches for this pass, on this thread.
+    matcher: &'a selectors::Matcher<'a>,
 }
 
 /// One past the largest node index reachable from the root.
@@ -1698,16 +1612,7 @@ fn cascade_element(
     if doc.get(id).data().attr("hidden").is_some() {
         style.display = Display::None;
     }
-    apply_author(
-        &mut style,
-        vars,
-        doc,
-        id,
-        cx.sheet,
-        cx.viewport_width,
-        parent_font_px,
-        cx.root_font_px,
-    );
+    apply_author(&mut style, vars, doc, id, cx, parent_font_px);
     style
 }
 
@@ -1725,11 +1630,10 @@ fn apply_author(
     vars: &mut HashMap<String, String>,
     doc: &Document,
     id: NodeId,
-    sheet: &Stylesheet,
-    viewport_width: f32,
+    cx: &Cascade,
     parent_font_px: f32,
-    root_font_px: f32,
 ) {
+    let (sheet, viewport_width, root_font_px) = (cx.sheet, cx.viewport_width, cx.root_font_px);
     let mut matched = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
         if let Some(mq) = &rule.media {
@@ -1740,7 +1644,7 @@ fn apply_author(
         let specificity = rule
             .selectors
             .iter()
-            .filter(|selector| selector.matches(doc, id))
+            .filter(|selector| cx.matcher.matches(selector, id))
             .map(Selector::specificity)
             .max();
         if let Some(specificity) = specificity {
@@ -3086,96 +2990,12 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     })
 }
 
-/// Split a selector list on commas outside brackets and quotes.
+/// Parse a selector list for a style rule.
 ///
 /// `None` when any selector in the list is invalid, so the caller drops the
-/// whole rule. A selector that is valid but uses something this crate does
-/// not match yet (a combinator other than space, an attribute selector, a
-/// pseudo-class) is left out of the list and never matches, while the other
-/// selectors in the rule still apply.
+/// whole rule. See [`Selector`] for what matches.
 fn parse_selectors(source: &str) -> Option<Vec<Selector>> {
-    if !selector_check::is_valid_selector_list(source) {
-        return None;
-    }
-    Some(
-        selector_check::split_selector_list(source)
-            .into_iter()
-            .filter_map(parse_selector)
-            .collect(),
-    )
-}
-
-/// Parse one selector. Compounds are split on whitespace, so the combinator
-/// is always the descendant combinator. `None` when any compound fails or the
-/// selector is empty. `>`, `+`, and `~` make the compound fail.
-fn parse_selector(source: &str) -> Option<Selector> {
-    let mut chain = Vec::new();
-    for token in source.split_whitespace() {
-        let compound = parse_compound_selector(token)?;
-        chain.push(compound);
-    }
-    if chain.is_empty() {
-        None
-    } else {
-        Some(Selector { chain })
-    }
-}
-
-/// Parse one compound: `*`, a tag, and then `#id` or `.class` pieces.
-///
-/// `None` for an empty token, a bad character, or an empty identifier.
-/// The tag is lowercased. Id and class text keep their case.
-fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
-    let token = token.trim();
-    if token.is_empty() {
-        return None;
-    }
-    if token.eq_ignore_ascii_case(":root") {
-        return Some(CompoundSelector {
-            tag: Some("html".to_string()),
-            ..CompoundSelector::default()
-        });
-    }
-    if token == "*" {
-        return Some(CompoundSelector {
-            universal: true,
-            ..CompoundSelector::default()
-        });
-    }
-    let mut out = CompoundSelector::default();
-    let mut chars = token.chars().peekable();
-    let mut mode = 't'; // 't' = tag, '#' = id, '.' = class
-
-    while chars.peek().is_some() {
-        if let Some(&prefix @ ('#' | '.')) = chars.peek() {
-            mode = prefix;
-            chars.next();
-        }
-        let mut ident = String::new();
-        while let Some(&ch) = chars.peek() {
-            if ch == '#' || ch == '.' {
-                break;
-            }
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ident.push(ch);
-                chars.next();
-            } else {
-                return None;
-            }
-        }
-        if ident.is_empty() {
-            return None;
-        }
-        match mode {
-            't' => out.tag = Some(ident.to_ascii_lowercase()),
-            '#' => out.id = Some(ident),
-            '.' => out.classes.push(ident),
-            _ => return None,
-        }
-        mode = ' ';
-    }
-
-    if out.is_empty() { None } else { Some(out) }
+    selectors::parse_selector_list(source)
 }
 
 /// Parse `name: value` pairs separated by `;`.

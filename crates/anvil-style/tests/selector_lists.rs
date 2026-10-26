@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Buntato
 //! One invalid selector in a list drops the whole rule.
 //!
-//! A selector that is valid but not matched by this crate yet (a child
-//! combinator, a pseudo-class) does not drop the rule: it just never matches.
+//! A selector that is valid but does not match the element does not drop the
+//! rule: the other selectors in the list still apply.
 
 use anvil_dom::parse_html;
 use anvil_style::{Color, compute_styles, parse_css};
