@@ -61,6 +61,11 @@ inline i32 array_index(f64 v) noexcept {
     return static_cast<f64>(i) == v ? i : -1;
 }
 
+// `==` for the values where it needs no conversion. Sets `known` to false
+// for pairs that convert first (a number and a string, for example), which
+// the VM leaves to the interpreter.
+bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, bool& known) noexcept;
+
 bool values_strictly_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b) noexcept {
     // Numbers compare as doubles first, so NaN is not equal to itself and
     // 0 equals -0.
@@ -73,6 +78,23 @@ bool values_strictly_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b) no
     if (a.is_string() && b.is_string()) {
         return heap.string_equals(a.payload(), b.payload());
     }
+    return false;
+}
+
+bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, bool& known) noexcept {
+    known = true;
+    if (a.is_number() && b.is_number()) {
+        return a.as_number() == b.as_number();
+    }
+    const bool a_nullish = a.is_null() || a.is_undefined();
+    const bool b_nullish = b.is_null() || b.is_undefined();
+    if (a_nullish || b_nullish) {
+        return a_nullish && b_nullish;
+    }
+    if (a.tag() == b.tag()) {
+        return values_strictly_equal(heap, a, b);
+    }
+    known = false;
     return false;
 }
 
@@ -340,6 +362,18 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
             case AnvilOpcode::CmpNe:
                 R[inst.a] = AnvilValue::make_bool(!values_strictly_equal(heap, R[inst.b], R[inst.c]));
                 break;
+
+            case AnvilOpcode::CmpLooseEq:
+            case AnvilOpcode::CmpLooseNe: {
+                bool known = true;
+                const bool equal = values_loosely_equal(heap, R[inst.b], R[inst.c], known);
+                if (!known) {
+                    fail(VM_STOP_UNSUPPORTED, "== between values of different types");
+                    return AnvilValue::make_undefined();
+                }
+                R[inst.a] = AnvilValue::make_bool(inst.op == AnvilOpcode::CmpLooseEq ? equal : !equal);
+                break;
+            }
 
             case AnvilOpcode::CmpLt:
                 R[inst.a] = AnvilValue::make_bool(R[inst.b].as_number() < R[inst.c].as_number());

@@ -314,6 +314,8 @@ bool opcode_supported(AnvilOpcode op) noexcept {
         case AnvilOpcode::UShr:
         case AnvilOpcode::CmpEq:
         case AnvilOpcode::CmpNe:
+        case AnvilOpcode::CmpLooseEq:
+        case AnvilOpcode::CmpLooseNe:
         case AnvilOpcode::CmpLt:
         case AnvilOpcode::CmpLe:
         case AnvilOpcode::CmpGt:
@@ -367,7 +369,8 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
                                 inst.op == AnvilOpcode::Not || inst.op == AnvilOpcode::CmpEq ||
                                 inst.op == AnvilOpcode::CmpNe || inst.op == AnvilOpcode::CmpLt ||
                                 inst.op == AnvilOpcode::CmpLe || inst.op == AnvilOpcode::CmpGt ||
-                                inst.op == AnvilOpcode::CmpGe;
+                                inst.op == AnvilOpcode::CmpGe || inst.op == AnvilOpcode::CmpLooseEq ||
+                                inst.op == AnvilOpcode::CmpLooseNe;
         if (makes_bool) {
             if (i + 1u >= program.code_len) {
                 return false;
@@ -644,12 +647,16 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 break;
             case AnvilOpcode::CmpEq:
             case AnvilOpcode::CmpNe:
+            case AnvilOpcode::CmpLooseEq:
+            case AnvilOpcode::CmpLooseNe:
             case AnvilOpcode::CmpLt:
             case AnvilOpcode::CmpLe:
             case AnvilOpcode::CmpGt:
             case AnvilOpcode::CmpGe: {
+                // Native code only runs programs where every value is a
+                // number, and there `==` is the same as `===`.
                 double (*fn)(double, double) = &cmp_eq;
-                if (inst.op == AnvilOpcode::CmpNe) fn = &cmp_ne;
+                if (inst.op == AnvilOpcode::CmpNe || inst.op == AnvilOpcode::CmpLooseNe) fn = &cmp_ne;
                 if (inst.op == AnvilOpcode::CmpLt) fn = &cmp_lt;
                 if (inst.op == AnvilOpcode::CmpLe) fn = &cmp_le;
                 if (inst.op == AnvilOpcode::CmpGt) fn = &cmp_gt;

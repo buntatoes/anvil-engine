@@ -674,3 +674,53 @@ fn loop_jumps_the_vm_cannot_place_are_refused() {
     let error = vm_error(&jumps);
     assert_eq!(error.message, "break limit reached: 32 jumps per loop");
 }
+
+#[test]
+fn loose_equality_postfix_and_push_values() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let cases = [
+        ("let a = 1; let r = 0; if (a == 1) { r = 1; } r;", 1.0),
+        ("let a = 1; let r = 0; if (a != 2) { r = 1; } r;", 1.0),
+        ("let u; let r = 0; if (u == null) { r = 1; } r;", 1.0),
+        (
+            "let n = null; let r = 0; if (n != undefined) { r = 1; } r;",
+            0.0,
+        ),
+        ("let n = null; let r = 0; if (n == 0) { r = 1; } r;", 0.0),
+        ("let s = 'a'; let r = 0; if (s == 'a') { r = 1; } r;", 1.0),
+        ("let b = 0; let c = b++; c * 10 + b;", 1.0),
+        ("let b = 5; let c = b--; c * 10 + b;", 54.0),
+        (
+            "function f(x) { let y = x++; return y * 10 + x; } f(3);",
+            34.0,
+        ),
+        ("let a = []; let n = a.push(7); n = a.push(8); n;", 2.0),
+        ("let b = 3; b++;", 3.0),
+        ("let b = 3; b--; b;", 2.0),
+        ("function f() { let k = 0; k++; k++; return k; } f();", 2.0),
+        (
+            "let s = 0; for (let i = 0; i < 1000; i++) { if (i % 3 == 0) { s += i; } } s;",
+            166833.0,
+        ),
+    ];
+    for (source, want) in cases {
+        assert_eq!(cpp(source), Some(want), "{source}");
+    }
+    let u = cpp("let u; let v = u++; v;").expect("ran");
+    assert!(u.is_nan());
+
+    // Pairs that convert before comparing go to the interpreter.
+    for source in [
+        "let a = 1; let r = 0; if (a == '1') { r = 1; } r;",
+        "let t = true; let r = 0; if (t == 1) { r = 1; } r;",
+    ] {
+        let error = vm_error(source);
+        assert_eq!(error.code, 10, "{source}: {}", error.message);
+        assert_eq!(error.message, "== between values of different types");
+    }
+    let error = vm_error("let o = {n: 1}; o.n++; o.n;");
+    assert_eq!(error.code, 33);
+    assert!(error.message.contains("++ or --"), "{}", error.message);
+}

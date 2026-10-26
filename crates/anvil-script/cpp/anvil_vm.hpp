@@ -737,6 +737,8 @@ enum class AnvilOpcode : u8 {
     // R[a] is a number. imm16 is a slot in AnvilVmContext::host_ids.
     // The native compiler calls the page host. The interpreter ignores it.
     HostSetText  = 43u,
+    CmpLooseEq   = 44u,  // R[a] = (R[b] == R[c])
+    CmpLooseNe   = 45u,  // R[a] = (R[b] != R[c])
 };
 
 struct AnvilInstruction {

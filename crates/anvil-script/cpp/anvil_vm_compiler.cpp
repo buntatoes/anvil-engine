@@ -67,6 +67,8 @@ enum class TokenKind : u8 {
     KwDo       = 54u,
     KwBreak    = 55u,
     KwContinue = 56u,
+    LooseEq    = 57u,
+    LooseNe    = 58u,
 };
 
 struct Token {
@@ -316,12 +318,12 @@ struct AnvilLexer {
                 continue;
             }
             if (c == '=' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::EqEq, pos, 2u, 0.0};
+                tokens[count++] = Token{TokenKind::LooseEq, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '!' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::BangEq, pos, 2u, 0.0};
+                tokens[count++] = Token{TokenKind::LooseNe, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
@@ -782,6 +784,15 @@ struct AnvilCompiler {
         return r;
     }
 
+    u32 intern_name(const char* name, u32 len) noexcept {
+        const u32 sym = ctx->heap.intern_string(name, len);
+        if (sym == NO_SLOT) {
+            reject_limit(VM_REFUSE_STRINGS, "string pool", MAX_STRING_BYTES, "bytes");
+            return 0u;
+        }
+        return sym;
+    }
+
     u32 token_sym(const Token& t) noexcept {
         const u32 sym = ctx->heap.intern_string(&src[t.offset], t.length);
         if (sym == NO_SLOT) {
@@ -1017,6 +1028,16 @@ struct AnvilCompiler {
                     const u8 val_reg = compile_expr();
                     expect(TokenKind::RParen);
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ArrayPush, cur, val_reg, 0u));
+                    // push gives the new length.
+                    const u32 len_site = new_site(intern_name("length", 6u));
+                    const u8 len_reg = alloc_reg();
+                    ctx->program.emit(AnvilInstruction::make_abc(
+                        AnvilOpcode::GetPropIC,
+                        len_reg,
+                        cur,
+                        static_cast<u8>(len_site & 0xFFu)
+                    ));
+                    cur = len_reg;
                     continue;
                 }
                 // Method calls other than push are not compiled.
@@ -1066,20 +1087,31 @@ struct AnvilCompiler {
                 cur = dst;
                 continue;
             }
-            if (match(TokenKind::PlusPlus) || match(TokenKind::MinusMinus)) {
-                const bool is_inc = lexer.tokens[cursor - 1u].kind == TokenKind::PlusPlus;
+            if (peek().kind == TokenKind::PlusPlus || peek().kind == TokenKind::MinusMinus) {
+                // Only a plain variable is compiled. `o.n++` or `a[i]++`
+                // would need the store to go back to the property.
+                if (cur != base_reg) {
+                    reject_here(VM_REFUSE_UNSUPPORTED, "++ or -- on something other than a variable");
+                    break;
+                }
+                const bool is_inc = advance().kind == TokenKind::PlusPlus;
+                // The value of `x++` is the old value as a number.
+                const u8 zero_reg = alloc_reg();
+                emit_load_number(zero_reg, 0.0);
+                const u8 old_reg = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Sub, old_reg, cur, zero_reg));
                 const u8 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
                 const u8 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(
                     is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub,
                     dst,
-                    cur,
+                    old_reg,
                     one_reg
                 ));
                 store_back_ident(ident_sym, local_r, dst);
-                cur = dst;
-                continue;
+                cur = old_reg;
+                break;
             }
             break;
         }
@@ -1190,16 +1222,20 @@ struct AnvilCompiler {
 
     u8 compile_equality() noexcept {
         u8 lhs = compile_relational();
-        while (peek().kind == TokenKind::EqEq || peek().kind == TokenKind::BangEq) {
+        while (peek().kind == TokenKind::EqEq || peek().kind == TokenKind::BangEq ||
+               peek().kind == TokenKind::LooseEq || peek().kind == TokenKind::LooseNe) {
             const TokenKind op = advance().kind;
             const u8 rhs = compile_relational();
             const u8 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(
-                op == TokenKind::EqEq ? AnvilOpcode::CmpEq : AnvilOpcode::CmpNe,
-                dst,
-                lhs,
-                rhs
-            ));
+            AnvilOpcode opc = AnvilOpcode::CmpEq;
+            if (op == TokenKind::BangEq) {
+                opc = AnvilOpcode::CmpNe;
+            } else if (op == TokenKind::LooseEq) {
+                opc = AnvilOpcode::CmpLooseEq;
+            } else if (op == TokenKind::LooseNe) {
+                opc = AnvilOpcode::CmpLooseNe;
+            }
+            ctx->program.emit(AnvilInstruction::make_abc(opc, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -1625,6 +1661,38 @@ struct AnvilCompiler {
         }
         if (peek().kind == TokenKind::Ident) {
             const TokenKind second = peek(1u).kind;
+            const TokenKind third = peek(2u).kind;
+            // `x++;` or a for-loop step `x++)` alone: nothing reads the
+            // value, so the old value is not kept as a number.
+            if ((second == TokenKind::PlusPlus || second == TokenKind::MinusMinus) &&
+                (third == TokenKind::Semicolon || third == TokenKind::RParen ||
+                 third == TokenKind::RBrace || third == TokenKind::Eof)) {
+                const Token id_tok = advance();
+                const bool is_inc = advance().kind == TokenKind::PlusPlus;
+                const u32 sym = token_sym(id_tok);
+                const i32 local_r = find_local(sym);
+                u8 cur_reg = 0u;
+                if (local_r >= 0) {
+                    cur_reg = static_cast<u8>(local_r);
+                } else {
+                    cur_reg = alloc_reg();
+                    const u16 g_slot = global_slot(sym);
+                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::GetGlobal, cur_reg, g_slot));
+                }
+                const u8 one_reg = alloc_reg();
+                emit_load_number(one_reg, 1.0);
+                const u8 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(
+                    is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub,
+                    dst,
+                    cur_reg,
+                    one_reg
+                ));
+                store_back_ident(sym, local_r, dst);
+                // At the top level the old value is still in its temporary,
+                // and the VM reads a script's value as a number.
+                return local_r >= 0 ? dst : cur_reg;
+            }
             if (second == TokenKind::Assign ||
                 second == TokenKind::PlusEq ||
                 second == TokenKind::MinusEq ||
