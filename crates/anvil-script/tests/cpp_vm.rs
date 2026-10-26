@@ -95,7 +95,7 @@ fn scripts_with_unknown_names_are_left_to_the_interpreter() {
         "foo(1); 2;",
         "let r = page_total + 1; r;",
         "let r = 1; done = r; r;",
-        "let r = Math.max(1, 5); r;",
+        "let r = Math.log(1); r;",
         "let a = [1, 2]; a.pop(); a.length;",
         "let o = {a: 1}; let r = o.a; o.toString(); r;",
         "let r = 0; try { r = 1; } finally { r = 2; } r;",
@@ -220,10 +220,7 @@ fn refused_scripts_say_why() {
             "let r = page_total + 1; r;",
             "name not declared in this script 'page_total'",
         ),
-        (
-            "let r = Math.max(1, 5); r;",
-            "unsupported Math function 'max'",
-        ),
+        ("let r = Math.log(1); r;", "unsupported Math function 'log'"),
         ("let n = 1e3; n;", "unsupported number '1e3'"),
         ("return 1;", "return outside a function near '1'"),
         ("let s = 'abc", "unterminated string ''abc'"),
@@ -498,6 +495,63 @@ fn numbers_follow_javascript() {
         cpp("let s = ''; let r = 0; if (s) { r = 1; } r;"),
         Some(0.0)
     );
+}
+
+#[test]
+fn more_math_functions_run_on_the_vm() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Plain numeric results.
+    let cases = [
+        ("Math.min(3, 5)", 3.0),
+        ("Math.max(3, 5)", 5.0),
+        ("Math.min(8, 3, 9, 1)", 1.0),
+        ("Math.max(8, 3, 9, 1)", 9.0),
+        ("Math.min(7)", 7.0),
+        ("Math.pow(2, 10)", 1024.0),
+        ("Math.pow(0 / 0, 0)", 1.0),
+        ("Math.pow(2, -2)", 0.25),
+        ("Math.trunc(4.7)", 4.0),
+        ("Math.trunc(-4.7)", -4.0),
+        ("Math.sign(-3)", -1.0),
+        ("Math.sign(12)", 1.0),
+        ("Math.imul(3, 4)", 12.0),
+        ("Math.imul(0 - 1, 8)", -8.0),
+        ("Math.PI", std::f64::consts::PI),
+        ("Math.E", std::f64::consts::E),
+        ("Math.SQRT2", std::f64::consts::SQRT_2),
+    ];
+    for (expr, want) in cases {
+        let plain = format!("let r = {expr}; r;");
+        assert_eq!(cpp(&plain), Some(want), "{plain}");
+    }
+
+    // NaN propagates through min/max/pow.
+    assert!(cpp("let r = Math.min(1, 0 / 0); r;").expect("ran").is_nan());
+    assert!(cpp("let r = Math.max(1, 0 / 0); r;").expect("ran").is_nan());
+    assert!(cpp("let r = Math.pow(1, 1 / 0); r;").expect("ran").is_nan());
+    assert!(cpp("let r = Math.sign(0 / 0); r;").expect("ran").is_nan());
+    assert!(cpp("let r = Math.trunc(0 / 0); r;").expect("ran").is_nan());
+
+    // Infinity through pow.
+    assert_eq!(cpp("let r = Math.pow(2, 1 / 0); r;"), Some(f64::INFINITY));
+    assert_eq!(cpp("let r = Math.pow(2, -1 / 0); r;"), Some(0.0));
+
+    // -0 semantics: min(-0, +0) = -0, max(-0, +0) = +0, sign(-0) = -0,
+    // trunc(-0.4) = -0.
+    let m = cpp("let r = Math.min(-0, 0); r;").expect("ran");
+    assert!(m == 0.0 && m.is_sign_negative(), "min(-0,0) should be -0");
+    let x = cpp("let r = Math.max(-0, 0); r;").expect("ran");
+    assert!(x == 0.0 && x.is_sign_positive(), "max(-0,0) should be +0");
+    let g = cpp("let r = Math.sign(-1 * 0); r;").expect("ran");
+    assert!(g == 0.0 && g.is_sign_negative(), "sign(-0) should be -0");
+    let t = cpp("let r = Math.trunc(-1 * 0); r;").expect("ran");
+    assert!(t == 0.0 && t.is_sign_negative(), "trunc(-0) should be -0");
+
+    // Math.min() and Math.max() with no args are +/-Infinity.
+    assert_eq!(cpp("let r = Math.min(); r;"), Some(f64::INFINITY));
+    assert_eq!(cpp("let r = Math.max(); r;"), Some(f64::NEG_INFINITY));
 }
 
 #[test]

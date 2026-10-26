@@ -494,6 +494,8 @@ double math_call(u32 op, double v) noexcept {
         case 3u: return js_ceil(v);
         case 4u: return js_round(v);
         case 5u: return js_sqrt(v);
+        case 6u: return js_trunc(v);
+        case 7u: return js_sign(v);
         default: return v;
     }
 }

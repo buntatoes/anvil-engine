@@ -1194,23 +1194,97 @@ struct AnvilCompiler {
                 return compile_function_literal(true, false, sym);
             }
 
-            // Built-in `Math.<op>(arg)` intrinsic call lowering.
+            // Built-in `Math.<op>(...)` intrinsics and `Math.<CONST>`.
             if (match_kw(&src[id_tok.offset], id_tok.length, "Math", 4) && match(TokenKind::Dot)) {
                 const Token m_tok = advance();
-                u8 math_op = 0u;
-                if (match_kw(&src[m_tok.offset], m_tok.length, "abs", 3)) math_op = 1u;
-                else if (match_kw(&src[m_tok.offset], m_tok.length, "floor", 5)) math_op = 2u;
-                else if (match_kw(&src[m_tok.offset], m_tok.length, "ceil", 4)) math_op = 3u;
-                else if (match_kw(&src[m_tok.offset], m_tok.length, "round", 5)) math_op = 4u;
-                else if (match_kw(&src[m_tok.offset], m_tok.length, "sqrt", 4)) math_op = 5u;
-                if (math_op == 0u) {
-                    reject_name(VM_REFUSE_UNSUPPORTED, "unsupported Math function", m_tok);
+                const char* mp = &src[m_tok.offset];
+                const u32 ml = m_tok.length;
+
+                // `Math.PI` and friends: a bare member, no call, loads a number.
+                if (peek().kind != TokenKind::LParen) {
+                    f64 cval = 0.0;
+                    bool is_const = true;
+                    if (match_kw(mp, ml, "PI", 2)) cval = 3.141592653589793;
+                    else if (match_kw(mp, ml, "E", 1)) cval = 2.718281828459045;
+                    else if (match_kw(mp, ml, "LN2", 3)) cval = 0.6931471805599453;
+                    else if (match_kw(mp, ml, "LN10", 4)) cval = 2.302585092994046;
+                    else if (match_kw(mp, ml, "LOG2E", 5)) cval = 1.4426950408889634;
+                    else if (match_kw(mp, ml, "LOG10E", 6)) cval = 0.4342944819032518;
+                    else if (match_kw(mp, ml, "SQRT2", 5)) cval = 1.4142135623730951;
+                    else if (match_kw(mp, ml, "SQRT1_2", 7)) cval = 0.7071067811865476;
+                    else is_const = false;
+                    if (!is_const) {
+                        reject_name(VM_REFUSE_UNSUPPORTED, "unsupported Math member", m_tok);
+                    }
+                    const u16 dst = alloc_reg();
+                    emit_load_number(dst, cval);
+                    return dst;
                 }
-                expect(TokenKind::LParen);
-                const u16 arg_reg = compile_expr();
-                expect(TokenKind::RParen);
+
+                // Single-argument numeric intrinsics.
+                u8 math_op = 0u;
+                if (match_kw(mp, ml, "abs", 3)) math_op = 1u;
+                else if (match_kw(mp, ml, "floor", 5)) math_op = 2u;
+                else if (match_kw(mp, ml, "ceil", 4)) math_op = 3u;
+                else if (match_kw(mp, ml, "round", 5)) math_op = 4u;
+                else if (match_kw(mp, ml, "sqrt", 4)) math_op = 5u;
+                else if (match_kw(mp, ml, "trunc", 5)) math_op = 6u;
+                else if (match_kw(mp, ml, "sign", 4)) math_op = 7u;
+                if (math_op != 0u) {
+                    expect(TokenKind::LParen);
+                    const u16 arg_reg = compile_expr();
+                    expect(TokenKind::RParen);
+                    const u16 dst = alloc_reg();
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallMath, dst, math_op, arg_reg));
+                    return dst;
+                }
+
+                // Two-argument intrinsics: Math.pow, Math.imul.
+                u32 op2 = 0u;
+                if (match_kw(mp, ml, "pow", 3)) op2 = 1u;
+                else if (match_kw(mp, ml, "imul", 4)) op2 = 2u;
+                if (op2 != 0u) {
+                    expect(TokenKind::LParen);
+                    const u16 a_reg = compile_expr();
+                    expect(TokenKind::Comma);
+                    const u16 b_reg = compile_expr();
+                    expect(TokenKind::RParen);
+                    const u16 dst = alloc_reg();
+                    ctx->program.emit(AnvilInstruction{AnvilOpcode::CallMath2, 0u, dst, a_reg, b_reg, op2});
+                    return dst;
+                }
+
+                // Variadic Math.min / Math.max, folded two at a time. No args
+                // gives +Infinity for min and -Infinity for max, as in JS.
+                u32 mm = 0u;
+                if (match_kw(mp, ml, "min", 3)) mm = 3u;
+                else if (match_kw(mp, ml, "max", 3)) mm = 4u;
+                if (mm != 0u) {
+                    expect(TokenKind::LParen);
+                    if (peek().kind == TokenKind::RParen) {
+                        advance();
+                        const u16 dst = alloc_reg();
+                        emit_load_number(dst, bits_to_f64(mm == 3u ? 0x7FF0000000000000ULL
+                                                                   : 0xFFF0000000000000ULL));
+                        return dst;
+                    }
+                    u16 acc = compile_expr();
+                    while (match(TokenKind::Comma)) {
+                        if (peek().kind == TokenKind::RParen) {
+                            break;
+                        }
+                        const u16 nxt = compile_expr();
+                        const u16 res = alloc_reg();
+                        ctx->program.emit(AnvilInstruction{AnvilOpcode::CallMath2, 0u, res, acc, nxt, mm});
+                        acc = res;
+                    }
+                    expect(TokenKind::RParen);
+                    return acc;
+                }
+
+                reject_name(VM_REFUSE_UNSUPPORTED, "unsupported Math function", m_tok);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallMath, dst, math_op, arg_reg));
+                emit_load_undefined(dst);
                 return dst;
             }
 

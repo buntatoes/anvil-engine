@@ -330,6 +330,73 @@ inline u32 js_to_uint32(f64 v) noexcept {
     return static_cast<u32>(js_to_int32(v));
 }
 
+// Math.trunc: drop the fraction toward zero, keeping -0 for a small negative.
+inline f64 js_trunc(f64 v) noexcept {
+    if (!js_is_finite(v)) {
+        return v;
+    }
+    return v < 0.0 ? -js_floor(-v) : js_floor(v);
+}
+
+// Math.sign: -1, -0, +0, 1 or NaN, with the zero sign kept.
+inline f64 js_sign(f64 v) noexcept {
+    if (js_is_nan(v)) {
+        return v;
+    }
+    if (v > 0.0) {
+        return 1.0;
+    }
+    if (v < 0.0) {
+        return -1.0;
+    }
+    return v;
+}
+
+// Math.pow with the ECMAScript edge cases that differ from C's pow: a zero
+// exponent is 1 for any base (even NaN), a NaN exponent gives NaN, and a base
+// of 1 or -1 raised to an infinite power gives NaN.
+inline f64 js_pow(f64 base, f64 exp) noexcept {
+    if (exp == 0.0) {
+        return 1.0;
+    }
+    if (js_is_nan(exp) || js_is_nan(base)) {
+        return bits_to_f64(0x7FF8000000000000ULL);
+    }
+    if ((base == 1.0 || base == -1.0) && !js_is_finite(exp)) {
+        return bits_to_f64(0x7FF8000000000000ULL);
+    }
+    return __builtin_pow(base, exp);
+}
+
+// Math.imul: the 32-bit integer product, as a signed 32-bit result.
+inline i32 js_imul(f64 a, f64 b) noexcept {
+    return static_cast<i32>(js_to_uint32(a) * js_to_uint32(b));
+}
+
+// Math.min of two values: NaN propagates and -0 is less than +0.
+inline f64 js_min2(f64 a, f64 b) noexcept {
+    if (js_is_nan(a) || js_is_nan(b)) {
+        return bits_to_f64(0x7FF8000000000000ULL);
+    }
+    if (a == 0.0 && b == 0.0) {
+        const bool neg = (f64_to_bits(a) >> 63) != 0u || (f64_to_bits(b) >> 63) != 0u;
+        return neg ? -0.0 : 0.0;
+    }
+    return a < b ? a : b;
+}
+
+// Math.max of two values: NaN propagates and +0 is greater than -0.
+inline f64 js_max2(f64 a, f64 b) noexcept {
+    if (js_is_nan(a) || js_is_nan(b)) {
+        return bits_to_f64(0x7FF8000000000000ULL);
+    }
+    if (a == 0.0 && b == 0.0) {
+        const bool both_neg = (f64_to_bits(a) >> 63) != 0u && (f64_to_bits(b) >> 63) != 0u;
+        return both_neg ? -0.0 : 0.0;
+    }
+    return a > b ? a : b;
+}
+
 // The % operator: the sign follows the dividend, as in JavaScript. Each
 // subtraction of a power-of-two multiple of the divisor is exact.
 inline f64 js_remainder(f64 x, f64 y) noexcept {
@@ -957,6 +1024,7 @@ enum class AnvilOpcode : u8 {
     CmpLooseNe   = 45u,  // R[a] = (R[b] != R[c])
     LoadFunc     = 46u,  // R[a] = function value for fn_id = imm32
     CallValue    = 47u,  // R[a] = call(R[b], arg_base = c, argc = imm32)
+    CallMath2    = 48u,  // R[a] = math2(op = imm32, R[b], R[c])
 };
 
 struct AnvilInstruction {

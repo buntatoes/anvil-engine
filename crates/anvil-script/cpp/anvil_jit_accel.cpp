@@ -818,9 +818,24 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                     case 3u: out = js_ceil(v); break;
                     case 4u: out = js_round(v); break;
                     case 5u: out = js_sqrt(v); break;
+                    case 6u: out = js_trunc(v); break;
+                    case 7u: out = js_sign(v); break;
                     default: break;
                 }
                 R[inst.a] = AnvilValue::make_number(out);
+                break;
+            }
+
+            case AnvilOpcode::CallMath2: {
+                const f64 a = R[inst.b].as_number();
+                const f64 b = R[inst.c].as_number();
+                switch (inst.imm32()) {
+                    case 1u: R[inst.a] = AnvilValue::make_number(js_pow(a, b)); break;
+                    case 2u: R[inst.a] = AnvilValue::make_number(static_cast<f64>(js_imul(a, b))); break;
+                    case 3u: R[inst.a] = AnvilValue::make_number(js_min2(a, b)); break;
+                    case 4u: R[inst.a] = AnvilValue::make_number(js_max2(a, b)); break;
+                    default: R[inst.a] = AnvilValue::make_undefined(); break;
+                }
                 break;
             }
 
