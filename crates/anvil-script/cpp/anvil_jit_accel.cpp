@@ -755,7 +755,20 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
             }
 
             case AnvilOpcode::LoadFunc: {
-                R[inst.a] = AnvilValue::make_function(inst.imm32());
+                const u32 fn_id = inst.imm32();
+                u32 cid = NO_SLOT;
+                if (fn_id < heap.function_count) {
+                    cid = heap.functions()[fn_id].canonical_closure;
+                    if (cid == NO_SLOT) {
+                        cid = heap.alloc_closure(fn_id, NO_SLOT, 0u, true);
+                        if (cid == NO_SLOT) {
+                            fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
+                            return AnvilValue::make_undefined();
+                        }
+                        heap.functions()[fn_id].canonical_closure = cid;
+                    }
+                }
+                R[inst.a] = AnvilValue::make_function(cid);
                 break;
             }
 
@@ -765,7 +778,12 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                     fail(VM_STOP_NOT_FUNCTION, "called value is not a function");
                     return AnvilValue::make_undefined();
                 }
-                const u32 fn_id = callee.payload();
+                const u32 cid = callee.payload();
+                if (cid >= heap.closure_count || !heap.closures()[cid].active) {
+                    fail(VM_STOP_NOT_FUNCTION, "called value is not a function");
+                    return AnvilValue::make_undefined();
+                }
+                const u32 fn_id = heap.closures()[cid].fn_id;
                 if (fn_id >= heap.function_count || !heap.functions()[fn_id].active) {
                     fail(VM_STOP_NOT_FUNCTION, "called value is not a function");
                     return AnvilValue::make_undefined();

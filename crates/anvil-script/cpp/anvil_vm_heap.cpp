@@ -133,6 +133,12 @@ void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
     function_count = 0u;
     ensure_functions(INIT_FUNCTION_TABLE);
 
+    closures_off = 0u;
+    closures_cap = 0u;
+    closure_count = 0u;
+    live_closures = 0u;
+    ensure_closures(INIT_FUNCTION_TABLE);
+
     live_objects = 0u;
     live_arrays = 0u;
     bytes_allocated = sizeof(AnvilShape);
@@ -524,7 +530,63 @@ u32 AnvilHeap::alloc_function(
     f.local_count = local_count;
     f.code_start = code_start;
     f.code_len = code_len;
+    f.canonical_closure = NO_SLOT;
     bytes_allocated += static_cast<u32>(sizeof(AnvilHeapFunction));
+    return id;
+}
+
+bool AnvilHeap::ensure_closures(u32 need) noexcept {
+    if (need <= closures_cap) {
+        return true;
+    }
+    u32 new_cap = closures_cap == 0u ? INIT_FUNCTION_TABLE : closures_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilHeapClosure)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilHeapClosure* dst = reinterpret_cast<AnvilHeapClosure*>(arena.at(new_off));
+    const AnvilHeapClosure* src = closures();
+    for (u32 i = 0u; i < closure_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = closures_off;
+    const u32 old_cap = closures_cap;
+    closures_off = new_off;
+    closures_cap = new_cap;
+    if (old_cap != 0u) {
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapClosure)));
+    }
+    return true;
+}
+
+u32 AnvilHeap::alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pinned) noexcept {
+    // Reuse a swept table slot, or grow the table for a new one.
+    u32 id = NO_SLOT;
+    for (u32 i = 0u; i < closure_count; ++i) {
+        if (!closures()[i].active) {
+            id = i;
+            break;
+        }
+    }
+    if (id == NO_SLOT) {
+        if (!ensure_closures(closure_count + 1u)) {
+            return NO_SLOT;
+        }
+        id = closure_count++;
+    }
+    AnvilHeapClosure& c = closures()[id];
+    c.active = true;
+    c.marked = false;
+    c.pinned = pinned;
+    c.fn_id = fn_id;
+    c.upvals_off = upvals_off;
+    c.upval_count = upval_count;
+    ++live_closures;
+    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapClosure));
     return id;
 }
 
@@ -841,13 +903,9 @@ void AnvilHeap::mark_value(AnvilValue v) noexcept {
         case ValueTag::Array:
             mark_array(v.payload());
             break;
-        case ValueTag::Function: {
-            const u32 fn_id = v.payload();
-            if (fn_id < function_count) {
-                functions()[fn_id].marked = true;
-            }
+        case ValueTag::Function:
+            mark_closure(v.payload());
             break;
-        }
         default:
             break;
     }
@@ -881,6 +939,26 @@ void AnvilHeap::mark_array(u32 arr_id) noexcept {
         mark_value(elems[i]);
     }
 }
+void AnvilHeap::mark_closure(u32 closure_id) noexcept {
+    if (closure_id >= closure_count || !closures()[closure_id].active ||
+        closures()[closure_id].marked) {
+        return;
+    }
+    closures()[closure_id].marked = true;
+    const u32 n = closures()[closure_id].upval_count;
+    const u32 off = closures()[closure_id].upvals_off;
+    if (off != NO_SLOT) {
+        const u32* cells = closure_upvals(off);
+        for (u32 i = 0u; i < n; ++i) {
+            mark_array(cells[i]);
+        }
+    }
+    const u32 fn_id = closures()[closure_id].fn_id;
+    if (fn_id < function_count) {
+        functions()[fn_id].marked = true;
+    }
+}
+
 u32 AnvilHeap::sweep_unmarked() noexcept {
     u32 reclaimed = 0u;
     for (u32 i = 0; i < object_count; ++i) {
@@ -931,6 +1009,26 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
             }
         }
     }
+    for (u32 i = 0; i < closure_count; ++i) {
+        AnvilHeapClosure& c = closures()[i];
+        if (c.active && !c.marked && !c.pinned) {
+            if (c.upvals_off != NO_SLOT) {
+                arena.free(c.upvals_off, c.upval_count * static_cast<u32>(sizeof(u32)));
+            }
+            c.active = false;
+            c.upvals_off = NO_SLOT;
+            c.upval_count = 0u;
+            if (live_closures > 0u) {
+                --live_closures;
+            }
+            if (bytes_allocated >= sizeof(AnvilHeapClosure)) {
+                bytes_allocated -= static_cast<u32>(sizeof(AnvilHeapClosure));
+            }
+            ++reclaimed;
+        } else {
+            c.marked = false;
+        }
+    }
     ++gc_collections;
     return reclaimed;
 }
@@ -942,6 +1040,9 @@ void AnvilHeap::clear_marks() noexcept {
     }
     for (u32 i = 0; i < array_count; ++i) {
         arrays()[i].marked = false;
+    }
+    for (u32 i = 0; i < closure_count; ++i) {
+        closures()[i].marked = false;
     }
 }
 

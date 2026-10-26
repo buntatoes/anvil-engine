@@ -760,6 +760,23 @@ struct AnvilHeapFunction {
     u32 local_count;
     u32 code_start;
     u32 code_len;
+    // The one canonical closure for this function, created on first use, so a
+    // non-capturing function is the same value every time (`f === f`). NO_SLOT
+    // until first referenced as a value.
+    u32 canonical_closure;
+};
+
+// A closure is a function value: a function id plus the cells it captured. A
+// non-capturing function has a single pinned canonical closure; a capturing
+// function makes a fresh closure, holding its own cells, each time it is
+// evaluated, so two such closures are distinct under ===.
+struct AnvilHeapClosure {
+    bool active;
+    bool marked;
+    bool pinned;        // a canonical closure, never collected
+    u32 fn_id;
+    u32 upvals_off;     // arena block: u32[upval_count] of cell array ids, or NO_SLOT
+    u32 upval_count;
 };
 
 struct AnvilHeap {
@@ -848,6 +865,26 @@ struct AnvilHeap {
     }
     bool ensure_functions(u32 need) noexcept;
 
+    // Closures: a growable table in the arena. A closure is created when a
+    // function is used as a value (LoadFunc / MakeClosure) and, unless pinned
+    // as a function's canonical closure, is collected like any other heap value.
+    u32 closures_off;
+    u32 closures_cap;
+    u32 closure_count;
+    u32 live_closures;
+    AnvilHeapClosure* closures() noexcept {
+        return reinterpret_cast<AnvilHeapClosure*>(arena.at(closures_off));
+    }
+    const AnvilHeapClosure* closures() const noexcept {
+        return reinterpret_cast<const AnvilHeapClosure*>(arena.at(closures_off));
+    }
+    u32* closure_upvals(u32 off) noexcept { return reinterpret_cast<u32*>(arena.at(off)); }
+    const u32* closure_upvals(u32 off) const noexcept {
+        return reinterpret_cast<const u32*>(arena.at(off));
+    }
+    bool ensure_closures(u32 need) noexcept;
+    u32 alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pinned) noexcept;
+
     // Arrays and their element storage live in the arena and grow as needed, so
     // neither the number of arrays nor their length is capped any more. Each
     // array owns its element block; growth allocates a larger block and frees
@@ -904,6 +941,7 @@ struct AnvilHeap {
     void mark_value(AnvilValue v) noexcept;
     void mark_object(u32 obj_id) noexcept;
     void mark_array(u32 arr_id) noexcept;
+    void mark_closure(u32 closure_id) noexcept;
     void clear_marks() noexcept;
     u32 sweep_unmarked() noexcept;
     u32 collect_garbage(const AnvilValue* roots, u32 root_count) noexcept;
