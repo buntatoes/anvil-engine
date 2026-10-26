@@ -184,32 +184,19 @@ fn compile_limits_refuse_with_a_reason() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
+    // The function, global, constant and IC-site tables all grow in the arena
+    // now, so those refusals are gone. What the compiler still refuses are its
+    // own front-end limits, lifted later in the new front end: too many
+    // registers in one function and too many tokens in one script.
     let nested = format!("{}1{};", "(1 + ".repeat(70), ")".repeat(70));
-    let mut functions = String::new();
-    let mut globals = String::new();
-    for i in 0..129 {
-        functions.push_str(&format!("function f{i}() {{}} "));
-    }
-    for i in 0..257 {
-        globals.push_str(&format!("let g{i} = 0; "));
-    }
-    let sites = format!("let o = {{a: 1}}; let r = 0; {}", "r = o.a; ".repeat(257));
     let tokens = format!("let r = [{}];", vec!["1"; 1100].join(", "));
-    let mut constants = String::from("let r = 0; ");
-    for i in 0..257 {
-        constants.push_str(&format!("r = {}.5 + {}.5; ", 2 * i, 2 * i + 1));
-    }
     let cases = [
         (
             nested,
             40,
             "register limit reached: 64 registers per function",
         ),
-        (functions, 44, "function limit reached: 128 functions"),
-        (globals, 45, "global limit reached: 256 globals"),
-        (sites, 46, "property site limit reached: 256 sites"),
         (tokens, 41, "token limit reached: 2048 tokens"),
-        (constants, 43, "constant limit reached: 512 constants"),
     ];
     for (source, code, message) in cases {
         let error = vm_error(&source);

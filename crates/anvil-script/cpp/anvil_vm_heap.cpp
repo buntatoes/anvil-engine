@@ -28,6 +28,7 @@ constexpr u32 INIT_SHAPE_TABLE = 16u;
 constexpr u32 INIT_TRANSITION_TABLE = 16u;
 constexpr u32 INIT_OBJECT_TABLE = 16u;
 constexpr u32 INIT_OBJECT_SLOTS = 4u;
+constexpr u32 INIT_FUNCTION_TABLE = 16u;
 } // namespace
 
 bool AnvilHeap::ensure_string_bytes(u32 need) noexcept {
@@ -127,16 +128,10 @@ void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
     array_count = 0u;
     ensure_arrays(INIT_ARRAY_TABLE);
 
+    functions_off = 0u;
+    functions_cap = 0u;
     function_count = 0u;
-    for (u32 i = 0; i < MAX_FUNCTIONS; ++i) {
-        functions[i].active = false;
-        functions[i].marked = false;
-        functions[i].name_sym = 0u;
-        functions[i].arity = 0u;
-        functions[i].local_count = 0u;
-        functions[i].code_start = 0u;
-        functions[i].code_len = 0u;
-    }
+    ensure_functions(INIT_FUNCTION_TABLE);
 
     live_objects = 0u;
     live_arrays = 0u;
@@ -290,6 +285,34 @@ bool AnvilHeap::ensure_transitions(u32 need) noexcept {
     transitions_cap = new_cap;
     if (old_cap != 0u) {
         arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilShapeTransition)));
+    }
+    return true;
+}
+
+bool AnvilHeap::ensure_functions(u32 need) noexcept {
+    if (need <= functions_cap) {
+        return true;
+    }
+    u32 new_cap = functions_cap == 0u ? INIT_FUNCTION_TABLE : functions_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilHeapFunction)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilHeapFunction* dst = reinterpret_cast<AnvilHeapFunction*>(arena.at(new_off));
+    const AnvilHeapFunction* src = functions();
+    for (u32 i = 0u; i < function_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = functions_off;
+    const u32 old_cap = functions_cap;
+    functions_off = new_off;
+    functions_cap = new_cap;
+    if (old_cap != 0u) {
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapFunction)));
     }
     return true;
 }
@@ -489,18 +512,19 @@ u32 AnvilHeap::alloc_function(
     u32 code_start,
     u32 code_len
 ) noexcept {
-    if (function_count >= MAX_FUNCTIONS) {
+    if (!ensure_functions(function_count + 1u)) {
         return NO_SLOT;
     }
     const u32 id = function_count++;
-    functions[id].active = true;
-    functions[id].marked = true;
-    functions[id].name_sym = name_sym;
-    functions[id].arity = arity;
-    functions[id].local_count = local_count;
-    functions[id].code_start = code_start;
-    functions[id].code_len = code_len;
-    bytes_allocated += sizeof(AnvilHeapFunction);
+    AnvilHeapFunction& f = functions()[id];
+    f.active = true;
+    f.marked = true;
+    f.name_sym = name_sym;
+    f.arity = arity;
+    f.local_count = local_count;
+    f.code_start = code_start;
+    f.code_len = code_len;
+    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapFunction));
     return id;
 }
 
@@ -820,7 +844,7 @@ void AnvilHeap::mark_value(AnvilValue v) noexcept {
         case ValueTag::Function: {
             const u32 fn_id = v.payload();
             if (fn_id < function_count) {
-                functions[fn_id].marked = true;
+                functions()[fn_id].marked = true;
             }
             break;
         }

@@ -347,7 +347,7 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
         }
         if (inst.op == AnvilOpcode::LoadConst) {
             const u16 idx = inst.imm16();
-            if (idx >= program.const_len || !program.constants[idx].is_number()) {
+            if (idx >= program.const_len || !program.constants()[idx].is_number()) {
                 return false;
             }
         }
@@ -398,15 +398,15 @@ double global_load(AnvilVmContext* ctx, u32 slot) noexcept {
     if (slot >= ctx->global_count) {
         return 0.0;
     }
-    return ctx->globals[slot].value.as_number();
+    return ctx->globals()[slot].value.as_number();
 }
 
 void global_store(AnvilVmContext* ctx, u32 slot, double value) noexcept {
-    if (slot >= MAX_GLOBALS) {
+    if (slot >= ctx->globals_cap) {
         return;
     }
-    ctx->globals[slot].value = AnvilValue::make_number(value);
-    ctx->globals[slot].occupied = true;
+    ctx->globals()[slot].value = AnvilValue::make_number(value);
+    ctx->globals()[slot].occupied = true;
     if (slot >= ctx->global_count) {
         ctx->global_count = slot + 1u;
     }
@@ -590,7 +590,7 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 ok = ok && as.xorpd_xmm(0u) && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
             case AnvilOpcode::LoadConst: {
-                const f64 n = ctx->program.constants[inst.imm16()].as_number();
+                const f64 n = ctx->program.constants()[inst.imm16()].as_number();
                 u64 bits = 0;
                 copy_bytes(&bits, &n, 8u);
                 // mov rax, bits ; movq xmm0, rax ; store

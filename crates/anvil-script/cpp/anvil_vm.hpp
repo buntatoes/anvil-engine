@@ -55,11 +55,7 @@ constexpr u32 MAX_CALL_DEPTH =
     (MAX_CALL_FRAMES - 1u) < (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u)
         ? (MAX_CALL_FRAMES - 1u)
         : (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u);
-constexpr u32 MAX_FUNCTIONS             = 128u;
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
-constexpr u32 MAX_CONSTANTS             = 512u;
-constexpr u32 MAX_GLOBALS               = 256u;
-constexpr u32 MAX_IC_SITES              = 256u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
 
@@ -751,8 +747,16 @@ struct AnvilHeap {
     bool ensure_object_slots(u32 obj_id, u32 need) noexcept;
     bool convert_object_to_dict(u32 obj_id) noexcept;
 
-    AnvilHeapFunction functions[MAX_FUNCTIONS];
+    u32 functions_off;
+    u32 functions_cap;
     u32 function_count;
+    AnvilHeapFunction* functions() noexcept {
+        return reinterpret_cast<AnvilHeapFunction*>(arena.at(functions_off));
+    }
+    const AnvilHeapFunction* functions() const noexcept {
+        return reinterpret_cast<const AnvilHeapFunction*>(arena.at(functions_off));
+    }
+    bool ensure_functions(u32 need) noexcept;
 
     // Arrays and their element storage live in the arena and grow as needed, so
     // neither the number of arrays nor their length is capped any more. Each
@@ -846,8 +850,15 @@ struct AnvilDomIcEntry {
 };
 
 struct AnvilIcTable {
-    AnvilIcSite sites[MAX_IC_SITES];
+    AnvilArena* arena;
+    u32 sites_off;
+    u32 sites_cap;
     u32 site_count;
+    AnvilIcSite* sites() noexcept { return reinterpret_cast<AnvilIcSite*>(arena->at(sites_off)); }
+    const AnvilIcSite* sites() const noexcept {
+        return reinterpret_cast<const AnvilIcSite*>(arena->at(sites_off));
+    }
+    bool ensure_sites(u32 need) noexcept;
     u32 ic_hits;
     u32 ic_misses;
     u32 polymorphic_upgrades;
@@ -857,7 +868,7 @@ struct AnvilIcTable {
     u32 dom_ic_hits;
     u32 dom_ic_misses;
 
-    void init() noexcept;
+    void init(AnvilArena* a) noexcept;
     // NO_SLOT when all sites are taken.
     u32 allocate_site(u32 prop_sym) noexcept;
     AnvilValue load_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym) noexcept;
@@ -957,6 +968,11 @@ struct AnvilGlobalBinding {
     bool occupied;
     // Declared at the top level or with `var`, so later scripts see it.
     bool exported;
+    // Compile-time scope state for this global, carried with the binding so it
+    // grows with the table: whether a top-level declaration gave it a value,
+    // and the block depth of that declaration (0xFFFFFFFF before it has one).
+    bool declared;
+    u32 decl_depth;
 };
 
 struct AnvilCallFrame {
@@ -969,15 +985,30 @@ struct AnvilCallFrame {
 struct AnvilBytecodeProgram {
     AnvilInstruction code[MAX_BYTECODE_INSTRUCTIONS];
     u32 code_len;
-    AnvilValue constants[MAX_CONSTANTS];
+    // The constant pool grows in the shared arena; `arena` points at it, set by
+    // init() each run (like the heap's own base pointer).
+    AnvilArena* arena;
+    u32 constants_off;
+    u32 constants_cap;
     u32 const_len;
     u32 loop_trip_counts[64];
     bool compile_ok;
     // VM_REFUSE_CODE_SIZE or VM_REFUSE_CONSTANTS once compile_ok is false.
     u32 overflow;
 
-    void init() noexcept {
+    AnvilValue* constants() noexcept {
+        return reinterpret_cast<AnvilValue*>(arena->at(constants_off));
+    }
+    const AnvilValue* constants() const noexcept {
+        return reinterpret_cast<const AnvilValue*>(arena->at(constants_off));
+    }
+    bool ensure_constants(u32 need) noexcept;
+
+    void init(AnvilArena* a) noexcept {
+        arena = a;
         code_len = 0u;
+        constants_off = 0u;
+        constants_cap = 0u;
         const_len = 0u;
         for (u32 i = 0; i < 64u; ++i) {
             loop_trip_counts[i] = 0u;
@@ -1001,11 +1032,11 @@ struct AnvilBytecodeProgram {
 
     u16 add_constant(AnvilValue val) noexcept {
         for (u32 i = 0; i < const_len; ++i) {
-            if (constants[i].bits == val.bits) {
+            if (constants()[i].bits == val.bits) {
                 return static_cast<u16>(i);
             }
         }
-        if (const_len >= MAX_CONSTANTS) {
+        if (!ensure_constants(const_len + 1u)) {
             if (compile_ok) {
                 overflow = VM_REFUSE_CONSTANTS;
             }
@@ -1013,7 +1044,7 @@ struct AnvilBytecodeProgram {
             return 0u;
         }
         const u16 idx = static_cast<u16>(const_len++);
-        constants[idx] = val;
+        constants()[idx] = val;
         return idx;
     }
 };
@@ -1055,8 +1086,16 @@ struct AnvilVmContext {
     AnvilIcTable ic;
     AnvilBytecodeProgram program;
     AnvilValue registers[MAX_TOTAL_REGISTERS];
-    AnvilGlobalBinding globals[MAX_GLOBALS];
+    u32 globals_off;
+    u32 globals_cap;
     u32 global_count;
+    AnvilGlobalBinding* globals() noexcept {
+        return reinterpret_cast<AnvilGlobalBinding*>(heap.arena.at(globals_off));
+    }
+    const AnvilGlobalBinding* globals() const noexcept {
+        return reinterpret_cast<const AnvilGlobalBinding*>(heap.arena.at(globals_off));
+    }
+    bool ensure_globals(u32 need) noexcept;
     AnvilCallFrame frames[MAX_CALL_FRAMES];
     u32 frame_count;
     u32 steps_executed;

@@ -7,21 +7,48 @@
 
 namespace anvil_vm {
 
-void AnvilIcTable::init() noexcept {
+namespace {
+constexpr u32 INIT_IC_SITE_TABLE = 16u;
+} // namespace
+
+bool AnvilIcTable::ensure_sites(u32 need) noexcept {
+    if (need <= sites_cap) {
+        return true;
+    }
+    u32 new_cap = sites_cap == 0u ? INIT_IC_SITE_TABLE : sites_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(AnvilIcSite)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilIcSite* dst = reinterpret_cast<AnvilIcSite*>(arena->at(new_off));
+    const AnvilIcSite* src = sites();
+    for (u32 i = 0u; i < site_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = sites_off;
+    const u32 old_cap = sites_cap;
+    sites_off = new_off;
+    sites_cap = new_cap;
+    if (old_cap != 0u) {
+        arena->free(old_off, old_cap * static_cast<u32>(sizeof(AnvilIcSite)));
+    }
+    return true;
+}
+
+void AnvilIcTable::init(AnvilArena* a) noexcept {
+    arena = a;
+    sites_off = 0u;
+    sites_cap = 0u;
     site_count = 0u;
     ic_hits = 0u;
     ic_misses = 0u;
     polymorphic_upgrades = 0u;
     megamorphic_fallbacks = 0u;
-    for (u32 i = 0; i < MAX_IC_SITES; ++i) {
-        sites[i].state = IcState::Uninitialized;
-        sites[i].count = 0u;
-        sites[i].prop_sym = 0u;
-        for (u32 s = 0; s < 4u; ++s) {
-            sites[i].stubs[s].shape_id = 0xFFFFFFFFu;
-            sites[i].stubs[s].slot_offset = -1;
-        }
-    }
+    ensure_sites(INIT_IC_SITE_TABLE);
 
     dom_ic_hits = 0u;
     dom_ic_misses = 0u;
@@ -34,16 +61,17 @@ void AnvilIcTable::init() noexcept {
 }
 
 u32 AnvilIcTable::allocate_site(u32 prop_sym) noexcept {
-    if (site_count >= MAX_IC_SITES) {
+    if (!ensure_sites(site_count + 1u)) {
         return NO_SLOT;
     }
     const u32 id = site_count++;
-    sites[id].state = IcState::Uninitialized;
-    sites[id].count = 0u;
-    sites[id].prop_sym = prop_sym;
+    AnvilIcSite& st = sites()[id];
+    st.state = IcState::Uninitialized;
+    st.count = 0u;
+    st.prop_sym = prop_sym;
     for (u32 s = 0; s < 4u; ++s) {
-        sites[id].stubs[s].shape_id = 0xFFFFFFFFu;
-        sites[id].stubs[s].slot_offset = -1;
+        st.stubs[s].shape_id = 0xFFFFFFFFu;
+        st.stubs[s].slot_offset = -1;
     }
     return id;
 }
@@ -82,7 +110,7 @@ AnvilValue AnvilIcTable::load_property_ic(
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
-        AnvilIcSite& site = sites[site_id];
+        AnvilIcSite& site = sites()[site_id];
         if (site.state == IcState::Monomorphic) {
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
@@ -105,7 +133,7 @@ AnvilValue AnvilIcTable::load_property_ic(
     const AnvilValue val = heap.get_object_prop(obj_id, prop_sym, &resolved_shape, &resolved_slot);
 
     if (site_id < site_count && resolved_slot >= 0) {
-        AnvilIcSite& site = sites[site_id];
+        AnvilIcSite& site = sites()[site_id];
         if (site.state == IcState::Uninitialized) {
             site.state = IcState::Monomorphic;
             site.count = 1u;
@@ -152,7 +180,7 @@ StoreResult AnvilIcTable::store_property_ic(
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
-        AnvilIcSite& site = sites[site_id];
+        AnvilIcSite& site = sites()[site_id];
         if (site.state == IcState::Monomorphic) {
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
@@ -176,7 +204,7 @@ StoreResult AnvilIcTable::store_property_ic(
     i32 slot = -1;
     const StoreResult stored = heap.set_object_prop(obj_id, prop_sym, val, &new_shape, &slot);
     if (stored == StoreResult::Ok && site_id < site_count && slot >= 0) {
-        AnvilIcSite& site = sites[site_id];
+        AnvilIcSite& site = sites()[site_id];
         if (site.state == IcState::Uninitialized) {
             site.state = IcState::Monomorphic;
             site.count = 1u;

@@ -129,6 +129,67 @@ bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, boo
 
 } // namespace
 
+namespace {
+constexpr u32 INIT_GLOBAL_TABLE = 16u;
+constexpr u32 INIT_CONSTANT_TABLE = 64u;
+} // namespace
+
+bool AnvilVmContext::ensure_globals(u32 need) noexcept {
+    if (need <= globals_cap) {
+        return true;
+    }
+    u32 new_cap = globals_cap == 0u ? INIT_GLOBAL_TABLE : globals_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilGlobalBinding)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilGlobalBinding* dst = reinterpret_cast<AnvilGlobalBinding*>(heap.arena.at(new_off));
+    const AnvilGlobalBinding* src = globals();
+    for (u32 i = 0u; i < global_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = globals_off;
+    const u32 old_cap = globals_cap;
+    globals_off = new_off;
+    globals_cap = new_cap;
+    if (old_cap != 0u) {
+        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilGlobalBinding)));
+    }
+    return true;
+}
+
+bool AnvilBytecodeProgram::ensure_constants(u32 need) noexcept {
+    if (need <= constants_cap) {
+        return true;
+    }
+    u32 new_cap = constants_cap == 0u ? INIT_CONSTANT_TABLE : constants_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilValue* dst = reinterpret_cast<AnvilValue*>(arena->at(new_off));
+    const AnvilValue* src = constants();
+    for (u32 i = 0u; i < const_len; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = constants_off;
+    const u32 old_cap = constants_cap;
+    constants_off = new_off;
+    constants_cap = new_cap;
+    if (old_cap != 0u) {
+        arena->free(old_off, old_cap * static_cast<u32>(sizeof(AnvilValue)));
+    }
+    return true;
+}
+
 void AnvilVmContext::init() noexcept {
     // The arena is the bytes Rust allocated after this header (see
     // anvil_cpp_vm_context_bytes). heap_byte_budget, kept across runs by a
@@ -136,18 +197,15 @@ void AnvilVmContext::init() noexcept {
     u8* arena_base = reinterpret_cast<u8*>(this) + sizeof(AnvilVmContext);
     const u32 budget = heap_byte_budget != 0u ? heap_byte_budget : ANVIL_DEFAULT_HEAP_BUDGET;
     heap.init(arena_base, ANVIL_ARENA_RESERVE_BYTES, budget);
-    ic.init();
-    program.init();
+    ic.init(&heap.arena);
+    program.init(&heap.arena);
     for (u32 i = 0; i < MAX_TOTAL_REGISTERS; ++i) {
         registers[i] = AnvilValue::make_undefined();
     }
+    globals_off = 0u;
+    globals_cap = 0u;
     global_count = 0u;
-    for (u32 i = 0; i < MAX_GLOBALS; ++i) {
-        globals[i].name_sym = 0u;
-        globals[i].value = AnvilValue::make_undefined();
-        globals[i].occupied = false;
-        globals[i].exported = false;
-    }
+    ensure_globals(INIT_GLOBAL_TABLE);
     frame_count = 0u;
     steps_executed = 0u;
     hot_loops_accelerated = 0u;
@@ -165,18 +223,21 @@ void AnvilVmContext::init() noexcept {
 
 u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
     for (u32 i = 0; i < global_count; ++i) {
-        if (globals[i].occupied && globals[i].name_sym == name_sym) {
+        if (globals()[i].occupied && globals()[i].name_sym == name_sym) {
             return static_cast<u16>(i);
         }
     }
-    if (global_count >= MAX_GLOBALS) {
+    if (!ensure_globals(global_count + 1u)) {
         return NO_GLOBAL;
     }
     const u16 slot = static_cast<u16>(global_count++);
-    globals[slot].name_sym = name_sym;
-    globals[slot].value = AnvilValue::make_undefined();
-    globals[slot].occupied = true;
-    globals[slot].exported = false;
+    AnvilGlobalBinding& g = globals()[slot];
+    g.name_sym = name_sym;
+    g.value = AnvilValue::make_undefined();
+    g.occupied = true;
+    g.exported = false;
+    g.declared = false;
+    g.decl_depth = 0xFFFFFFFFu; // NO_DEPTH
     return slot;
 }
 
@@ -212,9 +273,9 @@ void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
     for (u32 i = 0; i < top; ++i) {
         heap.mark_value(registers[i]);
     }
-    for (u32 i = 0; i < global_count && i < MAX_GLOBALS; ++i) {
-        if (globals[i].occupied) {
-            heap.mark_value(globals[i].value);
+    for (u32 i = 0; i < global_count; ++i) {
+        if (globals()[i].occupied) {
+            heap.mark_value(globals()[i].value);
         }
     }
     heap.sweep_unmarked();
@@ -258,7 +319,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::LoadConst: {
                 const u16 idx = inst.imm16();
-                R[inst.a] = (idx < program.const_len) ? program.constants[idx] : AnvilValue::make_null();
+                R[inst.a] = (idx < program.const_len) ? program.constants()[idx] : AnvilValue::make_null();
                 break;
             }
 
@@ -442,15 +503,15 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::GetGlobal: {
                 const u16 slot = inst.imm16();
-                R[inst.a] = (slot < global_count) ? globals[slot].value : AnvilValue::make_undefined();
+                R[inst.a] = (slot < global_count) ? globals()[slot].value : AnvilValue::make_undefined();
                 break;
             }
 
             case AnvilOpcode::SetGlobal: {
                 const u16 slot = inst.imm16();
-                if (slot < MAX_GLOBALS) {
-                    globals[slot].value = R[inst.a];
-                    globals[slot].occupied = true;
+                if (slot < global_count) {
+                    globals()[slot].value = R[inst.a];
+                    globals()[slot].occupied = true;
                 }
                 break;
             }
@@ -487,7 +548,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::GetPropIC: {
                 const u32 site_id = inst.c;
-                const u32 prop_sym = (site_id < ic.site_count) ? ic.sites[site_id].prop_sym : 0u;
+                const u32 prop_sym = (site_id < ic.site_count) ? ic.sites()[site_id].prop_sym : 0u;
                 if (!R[inst.b].is_object() && !R[inst.b].is_array()) {
                     fail(VM_STOP_UNSUPPORTED, "property read on a value that is not an object or array");
                     return AnvilValue::make_undefined();
@@ -498,7 +559,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::SetPropIC: {
                 const u32 site_id = inst.c;
-                const u32 prop_sym = (site_id < ic.site_count) ? ic.sites[site_id].prop_sym : 0u;
+                const u32 prop_sym = (site_id < ic.site_count) ? ic.sites()[site_id].prop_sym : 0u;
                 const StoreResult stored = ic.store_property_ic(heap, site_id, R[inst.a], prop_sym, R[inst.b]);
                 if (!store_ok(stored)) {
                     return AnvilValue::make_undefined();
@@ -558,7 +619,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::Call: {
                 const u32 fn_id = inst.b;
-                if (fn_id >= heap.function_count || !heap.functions[fn_id].active) {
+                if (fn_id >= heap.function_count || !heap.functions()[fn_id].active) {
                     R[inst.a] = AnvilValue::make_null();
                     break;
                 }
@@ -567,7 +628,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", MAX_CALL_DEPTH, "nested calls");
                     return AnvilValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions[fn_id];
+                const AnvilHeapFunction& fn = heap.functions()[fn_id];
                 if (static_cast<u32>(inst.c) + fn.arity > MAX_REGISTERS_PER_FRAME) {
                     fail(VM_STOP_UNSUPPORTED, "call arguments outside the caller's registers");
                     return AnvilValue::make_undefined();
@@ -709,9 +770,9 @@ struct ExportWriter {
 // or function (name only). `exports_full` is 1 when they did not all fit.
 void AnvilVmContext::fill_exports(AnvilVmTelemetryC* out) const noexcept {
     ExportWriter w{out->exports, MAX_EXPORT_BYTES, 0u, false};
-    const u32 count = global_count < MAX_GLOBALS ? global_count : MAX_GLOBALS;
+    const u32 count = global_count;
     for (u32 index = 0u; index < count && !w.full; ++index) {
-        const AnvilGlobalBinding& g = globals[index];
+        const AnvilGlobalBinding& g = globals()[index];
         if (!g.occupied || !g.exported) {
             continue;
         }
@@ -980,14 +1041,14 @@ extern "C" u32 anvil_cpp_vm_copy_global(
         return 0u;
     }
     const auto& ctx = *static_cast<const anvil_vm::AnvilVmContext*>(context_memory);
-    if (index >= ctx.global_count || !ctx.globals[index].occupied) {
+    if (index >= ctx.global_count || !ctx.globals()[index].occupied) {
         return 0u;
     }
-    if (!ctx.globals[index].value.is_number()) {
+    if (!ctx.globals()[index].value.is_number()) {
         return 0u;
     }
     u32 len = 0u;
-    const char* text = ctx.heap.get_string_ptr(ctx.globals[index].name_sym, &len);
+    const char* text = ctx.heap.get_string_ptr(ctx.globals()[index].name_sym, &len);
     if (!text || len == 0u) {
         return 0u;
     }
@@ -996,7 +1057,7 @@ extern "C" u32 anvil_cpp_vm_copy_global(
         name_out[i] = text[i];
     }
     name_out[n] = '\0';
-    *value_out = ctx.globals[index].value.as_number();
+    *value_out = ctx.globals()[index].value.as_number();
     return 1u;
 }
 

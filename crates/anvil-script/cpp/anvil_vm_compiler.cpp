@@ -471,14 +471,6 @@ struct AnvilCompiler {
     u32 loop_depth;
     bool in_function;
     bool had_error;
-    // Globals given a value by a top-level `let`, `const` or `var`. The VM
-    // cannot see names the page defined in other scripts, so any other
-    // global name rejects the script.
-    bool global_declared[MAX_GLOBALS];
-    // Block depth of each global's declaration, NO_DEPTH before it has one.
-    // A name declared at two depths is one variable shadowing another,
-    // which a single global slot cannot hold.
-    u32 decl_depth[MAX_GLOBALS];
     // Braces and for-loop headers around the statement being compiled.
     u32 block_depth;
 
@@ -658,8 +650,8 @@ struct AnvilCompiler {
     }
 
     u32 find_function(u32 sym) const noexcept {
-        for (u32 i = 0; i < ctx->heap.function_count && i < MAX_FUNCTIONS; ++i) {
-            if (ctx->heap.functions[i].name_sym == sym) {
+        for (u32 i = 0; i < ctx->heap.function_count; ++i) {
+            if (ctx->heap.functions()[i].name_sym == sym) {
                 return i;
             }
         }
@@ -714,7 +706,7 @@ struct AnvilCompiler {
                 }
             }
             if (ctx->heap.alloc_function(sym, arity, 0u, 0u, 0u) == NO_SLOT) {
-                reject_limit(VM_REFUSE_FUNCTIONS, "function", MAX_FUNCTIONS, "functions");
+                reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
                 return;
             }
         }
@@ -723,7 +715,7 @@ struct AnvilCompiler {
     u32 new_site(u32 prop_sym) noexcept {
         const u32 site = ctx->ic.allocate_site(prop_sym);
         if (site == NO_SLOT) {
-            reject_limit(VM_REFUSE_SITES, "property site", MAX_IC_SITES, "sites");
+            reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
         return site;
@@ -732,7 +724,7 @@ struct AnvilCompiler {
     u16 global_slot(u32 sym) noexcept {
         const u16 slot = ctx->resolve_global_slot(sym);
         if (slot == NO_GLOBAL) {
-            reject_limit(VM_REFUSE_GLOBALS, "global", MAX_GLOBALS, "globals");
+            reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
         return slot;
@@ -932,7 +924,7 @@ struct AnvilCompiler {
             if (match(TokenKind::LParen)) {
                 u32 target_fn = 0xFFFFFFFFu;
                 for (u32 fi = 0; fi < ctx->heap.function_count; ++fi) {
-                    if (ctx->heap.functions[fi].name_sym == sym) {
+                    if (ctx->heap.functions()[fi].name_sym == sym) {
                         target_fn = fi;
                         break;
                     }
@@ -965,7 +957,7 @@ struct AnvilCompiler {
                 expect(TokenKind::RParen);
                 // Extra arguments are evaluated and dropped. Missing ones
                 // are filled in.
-                const u32 arity = (target_fn < ctx->heap.function_count) ? ctx->heap.functions[target_fn].arity : 0u;
+                const u32 arity = (target_fn < ctx->heap.function_count) ? ctx->heap.functions()[target_fn].arity : 0u;
                 const u8 call_base = next_reg;
                 for (u32 i = 0u; i < arity && !had_error; ++i) {
                     const u8 slot_r = alloc_reg();
@@ -1362,17 +1354,18 @@ struct AnvilCompiler {
                 }
                 reject_if_expression_continues();
                 const u16 g_slot = global_slot(sym);
-                if (!had_error && g_slot < MAX_GLOBALS) {
-                    if (decl_depth[g_slot] != NO_DEPTH && decl_depth[g_slot] != block_depth) {
+                if (!had_error && g_slot < ctx->global_count) {
+                    AnvilGlobalBinding& gb = ctx->globals()[g_slot];
+                    if (gb.decl_depth != NO_DEPTH && gb.decl_depth != block_depth) {
                         reject_name(VM_REFUSE_UNSUPPORTED, "name declared again in an inner block", id_tok);
                         return 0u;
                     }
-                    decl_depth[g_slot] = block_depth;
-                    global_declared[g_slot] = true;
+                    gb.decl_depth = block_depth;
+                    gb.declared = true;
                     // Later scripts see top-level names and `var`s. A
                     // `let` or `const` in a block is gone after it.
                     if (block_depth == 0u || is_var) {
-                        ctx->globals[g_slot].exported = true;
+                        gb.exported = true;
                     }
                 }
                 ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, val_reg, g_slot));
@@ -1619,7 +1612,7 @@ struct AnvilCompiler {
             if (fn_id == NO_SLOT) {
                 reject_name(VM_REFUSE_SYNTAX, "function not found by the first pass", fn_tok);
             } else {
-                ctx->heap.functions[fn_id].code_start = fn_start_pc;
+                ctx->heap.functions()[fn_id].code_start = fn_start_pc;
             }
 
             compile_statement();
@@ -1627,9 +1620,9 @@ struct AnvilCompiler {
             emit_load_undefined(fallthrough_reg);
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, fallthrough_reg, 0u, 0u));
 
-            if (fn_id < MAX_FUNCTIONS) {
-                ctx->heap.functions[fn_id].local_count = high_reg;
-                ctx->heap.functions[fn_id].code_len = ctx->program.code_len - fn_start_pc;
+            if (fn_id < ctx->heap.function_count) {
+                ctx->heap.functions()[fn_id].local_count = high_reg;
+                ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
             }
             ctx->program.code[jskip_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
@@ -1754,10 +1747,6 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.loop_depth = 0u;
     g_compiler.in_function = false;
     g_compiler.had_error = false;
-    for (u32 i = 0u; i < MAX_GLOBALS; ++i) {
-        g_compiler.global_declared[i] = false;
-        g_compiler.decl_depth[i] = NO_DEPTH;
-    }
     g_compiler.block_depth = 0u;
 
     if (!g_compiler.lexer.tokenize(src, len)) {
@@ -1785,7 +1774,7 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     ctx.program.emit(AnvilInstruction::make_abc(AnvilOpcode::Halt, last_reg, 0u, 0u));
     if (!ctx.program.compile_ok) {
         if (ctx.program.overflow == VM_REFUSE_CONSTANTS) {
-            ctx.fail_limit(VM_REFUSE_CONSTANTS, "constant", MAX_CONSTANTS, "constants");
+            ctx.fail_limit(VM_REFUSE_HEAP, "heap", ctx.heap.arena.budget, "bytes");
         } else {
             ctx.fail_limit(VM_REFUSE_CODE_SIZE, "code size", MAX_BYTECODE_INSTRUCTIONS, "instructions");
         }
@@ -1793,11 +1782,11 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     // A global no top-level declaration gave a value belongs to another
     // script or to the page (console, document, a library). Leave the whole
     // script to the Rust interpreter, which can see those names.
-    for (u32 i = 0u; i < ctx.global_count && i < MAX_GLOBALS; ++i) {
-        if (!g_compiler.global_declared[i]) {
+    for (u32 i = 0u; i < ctx.global_count; ++i) {
+        if (!ctx.globals()[i].declared) {
             g_compiler.had_error = true;
             u32 name_len = 0u;
-            const char* name = ctx.heap.get_string_ptr(ctx.globals[i].name_sym, &name_len);
+            const char* name = ctx.heap.get_string_ptr(ctx.globals()[i].name_sym, &name_len);
             ctx.fail_name(VM_REFUSE_UNKNOWN_NAME, "name not declared in this script", name, name_len);
         }
     }

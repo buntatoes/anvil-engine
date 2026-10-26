@@ -365,3 +365,68 @@ fn a_small_budget_stops_object_growth() {
     let error = anvil_script::eval_cpp_vm_request_heap_budget(32 * 1024, source).unwrap_err();
     assert_eq!(error.message, "heap limit reached: 32768 bytes");
 }
+
+// ---- Compiler/VM tables on the arena -----------------------------------
+
+/// More functions than the old 128-function table held. (The count is kept
+/// inside the compiler's fixed token budget, lifted later in the front end.)
+#[test]
+fn functions_table_grows_past_the_old_cap() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::new();
+    for i in 0..150 {
+        source.push_str(&format!("function f{i}() {{ return {i}; }} "));
+    }
+    source.push_str("f149() + f0();");
+    let (value, _) = eval_cpp_vm_script(&source).expect("runs");
+    assert_eq!(value, 149.0);
+}
+
+/// More top-level globals than the old 256-global table held.
+#[test]
+fn globals_table_grows_past_the_old_cap() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::new();
+    for i in 0..300 {
+        source.push_str(&format!("let g{i} = {i}; "));
+    }
+    source.push_str("g299 + g0;");
+    let (value, _) = eval_cpp_vm_script(&source).expect("runs");
+    assert_eq!(value, 299.0);
+}
+
+/// More property inline-cache sites than the old 256-site table held.
+#[test]
+fn ic_sites_table_grows_past_the_old_cap() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::from("const o = {a: 5}; let r = 0; ");
+    for _ in 0..300 {
+        source.push_str("r = o.a; ");
+    }
+    source.push_str("r;");
+    let (value, _) = eval_cpp_vm_script(&source).expect("runs");
+    assert_eq!(value, 5.0);
+}
+
+/// The constant pool starts small and grows in the arena, so a script with far
+/// more distinct number constants than the initial pool held still runs. (The
+/// count is kept inside the compiler's fixed token budget, lifted later.)
+#[test]
+fn constant_pool_grows_in_the_arena() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::from("let r = 0; ");
+    for i in 0..200 {
+        source.push_str(&format!("r = {i}.5; "));
+    }
+    source.push_str("r;");
+    let (value, _) = eval_cpp_vm_script(&source).expect("runs");
+    assert_eq!(value, 199.5);
+}
