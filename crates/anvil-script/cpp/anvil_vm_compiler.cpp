@@ -362,6 +362,12 @@ struct AnvilCompiler {
     LocalBinding locals[MAX_REGISTERS_PER_FRAME];
     u32 local_count;
     u8 next_reg;
+    // Registers below this hold the current function's parameters and
+    // locals. Registers from here up are temporaries, free again after
+    // each statement.
+    u8 reg_floor;
+    // Highest register count the current function has used.
+    u8 high_reg;
     u32 next_loop_id;
     bool in_function;
     bool had_error;
@@ -457,7 +463,11 @@ struct AnvilCompiler {
             had_error = true;
             return MAX_REGISTERS_PER_FRAME - 1u;
         }
-        return next_reg++;
+        const u8 r = next_reg++;
+        if (next_reg > high_reg) {
+            high_reg = next_reg;
+        }
+        return r;
     }
 
     i32 find_local(u32 sym) const noexcept {
@@ -477,6 +487,9 @@ struct AnvilCompiler {
         const u8 r = alloc_reg();
         if (local_count < MAX_REGISTERS_PER_FRAME) {
             locals[local_count++] = LocalBinding{sym, r};
+        }
+        if (r + 1u > reg_floor) {
+            reg_floor = static_cast<u8>(r + 1u);
         }
         return r;
     }
@@ -921,7 +934,18 @@ struct AnvilCompiler {
         return cond_or_val;
     }
 
+    // No temporary outlives the statement that made it, so the registers
+    // above the locals are free again once a statement is compiled. The
+    // returned register is only read by the final Halt.
     u8 compile_statement() noexcept {
+        const u8 result = compile_statement_body();
+        if (next_reg > reg_floor) {
+            next_reg = reg_floor;
+        }
+        return result;
+    }
+
+    u8 compile_statement_body() noexcept {
         while (match(TokenKind::Semicolon)) {}
         const Token& t = peek();
         if (t.kind == TokenKind::Eof || t.kind == TokenKind::RBrace) {
@@ -944,6 +968,22 @@ struct AnvilCompiler {
                 return 0u;
             }
             const u32 sym = token_sym(id_tok);
+            if (!in_function) {
+                // A top-level name lives only in its global slot, so a
+                // function that reads or writes it sees the same value as
+                // the top-level code does.
+                u8 val_reg = 0u;
+                if (match(TokenKind::Assign)) {
+                    val_reg = compile_expr();
+                } else {
+                    val_reg = alloc_reg();
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, val_reg, 0u, 0u));
+                }
+                const u16 g_slot = ctx->resolve_global_slot(sym);
+                ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, val_reg, g_slot));
+                match(TokenKind::Semicolon);
+                return val_reg;
+            }
             const u8 dst = declare_local(sym);
             if (match(TokenKind::Assign)) {
                 const u8 val_reg = compile_expr();
@@ -952,10 +992,6 @@ struct AnvilCompiler {
                 }
             } else {
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, dst, 0u, 0u));
-            }
-            if (!in_function) {
-                const u16 g_slot = ctx->resolve_global_slot(sym);
-                ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, dst, g_slot));
             }
             match(TokenKind::Semicolon);
             return dst;
@@ -1102,10 +1138,14 @@ struct AnvilCompiler {
             }
             const u32 saved_local_count = local_count;
             const u8 saved_next_reg = next_reg;
+            const u8 saved_reg_floor = reg_floor;
+            const u8 saved_high_reg = high_reg;
             const bool saved_in_fn = in_function;
 
             local_count = 0u;
             next_reg = 0u;
+            reg_floor = 0u;
+            high_reg = 0u;
             in_function = true;
 
             u32 arity = 0u;
@@ -1132,7 +1172,7 @@ struct AnvilCompiler {
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, fallthrough_reg, 0u, 0u));
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, fallthrough_reg, 0u, 0u));
 
-            ctx->heap.functions[fn_id].local_count = next_reg;
+            ctx->heap.functions[fn_id].local_count = high_reg;
             ctx->heap.functions[fn_id].code_len = ctx->program.code_len - fn_start_pc;
             ctx->program.code[jskip_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
@@ -1146,6 +1186,8 @@ struct AnvilCompiler {
             }
             local_count = saved_local_count;
             next_reg = saved_next_reg;
+            reg_floor = saved_reg_floor;
+            high_reg = saved_high_reg;
             in_function = saved_in_fn;
             return 0u;
         }
@@ -1216,6 +1258,8 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.cursor = 0u;
     g_compiler.local_count = 0u;
     g_compiler.next_reg = 0u;
+    g_compiler.reg_floor = 0u;
+    g_compiler.high_reg = 0u;
     g_compiler.next_loop_id = 0u;
     g_compiler.in_function = false;
     g_compiler.had_error = false;
