@@ -638,8 +638,12 @@ pub const MAX_SCRIPT_SOURCE: usize = 256 * 1024;
 /// Maximum nested user-function call frames.
 pub const MAX_CALL_DEPTH: usize = 64;
 
-/// Maximum elements kept from one array literal.
+/// Maximum elements in one array. Making a longer one stops the turn with
+/// a reason.
 pub const MAX_ARRAY_LEN: usize = 10_000;
+
+/// Console lines kept on the runtime. One warning line follows the last.
+pub const MAX_CONSOLE_LINES: usize = 256;
 
 /// Maximum UTF-8 bytes in one string built by `+`, `+=`, a template literal,
 /// `repeat`, or `join`. A longer result aborts the turn, like the step budget,
@@ -981,6 +985,9 @@ pub struct ScriptRuntime {
     clock_ms: u64,
     timer_depth: u32,
     abort_reason: Option<String>,
+    // Set once a top-level script on the page stopped at a limit. Later
+    // scripts still run; this keeps was_aborted and abort_reason true.
+    script_stopped: Option<String>,
     local_storage: Vec<(String, String, String)>,
     session_storage: Vec<(String, String, String)>,
     fetch_mocks: Vec<(String, u16, String)>,
@@ -1027,6 +1034,7 @@ impl Default for ScriptRuntime {
             clock_ms: 0,
             timer_depth: 0,
             abort_reason: None,
+            script_stopped: None,
             local_storage: Vec::new(),
             session_storage: Vec::new(),
             fetch_mocks: Vec::new(),
@@ -1167,8 +1175,10 @@ impl ScriptRuntime {
         self.local_storage.retain(|(o, _, _)| o != &origin);
     }
 
+    /// True when the current turn stopped at a limit, or when a page
+    /// script stopped at one during [`Self::run_document_scripts`].
     pub fn was_aborted(&self) -> bool {
-        self.aborted
+        self.aborted || self.script_stopped.is_some()
     }
 
     /// True when the previous [`Self::eval_script`] call ran on the numeric VM.
@@ -1198,6 +1208,7 @@ impl ScriptRuntime {
         self.call_depth = 0;
         self.aborted = false;
         self.abort_reason = None;
+        self.script_stopped = None;
         self.thrown_error = None;
         self.loop_break = false;
         self.loop_continue = false;
@@ -1209,10 +1220,72 @@ impl ScriptRuntime {
         let left = left.as_string(doc);
         let right = right.as_string(doc);
         if left.len().saturating_add(right.len()) > MAX_STRING_LEN {
-            self.aborted = true;
+            self.abort_string_limit();
             return Value::Null;
         }
         Value::Str(left + &right)
+    }
+
+    fn abort_string_limit(&mut self) {
+        self.abort_with(&format!(
+            "string length limit reached: {MAX_STRING_LEN} bytes"
+        ));
+    }
+
+    fn abort_call_depth(&mut self) {
+        self.abort_with(&format!(
+            "call depth limit reached: {MAX_CALL_DEPTH} nested calls"
+        ));
+    }
+
+    /// True when an array of `len` elements is allowed. A longer one stops
+    /// the turn with a reason instead of being cut short.
+    fn array_fits(&mut self, len: usize) -> bool {
+        if len <= MAX_ARRAY_LEN {
+            return true;
+        }
+        self.abort_with(&format!(
+            "array length limit reached: {MAX_ARRAY_LEN} elements"
+        ));
+        false
+    }
+
+    /// Add a console line. Past the line limit, one warning says so and
+    /// later lines are dropped.
+    fn push_console(&mut self, line: String) {
+        match self.console_logs.len().cmp(&MAX_CONSOLE_LINES) {
+            std::cmp::Ordering::Less => self.console_logs.push(line),
+            std::cmp::Ordering::Equal => self.console_logs.push(format!(
+                "[warn] console limit reached: {MAX_CONSOLE_LINES} lines, later lines are dropped"
+            )),
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    /// End one top-level page script. An uncaught throw and a stop at a limit
+    /// each leave an error line on the console. After a stop, the step
+    /// budget and call depth start over so the next script runs.
+    fn finish_page_script(&mut self, doc: &Document) {
+        if let Some(error) = self.thrown_error.take() {
+            let text = thrown_text(&error, doc);
+            self.push_console(format!("[error] Uncaught {text}"));
+        }
+        if self.aborted {
+            let reason = self
+                .abort_reason
+                .take()
+                .unwrap_or_else(|| "stopped".to_string());
+            self.push_console(format!("[error] Script stopped: {reason}"));
+            if self.script_stopped.is_none() {
+                self.script_stopped = Some(reason);
+            }
+            self.steps = 0;
+            self.call_depth = 0;
+            self.aborted = false;
+            self.return_value = None;
+            self.loop_break = false;
+            self.loop_continue = false;
+        }
     }
 
     fn consume_step(&mut self) -> bool {
@@ -1329,7 +1402,9 @@ impl ScriptRuntime {
 
     /// Reason the current turn was cut off, if the budget stopped it.
     pub fn abort_reason(&self) -> Option<&str> {
-        self.abort_reason.as_deref()
+        self.abort_reason
+            .as_deref()
+            .or(self.script_stopped.as_deref())
     }
 
     /// Number of promises left rejected with no handler attached.
@@ -2224,7 +2299,7 @@ impl ScriptRuntime {
         };
         if self.call_depth >= MAX_CALL_DEPTH {
             self.frames[slot] = FrameSlot::Free;
-            self.aborted = true;
+            self.abort_call_depth();
             return;
         }
         let saved = std::mem::take(&mut frame.saved);
@@ -2602,9 +2677,6 @@ impl ScriptRuntime {
         }
         match state {
             LoopState::While { cond, body, iters } => {
-                if iters >= 10_000 {
-                    return StepResult::Next;
-                }
                 let ok = self.eval_expr(doc, &cond).is_truthy();
                 if let Some(err) = self.thrown_error.take() {
                     return StepResult::Complete(Completion::Throw(err));
@@ -2624,9 +2696,6 @@ impl ScriptRuntime {
                 body,
                 iters,
             } => {
-                if iters >= 10_000 {
-                    return StepResult::Next;
-                }
                 if iters > 0 {
                     self.exec_statement(doc, &step);
                 }
@@ -2651,9 +2720,6 @@ impl ScriptRuntime {
                 body,
                 awaits,
             } => {
-                if next >= MAX_ARRAY_LEN {
-                    return StepResult::Next;
-                }
                 let Some(item) = items.get(next).cloned() else {
                     return StepResult::Next;
                 };
@@ -2706,12 +2772,9 @@ impl ScriptRuntime {
         self.reset_execution_budget();
         self.collect_onclick_attrs(doc, doc.root());
         for script in doc.scripts() {
-            if self.aborted {
-                break;
-            }
             self.thrown_error = None;
             self.eval_script(doc, &script);
-            self.thrown_error = None;
+            self.finish_page_script(doc);
         }
         let _ = self.run_timers(doc);
     }
@@ -2791,7 +2854,16 @@ impl ScriptRuntime {
     }
 
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
-        if self.aborted || !script_runs_here(source) {
+        if self.aborted {
+            return;
+        }
+        if !script_runs_here(source) {
+            let code = code_bytes_outside_strings(source.trim());
+            if !self.in_rust_eval && code > MAX_SCRIPT_SOURCE {
+                self.push_console(format!(
+                    "[warn] Script not run: {code} bytes of code, over the {MAX_SCRIPT_SOURCE} byte limit"
+                ));
+            }
             return;
         }
         self.last_script_used_vm = false;
@@ -3233,10 +3305,15 @@ impl ScriptRuntime {
             let rest_trimmed = rest.trim_start();
             if rest_trimmed.starts_with('{') {
                 if let Some((try_body, after_try)) = extract_first_brace_block(rest_trimmed) {
+                    let reason_before = self.abort_reason.clone();
                     self.eval_script(doc, &try_body);
                     let mut had_err = self.thrown_error.take();
                     if had_err.is_none() && self.aborted && self.steps <= MAX_EXECUTION_STEPS {
+                        // A limit other than the step budget becomes an
+                        // error the catch block sees. The turn goes on, so
+                        // the reason is not kept.
                         self.aborted = false;
+                        self.abort_reason = reason_before;
                         had_err = Some(Value::Str("Error".to_string()));
                     }
                     let mut rem = after_try.trim();
@@ -3401,9 +3478,10 @@ impl ScriptRuntime {
                         {
                             return;
                         }
-                        for _ in 0..10_000 {
-                            if self.aborted
-                                || self.return_value.is_some()
+                        // Each pass spends a step, so the step budget ends
+                        // a loop that does not.
+                        while self.consume_step() {
+                            if self.return_value.is_some()
                                 || self.thrown_error.is_some()
                                 || !self.eval_expr(doc, &cond_str).is_truthy()
                             {
@@ -3437,11 +3515,8 @@ impl ScriptRuntime {
                                 return;
                             }
                             self.exec_statement(doc, parts[0]);
-                            for _ in 0..10_000 {
-                                if self.aborted
-                                    || self.return_value.is_some()
-                                    || self.thrown_error.is_some()
-                                {
+                            while self.consume_step() {
+                                if self.return_value.is_some() || self.thrown_error.is_some() {
                                     break;
                                 }
                                 if !parts[1].trim().is_empty()
@@ -3480,8 +3555,8 @@ impl ScriptRuntime {
                                 }
                                 _ => Vec::new(),
                             };
-                            for item in items.into_iter().take(MAX_ARRAY_LEN) {
-                                if self.aborted
+                            for item in items {
+                                if !self.consume_step()
                                     || self.return_value.is_some()
                                     || self.thrown_error.is_some()
                                 {
@@ -3520,8 +3595,8 @@ impl ScriptRuntime {
                                     .collect(),
                                 _ => Vec::new(),
                             };
-                            for key in keys.into_iter().take(MAX_ARRAY_LEN) {
-                                if self.aborted
+                            for key in keys {
+                                if !self.consume_step()
                                     || self.return_value.is_some()
                                     || self.thrown_error.is_some()
                                 {
@@ -3828,8 +3903,11 @@ impl ScriptRuntime {
                                         let i = n.max(0.0) as usize;
                                         if i < items.len() {
                                             items[i] = value;
-                                        } else if i == items.len() && items.len() < MAX_ARRAY_LEN {
+                                        } else if self.array_fits(i + 1) {
+                                            items.resize(i, Value::Null);
                                             items.push(value);
+                                        } else {
+                                            return;
                                         }
                                         self.set_var(target_ident, Value::Array(items));
                                     }
@@ -3960,22 +4038,24 @@ impl ScriptRuntime {
         if expr.starts_with('[') && expr.ends_with(']') {
             let inner = &expr[1..expr.len() - 1];
             let mut items: Vec<Value> = Vec::new();
-            for item in split_args(inner).into_iter().take(MAX_ARRAY_LEN) {
+            let parts = split_args(inner);
+            if !self.array_fits(parts.len()) {
+                return Value::Null;
+            }
+            for item in parts {
                 if let Some(spread_expr) = item.trim().strip_prefix("...") {
                     match self.eval_expr(doc, spread_expr.trim()) {
                         Value::Array(sub) => {
-                            for v in sub {
-                                if items.len() < MAX_ARRAY_LEN {
-                                    items.push(v);
-                                }
+                            if !self.array_fits(items.len().saturating_add(sub.len())) {
+                                return Value::Null;
                             }
+                            items.extend(sub);
                         }
                         Value::Json(JsonValue::Array(sub)) => {
-                            for v in sub {
-                                if items.len() < MAX_ARRAY_LEN {
-                                    items.push(Value::from_json_value(v));
-                                }
+                            if !self.array_fits(items.len().saturating_add(sub.len())) {
+                                return Value::Null;
                             }
+                            items.extend(sub.into_iter().map(Value::from_json_value));
                         }
                         _ => {}
                     }
@@ -4429,15 +4509,17 @@ impl ScriptRuntime {
             "Array" => {
                 if args.len() == 1 {
                     if let Some(n) = self.eval_expr(doc, &args[0]).as_number() {
-                        let count = (n.max(0.0) as usize).min(MAX_ARRAY_LEN);
+                        let count = n.max(0.0) as usize;
+                        if !self.array_fits(count) {
+                            return Value::Null;
+                        }
                         return Value::Array(vec![Value::Null; count]);
                     }
                 }
-                let items = args
-                    .into_iter()
-                    .take(MAX_ARRAY_LEN)
-                    .map(|a| self.eval_expr(doc, &a))
-                    .collect();
+                if !self.array_fits(args.len()) {
+                    return Value::Null;
+                }
+                let items = args.into_iter().map(|a| self.eval_expr(doc, &a)).collect();
                 Value::Array(items)
             }
             "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" => {
@@ -4598,15 +4680,28 @@ impl ScriptRuntime {
                 let len_opt = args
                     .get(2)
                     .and_then(|a| self.eval_expr(doc, a).as_number())
-                    .map(|n| (n.max(0.0) as usize).min(MAX_ARRAY_LEN));
+                    .map(|n| n.max(0.0) as usize);
+                if let Some(len) = len_opt {
+                    if !self.array_fits(len) {
+                        return Value::Null;
+                    }
+                }
+                if let Value::Number(n) = first_val {
+                    if !self.array_fits(n.max(0.0) as usize) {
+                        return Value::Null;
+                    }
+                }
                 self.construct_typed_array(callee, first_val, offset, len_opt)
             }
             "ArrayBuffer" => {
                 let byte_len = args
                     .first()
                     .and_then(|a| self.eval_expr(doc, a).as_number())
-                    .map(|n| (n.max(0.0) as usize).min(MAX_ARRAY_LEN))
+                    .map(|n| n.max(0.0) as usize)
                     .unwrap_or(0);
+                if !self.array_fits(byte_len) {
+                    return Value::Null;
+                }
                 let mut obj = JsonValue::empty_object();
                 obj.insert("byteLength", JsonValue::Number(byte_len as f64));
                 obj.insert(
@@ -4738,7 +4833,7 @@ impl ScriptRuntime {
         super_class: Option<&str>,
     ) -> Value {
         if self.call_depth >= MAX_CALL_DEPTH {
-            self.aborted = true;
+            self.abort_call_depth();
             return Value::Null;
         }
         let evaled_args: Vec<Value> = args.iter().map(|a| self.eval_expr(doc, a)).collect();
@@ -4808,7 +4903,7 @@ impl ScriptRuntime {
                 let val = self.eval_expr(doc, expr_str);
                 out.push_str(&val.as_string(doc));
                 if out.len() > MAX_STRING_LEN {
-                    self.aborted = true;
+                    self.abort_string_limit();
                     return String::new();
                 }
                 rest = &after[end + 1..];
@@ -5160,11 +5255,10 @@ impl ScriptRuntime {
             }
             "Array.of" => {
                 let args = split_args(args_src);
-                let items = args
-                    .into_iter()
-                    .take(MAX_ARRAY_LEN)
-                    .map(|a| self.eval_expr(doc, &a))
-                    .collect();
+                if !self.array_fits(args.len()) {
+                    return Value::Null;
+                }
+                let items = args.into_iter().map(|a| self.eval_expr(doc, &a)).collect();
                 return Value::Array(items);
             }
             "encodeURI" | "encodeURIComponent" => {
@@ -5469,14 +5563,12 @@ impl ScriptRuntime {
                     .map(|a| self.eval_expr(doc, a).as_string(doc))
                     .collect::<Vec<_>>()
                     .join(" ");
-                if self.console_logs.len() < 256 {
-                    let prefix = match method {
-                        "warn" => "[warn] ",
-                        "error" => "[error] ",
-                        _ => "",
-                    };
-                    self.console_logs.push(format!("{prefix}{line}"));
-                }
+                let prefix = match method {
+                    "warn" => "[warn] ",
+                    "error" => "[error] ",
+                    _ => "",
+                };
+                self.push_console(format!("{prefix}{line}"));
                 return Value::Null;
             }
 
@@ -5701,10 +5793,11 @@ impl ScriptRuntime {
                     let args = split_args(args_src);
                     match method {
                         "push" => {
+                            if !self.array_fits(items.len().saturating_add(args.len())) {
+                                return Value::Null;
+                            }
                             for arg in &args {
-                                if items.len() < MAX_ARRAY_LEN {
-                                    items.push(self.eval_expr(doc, arg));
-                                }
+                                items.push(self.eval_expr(doc, arg));
                             }
                             let len = items.len();
                             self.set_var(obj_expr, Value::Array(items));
@@ -5725,11 +5818,12 @@ impl ScriptRuntime {
                             return shifted;
                         }
                         "unshift" => {
+                            if !self.array_fits(items.len().saturating_add(args.len())) {
+                                return Value::Null;
+                            }
                             for (idx, arg) in args.iter().enumerate() {
-                                if items.len() < MAX_ARRAY_LEN {
-                                    let val = self.eval_expr(doc, arg);
-                                    items.insert(idx, val);
-                                }
+                                let val = self.eval_expr(doc, arg);
+                                items.insert(idx, val);
                             }
                             let len = items.len();
                             self.set_var(obj_expr, Value::Array(items));
@@ -5766,13 +5860,14 @@ impl ScriptRuntime {
                             Value::Number(s.find(&arg0).map(|idx| idx as f64).unwrap_or(-1.0))
                         }
                         "repeat" => {
-                            let count =
-                                args.first()
-                                    .and_then(|a| self.eval_expr(doc, a).as_number())
-                                    .unwrap_or(0.0)
-                                    .clamp(0.0, 1024.0) as usize;
+                            let count = args
+                                .first()
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(0.0)
+                                .clamp(0.0, MAX_STRING_LEN as f64)
+                                as usize;
                             if s.len().saturating_mul(count) > MAX_STRING_LEN {
-                                self.aborted = true;
+                                self.abort_string_limit();
                                 Value::Null
                             } else {
                                 Value::Str(s.repeat(count))
@@ -5871,7 +5966,7 @@ impl ScriptRuntime {
                                 }
                                 joined.push_str(&item.as_string(doc));
                                 if joined.len() > MAX_STRING_LEN {
-                                    self.aborted = true;
+                                    self.abort_string_limit();
                                     return Value::Null;
                                 }
                             }
@@ -5899,20 +5994,14 @@ impl ScriptRuntime {
                         "concat" => {
                             let mut out = items;
                             for arg in &args {
-                                match self.eval_expr(doc, arg) {
-                                    Value::Array(more) => {
-                                        for m in more {
-                                            if out.len() < MAX_ARRAY_LEN {
-                                                out.push(m);
-                                            }
-                                        }
-                                    }
-                                    other => {
-                                        if out.len() < MAX_ARRAY_LEN {
-                                            out.push(other);
-                                        }
-                                    }
+                                let more = match self.eval_expr(doc, arg) {
+                                    Value::Array(more) => more,
+                                    other => vec![other],
+                                };
+                                if !self.array_fits(out.len().saturating_add(more.len())) {
+                                    return Value::Null;
                                 }
+                                out.extend(more);
                             }
                             Value::Array(out)
                         }
@@ -6174,10 +6263,12 @@ impl ScriptRuntime {
                                     .first()
                                     .map(|a| self.eval_expr(doc, a).as_string(doc))
                                     .unwrap_or_default();
+                                if !self.array_fits(text.len()) {
+                                    return Value::Null;
+                                }
                                 return Value::Array(
                                     text.as_bytes()
                                         .iter()
-                                        .take(MAX_ARRAY_LEN)
                                         .map(|b| Value::Number(*b as f64))
                                         .collect(),
                                 );
@@ -6766,8 +6857,21 @@ impl ScriptRuntime {
         }
     }
 
+    /// A copied view of WebAssembly memory longer than [`MAX_ARRAY_LEN`] is
+    /// cut to that length. Pages often view a whole memory and read the
+    /// start of it, so this warns on the console rather than stopping.
+    fn finish_memory_view(&mut self, view: (Vec<Value>, usize)) -> Value {
+        let (items, wanted) = view;
+        if wanted > items.len() {
+            self.push_console(format!(
+                "[warn] memory view cut from {wanted} to {MAX_ARRAY_LEN} elements, the array length limit"
+            ));
+        }
+        Value::Array(items)
+    }
+
     fn construct_typed_array(
-        &self,
+        &mut self,
         _callee: &str,
         first_val: Value,
         offset: usize,
@@ -6793,35 +6897,22 @@ impl ScriptRuntime {
             Value::Json(jobj) => {
                 if let Some(JsonValue::Number(inst_id_f)) = jobj.get("__anvil_wasm_memory") {
                     let inst_id = *inst_id_f as usize;
-                    if let Some(inst) = self.wasm_instances.get(inst_id) {
-                        let mem = &inst.memory;
-                        let total = mem.bytes.len();
-                        let start = offset.min(total);
-                        let take_len = len_opt
-                            .unwrap_or_else(|| total.saturating_sub(start))
-                            .min(total.saturating_sub(start))
-                            .min(MAX_ARRAY_LEN);
-                        if let Some(slice) = mem.bytes.get(start..start + take_len) {
-                            return Value::Array(
-                                slice.iter().map(|b| Value::Number(*b as f64)).collect(),
-                            );
-                        }
+                    let view = self
+                        .wasm_instances
+                        .get(inst_id)
+                        .map(|inst| memory_view(&inst.memory.bytes, offset, len_opt));
+                    if let Some(view) = view {
+                        return self.finish_memory_view(view);
                     }
                 }
                 if let Some(JsonValue::Number(mem_id_f)) = jobj.get("__anvil_wasm_standalone_mem") {
                     let mem_id = *mem_id_f as usize;
-                    if let Some(mem) = self.wasm_memories.get(mem_id) {
-                        let total = mem.bytes.len();
-                        let start = offset.min(total);
-                        let take_len = len_opt
-                            .unwrap_or_else(|| total.saturating_sub(start))
-                            .min(total.saturating_sub(start))
-                            .min(MAX_ARRAY_LEN);
-                        if let Some(slice) = mem.bytes.get(start..start + take_len) {
-                            return Value::Array(
-                                slice.iter().map(|b| Value::Number(*b as f64)).collect(),
-                            );
-                        }
+                    let view = self
+                        .wasm_memories
+                        .get(mem_id)
+                        .map(|mem| memory_view(&mem.bytes, offset, len_opt));
+                    if let Some(view) = view {
+                        return self.finish_memory_view(view);
                     }
                 }
                 if let Some(JsonValue::Array(items)) = jobj.get("__bytes") {
@@ -8090,6 +8181,37 @@ pub fn script_runs_here(source: &str) -> bool {
         return true;
     }
     code_bytes_outside_strings(trimmed) <= MAX_SCRIPT_SOURCE
+}
+
+/// Console text for an uncaught throw: `Name: message` for an error
+/// object, the value as text otherwise.
+fn thrown_text(error: &Value, doc: &Document) -> String {
+    if let Value::Json(obj) = error {
+        if let Some(JsonValue::String(message)) = obj.get("message") {
+            let name = match obj.get("name") {
+                Some(JsonValue::String(name)) => name.as_str(),
+                _ => "Error",
+            };
+            return format!("{name}: {message}");
+        }
+    }
+    error.as_string(doc)
+}
+
+/// Copy up to [`MAX_ARRAY_LEN`] bytes of `bytes` from `offset` as numbers,
+/// with the length the view asked for.
+fn memory_view(bytes: &[u8], offset: usize, len_opt: Option<usize>) -> (Vec<Value>, usize) {
+    let total = bytes.len();
+    let start = offset.min(total);
+    let wanted = len_opt
+        .unwrap_or_else(|| total.saturating_sub(start))
+        .min(total.saturating_sub(start));
+    let take_len = wanted.min(MAX_ARRAY_LEN);
+    let items = bytes
+        .get(start..start + take_len)
+        .map(|slice| slice.iter().map(|b| Value::Number(*b as f64)).collect())
+        .unwrap_or_default();
+    (items, wanted)
 }
 
 /// Bytes of `source` that are not inside `'`, `"`, or `` ` ``.
