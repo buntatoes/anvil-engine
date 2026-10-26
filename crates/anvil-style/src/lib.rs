@@ -16,7 +16,9 @@
 //! viewport units or `ch`. `display` accepts `block`, `inline`, `inline-block`,
 //! `list-item`, `flow-root`, `flex`, `inline-flex`, `grid`, `inline-grid`,
 //! and `none`. A descendant selector is whitespace between compounds. `>`,
-//! `+`, `~`, attribute selectors, and pseudo-classes are not parsed.
+//! `+`, `~`, attribute selectors, and pseudo-classes are checked for syntax
+//! but never match yet. A rule whose selector list holds an invalid selector
+//! is dropped whole.
 //!
 //! `transform` keeps up to [`MAX_TRANSFORM_FNS`] 2D functions:
 //! `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`,
@@ -50,6 +52,7 @@ use anvil_dom::{Document, NodeData, NodeId};
 use std::collections::HashMap;
 
 mod animation;
+mod selector_check;
 pub use animation::{
     ANIMATABLE, AnimProperty, AnimValue, AnimationDirection, AnimationSpec, Animations, Animator,
     FillMode, FrameClock, Keyframe, KeyframesRule, MAX_ANIMATIONS, MAX_TRANSITIONS, ManualClock,
@@ -950,6 +953,7 @@ fn find_matching_brace(src: &str) -> usize {
 /// `active_media` is cloned onto each rule. `@media` replaces it for the
 /// nested body instead of intersecting the two queries. A prelude that starts
 /// with `@` and is not `@media` or `@keyframes` is dropped, body included.
+/// A rule whose selector list has an invalid selector is dropped too.
 fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
     while let Some(open) = rest.find('{') {
         let selector_src = rest[..open].trim();
@@ -975,7 +979,9 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
         if selector_src.starts_with('@') {
             continue;
         }
-        let selectors = parse_selectors(selector_src);
+        let Some(selectors) = parse_selectors(selector_src) else {
+            continue;
+        };
         if selectors.is_empty() {
             continue;
         }
@@ -2702,9 +2708,23 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     })
 }
 
-/// Split a selector list on commas. A group that fails to parse is dropped.
-fn parse_selectors(source: &str) -> Vec<Selector> {
-    source.split(',').filter_map(parse_selector).collect()
+/// Split a selector list on commas outside brackets and quotes.
+///
+/// `None` when any selector in the list is invalid, so the caller drops the
+/// whole rule. A selector that is valid but uses something this crate does
+/// not match yet (a combinator other than space, an attribute selector, a
+/// pseudo-class) is left out of the list and never matches, while the other
+/// selectors in the rule still apply.
+fn parse_selectors(source: &str) -> Option<Vec<Selector>> {
+    if !selector_check::is_valid_selector_list(source) {
+        return None;
+    }
+    Some(
+        selector_check::split_selector_list(source)
+            .into_iter()
+            .filter_map(parse_selector)
+            .collect(),
+    )
 }
 
 /// Parse one selector. Compounds are split on whitespace, so the combinator
