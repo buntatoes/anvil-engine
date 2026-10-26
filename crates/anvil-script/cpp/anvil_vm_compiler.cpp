@@ -772,6 +772,14 @@ struct AnvilCompiler {
             reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
+        // The site index rides in a byte-wide instruction operand, so only 256
+        // sites can be addressed until the wider encoding lands. Past that,
+        // refuse with a reason rather than let the index wrap onto another
+        // site and read or write the wrong property.
+        if (site > 0xFFu) {
+            reject_limit(VM_REFUSE_SITES, "inline cache site", 256u, "sites per script");
+            return 0u;
+        }
         return site;
     }
 

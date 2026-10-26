@@ -399,21 +399,6 @@ fn globals_table_grows_past_the_old_cap() {
     assert_eq!(value, 299.0);
 }
 
-/// More property inline-cache sites than the old 256-site table held.
-#[test]
-fn ic_sites_table_grows_past_the_old_cap() {
-    if !is_cpp_jit_kernel_active() {
-        return;
-    }
-    let mut source = String::from("const o = {a: 5}; let r = 0; ");
-    for _ in 0..300 {
-        source.push_str("r = o.a; ");
-    }
-    source.push_str("r;");
-    let (value, _) = eval_cpp_vm_script(&source).expect("runs");
-    assert_eq!(value, 5.0);
-}
-
 /// The constant pool starts small and grows in the arena, so a script with far
 /// more distinct number constants than the initial pool held still runs. (The
 /// count is kept inside the compiler's fixed token budget, lifted later.)
@@ -605,4 +590,59 @@ fn a_2000_statement_script_compiles() {
     let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
         .expect("compiles past the old instruction cap");
     assert_eq!(value, 2000.0);
+}
+
+// ---- Guard the byte-wide inline-cache site index -------------------------
+
+/// Up to 256 distinct property-access sites address correctly; the 257th would
+/// wrap the byte-wide site operand, so the compiler refuses past that with a
+/// reason instead of reading the wrong property. (The wider encoding lifts this
+/// later.) Before the guard the over-256 case ran and returned a wrong value.
+#[test]
+fn inline_cache_sites_are_correct_up_to_256_then_refused() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // 200 distinct sites: well within the byte operand, correct value out.
+    let mut within = String::from("const o = {}; ");
+    for i in 0..200 {
+        within.push_str(&format!("o.p{i} = {i}; "));
+    }
+    within.push_str("o.p199;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &within)
+        .expect("200 property sites compile and run");
+    assert_eq!(value, 199.0);
+
+    // 300 distinct sites: past the byte operand, refused with a reason.
+    let mut over = String::from("const o = {}; ");
+    for i in 0..300 {
+        over.push_str(&format!("o.p{i} = {i}; "));
+    }
+    over.push_str("o.p299;");
+    let error = anvil_script::eval_cpp_vm_request_configured(5_000_000, &over).unwrap_err();
+    assert_eq!(
+        error.message,
+        "inline cache site limit reached: 256 sites per script"
+    );
+    assert!(error.is_limit() && error.refused());
+}
+
+/// More than 512 distinct numeric constants in one script.
+/// The constant pool grows in the arena and the constant index is 16-bit, so
+/// this compiles and runs now that the token cap is gone.
+#[test]
+fn more_than_512_constants_compile() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::from("let t = 0; ");
+    let mut expected = 0.0_f64;
+    for i in 0..600 {
+        source.push_str(&format!("t = t + {i}.5; "));
+        expected += i as f64 + 0.5;
+    }
+    source.push_str("t;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(50_000_000, &source)
+        .expect("more than 512 constants compile and run");
+    assert_eq!(value, expected);
 }
