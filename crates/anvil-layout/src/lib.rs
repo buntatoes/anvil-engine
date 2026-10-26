@@ -16,6 +16,8 @@
 //! `position: absolute` uses the parent's border box. A percentage width uses
 //! the containing block width. A percentage height uses the containing block
 //! height when that height is set, and is treated as `auto` when it is not.
+//! A box with a definite `height` keeps it even when its content is taller;
+//! the content overflows, and `overflow: hidden` clips it.
 //! `em` uses the element's font size. `rem` uses [`StyleMap::root_font_px`].
 //! `ch` uses [`ch_width`] at the element's font size.
 //! A flex row wraps when `flex-wrap` is `wrap`. `flex-grow` shares positive
@@ -1103,7 +1105,7 @@ fn layout_block(
 
     let flow_height = cursor_y - (border_y + border.top + padding.top);
     let content_height = match used_length(style.height, containing_height, &style, styles) {
-        Some(height) => height.max(flow_height),
+        Some(height) => height,
         None if is_img => data
             .attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
@@ -2014,7 +2016,7 @@ fn layout_grid(
     } else {
         (row_offsets[row_count] - content_y).max(0.0)
     };
-    let content_height = specified_height.unwrap_or(0.0).max(flow_height);
+    let content_height = specified_height.unwrap_or(flow_height);
     let parent_rect = Rect {
         x: border_x,
         y: border_y,
@@ -2129,7 +2131,7 @@ fn layout_flex(
             children.push(child_box);
         }
         let flow_height = (cursor_y - content_y).max(0.0);
-        let content_height = specified_height.unwrap_or(0.0).max(flow_height);
+        let content_height = specified_height.unwrap_or(flow_height);
         return LayoutBox {
             node: id,
             rect: Rect {
@@ -2310,7 +2312,7 @@ fn layout_flex(
         }
     }
 
-    let content_height = specified_height.unwrap_or(0.0).max(lines_cross);
+    let content_height = specified_height.unwrap_or(lines_cross);
     LayoutBox {
         node: id,
         rect: Rect {
