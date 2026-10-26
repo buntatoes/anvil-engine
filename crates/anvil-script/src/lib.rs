@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: LicenseRef-Proprietary
 // Copyright (c) 2026 Buntato
-//! Hybrid Rust + C++20 (`AnvilVM`) script runtime, bytecode compiler, and DOM binding layer.
+//! Hybrid Rust + WebAssembly 1.0 (`WASM`) + C++20 (`AnvilVM`) script runtime, bytecode compiler, and DOM binding layer.
 //!
 //! `anvil-browser` owns the [`ScriptRuntime`]. It sets the page origin, optionally
 //! imports persisted `localStorage` entries from `profile.anvil`, runs external
-//! script text with [`ScriptRuntime::eval_script`], and runs inline scripts with
-//! [`ScriptRuntime::run_document_scripts`].
+//! script text with [`ScriptRuntime::eval_script`], runs inline scripts with
+//! [`ScriptRuntime::run_document_scripts`], and hydrates interactive `onclick`
+//! and `addEventListener('click', ...)` bindings on `--tab-worker` documents via
+//! [`ScriptRuntime::hydrate_interactive_bindings`].
+//!
+//! [`wasm`] provides a self-contained WebAssembly 1.0 (`\0asm` version `1`) binary
+//! module decoder ([`WasmModule::decode`]), validator ([`validate_wasm`]), bounded
+//! 64 KiB page linear memory ([`WasmMemory`]), and stack VM ([`WasmInstance`]),
+//! exposed to JavaScript through the `WebAssembly` namespace and `TypedArray` views.
 //!
 //! `fetch()` is same-origin only. The Rust interpreter performs it. A registered
 //! mock wins over the host. Otherwise the interpreter calls the host callback
@@ -27,6 +34,15 @@
 
 use std::sync::Arc;
 
+pub mod wasm;
+
+pub use wasm::{
+    MAX_WASM_CALL_DEPTH, MAX_WASM_PAGES, MAX_WASM_STACK, MAX_WASM_STEPS, WASM_MAGIC,
+    WASM_PAGE_SIZE, WASM_VERSION, WasmCodeBody, WasmDataSegment, WasmElementSegment, WasmError,
+    WasmExport, WasmExportKind, WasmFuncType, WasmGlobalDef, WasmImportFunc, WasmInstance,
+    WasmMemory, WasmModule, WasmValType, WasmValue, validate_wasm,
+};
+
 use anvil_dom::{Document, NodeId};
 use anvil_json::{JsonValue, parse_json, to_json_string};
 
@@ -34,7 +50,7 @@ use anvil_json::{JsonValue, parse_json, to_json_string};
 ///
 /// A longer body is cut on a character boundary. `anvil-net` also stops reading
 /// a response at its own raw cap before this host callback returns.
-pub const MAX_SCRIPT_FETCH_BODY: usize = 64 * 1024;
+pub const MAX_SCRIPT_FETCH_BODY: usize = 256 * 1024;
 
 /// Status and body returned by a `fetch()` host callback.
 ///
@@ -518,10 +534,10 @@ impl Default for JitStats {
 }
 
 /// Steps allowed in one turn.
-pub const MAX_EXECUTION_STEPS: usize = 100_000;
+pub const MAX_EXECUTION_STEPS: usize = 200_000;
 
 /// A script longer than this is an application bundle, not the subset interpreter.
-pub const MAX_SCRIPT_SOURCE: usize = 8 * 1024;
+pub const MAX_SCRIPT_SOURCE: usize = 256 * 1024;
 
 /// Maximum nested user-function call frames.
 pub const MAX_CALL_DEPTH: usize = 64;
@@ -535,7 +551,7 @@ pub const MAX_ARRAY_LEN: usize = 10_000;
 pub const MAX_STRING_LEN: usize = 1024 * 1024;
 
 /// Maximum `setTimeout` and `requestAnimationFrame` callbacks kept on the runtime.
-pub const MAX_TIMERS: usize = 64;
+pub const MAX_TIMERS: usize = 128;
 
 /// Maximum jobs waiting on the microtask queue at one time.
 ///
@@ -887,6 +903,9 @@ pub struct ScriptRuntime {
     last_vm_number: Option<f64>,
     in_rust_eval: bool,
     vm_owner: VmOwner,
+    wasm_modules: Vec<WasmModule>,
+    wasm_instances: Vec<WasmInstance>,
+    wasm_memories: Vec<WasmMemory>,
     steps: usize,
     call_depth: usize,
     aborted: bool,
@@ -929,6 +948,9 @@ impl Default for ScriptRuntime {
             last_vm_number: None,
             in_rust_eval: false,
             vm_owner: VmOwner::empty(),
+            wasm_modules: Vec::new(),
+            wasm_instances: Vec::new(),
+            wasm_memories: Vec::new(),
             steps: 0,
             call_depth: 0,
             aborted: false,
@@ -2591,6 +2613,61 @@ impl ScriptRuntime {
         let _ = self.run_timers(doc);
     }
 
+    /// Hydrate `onclick` attributes, declared functions/classes, and click
+    /// event listeners on a document whose initial script pass already ran
+    /// inside `--tab-worker`, without re-running imperative DOM mutations.
+    pub fn hydrate_interactive_bindings(&mut self, doc: &mut Document) {
+        self.ensure_prelude_loaded(doc);
+        self.reset_execution_budget();
+        self.collect_onclick_attrs(doc, doc.root());
+        for script in doc.scripts() {
+            if !script_runs_here(&script) {
+                continue;
+            }
+            let cleaned = strip_comments(&script);
+            for stmt in split_statements(&cleaned) {
+                let s = stmt.trim();
+                if s.starts_with("function ")
+                    || s.starts_with("async function ")
+                    || s.starts_with("class ")
+                {
+                    self.exec_statement(doc, s);
+                } else if (s.starts_with("let ")
+                    || s.starts_with("const ")
+                    || s.starts_with("var "))
+                    && !s.contains("fetch(")
+                    && !s.contains("setTimeout(")
+                    && !s.contains("setInterval(")
+                    && !s.contains(".innerHTML")
+                    && !s.contains(".textContent")
+                {
+                    self.exec_statement(doc, s);
+                } else if s.contains(".addEventListener(")
+                    && (s.contains("'click'") || s.contains("\"click\""))
+                {
+                    self.exec_statement(doc, s);
+                }
+            }
+        }
+        self.reset_execution_budget();
+        self.in_rust_eval = true;
+    }
+
+    /// Compiled WebAssembly modules held by this runtime.
+    pub fn wasm_modules(&self) -> &[WasmModule] {
+        &self.wasm_modules
+    }
+
+    /// Active WebAssembly instances held by this runtime.
+    pub fn wasm_instances(&self) -> &[WasmInstance] {
+        &self.wasm_instances
+    }
+
+    /// Mutable access to an active WebAssembly instance by handle index.
+    pub fn wasm_instance_mut(&mut self, index: usize) -> Option<&mut WasmInstance> {
+        self.wasm_instances.get_mut(index)
+    }
+
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
         self.ensure_prelude_loaded(doc);
         self.reset_execution_budget();
@@ -2604,7 +2681,7 @@ impl ScriptRuntime {
                 .map(|(_, body)| body.clone())
                 .collect();
             for body in handlers {
-                self.eval_script(doc, &body);
+                self.eval_deferred(doc, &body);
                 handled = true;
             }
             cursor = doc.get(id).parent();
@@ -3944,7 +4021,7 @@ impl ScriptRuntime {
         if expr == "null" || expr == "undefined" {
             return Value::Null;
         }
-        if let Ok(num) = expr.parse::<f64>() {
+        if let Some(num) = parse_js_number_literal(expr) {
             return Value::Number(num);
         }
         if expr == "document.title" || expr == "window.document.title" {
@@ -4252,6 +4329,235 @@ impl ScriptRuntime {
                 Value::Json(obj)
             }
             "Date" => Value::Number(1_700_000_000_000.0 + self.steps as f64),
+            "WebAssembly.Module" => {
+                let bytes = args
+                    .first()
+                    .map(|a| {
+                        let v = self.eval_expr(doc, a);
+                        self.extract_wasm_bytes(&v)
+                    })
+                    .unwrap_or_default();
+                match WasmModule::decode(&bytes) {
+                    Ok(module) => self.register_wasm_module_value(module),
+                    Err(err) => {
+                        let mut err_obj = JsonValue::empty_object();
+                        err_obj.insert("name", JsonValue::String("CompileError".to_string()));
+                        err_obj.insert("message", JsonValue::String(err.to_string()));
+                        self.thrown_error = Some(Value::Json(err_obj));
+                        Value::Null
+                    }
+                }
+            }
+            "WebAssembly.Instance" => {
+                let first_val = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+                let imports_val = args.get(1).map(|a| self.eval_expr(doc, a));
+                let module_res = match &first_val {
+                    Value::Json(jobj) => {
+                        if let Some(JsonValue::Number(mid)) = jobj.get("__anvil_wasm_module") {
+                            self.wasm_modules
+                                .get(*mid as usize)
+                                .cloned()
+                                .ok_or(WasmError::InvalidModule("unknown module id"))
+                        } else {
+                            let bytes = self.extract_wasm_bytes(&first_val);
+                            WasmModule::decode(&bytes)
+                        }
+                    }
+                    _ => {
+                        let bytes = self.extract_wasm_bytes(&first_val);
+                        WasmModule::decode(&bytes)
+                    }
+                };
+                match module_res
+                    .and_then(|m| self.instantiate_wasm_module_value(m, imports_val.as_ref()))
+                {
+                    Ok((_, _, inst_val)) => inst_val,
+                    Err(err) => {
+                        let mut err_obj = JsonValue::empty_object();
+                        err_obj.insert("name", JsonValue::String("RuntimeError".to_string()));
+                        err_obj.insert("message", JsonValue::String(err.to_string()));
+                        self.thrown_error = Some(Value::Json(err_obj));
+                        Value::Null
+                    }
+                }
+            }
+            "WebAssembly.Memory" => {
+                let (initial, maximum) = if let Some(first) = args.first() {
+                    if let Value::Json(jobj) = self.eval_expr(doc, first) {
+                        let init = jobj
+                            .get("initial")
+                            .and_then(|v| match v {
+                                JsonValue::Number(n) => Some(*n as u32),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+                        let max = jobj.get("maximum").and_then(|v| match v {
+                            JsonValue::Number(n) => Some(*n as u32),
+                            _ => None,
+                        });
+                        (init, max)
+                    } else {
+                        (1, None)
+                    }
+                } else {
+                    (1, None)
+                };
+                match WasmMemory::new(initial, maximum) {
+                    Ok(mem) => {
+                        let byte_len = mem.bytes.len();
+                        let pages = mem.pages();
+                        let mem_id = self.wasm_memories.len();
+                        self.wasm_memories.push(mem);
+                        let mut buf = JsonValue::empty_object();
+                        buf.insert(
+                            "__anvil_wasm_standalone_mem",
+                            JsonValue::Number(mem_id as f64),
+                        );
+                        buf.insert("byteLength", JsonValue::Number(byte_len as f64));
+                        let mut obj = JsonValue::empty_object();
+                        obj.insert(
+                            "__anvil_wasm_standalone_mem",
+                            JsonValue::Number(mem_id as f64),
+                        );
+                        obj.insert("byteLength", JsonValue::Number(byte_len as f64));
+                        obj.insert("pages", JsonValue::Number(pages as f64));
+                        obj.insert("buffer", buf);
+                        Value::Json(obj)
+                    }
+                    Err(err) => {
+                        let mut err_obj = JsonValue::empty_object();
+                        err_obj.insert("name", JsonValue::String("RangeError".to_string()));
+                        err_obj.insert("message", JsonValue::String(err.to_string()));
+                        self.thrown_error = Some(Value::Json(err_obj));
+                        Value::Null
+                    }
+                }
+            }
+            "WebAssembly.Global" => {
+                let init_val = args
+                    .get(1)
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                    .unwrap_or(0.0);
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_wasm_global", JsonValue::Bool(true));
+                obj.insert("value", JsonValue::Number(init_val));
+                Value::Json(obj)
+            }
+            "WebAssembly.Table" => {
+                let initial = args
+                    .first()
+                    .and_then(|a| match self.eval_expr(doc, a) {
+                        Value::Json(j) => j.get("initial").and_then(|v| match v {
+                            JsonValue::Number(n) => Some(*n),
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0);
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_wasm_table", JsonValue::Bool(true));
+                obj.insert("length", JsonValue::Number(initial));
+                Value::Json(obj)
+            }
+            "Uint8Array" | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array"
+            | "Uint32Array" | "Int32Array" | "Float32Array" | "Float64Array" => {
+                let first_val = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+                let offset = args
+                    .get(1)
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                    .map(|n| n.max(0.0) as usize)
+                    .unwrap_or(0);
+                let len_opt = args
+                    .get(2)
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                    .map(|n| (n.max(0.0) as usize).min(MAX_ARRAY_LEN));
+                self.construct_typed_array(callee, first_val, offset, len_opt)
+            }
+            "ArrayBuffer" => {
+                let byte_len = args
+                    .first()
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                    .map(|n| (n.max(0.0) as usize).min(MAX_ARRAY_LEN))
+                    .unwrap_or(0);
+                let mut obj = JsonValue::empty_object();
+                obj.insert("byteLength", JsonValue::Number(byte_len as f64));
+                obj.insert(
+                    "__bytes",
+                    JsonValue::Array(vec![JsonValue::Number(0.0); byte_len]),
+                );
+                Value::Json(obj)
+            }
+            "TextEncoder" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String("TextEncoder".to_string()));
+                obj.insert("encoding", JsonValue::String("utf-8".to_string()));
+                Value::Json(obj)
+            }
+            "TextDecoder" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String("TextDecoder".to_string()));
+                obj.insert("encoding", JsonValue::String("utf-8".to_string()));
+                Value::Json(obj)
+            }
+            "URLSearchParams" => {
+                let raw = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                let query = raw.trim_start_matches('?');
+                let mut obj = JsonValue::empty_object();
+                for pair in query.split('&').filter(|p| !p.is_empty()) {
+                    let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                    obj.insert(
+                        &k.replace("%20", " ").replace('+', " "),
+                        JsonValue::String(v.replace("%20", " ").replace('+', " ")),
+                    );
+                }
+                Value::Json(obj)
+            }
+            "DOMParser" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String("DOMParser".to_string()));
+                Value::Json(obj)
+            }
+            "AbortController" => {
+                let mut sig = JsonValue::empty_object();
+                sig.insert("aborted", JsonValue::Bool(false));
+                let mut obj = JsonValue::empty_object();
+                obj.insert(
+                    "__anvil_kind",
+                    JsonValue::String("AbortController".to_string()),
+                );
+                obj.insert("signal", sig);
+                Value::Json(obj)
+            }
+            "MutationObserver" | "IntersectionObserver" | "ResizeObserver" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
+                Value::Json(obj)
+            }
+            "Event" | "CustomEvent" => {
+                let ev_type = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                let mut obj = JsonValue::empty_object();
+                obj.insert("type", JsonValue::String(ev_type));
+                if let Some(opts) = args.get(1) {
+                    if let Value::Json(jopts) = self.eval_expr(doc, opts) {
+                        if let Some(detail) = jopts.get("detail").cloned() {
+                            obj.insert("detail", detail);
+                        }
+                    }
+                }
+                Value::Json(obj)
+            }
             "URL" => {
                 let raw = args
                     .first()
@@ -4455,6 +4761,21 @@ impl ScriptRuntime {
                     let (params, body) = extract_multi_param_callback(inner_fn.trim());
                     return self.invoke_method_body(doc, &params, &body, &args, None);
                 }
+
+                if let Some(Value::Str(marker)) = self.get_var(callee).cloned() {
+                    if let Some(rest) = marker.strip_prefix("__wasm_fn:") {
+                        if let Some((inst_str, fn_name)) = rest.split_once(':') {
+                            if let Ok(inst_id) = inst_str.parse::<usize>() {
+                                let args = split_args(args_src);
+                                let args_f64: Vec<f64> = args
+                                    .iter()
+                                    .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
+                                    .collect();
+                                return self.call_wasm_instance_export(inst_id, fn_name, &args_f64);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4651,7 +4972,80 @@ impl ScriptRuntime {
                 }
                 return Value::Json(obj);
             }
-            "encodeURIComponent" => {
+            "atob" => {
+                let args = split_args(args_src);
+                let raw = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                return Value::Str(decode_base64_to_latin1(&raw));
+            }
+            "btoa" => {
+                let args = split_args(args_src);
+                let raw = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                    .unwrap_or_default();
+                return Value::Str(encode_latin1_to_base64(raw.as_bytes()));
+            }
+            "structuredClone" => {
+                let args = split_args(args_src);
+                return args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+            }
+            "String.fromCharCode" | "String.fromCodePoint" => {
+                let args = split_args(args_src);
+                let mut out = String::new();
+                for arg in &args {
+                    if let Some(code) = self.eval_expr(doc, arg).as_number() {
+                        if let Some(ch) = char::from_u32(code.max(0.0) as u32) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                return Value::Str(out);
+            }
+            "Object.freeze" | "Object.seal" | "Object.create" => {
+                let args = split_args(args_src);
+                return args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or_else(|| Value::Json(JsonValue::empty_object()));
+            }
+            "Object.is" => {
+                let args = split_args(args_src);
+                let a = args
+                    .first()
+                    .map(|x| self.eval_expr(doc, x))
+                    .unwrap_or(Value::Null);
+                let b = args
+                    .get(1)
+                    .map(|x| self.eval_expr(doc, x))
+                    .unwrap_or(Value::Null);
+                return Value::Bool(values_equal(&a, &b, doc));
+            }
+            "Object.hasOwn" => {
+                let args = split_args(args_src);
+                if args.len() >= 2 {
+                    if let Value::Json(jobj) = self.eval_expr(doc, &args[0]) {
+                        let key = self.eval_expr(doc, &args[1]).as_string(doc);
+                        return Value::Bool(jobj.get(&key).is_some());
+                    }
+                }
+                return Value::Bool(false);
+            }
+            "Array.of" => {
+                let args = split_args(args_src);
+                let items = args
+                    .into_iter()
+                    .take(MAX_ARRAY_LEN)
+                    .map(|a| self.eval_expr(doc, &a))
+                    .collect();
+                return Value::Array(items);
+            }
+            "encodeURI" | "encodeURIComponent" => {
                 let args = split_args(args_src);
                 let raw = args
                     .first()
@@ -5076,6 +5470,11 @@ impl ScriptRuntime {
                     }
                     _ => Value::Null,
                 };
+            }
+
+            if obj_expr == "WebAssembly" || obj_expr == "window.WebAssembly" {
+                let args = split_args(args_src);
+                return self.eval_webassembly_static(doc, method, &args);
             }
 
             if obj_expr == "navigator" {
@@ -5605,6 +6004,100 @@ impl ScriptRuntime {
                         }
                     }
                     match method {
+                        _ => {}
+                    }
+                    if let Some(JsonValue::Number(inst_id_f)) = jval.get("__anvil_wasm_exports") {
+                        let inst_id = *inst_id_f as usize;
+                        let args = split_args(args_src);
+                        let args_f64: Vec<f64> = args
+                            .iter()
+                            .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
+                            .collect();
+                        return self.call_wasm_instance_export(inst_id, method, &args_f64);
+                    }
+                    if let Some(JsonValue::Number(inst_id_f)) = jval.get("__anvil_wasm_memory") {
+                        let inst_id = *inst_id_f as usize;
+                        if method == "grow" {
+                            let args = split_args(args_src);
+                            let delta = args
+                                .first()
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(0.0)
+                                .max(0.0) as u32;
+                            if let Some(inst) = self.wasm_instances.get_mut(inst_id) {
+                                return Value::Number(inst.memory.grow(delta) as f64);
+                            }
+                            return Value::Number(-1.0);
+                        }
+                    }
+                    if let Some(JsonValue::Number(mem_id_f)) =
+                        jval.get("__anvil_wasm_standalone_mem")
+                    {
+                        let mem_id = *mem_id_f as usize;
+                        if method == "grow" {
+                            let args = split_args(args_src);
+                            let delta = args
+                                .first()
+                                .and_then(|a| self.eval_expr(doc, a).as_number())
+                                .unwrap_or(0.0)
+                                .max(0.0) as u32;
+                            if let Some(mem) = self.wasm_memories.get_mut(mem_id) {
+                                return Value::Number(mem.grow(delta) as f64);
+                            }
+                            return Value::Number(-1.0);
+                        }
+                    }
+                    if let Some(kind) = jval.get("__anvil_kind").and_then(|v| v.as_str()) {
+                        let args = split_args(args_src);
+                        match (kind, method) {
+                            ("TextEncoder", "encode") => {
+                                let text = args
+                                    .first()
+                                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                    .unwrap_or_default();
+                                return Value::Array(
+                                    text.as_bytes()
+                                        .iter()
+                                        .take(MAX_ARRAY_LEN)
+                                        .map(|b| Value::Number(*b as f64))
+                                        .collect(),
+                                );
+                            }
+                            ("TextDecoder", "decode") => {
+                                let bytes = args
+                                    .first()
+                                    .map(|a| {
+                                        let v = self.eval_expr(doc, a);
+                                        self.extract_wasm_bytes(&v)
+                                    })
+                                    .unwrap_or_default();
+                                return Value::Str(String::from_utf8_lossy(&bytes).into_owned());
+                            }
+                            ("DOMParser", "parseFromString") => {
+                                let html = args
+                                    .first()
+                                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                    .unwrap_or_default();
+                                let wrapper = doc.create_element("div", Vec::new());
+                                doc.set_inner_html(wrapper, &html);
+                                return Value::Element(wrapper);
+                            }
+                            ("AbortController", "abort") => {
+                                let mut sig = JsonValue::empty_object();
+                                sig.insert("aborted", JsonValue::Bool(true));
+                                jval.insert("signal", sig);
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval));
+                                }
+                                return Value::Null;
+                            }
+                            (_, "observe" | "unobserve" | "disconnect") => {
+                                return Value::Null;
+                            }
+                            _ => {}
+                        }
+                    }
+                    match method {
                         "hasOwnProperty" | "has" => {
                             let args = split_args(args_src);
                             let key = args
@@ -5863,7 +6356,374 @@ impl ScriptRuntime {
             return self.invoke_method_body(doc, &params, &body, &args, None);
         }
 
+        if let Some(Value::Str(marker)) = self.get_var(callee).cloned() {
+            if let Some(rest) = marker.strip_prefix("__wasm_fn:") {
+                if let Some((inst_str, fn_name)) = rest.split_once(':') {
+                    if let Ok(inst_id) = inst_str.parse::<usize>() {
+                        let args = split_args(args_src);
+                        let args_f64: Vec<f64> = args
+                            .iter()
+                            .map(|a| self.eval_expr(doc, a).as_number().unwrap_or(0.0))
+                            .collect();
+                        return self.call_wasm_instance_export(inst_id, fn_name, &args_f64);
+                    }
+                }
+            }
+        }
+
         Value::Null
+    }
+
+    fn extract_wasm_bytes(&self, val: &Value) -> Vec<u8> {
+        match val {
+            Value::Array(items) => items
+                .iter()
+                .map(|v| (v.as_number().unwrap_or(0.0) as i64 & 0xFF) as u8)
+                .collect(),
+            Value::Json(JsonValue::Array(items)) => items
+                .iter()
+                .map(|v| match v {
+                    JsonValue::Number(n) => (*n as i64 & 0xFF) as u8,
+                    _ => 0,
+                })
+                .collect(),
+            Value::Json(jobj) => {
+                if let Some(JsonValue::Array(items)) =
+                    jobj.get("__bytes").or_else(|| jobj.get("bytes"))
+                {
+                    return items
+                        .iter()
+                        .map(|v| match v {
+                            JsonValue::Number(n) => (*n as i64 & 0xFF) as u8,
+                            _ => 0,
+                        })
+                        .collect();
+                }
+                if let Some(JsonValue::String(body)) = jobj.get("body") {
+                    return decode_wasm_text_bytes(body);
+                }
+                Vec::new()
+            }
+            Value::Str(s) => decode_wasm_text_bytes(s),
+            _ => Vec::new(),
+        }
+    }
+
+    fn extract_wasm_imports(&self, val: &Value) -> std::collections::HashMap<String, f64> {
+        let mut out = std::collections::HashMap::new();
+        if let Value::Json(JsonValue::Object(modules)) = val {
+            for (mod_name, mod_val) in modules {
+                if let JsonValue::Object(entries) = mod_val {
+                    for (field_name, field_val) in entries {
+                        match field_val {
+                            JsonValue::Number(n) => {
+                                out.insert(format!("{mod_name}.{field_name}"), *n);
+                            }
+                            JsonValue::Object(_) => {
+                                if let Some(JsonValue::Number(n)) = field_val.get("value") {
+                                    out.insert(format!("{mod_name}.{field_name}"), *n);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn register_wasm_module_value(&mut self, module: WasmModule) -> Value {
+        let mod_id = self.wasm_modules.len();
+        let exports_arr: Vec<JsonValue> = module
+            .exports
+            .iter()
+            .map(|e| {
+                let mut ex = JsonValue::empty_object();
+                ex.insert("name", JsonValue::String(e.name.clone()));
+                ex.insert(
+                    "kind",
+                    JsonValue::String(
+                        match e.kind {
+                            WasmExportKind::Func => "function",
+                            WasmExportKind::Table => "table",
+                            WasmExportKind::Memory => "memory",
+                            WasmExportKind::Global => "global",
+                        }
+                        .to_string(),
+                    ),
+                );
+                ex
+            })
+            .collect();
+        self.wasm_modules.push(module);
+        let mut obj = JsonValue::empty_object();
+        obj.insert("__anvil_wasm_module", JsonValue::Number(mod_id as f64));
+        obj.insert("exports", JsonValue::Array(exports_arr));
+        Value::Json(obj)
+    }
+
+    fn instantiate_wasm_module_value(
+        &mut self,
+        module: WasmModule,
+        imports_val: Option<&Value>,
+    ) -> Result<(usize, usize, Value), WasmError> {
+        let host_imports = imports_val
+            .map(|v| self.extract_wasm_imports(v))
+            .unwrap_or_default();
+        let mod_id = self.wasm_modules.len();
+        self.wasm_modules.push(module.clone());
+        let instance = WasmInstance::instantiate(module, host_imports)?;
+        let inst_id = self.wasm_instances.len();
+        let mut exports_obj = JsonValue::empty_object();
+        exports_obj.insert("__anvil_wasm_exports", JsonValue::Number(inst_id as f64));
+        for exp in &instance.module.exports {
+            match exp.kind {
+                WasmExportKind::Func => {
+                    exports_obj.insert(
+                        &exp.name,
+                        JsonValue::String(format!("__wasm_fn:{inst_id}:{}", exp.name)),
+                    );
+                }
+                WasmExportKind::Memory => {
+                    let byte_len = instance.memory.bytes.len();
+                    let pages = instance.memory.pages();
+                    let mut buf = JsonValue::empty_object();
+                    buf.insert("__anvil_wasm_memory", JsonValue::Number(inst_id as f64));
+                    buf.insert("byteLength", JsonValue::Number(byte_len as f64));
+                    let mut mem_obj = JsonValue::empty_object();
+                    mem_obj.insert("__anvil_wasm_memory", JsonValue::Number(inst_id as f64));
+                    mem_obj.insert("byteLength", JsonValue::Number(byte_len as f64));
+                    mem_obj.insert("pages", JsonValue::Number(pages as f64));
+                    mem_obj.insert("buffer", buf);
+                    exports_obj.insert(&exp.name, mem_obj);
+                }
+                WasmExportKind::Global => {
+                    let gval = instance
+                        .get_exported_global(&exp.name)
+                        .map(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let mut gobj = JsonValue::empty_object();
+                    gobj.insert("__anvil_wasm_global", JsonValue::Bool(true));
+                    gobj.insert("value", JsonValue::Number(gval));
+                    exports_obj.insert(&exp.name, gobj);
+                }
+                WasmExportKind::Table => {
+                    let mut tobj = JsonValue::empty_object();
+                    tobj.insert("__anvil_wasm_table", JsonValue::Bool(true));
+                    exports_obj.insert(&exp.name, tobj);
+                }
+            }
+        }
+        self.wasm_instances.push(instance);
+        let mut inst_obj = JsonValue::empty_object();
+        inst_obj.insert("__anvil_wasm_instance", JsonValue::Number(inst_id as f64));
+        inst_obj.insert("__anvil_wasm_module", JsonValue::Number(mod_id as f64));
+        inst_obj.insert("exports", exports_obj);
+        Ok((mod_id, inst_id, Value::Json(inst_obj)))
+    }
+
+    fn call_wasm_instance_export(
+        &mut self,
+        inst_id: usize,
+        method: &str,
+        args_f64: &[f64],
+    ) -> Value {
+        if !self.consume_step() {
+            return Value::Null;
+        }
+        let Some(inst) = self.wasm_instances.get_mut(inst_id) else {
+            return Value::Null;
+        };
+        match inst.call_export(method, args_f64) {
+            Ok(vals) => vals
+                .first()
+                .map(|v| Value::Number(v.as_f64()))
+                .unwrap_or(Value::Null),
+            Err(err) => {
+                let mut err_obj = JsonValue::empty_object();
+                err_obj.insert("name", JsonValue::String("RuntimeError".to_string()));
+                err_obj.insert("message", JsonValue::String(err.to_string()));
+                self.thrown_error = Some(Value::Json(err_obj));
+                Value::Null
+            }
+        }
+    }
+
+    fn eval_webassembly_static(
+        &mut self,
+        doc: &mut Document,
+        method: &str,
+        args: &[String],
+    ) -> Value {
+        match method {
+            "validate" => {
+                let bytes = args
+                    .first()
+                    .map(|a| {
+                        let v = self.eval_expr(doc, a);
+                        self.extract_wasm_bytes(&v)
+                    })
+                    .unwrap_or_default();
+                Value::Bool(validate_wasm(&bytes))
+            }
+            "compile" | "compileStreaming" => {
+                let first_val = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+                let first_settled = self.await_value(doc, first_val);
+                let bytes = self.extract_wasm_bytes(&first_settled);
+                match WasmModule::decode(&bytes) {
+                    Ok(module) => {
+                        let mod_val = self.register_wasm_module_value(module);
+                        let pid = self.new_resolved(mod_val);
+                        self.make_promise_value(pid)
+                    }
+                    Err(err) => {
+                        let mut err_obj = JsonValue::empty_object();
+                        err_obj.insert("name", JsonValue::String("CompileError".to_string()));
+                        err_obj.insert("message", JsonValue::String(err.to_string()));
+                        let pid = self.new_rejected(Value::Json(err_obj));
+                        self.make_promise_value(pid)
+                    }
+                }
+            }
+            "instantiate" | "instantiateStreaming" => {
+                let first_val = args
+                    .first()
+                    .map(|a| self.eval_expr(doc, a))
+                    .unwrap_or(Value::Null);
+                let first_settled = self.await_value(doc, first_val);
+                let imports_val = args.get(1).map(|a| self.eval_expr(doc, a));
+                let is_module_arg = matches!(
+                    &first_settled,
+                    Value::Json(j) if j.get("__anvil_wasm_module").is_some()
+                );
+                let module_res = match &first_settled {
+                    Value::Json(jobj) => {
+                        if let Some(JsonValue::Number(mid)) = jobj.get("__anvil_wasm_module") {
+                            self.wasm_modules
+                                .get(*mid as usize)
+                                .cloned()
+                                .ok_or(WasmError::InvalidModule("unknown module id"))
+                        } else {
+                            let bytes = self.extract_wasm_bytes(&first_settled);
+                            WasmModule::decode(&bytes)
+                        }
+                    }
+                    _ => {
+                        let bytes = self.extract_wasm_bytes(&first_settled);
+                        WasmModule::decode(&bytes)
+                    }
+                };
+                match module_res
+                    .and_then(|m| self.instantiate_wasm_module_value(m, imports_val.as_ref()))
+                {
+                    Ok((mod_id, _, inst_val)) => {
+                        let resolved = if is_module_arg {
+                            inst_val
+                        } else {
+                            let mut mod_obj = JsonValue::empty_object();
+                            mod_obj.insert("__anvil_wasm_module", JsonValue::Number(mod_id as f64));
+                            let mut pair = JsonValue::empty_object();
+                            pair.insert("module", mod_obj);
+                            pair.insert("instance", inst_val.to_json_value(doc));
+                            Value::Json(pair)
+                        };
+                        let pid = self.new_resolved(resolved);
+                        self.make_promise_value(pid)
+                    }
+                    Err(err) => {
+                        let mut err_obj = JsonValue::empty_object();
+                        err_obj.insert("name", JsonValue::String("CompileError".to_string()));
+                        err_obj.insert("message", JsonValue::String(err.to_string()));
+                        let pid = self.new_rejected(Value::Json(err_obj));
+                        self.make_promise_value(pid)
+                    }
+                }
+            }
+            _ => Value::Null,
+        }
+    }
+
+    fn construct_typed_array(
+        &self,
+        _callee: &str,
+        first_val: Value,
+        offset: usize,
+        len_opt: Option<usize>,
+    ) -> Value {
+        match first_val {
+            Value::Number(n) => {
+                let count = (n.max(0.0) as usize).min(MAX_ARRAY_LEN);
+                Value::Array(vec![Value::Number(0.0); count])
+            }
+            Value::Array(items) => {
+                let start = offset.min(items.len());
+                let end = len_opt
+                    .map(|l| start.saturating_add(l).min(items.len()))
+                    .unwrap_or(items.len());
+                Value::Array(
+                    items[start..end]
+                        .iter()
+                        .map(|v| Value::Number(v.as_number().unwrap_or(0.0)))
+                        .collect(),
+                )
+            }
+            Value::Json(jobj) => {
+                if let Some(JsonValue::Number(inst_id_f)) = jobj.get("__anvil_wasm_memory") {
+                    let inst_id = *inst_id_f as usize;
+                    if let Some(inst) = self.wasm_instances.get(inst_id) {
+                        let mem = &inst.memory;
+                        let total = mem.bytes.len();
+                        let start = offset.min(total);
+                        let take_len = len_opt
+                            .unwrap_or_else(|| total.saturating_sub(start))
+                            .min(total.saturating_sub(start))
+                            .min(MAX_ARRAY_LEN);
+                        if let Some(slice) = mem.bytes.get(start..start + take_len) {
+                            return Value::Array(
+                                slice.iter().map(|b| Value::Number(*b as f64)).collect(),
+                            );
+                        }
+                    }
+                }
+                if let Some(JsonValue::Number(mem_id_f)) = jobj.get("__anvil_wasm_standalone_mem") {
+                    let mem_id = *mem_id_f as usize;
+                    if let Some(mem) = self.wasm_memories.get(mem_id) {
+                        let total = mem.bytes.len();
+                        let start = offset.min(total);
+                        let take_len = len_opt
+                            .unwrap_or_else(|| total.saturating_sub(start))
+                            .min(total.saturating_sub(start))
+                            .min(MAX_ARRAY_LEN);
+                        if let Some(slice) = mem.bytes.get(start..start + take_len) {
+                            return Value::Array(
+                                slice.iter().map(|b| Value::Number(*b as f64)).collect(),
+                            );
+                        }
+                    }
+                }
+                if let Some(JsonValue::Array(items)) = jobj.get("__bytes") {
+                    let start = offset.min(items.len());
+                    let end = len_opt
+                        .map(|l| start.saturating_add(l).min(items.len()))
+                        .unwrap_or(items.len());
+                    return Value::Array(
+                        items[start..end]
+                            .iter()
+                            .map(|v| match v {
+                                JsonValue::Number(n) => Value::Number(*n),
+                                _ => Value::Number(0.0),
+                            })
+                            .collect(),
+                    );
+                }
+                Value::Array(Vec::new())
+            }
+            _ => Value::Array(Vec::new()),
+        }
     }
 
     /// Define `name(params) { body }` from the text after `function `.
@@ -6835,6 +7695,29 @@ fn script_stays_on_rust(source: &str) -> bool {
         "finally",
         "async",
         "await",
+        "WebAssembly",
+        "Uint8Array",
+        "Int8Array",
+        "Uint16Array",
+        "Int16Array",
+        "Uint32Array",
+        "Int32Array",
+        "Float32Array",
+        "Float64Array",
+        "ArrayBuffer",
+        "TextEncoder",
+        "TextDecoder",
+        "URLSearchParams",
+        "DOMParser",
+        "AbortController",
+        "MutationObserver",
+        "IntersectionObserver",
+        "ResizeObserver",
+        "CustomEvent",
+        "Event",
+        "atob",
+        "btoa",
+        "structuredClone",
     ];
     let mut ident = String::new();
     for ch in source.chars() {
@@ -7402,6 +8285,50 @@ fn split_top_level_op<'a>(input: &'a str, op: &str) -> Option<(&'a str, &'a str)
                     idx += 1;
                     continue;
                 }
+                if (op == "+" || op == "-")
+                    && idx >= 2
+                    && (bytes[idx - 1] == b'e' || bytes[idx - 1] == b'E')
+                    && bytes[idx - 2].is_ascii_digit()
+                {
+                    idx += 1;
+                    continue;
+                }
+                if op == "-" && idx > 0 {
+                    if let Some(&prev_b) =
+                        bytes[..idx].iter().rev().find(|b| !b.is_ascii_whitespace())
+                    {
+                        if matches!(
+                            prev_b,
+                            b'+' | b'-'
+                                | b'*'
+                                | b'/'
+                                | b'%'
+                                | b'='
+                                | b'!'
+                                | b'<'
+                                | b'>'
+                                | b'&'
+                                | b'|'
+                                | b'^'
+                                | b'?'
+                                | b':'
+                                | b','
+                                | b'('
+                                | b'['
+                                | b'{'
+                        ) {
+                            idx += 1;
+                            continue;
+                        }
+                    }
+                }
+                if op == "*"
+                    && (bytes.get(idx + 1) == Some(&b'*')
+                        || (idx > 0 && bytes.get(idx - 1) == Some(&b'*')))
+                {
+                    idx += 1;
+                    continue;
+                }
                 last_match = Some(idx);
                 idx += op_bytes.len();
                 continue;
@@ -7427,7 +8354,7 @@ fn find_call_open_paren(expr: &str) -> Option<usize> {
             continue;
         }
         match b {
-            b'"' | b'\'' => quote = Some(b),
+            b'"' | b'\'' | b'`' => quote = Some(b),
             b')' => depth += 1,
             b'(' => {
                 depth -= 1;
@@ -7505,6 +8432,29 @@ fn split_args(args_src: &str) -> Vec<String> {
     out
 }
 
+fn parse_js_number_literal(expr: &str) -> Option<f64> {
+    let trimmed = expr.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return i64::from_str_radix(hex, 16).ok().map(|v| v as f64);
+    }
+    if let Some(bin) = trimmed
+        .strip_prefix("0b")
+        .or_else(|| trimmed.strip_prefix("0B"))
+    {
+        return i64::from_str_radix(bin, 2).ok().map(|v| v as f64);
+    }
+    if let Some(oct) = trimmed
+        .strip_prefix("0o")
+        .or_else(|| trimmed.strip_prefix("0O"))
+    {
+        return i64::from_str_radix(oct, 8).ok().map(|v| v as f64);
+    }
+    trimmed.parse::<f64>().ok()
+}
+
 fn parse_string_literal(expr: &str) -> Option<String> {
     let bytes = expr.as_bytes();
     if bytes.len() < 2 {
@@ -7515,6 +8465,9 @@ fn parse_string_literal(expr: &str) -> Option<String> {
         return None;
     }
     let inner = &expr[1..expr.len() - 1];
+    if has_unescaped_quote(inner, quote as char) {
+        return None;
+    }
     let mut out = String::new();
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
@@ -7530,6 +8483,99 @@ fn parse_string_literal(expr: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+fn has_unescaped_quote(inner: &str, quote: char) -> bool {
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let _ = chars.next();
+        } else if ch == quote {
+            return true;
+        }
+    }
+    false
+}
+
+fn decode_wasm_text_bytes(s: &str) -> Vec<u8> {
+    if s.as_bytes().starts_with(&WASM_MAGIC) {
+        return s.as_bytes().to_vec();
+    }
+    let trimmed = s.trim();
+    if trimmed.len() >= 16
+        && trimmed.len().is_multiple_of(2)
+        && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        let mut out = Vec::with_capacity(trimmed.len() / 2);
+        let bytes = trimmed.as_bytes();
+        let mut idx = 0usize;
+        while idx + 1 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[idx..idx + 2]) {
+                if let Ok(b) = u8::from_str_radix(hex_str, 16) {
+                    out.push(b);
+                }
+            }
+            idx += 2;
+        }
+        return out;
+    }
+    decode_base64_bytes(trimmed)
+}
+
+fn decode_base64_bytes(input: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ if b.is_ascii_whitespace() => continue,
+            _ => continue,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+fn decode_base64_to_latin1(input: &str) -> String {
+    decode_base64_bytes(input)
+        .into_iter()
+        .map(|b| b as char)
+        .collect()
+}
+
+fn encode_latin1_to_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn is_identifier(name: &str) -> bool {
@@ -7551,7 +8597,7 @@ mod tests {
     #[test]
     fn skips_a_bundle_and_still_runs_a_short_script() {
         assert!(!script_runs_here(&"x".repeat(MAX_SCRIPT_SOURCE + 1)));
-        let bundle = format!("{}\n{}", "a".repeat(5000), "b".repeat(5000));
+        let bundle = format!("{}\n{}", "a".repeat(MAX_SCRIPT_SOURCE), "b".repeat(5000));
         assert!(!script_runs_here(&bundle));
         let mut doc = parse_html("<title>Old</title><script>document.title = 'New';</script>");
         let mut runtime = ScriptRuntime::new();
@@ -7559,7 +8605,7 @@ mod tests {
         assert_eq!(doc.title(), "New");
         let mut doc = parse_html(&format!(
             "<title>Stay</title><script>{}</script>",
-            "var x = 1;".repeat(2000)
+            "var x = 1;".repeat(MAX_SCRIPT_SOURCE / 8)
         ));
         let mut runtime = ScriptRuntime::new();
         runtime.run_document_scripts(&mut doc);

@@ -2,7 +2,7 @@
   <h1>Anvil Engine</h1>
   <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.23-ff6b24?style=flat-square" alt="v.23" />
+    <img src="https://img.shields.io/badge/release-v.23.1-ff6b24?style=flat-square" alt="v.23.1" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
@@ -11,7 +11,7 @@
   </p>
 </div>
 
-Version 0.23. Author: Buntato.
+Version 0.23.1. Author: Buntato.
 
 The source is public, so anyone can read it, audit it, and use it as part of Anvil Browser. It's still proprietary, though, not open source: you can't redistribute it on its own or use it to build a different product. [Anvil Browser](https://github.com/buntatoes/anvil-browser) and the nine companion libraries can be redistributed without it, under their own licenses. See [License](#license).
 
@@ -21,21 +21,25 @@ There are no crates.io dependencies.
 
 | Crate | What it is |
 | --- | --- |
-| `anvil-dom` | HTML tree and selectors |
+| `anvil-dom` | HTML tree, `<script>` comment-preserving tokenizer, and CSS selectors |
 | `anvil-style` | CSS cascade, media queries, animations, and multi-core subtree cascade (`compute_styles_parallel`) |
 | `anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
 | `anvil-paint` | Display list and zoom |
 | `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients), bounded LRU glyph coverage cache (`RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
-| `anvil-script` | Budgeted script runtime and the numeric x86-64 compiler |
+| `anvil-script` | Budgeted JavaScript runtime, WebAssembly 1.0 (`WASM`) decoder/validator/stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), and the numeric x86-64 compiler |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
 
-## Scripts
+## Scripts and WebAssembly 1.0 (`WASM`)
 
-`anvil-script` runs timers and promises on its own event loop. After each task the whole microtask queue is drained. Timers fire by due time, then in the order they were set, on a virtual clock that does not follow wall time. A timer set while a timer callback itself runs waits at least 4 ms. Timers set from the microtasks that callback queues, or after an `await` in an async timer callback, keep the delay they ask for.
+`anvil-script` runs timers, promises, WebAssembly 1.0 modules, and DOM mutations on its own event loop. After each task the whole microtask queue is drained. Timers fire by due time, then in the order they were set, on a virtual clock that does not follow wall time. A timer set while a timer callback itself runs waits at least 4 ms. Timers set from the microtasks that callback queues, or after an `await` in an async timer callback, keep the delay they ask for.
 
 Supported:
 
+- WebAssembly 1.0 (`\0asm` version `1`) binary module decoding (`WasmModule::decode`), validation (`validate_wasm`), bounded 64 KiB page linear memory (`WasmMemory`, up to 256 pages / 16 MiB), and stack machine execution (`WasmInstance::instantiate`, `call_export`, `get_exported_global`, `set_exported_global`) covering `i32`, `i64`, `f32`, and `f64` arithmetic, bitwise, comparison, conversion, load/store, `memory.size`, `memory.grow`, `memory.copy`, `memory.fill`, and structured control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `call`, `call_indirect`, `return`)
+- JavaScript `WebAssembly` API: `WebAssembly.validate`, `WebAssembly.compile`, `WebAssembly.compileStreaming`, `WebAssembly.instantiate`, `WebAssembly.instantiateStreaming`, `new WebAssembly.Module`, `new WebAssembly.Instance`, `new WebAssembly.Memory`, `new WebAssembly.Global`, `new WebAssembly.Table`, calling exported WASM functions (`instance.exports.<fn>(...)`), and `memory.grow(delta)`
+- `TypedArray` and binary web APIs: `Uint8Array`, `Uint8ClampedArray`, `Int8Array`, `Uint16Array`, `Int16Array`, `Uint32Array`, `Int32Array`, `Float32Array`, `Float64Array` (including views over `WasmMemory` buffers), `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `URLSearchParams`, `DOMParser`, `AbortController`, `MutationObserver`, `IntersectionObserver`, `ResizeObserver`, `Event`, and `CustomEvent`
+- Interactive hydration (`ScriptRuntime::hydrate_interactive_bindings`) for documents returned from `--tab-worker`, preserving `onclick` attributes, `addEventListener('click', ...)` listeners, and declared functions/classes in the browser window without re-running initial DOM mutations
 - `new Promise`, `then`, `catch`, `finally`, and `Promise.resolve`, `reject`, `all`, `allSettled`, `race`, `any`
 - A promise resolved with another promise follows it. A class instance with a `then` method is called like one
 - A rejection with no handler is counted (`unhandled_rejections()`) and does not stop the page
@@ -55,7 +59,7 @@ Not supported, or different:
 - A callback created inside an async function gets a copy of that function's locals, not a live link
 - No `unhandledrejection` event
 
-Limits: a turn spends at most 100,000 steps. Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 64 timers and 8,192 queued microtasks are kept at once. Scripts that use the event loop always run on the Rust interpreter. The numeric compiler rejects them.
+Limits: a turn spends at most 200,000 steps (`MAX_EXECUTION_STEPS`), script source and `fetch()` bodies are capped at 256 KiB, and WebAssembly calls are bounded at 500,000 instructions (`MAX_WASM_STEPS`), 64 call frames (`MAX_WASM_CALL_DEPTH`), and 256 linear-memory pages (16 MiB). Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 128 timers and 8,192 queued microtasks are kept at once. Scripts that use the event loop, DOM, or `WebAssembly` always run on the Rust interpreter.
 
 ## CSS support
 

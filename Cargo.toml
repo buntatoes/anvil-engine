@@ -1,4 +1,4 @@
-# Page engine. Crate version 0.23.0. Not published.
+# Page engine. Crate version 0.23.1. Not published.
 #
 # Page pipeline, in order:
 #   anvil-dom parses HTML into one node list.
@@ -7,7 +7,7 @@
 #   anvil-paint records a display list and applies zoom.
 #   anvil-raster fills a CPU framebuffer from that list (with C++20 scanline/SDF/compositor helpers).
 #
-# anvil-script runs a budgeted JS runtime and C++20 AnvilVM register bytecode interpreter
+# anvil-script runs a budgeted JS runtime, WebAssembly 1.0 stack VM, and C++20 AnvilVM register bytecode interpreter
 # against the document and uses anvil-json. It does not open a socket and does not link anvil-net.
 #
 # anvil-browser links these crates by path. It does not vendor them.
@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.23.0"
+version = "0.23.1"
 edition = "2024"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "HTML, CSS, layout, raster, and a budgeted script runtime."

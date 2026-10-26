@@ -105,7 +105,13 @@ pub fn parse_html(input: &str) -> Document {
                 // the text. It treats a raw newline as the end of a statement,
                 // and these pages were written for the collapsed form.
                 if let Some((text, next)) = read_raw_text(input, index, &name) {
-                    if let Some(text) = normalize_text(&decode_entities(&text)) {
+                    let decoded = decode_entities(&text);
+                    let prepared = if name == "script" {
+                        strip_js_comments_before_collapse(&decoded)
+                    } else {
+                        decoded
+                    };
+                    if let Some(text) = normalize_text(&prepared) {
                         if doc.node_count() < MAX_DOM_NODES {
                             let text_id = doc.create_text(&text);
                             doc.append(id, text_id).expect("new text node");
@@ -503,6 +509,53 @@ fn preserve_text(raw: &str) -> Option<String> {
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+fn strip_js_comments_before_collapse(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(esc) = chars.next() {
+                    out.push(esc);
+                }
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' || ch == '`' {
+            quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            let _ = chars.next();
+            for next_ch in chars.by_ref() {
+                if next_ch == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            let _ = chars.next();
+            while let Some(next_ch) = chars.next() {
+                if next_ch == '*' && chars.peek() == Some(&'/') {
+                    let _ = chars.next();
+                    out.push(' ');
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn normalize_text(raw: &str) -> Option<String> {
