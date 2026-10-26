@@ -74,11 +74,11 @@ AnvilValue AnvilIcTable::load_property_ic(
         return AnvilValue::make_undefined();
     }
     const u32 obj_id = receiver.payload();
-    if (obj_id >= MAX_HEAP_OBJECTS || !heap.objects[obj_id].active) {
+    if (obj_id >= heap.object_count || !heap.objects()[obj_id].active) {
         return AnvilValue::make_undefined();
     }
 
-    const AnvilHeapObject& obj = heap.objects[obj_id];
+    const AnvilHeapObject& obj = heap.objects()[obj_id];
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
@@ -86,13 +86,13 @@ AnvilValue AnvilIcTable::load_property_ic(
         if (site.state == IcState::Monomorphic) {
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
-                return obj.slots[site.stubs[0].slot_offset];
+                return heap.object_slots(obj.slots_off)[site.stubs[0].slot_offset];
             }
         } else if (site.state == IcState::Polymorphic) {
             for (u8 i = 0u; i < site.count; ++i) {
                 if (site.stubs[i].shape_id == shape_id && site.stubs[i].slot_offset >= 0) {
                     ++ic_hits;
-                    return obj.slots[site.stubs[i].slot_offset];
+                    return heap.object_slots(obj.slots_off)[site.stubs[i].slot_offset];
                 }
             }
         }
@@ -144,11 +144,11 @@ StoreResult AnvilIcTable::store_property_ic(
         return StoreResult::NotStored;
     }
     const u32 obj_id = receiver.payload();
-    if (obj_id >= MAX_HEAP_OBJECTS || !heap.objects[obj_id].active) {
+    if (obj_id >= heap.object_count || !heap.objects()[obj_id].active) {
         return StoreResult::NotStored;
     }
 
-    AnvilHeapObject& obj = heap.objects[obj_id];
+    AnvilHeapObject& obj = heap.objects()[obj_id];
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
@@ -156,14 +156,14 @@ StoreResult AnvilIcTable::store_property_ic(
         if (site.state == IcState::Monomorphic) {
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
-                obj.slots[site.stubs[0].slot_offset] = val;
+                heap.object_slots(obj.slots_off)[site.stubs[0].slot_offset] = val;
                 return StoreResult::Ok;
             }
         } else if (site.state == IcState::Polymorphic) {
             for (u8 i = 0u; i < site.count; ++i) {
                 if (site.stubs[i].shape_id == shape_id && site.stubs[i].slot_offset >= 0) {
                     ++ic_hits;
-                    obj.slots[site.stubs[i].slot_offset] = val;
+                    heap.object_slots(obj.slots_off)[site.stubs[i].slot_offset] = val;
                     return StoreResult::Ok;
                 }
             }

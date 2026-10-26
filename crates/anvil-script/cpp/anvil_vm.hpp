@@ -44,10 +44,12 @@ constexpr u32 MAX_TOTAL_REGISTERS       = MAX_CALL_FRAMES * MAX_REGISTERS_PER_FR
 // growable heap tables all draw from it, so these counts are no longer fixed.
 constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
 constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
-constexpr u32 MAX_SHAPES                = 256u;
-constexpr u32 MAX_SHAPE_PROPS           = 32u;
-constexpr u32 MAX_SHAPE_TRANSITIONS     = 512u;
-constexpr u32 MAX_HEAP_OBJECTS          = 512u;
+// An object keeps a shared hidden class (AnvilShape) until it has this many
+// named properties; past it the object switches to its own property map
+// (dictionary mode), so there is no fixed cap on how many properties an object
+// may hold. Shapes, the transition table and the object table all grow in the
+// arena, so their counts are bounded only by the byte budget.
+constexpr u32 DICT_THRESHOLD            = 64u;
 // Calls nest until the frame stack or the register file runs out.
 constexpr u32 MAX_CALL_DEPTH =
     (MAX_CALL_FRAMES - 1u) < (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u)
@@ -63,6 +65,8 @@ constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
 
 // Returned by the allocators and tables when they are full.
 constexpr u32 NO_SLOT = 0xFFFFFFFFu;
+// A dictionary-mode object carries this in place of a shape id.
+constexpr u32 DICT_SHAPE = 0xFFFFFFFEu;
 constexpr u16 NO_GLOBAL = 0xFFFFu;
 
 // Why a run stopped or the compiler refused a script. Codes below 32 stop
@@ -630,7 +634,7 @@ struct AnvilShape {
     u32 id;
     u32 parent_shape;
     u32 prop_count;
-    u32 prop_syms[MAX_SHAPE_PROPS];
+    u32 prop_syms[DICT_THRESHOLD];
 
     i32 find_slot(u32 sym) const noexcept {
         for (u32 i = 0; i < prop_count; ++i) {
@@ -645,9 +649,13 @@ struct AnvilShape {
 struct AnvilHeapObject {
     bool active;
     bool marked;
-    u32 shape_id;
+    bool dict;            // dictionary mode: own key map, no shared shape
+    u32 shape_id;         // a shape id, or DICT_SHAPE when dict
     u32 proto_obj_id;
-    AnvilValue slots[MAX_SHAPE_PROPS];
+    u32 prop_count;       // live properties, kept in both modes
+    u32 slots_off;        // arena block: AnvilValue[slots_cap]
+    u32 slots_cap;
+    u32 dict_keys_off;    // arena block: u32[slots_cap] of keys (dict only), else NO_SLOT
 };
 
 struct AnvilHeapArray {
@@ -697,14 +705,52 @@ struct AnvilHeap {
     bool ensure_string_bytes(u32 need) noexcept;
     bool ensure_string_table(u32 need) noexcept;
 
-    // Hidden classes (Shapes) & transition table
-    AnvilShape shapes[MAX_SHAPES];
+    // Hidden classes (Shapes) & transition table, both growable in the arena.
+    u32 shapes_off;
+    u32 shapes_cap;
     u32 shape_count;
-    AnvilShapeTransition transitions[MAX_SHAPE_TRANSITIONS];
+    u32 transitions_off;
+    u32 transitions_cap;
     u32 transition_count;
 
-    // GC-managed objects and functions (still fixed for now).
-    AnvilHeapObject objects[MAX_HEAP_OBJECTS];
+    AnvilShape* shapes() noexcept { return reinterpret_cast<AnvilShape*>(arena.at(shapes_off)); }
+    const AnvilShape* shapes() const noexcept {
+        return reinterpret_cast<const AnvilShape*>(arena.at(shapes_off));
+    }
+    AnvilShapeTransition* transitions() noexcept {
+        return reinterpret_cast<AnvilShapeTransition*>(arena.at(transitions_off));
+    }
+    const AnvilShapeTransition* transitions() const noexcept {
+        return reinterpret_cast<const AnvilShapeTransition*>(arena.at(transitions_off));
+    }
+    bool ensure_shapes(u32 need) noexcept;
+    bool ensure_transitions(u32 need) noexcept;
+
+    // GC-managed objects: a growable table in the arena, each object's slots and
+    // (in dictionary mode) key map in their own arena blocks.
+    u32 objects_off;
+    u32 objects_cap;
+    u32 object_count;
+    AnvilHeapObject* objects() noexcept {
+        return reinterpret_cast<AnvilHeapObject*>(arena.at(objects_off));
+    }
+    const AnvilHeapObject* objects() const noexcept {
+        return reinterpret_cast<const AnvilHeapObject*>(arena.at(objects_off));
+    }
+    AnvilValue* object_slots(u32 off) noexcept {
+        return reinterpret_cast<AnvilValue*>(arena.at(off));
+    }
+    const AnvilValue* object_slots(u32 off) const noexcept {
+        return reinterpret_cast<const AnvilValue*>(arena.at(off));
+    }
+    u32* object_keys(u32 off) noexcept { return reinterpret_cast<u32*>(arena.at(off)); }
+    const u32* object_keys(u32 off) const noexcept {
+        return reinterpret_cast<const u32*>(arena.at(off));
+    }
+    bool ensure_objects(u32 need) noexcept;
+    bool ensure_object_slots(u32 obj_id, u32 need) noexcept;
+    bool convert_object_to_dict(u32 obj_id) noexcept;
+
     AnvilHeapFunction functions[MAX_FUNCTIONS];
     u32 function_count;
 

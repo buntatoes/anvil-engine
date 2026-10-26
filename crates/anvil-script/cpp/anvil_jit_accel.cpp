@@ -189,16 +189,12 @@ void AnvilVmContext::reclaim_array_storage(u32 reg_top) noexcept {
 bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
     switch (stored) {
         case StoreResult::TooManyProperties:
-            fail_limit(VM_STOP_PROPERTIES, "property", MAX_SHAPE_PROPS, "properties per object");
-            return false;
         case StoreResult::ShapesFull:
-            fail_limit(VM_STOP_SHAPES, "shape", MAX_SHAPES, "shapes");
-            return false;
         case StoreResult::ArrayTooLong:
         case StoreResult::ArrayStorageFull:
         case StoreResult::HeapFull:
-            // Arrays grow in the arena now, so these only arise when the arena
-            // hits the byte budget.
+            // Objects, shapes and arrays all grow in the arena now, so every one
+            // of these only arises when the arena hits the byte budget.
             fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
             return false;
         case StoreResult::NotStored:
@@ -460,12 +456,14 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
             }
 
             case AnvilOpcode::NewObject: {
-                if (heap.live_objects + 8u >= MAX_HEAP_OBJECTS) {
-                    collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
-                }
-                const u32 obj_id = heap.alloc_object(0u);
+                u32 obj_id = heap.alloc_object(0u);
                 if (obj_id == NO_SLOT) {
-                    fail_limit(VM_STOP_OBJECTS, "object", MAX_HEAP_OBJECTS, "live objects");
+                    // Reclaim dead objects, then try once more.
+                    collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
+                    obj_id = heap.alloc_object(0u);
+                }
+                if (obj_id == NO_SLOT) {
+                    fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
                     return AnvilValue::make_undefined();
                 }
                 R[inst.a] = AnvilValue::make_object(obj_id);
@@ -1028,7 +1026,7 @@ u32 anvil_cpp_vm_run_ic_benchmark(
     i32 accum = 0;
 
     for (u32 i = 0u; i < capped; ++i) {
-        if (g_vm_ctx.heap.live_objects + 4u >= anvil_vm::MAX_HEAP_OBJECTS) {
+        if (i != 0u && (i & 255u) == 0u) {
             g_vm_ctx.heap.collect_garbage(nullptr, 0u);
         }
         const u32 obj_id = g_vm_ctx.heap.alloc_object(0u);

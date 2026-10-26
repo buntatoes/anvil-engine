@@ -279,3 +279,89 @@ fn array_churn_reuses_freed_blocks_under_a_tight_budget() {
     assert_eq!(value, 99_500.0);
     assert!(telemetry.gc_collections >= 1);
 }
+
+// ---- Objects, shapes and dictionary mode on the arena --------------------
+
+/// Far more live objects than the old 512-object table held.
+#[test]
+fn ten_thousand_objects_live_on_the_arena() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "const a = []; let i = 0; \
+                  while (i < 10000) { a.push({v: i}); i = i + 1; } \
+                  let r = a[9999].v + a[0].v + a.length; r;";
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, source).expect("runs");
+    assert_eq!(value, 19_999.0);
+}
+
+/// One object with a thousand properties. Past the 64-property threshold the
+/// object drops its shared shape and keeps its own key map (dictionary mode),
+/// so every property stays readable with no fixed cap.
+#[test]
+fn many_properties_on_one_object_in_dictionary_mode() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Far more than the old 64-property shape cap, so the object is in
+    // dictionary mode with its own growable key map. Written as separate
+    // statements, which reuse registers, to stay well inside the compiler's
+    // per-function register and token budgets.
+    let mut source = String::from("const o = {};");
+    for i in 0..150 {
+        source.push_str(&format!(" o.p{i} = {i};"));
+    }
+    source.push_str(" o.p149 + o.p75 + o.p0;");
+    let (value, _) =
+        anvil_script::eval_cpp_vm_request_configured(5_000_000, &source).expect("runs");
+    assert_eq!(value, 224.0);
+}
+
+/// Crossing the threshold must not lose or reorder the properties written
+/// before the switch: a property set in shape mode reads back after the object
+/// has gone to dictionary mode, and an update in dictionary mode sticks.
+#[test]
+fn properties_survive_the_switch_to_dictionary_mode() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::from("const o = {}; o.first = 7;");
+    for i in 0..200 {
+        source.push_str(&format!(" o.q{i} = {i};"));
+    }
+    // Update an early (shape-mode) property while in dictionary mode.
+    source.push_str(" o.first = 70; o.first + o.q0 + o.q199;");
+    let (value, _) =
+        anvil_script::eval_cpp_vm_request_configured(5_000_000, &source).expect("runs");
+    assert_eq!(value, 269.0);
+}
+
+/// GC keeps the object a global still points at, with all its properties, and
+/// reclaims the objects churned each iteration, across many collections under a
+/// tight byte budget.
+#[test]
+fn gc_keeps_a_reachable_object_through_churn() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "const keep = {a: 11, b: 22, c: 33}; let i = 0; \
+                  while (i < 4000) { const junk = {x: i, y: i, z: i}; junk.x = i; i = i + 1; } \
+                  let r = keep.a + keep.b + keep.c; r;";
+    let (value, telemetry) =
+        anvil_script::eval_cpp_vm_request_tuned(5_000_000, 64 * 1024, source).expect("runs");
+    assert_eq!(value, 66.0);
+    assert!(telemetry.gc_collections >= 1);
+}
+
+/// A tiny heap budget stops object growth with the heap limit, naming the
+/// budget, instead of any fixed object cap.
+#[test]
+fn a_small_budget_stops_object_growth() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "const a = []; let i = 0; \
+                  while (i < 100000) { a.push({v: i}); i = i + 1; } 1;";
+    let error = anvil_script::eval_cpp_vm_request_heap_budget(32 * 1024, source).unwrap_err();
+    assert_eq!(error.message, "heap limit reached: 32768 bytes");
+}

@@ -24,6 +24,10 @@ namespace {
 constexpr u32 INIT_STR_POOL_BYTES = 1024u;
 constexpr u32 INIT_STR_TABLE = 64u;
 constexpr u32 INIT_ARRAY_TABLE = 16u;
+constexpr u32 INIT_SHAPE_TABLE = 16u;
+constexpr u32 INIT_TRANSITION_TABLE = 16u;
+constexpr u32 INIT_OBJECT_TABLE = 16u;
+constexpr u32 INIT_OBJECT_SLOTS = 4u;
 } // namespace
 
 bool AnvilHeap::ensure_string_bytes(u32 need) noexcept {
@@ -97,35 +101,25 @@ void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
     ensure_string_bytes(INIT_STR_POOL_BYTES);
     ensure_string_table(INIT_STR_TABLE);
 
-    // Shape 0 is the empty root hidden class.
-    shape_count = 1u;
-    shapes[0].id = 0u;
-    shapes[0].parent_shape = 0u;
-    shapes[0].prop_count = 0u;
-    for (u32 j = 0; j < MAX_SHAPE_PROPS; ++j) {
-        shapes[0].prop_syms[j] = 0u;
-    }
-    for (u32 i = 1; i < MAX_SHAPES; ++i) {
-        shapes[i].id = i;
-        shapes[i].parent_shape = 0u;
-        shapes[i].prop_count = 0u;
-    }
-
+    shapes_off = 0u;
+    shapes_cap = 0u;
+    shape_count = 0u;
+    transitions_off = 0u;
+    transitions_cap = 0u;
     transition_count = 0u;
-    for (u32 i = 0; i < MAX_SHAPE_TRANSITIONS; ++i) {
-        transitions[i].from_shape = 0u;
-        transitions[i].prop_sym = 0u;
-        transitions[i].to_shape = 0u;
-    }
-
-    for (u32 i = 0; i < MAX_HEAP_OBJECTS; ++i) {
-        objects[i].active = false;
-        objects[i].marked = false;
-        objects[i].shape_id = 0u;
-        objects[i].proto_obj_id = 0xFFFFFFFFu;
-        for (u32 s = 0; s < MAX_SHAPE_PROPS; ++s) {
-            objects[i].slots[s] = AnvilValue::make_undefined();
-        }
+    objects_off = 0u;
+    objects_cap = 0u;
+    object_count = 0u;
+    ensure_shapes(INIT_SHAPE_TABLE);
+    ensure_transitions(INIT_TRANSITION_TABLE);
+    ensure_objects(INIT_OBJECT_TABLE);
+    // Shape 0 is the empty root hidden class.
+    if (shapes_cap > 0u) {
+        shape_count = 1u;
+        AnvilShape& root = shapes()[0];
+        root.id = 0u;
+        root.parent_shape = 0u;
+        root.prop_count = 0u;
     }
 
     arrays_off = 0u;
@@ -244,69 +238,182 @@ bool AnvilHeap::string_equals(u32 sym_a, u32 sym_b) const noexcept {
     return bytes_equal(&string_bytes()[a.offset], &string_bytes()[b.offset], a.length);
 }
 
+bool AnvilHeap::ensure_shapes(u32 need) noexcept {
+    if (need <= shapes_cap) {
+        return true;
+    }
+    u32 new_cap = shapes_cap == 0u ? INIT_SHAPE_TABLE : shapes_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilShape)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilShape* dst = reinterpret_cast<AnvilShape*>(arena.at(new_off));
+    const AnvilShape* src = shapes();
+    for (u32 i = 0u; i < shape_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = shapes_off;
+    const u32 old_cap = shapes_cap;
+    shapes_off = new_off;
+    shapes_cap = new_cap;
+    if (old_cap != 0u) {
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilShape)));
+    }
+    return true;
+}
+
+bool AnvilHeap::ensure_transitions(u32 need) noexcept {
+    if (need <= transitions_cap) {
+        return true;
+    }
+    u32 new_cap = transitions_cap == 0u ? INIT_TRANSITION_TABLE : transitions_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilShapeTransition)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilShapeTransition* dst = reinterpret_cast<AnvilShapeTransition*>(arena.at(new_off));
+    const AnvilShapeTransition* src = transitions();
+    for (u32 i = 0u; i < transition_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = transitions_off;
+    const u32 old_cap = transitions_cap;
+    transitions_off = new_off;
+    transitions_cap = new_cap;
+    if (old_cap != 0u) {
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilShapeTransition)));
+    }
+    return true;
+}
+
+bool AnvilHeap::ensure_objects(u32 need) noexcept {
+    if (need <= objects_cap) {
+        return true;
+    }
+    u32 new_cap = objects_cap == 0u ? INIT_OBJECT_TABLE : objects_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilHeapObject)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilHeapObject* dst = reinterpret_cast<AnvilHeapObject*>(arena.at(new_off));
+    const AnvilHeapObject* src = objects();
+    for (u32 i = 0u; i < object_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = objects_off;
+    const u32 old_cap = objects_cap;
+    objects_off = new_off;
+    objects_cap = new_cap;
+    if (old_cap != 0u) {
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapObject)));
+    }
+    return true;
+}
+
 i32 AnvilHeap::lookup_shape_slot(u32 shape_id, u32 prop_sym) const noexcept {
     if (shape_id >= shape_count) {
         return -1;
     }
-    return shapes[shape_id].find_slot(prop_sym);
+    return shapes()[shape_id].find_slot(prop_sym);
 }
 
 u32 AnvilHeap::transition_shape(u32 current_shape, u32 prop_sym) noexcept {
     if (current_shape >= shape_count) {
         return 0u;
     }
-    // Check if property already exists in current shape.
-    if (shapes[current_shape].find_slot(prop_sym) >= 0) {
+    if (shapes()[current_shape].find_slot(prop_sym) >= 0) {
         return current_shape;
     }
-    // Check existing transition edge (current_shape, prop_sym) -> to_shape.
     for (u32 i = 0; i < transition_count; ++i) {
-        if (transitions[i].from_shape == current_shape && transitions[i].prop_sym == prop_sym) {
-            return transitions[i].to_shape;
+        if (transitions()[i].from_shape == current_shape && transitions()[i].prop_sym == prop_sym) {
+            return transitions()[i].to_shape;
         }
     }
-    // Allocate a new hidden class with all properties of `current_shape` + `prop_sym`.
-    const AnvilShape& parent = shapes[current_shape];
-    if (parent.prop_count >= MAX_SHAPE_PROPS || shape_count >= MAX_SHAPES) {
+    // A shape never holds more than the dictionary threshold; past that the
+    // caller puts the object into dictionary mode instead of transitioning.
+    if (shapes()[current_shape].prop_count >= DICT_THRESHOLD) {
+        return current_shape;
+    }
+    // Copy the parent's keys out before growing, since a grow moves the table.
+    u32 parent_count = shapes()[current_shape].prop_count;
+    u32 parent_syms[DICT_THRESHOLD];
+    for (u32 i = 0; i < parent_count; ++i) {
+        parent_syms[i] = shapes()[current_shape].prop_syms[i];
+    }
+    if (!ensure_shapes(shape_count + 1u)) {
         return current_shape;
     }
     const u32 next_id = shape_count++;
-    AnvilShape& child = shapes[next_id];
+    AnvilShape& child = shapes()[next_id];
     child.id = next_id;
     child.parent_shape = current_shape;
-    child.prop_count = parent.prop_count + 1u;
-    for (u32 i = 0; i < parent.prop_count; ++i) {
-        child.prop_syms[i] = parent.prop_syms[i];
+    child.prop_count = parent_count + 1u;
+    for (u32 i = 0; i < parent_count; ++i) {
+        child.prop_syms[i] = parent_syms[i];
     }
-    child.prop_syms[parent.prop_count] = prop_sym;
+    child.prop_syms[parent_count] = prop_sym;
 
-    if (transition_count < MAX_SHAPE_TRANSITIONS) {
-        transitions[transition_count].from_shape = current_shape;
-        transitions[transition_count].prop_sym = prop_sym;
-        transitions[transition_count].to_shape = next_id;
+    if (ensure_transitions(transition_count + 1u)) {
+        AnvilShapeTransition& t = transitions()[transition_count];
+        t.from_shape = current_shape;
+        t.prop_sym = prop_sym;
+        t.to_shape = next_id;
         ++transition_count;
     }
     ++shape_transitions_count;
-    bytes_allocated += sizeof(AnvilShape);
+    bytes_allocated += static_cast<u32>(sizeof(AnvilShape));
     return next_id;
 }
 
 u32 AnvilHeap::alloc_object(u32 initial_shape) noexcept {
-    for (u32 i = 0; i < MAX_HEAP_OBJECTS; ++i) {
-        if (!objects[i].active) {
-            objects[i].active = true;
-            objects[i].marked = false;
-            objects[i].shape_id = initial_shape < shape_count ? initial_shape : 0u;
-            objects[i].proto_obj_id = 0xFFFFFFFFu;
-            for (u32 s = 0; s < MAX_SHAPE_PROPS; ++s) {
-                objects[i].slots[s] = AnvilValue::make_undefined();
-            }
-            ++live_objects;
-            bytes_allocated += sizeof(AnvilHeapObject);
-            return i;
+    bool over = false;
+    const u32 slots_off = arena.alloc(INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(AnvilValue)), &over);
+    if (slots_off == NO_SLOT) {
+        return NO_SLOT;
+    }
+    u32 id = NO_SLOT;
+    for (u32 i = 0; i < object_count; ++i) {
+        if (!objects()[i].active) {
+            id = i;
+            break;
         }
     }
-    return NO_SLOT;
+    if (id == NO_SLOT) {
+        if (!ensure_objects(object_count + 1u)) {
+            arena.free(slots_off, INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(AnvilValue)));
+            return NO_SLOT;
+        }
+        id = object_count++;
+    }
+    AnvilValue* slots = object_slots(slots_off);
+    for (u32 s = 0; s < INIT_OBJECT_SLOTS; ++s) {
+        slots[s] = AnvilValue::make_undefined();
+    }
+    AnvilHeapObject& obj = objects()[id];
+    obj.active = true;
+    obj.marked = false;
+    obj.dict = false;
+    obj.shape_id = initial_shape < shape_count ? initial_shape : 0u;
+    obj.proto_obj_id = 0xFFFFFFFFu;
+    obj.prop_count = obj.shape_id < shape_count ? shapes()[obj.shape_id].prop_count : 0u;
+    obj.slots_off = slots_off;
+    obj.slots_cap = INIT_OBJECT_SLOTS;
+    obj.dict_keys_off = NO_SLOT;
+    ++live_objects;
+    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapObject));
+    return id;
 }
 
 bool AnvilHeap::ensure_arrays(u32 need) noexcept {
@@ -397,41 +504,153 @@ u32 AnvilHeap::alloc_function(
     return id;
 }
 
+// Find a property on one object, in whichever mode it is in. Returns the value
+// and true when present. A dictionary object scans its own key map; a shape
+// object consults its hidden class.
+static bool find_own_prop(const AnvilHeap& heap, const AnvilHeapObject& obj, u32 prop_sym,
+                          AnvilValue* out) noexcept {
+    if (obj.dict) {
+        const u32* keys = heap.object_keys(obj.dict_keys_off);
+        const AnvilValue* slots = heap.object_slots(obj.slots_off);
+        for (u32 i = 0; i < obj.prop_count; ++i) {
+            if (keys[i] == prop_sym) {
+                *out = slots[i];
+                return true;
+            }
+        }
+        return false;
+    }
+    const i32 slot = heap.lookup_shape_slot(obj.shape_id, prop_sym);
+    if (slot >= 0 && static_cast<u32>(slot) < obj.slots_cap) {
+        *out = heap.object_slots(obj.slots_off)[slot];
+        return true;
+    }
+    return false;
+}
+
 AnvilValue AnvilHeap::get_object_prop(
     u32 obj_id,
     u32 prop_sym,
     u32* out_shape,
     i32* out_slot
 ) const noexcept {
-    if (obj_id >= MAX_HEAP_OBJECTS || !objects[obj_id].active) {
+    if (obj_id >= object_count || !objects()[obj_id].active) {
         if (out_slot) {
             *out_slot = -1;
         }
         return AnvilValue::make_undefined();
     }
-    const AnvilHeapObject& obj = objects[obj_id];
+    const AnvilHeapObject& obj = objects()[obj_id];
     if (out_shape) {
         *out_shape = obj.shape_id;
     }
-    const i32 slot = lookup_shape_slot(obj.shape_id, prop_sym);
-    if (out_slot) {
-        *out_slot = slot;
+    // A dictionary object is never cached: its slot layout is its own, so a
+    // stub keyed on its (sentinel) shape would mislead other objects.
+    if (obj.dict) {
+        if (out_slot) {
+            *out_slot = -1;
+        }
+    } else {
+        const i32 slot = lookup_shape_slot(obj.shape_id, prop_sym);
+        if (out_slot) {
+            *out_slot = slot;
+        }
     }
-    if (slot >= 0 && static_cast<u32>(slot) < MAX_SHAPE_PROPS) {
-        return obj.slots[slot];
+    AnvilValue found;
+    if (find_own_prop(*this, obj, prop_sym, &found)) {
+        return found;
     }
     // Check prototype chain (up to 4 hops to avoid cycles).
     u32 proto = obj.proto_obj_id;
     u32 hops = 0u;
-    while (proto < MAX_HEAP_OBJECTS && objects[proto].active && hops < 4u) {
-        const i32 pslot = lookup_shape_slot(objects[proto].shape_id, prop_sym);
-        if (pslot >= 0 && static_cast<u32>(pslot) < MAX_SHAPE_PROPS) {
-            return objects[proto].slots[pslot];
+    while (proto < object_count && objects()[proto].active && hops < 4u) {
+        if (find_own_prop(*this, objects()[proto], prop_sym, &found)) {
+            return found;
         }
-        proto = objects[proto].proto_obj_id;
+        proto = objects()[proto].proto_obj_id;
         ++hops;
     }
     return AnvilValue::make_undefined();
+}
+
+// Grow an object's slot block (and, in dictionary mode, its key block) to hold
+// at least `need` entries. Both blocks grow together so key i always lines up
+// with slot i. False on heap limit.
+bool AnvilHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
+    if (need <= objects()[obj_id].slots_cap) {
+        return true;
+    }
+    u32 new_cap = objects()[obj_id].slots_cap == 0u ? INIT_OBJECT_SLOTS : objects()[obj_id].slots_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    const bool dict = objects()[obj_id].dict;
+    bool over = false;
+    const u32 new_slots = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    if (new_slots == NO_SLOT) {
+        return false;
+    }
+    u32 new_keys = NO_SLOT;
+    if (dict) {
+        new_keys = arena.alloc(new_cap * static_cast<u32>(sizeof(u32)), &over);
+        if (new_keys == NO_SLOT) {
+            arena.free(new_slots, new_cap * static_cast<u32>(sizeof(AnvilValue)));
+            return false;
+        }
+    }
+    AnvilHeapObject& obj = objects()[obj_id];
+    const u32 pc = obj.prop_count;
+    AnvilValue* sdst = object_slots(new_slots);
+    const AnvilValue* ssrc = object_slots(obj.slots_off);
+    for (u32 i = 0; i < new_cap; ++i) {
+        sdst[i] = (i < pc) ? ssrc[i] : AnvilValue::make_undefined();
+    }
+    const u32 old_slots = obj.slots_off;
+    const u32 old_cap = obj.slots_cap;
+    obj.slots_off = new_slots;
+    obj.slots_cap = new_cap;
+    arena.free(old_slots, old_cap * static_cast<u32>(sizeof(AnvilValue)));
+    if (dict) {
+        u32* kdst = object_keys(new_keys);
+        const u32* ksrc = object_keys(obj.dict_keys_off);
+        for (u32 i = 0; i < new_cap; ++i) {
+            kdst[i] = (i < pc) ? ksrc[i] : 0u;
+        }
+        const u32 old_keys = obj.dict_keys_off;
+        obj.dict_keys_off = new_keys;
+        arena.free(old_keys, old_cap * static_cast<u32>(sizeof(u32)));
+    }
+    return true;
+}
+
+// Switch an object to dictionary mode: give it its own key map, seeded from the
+// shared shape's property order, and drop the shared shape. False on heap limit.
+bool AnvilHeap::convert_object_to_dict(u32 obj_id) noexcept {
+    if (objects()[obj_id].dict) {
+        return true;
+    }
+    const u32 cap = objects()[obj_id].slots_cap;
+    bool over = false;
+    const u32 keys_off = arena.alloc(cap * static_cast<u32>(sizeof(u32)), &over);
+    if (keys_off == NO_SLOT) {
+        return false;
+    }
+    AnvilHeapObject& obj = objects()[obj_id];
+    u32* keys = object_keys(keys_off);
+    for (u32 i = 0; i < cap; ++i) {
+        keys[i] = 0u;
+    }
+    if (obj.shape_id < shape_count) {
+        const AnvilShape& sh = shapes()[obj.shape_id];
+        const u32 n = sh.prop_count < obj.prop_count ? sh.prop_count : obj.prop_count;
+        for (u32 i = 0; i < n; ++i) {
+            keys[i] = sh.prop_syms[i];
+        }
+    }
+    obj.dict = true;
+    obj.shape_id = DICT_SHAPE;
+    obj.dict_keys_off = keys_off;
+    return true;
 }
 
 StoreResult AnvilHeap::set_object_prop(
@@ -441,34 +660,92 @@ StoreResult AnvilHeap::set_object_prop(
     u32* out_shape,
     i32* out_slot
 ) noexcept {
-    if (obj_id >= MAX_HEAP_OBJECTS || !objects[obj_id].active) {
+    if (obj_id >= object_count || !objects()[obj_id].active) {
         if (out_slot) {
             *out_slot = -1;
         }
         return StoreResult::NotStored;
     }
-    AnvilHeapObject& obj = objects[obj_id];
-    i32 slot = lookup_shape_slot(obj.shape_id, prop_sym);
-    StoreResult full = StoreResult::NotStored;
-    if (slot < 0) {
-        const bool props_full =
-            obj.shape_id < shape_count && shapes[obj.shape_id].prop_count >= MAX_SHAPE_PROPS;
-        full = props_full ? StoreResult::TooManyProperties : StoreResult::ShapesFull;
-        const u32 new_shape = transition_shape(obj.shape_id, prop_sym);
-        obj.shape_id = new_shape;
-        slot = lookup_shape_slot(new_shape, prop_sym);
+    // Dictionary mode: find in, or append to, the object's own key map. Never
+    // cached, so the slot is reported as -1.
+    if (objects()[obj_id].dict) {
+        if (out_shape) {
+            *out_shape = DICT_SHAPE;
+        }
+        if (out_slot) {
+            *out_slot = -1;
+        }
+        const u32 pc = objects()[obj_id].prop_count;
+        u32* keys = object_keys(objects()[obj_id].dict_keys_off);
+        AnvilValue* slots = object_slots(objects()[obj_id].slots_off);
+        for (u32 i = 0; i < pc; ++i) {
+            if (keys[i] == prop_sym) {
+                slots[i] = val;
+                return StoreResult::Ok;
+            }
+        }
+        if (!ensure_object_slots(obj_id, pc + 1u)) {
+            return StoreResult::HeapFull;
+        }
+        AnvilHeapObject& obj = objects()[obj_id];
+        object_keys(obj.dict_keys_off)[pc] = prop_sym;
+        object_slots(obj.slots_off)[pc] = val;
+        obj.prop_count = pc + 1u;
+        return StoreResult::Ok;
     }
+    // Shape mode: an existing property writes in place.
+    {
+        const u32 cur_shape = objects()[obj_id].shape_id;
+        const i32 slot = lookup_shape_slot(cur_shape, prop_sym);
+        if (slot >= 0 && static_cast<u32>(slot) < objects()[obj_id].slots_cap) {
+            object_slots(objects()[obj_id].slots_off)[slot] = val;
+            if (out_shape) {
+                *out_shape = cur_shape;
+            }
+            if (out_slot) {
+                *out_slot = slot;
+            }
+            return StoreResult::Ok;
+        }
+    }
+    // A new property. At the threshold, switch to dictionary mode and retry;
+    // otherwise transition to a child shape and write the new slot.
+    if (objects()[obj_id].shape_id < shape_count &&
+        shapes()[objects()[obj_id].shape_id].prop_count >= DICT_THRESHOLD) {
+        if (!convert_object_to_dict(obj_id)) {
+            if (out_slot) {
+                *out_slot = -1;
+            }
+            return StoreResult::HeapFull;
+        }
+        return set_object_prop(obj_id, prop_sym, val, out_shape, out_slot);
+    }
+    const u32 cur_shape = objects()[obj_id].shape_id;
+    const u32 new_shape = transition_shape(cur_shape, prop_sym);
+    const i32 slot = lookup_shape_slot(new_shape, prop_sym);
+    if (slot < 0) {
+        if (out_slot) {
+            *out_slot = -1;
+        }
+        return StoreResult::HeapFull;
+    }
+    if (!ensure_object_slots(obj_id, static_cast<u32>(slot) + 1u)) {
+        if (out_slot) {
+            *out_slot = -1;
+        }
+        return StoreResult::HeapFull;
+    }
+    AnvilHeapObject& obj = objects()[obj_id];
+    obj.shape_id = new_shape;
+    obj.prop_count = shapes()[new_shape].prop_count;
+    object_slots(obj.slots_off)[slot] = val;
     if (out_shape) {
-        *out_shape = obj.shape_id;
+        *out_shape = new_shape;
     }
     if (out_slot) {
         *out_slot = slot;
     }
-    if (slot >= 0 && static_cast<u32>(slot) < MAX_SHAPE_PROPS) {
-        obj.slots[slot] = val;
-        return StoreResult::Ok;
-    }
-    return full;
+    return StoreResult::Ok;
 }
 
 AnvilValue AnvilHeap::get_array_elem(u32 arr_id, i32 index) const noexcept {
@@ -553,17 +830,18 @@ void AnvilHeap::mark_value(AnvilValue v) noexcept {
 }
 
 void AnvilHeap::mark_object(u32 obj_id) noexcept {
-    if (obj_id >= MAX_HEAP_OBJECTS || !objects[obj_id].active || objects[obj_id].marked) {
+    if (obj_id >= object_count || !objects()[obj_id].active || objects()[obj_id].marked) {
         return;
     }
-    AnvilHeapObject& obj = objects[obj_id];
-    obj.marked = true;
-    const u32 count = obj.shape_id < shape_count ? shapes[obj.shape_id].prop_count : 0u;
+    objects()[obj_id].marked = true;
+    const u32 count = objects()[obj_id].prop_count;
+    const u32 slots_off = objects()[obj_id].slots_off;
     for (u32 i = 0; i < count; ++i) {
-        mark_value(obj.slots[i]);
+        mark_value(object_slots(slots_off)[i]);
     }
-    if (obj.proto_obj_id < MAX_HEAP_OBJECTS) {
-        mark_object(obj.proto_obj_id);
+    const u32 proto = objects()[obj_id].proto_obj_id;
+    if (proto < object_count) {
+        mark_object(proto);
     }
 }
 
@@ -581,20 +859,30 @@ void AnvilHeap::mark_array(u32 arr_id) noexcept {
 }
 u32 AnvilHeap::sweep_unmarked() noexcept {
     u32 reclaimed = 0u;
-    for (u32 i = 0; i < MAX_HEAP_OBJECTS; ++i) {
-        if (objects[i].active) {
-            if (!objects[i].marked) {
-                objects[i].active = false;
-                objects[i].shape_id = 0u;
+    for (u32 i = 0; i < object_count; ++i) {
+        AnvilHeapObject& obj = objects()[i];
+        if (obj.active) {
+            if (!obj.marked) {
+                arena.free(obj.slots_off, obj.slots_cap * static_cast<u32>(sizeof(AnvilValue)));
+                if (obj.dict && obj.dict_keys_off != NO_SLOT) {
+                    arena.free(obj.dict_keys_off, obj.slots_cap * static_cast<u32>(sizeof(u32)));
+                }
+                obj.active = false;
+                obj.dict = false;
+                obj.shape_id = 0u;
+                obj.prop_count = 0u;
+                obj.slots_off = NO_SLOT;
+                obj.slots_cap = 0u;
+                obj.dict_keys_off = NO_SLOT;
                 if (live_objects > 0u) {
                     --live_objects;
                 }
                 if (bytes_allocated >= sizeof(AnvilHeapObject)) {
-                    bytes_allocated -= sizeof(AnvilHeapObject);
+                    bytes_allocated -= static_cast<u32>(sizeof(AnvilHeapObject));
                 }
                 ++reclaimed;
             } else {
-                objects[i].marked = false;
+                obj.marked = false;
             }
         }
     }
@@ -625,8 +913,8 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
 
 
 void AnvilHeap::clear_marks() noexcept {
-    for (u32 i = 0; i < MAX_HEAP_OBJECTS; ++i) {
-        objects[i].marked = false;
+    for (u32 i = 0; i < object_count; ++i) {
+        objects()[i].marked = false;
     }
     for (u32 i = 0; i < array_count; ++i) {
         arrays()[i].marked = false;

@@ -130,7 +130,7 @@ fn run_limits_stop_with_a_reason() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let cases: [(&str, u32, &str); 5] = [
+    let cases: [(&str, u32, &str); 3] = [
         (
             // Numeric, so the native loop counts the steps.
             "let i = 0; while (i < 1000000) { i = i + 1; } i;",
@@ -147,20 +147,6 @@ fn run_limits_stop_with_a_reason() {
             2,
             "call depth limit reached: 63 nested calls",
         ),
-        (
-            "let head = null; let i = 0; while (i < 600) { head = {next: head}; i = i + 1; } 1;",
-            3,
-            "object limit reached: 512 live objects",
-        ),
-        (
-            "let i = 0; while (i < 512) { let o = {}; \
-             if (i & 1) { o.a = 1; } if (i & 2) { o.b = 1; } if (i & 4) { o.c = 1; } \
-             if (i & 8) { o.d = 1; } if (i & 16) { o.e = 1; } if (i & 32) { o.f = 1; } \
-             if (i & 64) { o.g = 1; } if (i & 128) { o.h = 1; } if (i & 256) { o.k = 1; } \
-             i = i + 1; } 1;",
-            9,
-            "shape limit reached: 256 shapes",
-        ),
     ];
     for (source, code, message) in cases {
         let error = vm_error(source);
@@ -171,17 +157,6 @@ fn run_limits_stop_with_a_reason() {
         );
         assert!(error.is_limit() && !error.refused(), "{source}");
     }
-    let mut props = String::from("let o = {};");
-    for i in 0..33 {
-        props.push_str(&format!(" o.p{i} = {i};"));
-    }
-    props.push_str(" 1;");
-    let error = vm_error(&props);
-    assert_eq!(error.code, 8);
-    assert_eq!(
-        error.message,
-        "property limit reached: 32 properties per object"
-    );
 }
 
 #[test]
