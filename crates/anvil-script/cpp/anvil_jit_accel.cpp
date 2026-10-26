@@ -215,6 +215,7 @@ void AnvilVmContext::init() noexcept {
     paused = false;
     resume_pc = 0u;
     resume_reg_base = 0u;
+    resume_frame_regs = 0u;
     steps_executed = 0u;
     hot_loops_accelerated = 0u;
     native_compilations = 0u;
@@ -360,16 +361,20 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
     }
 
     frame_count = 0u;
-    return run_loop(entry_pc, 0u);
+    const u32 top_regs = program.top_frame_regs != 0u ? program.top_frame_regs : 1u;
+    return run_loop(entry_pc, 0u, top_regs);
 }
 
 AnvilValue AnvilVmContext::resume() noexcept {
     paused = false;
-    return run_loop(resume_pc, resume_reg_base);
+    return run_loop(resume_pc, resume_reg_base, resume_frame_regs);
 }
 
-AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
+AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexcept {
     const u32 step_limit_now = effective_step_limit();
+    // Registers the running function owns: the base advances by this on a call
+    // and back on a return, so frames take only the space each function needs.
+    u32 cur_frame_regs = frame_regs;
     u32 slice = 0u;
     while (pc < program.code_len) {
         // Pause at a yield boundary: save where to continue and hand control
@@ -379,6 +384,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
             paused = true;
             resume_pc = pc;
             resume_reg_base = reg_base;
+            resume_frame_regs = cur_frame_regs;
             return AnvilValue::make_undefined();
         }
         ++slice;
@@ -608,7 +614,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                 u32 obj_id = heap.alloc_object(0u);
                 if (obj_id == NO_SLOT) {
                     // Reclaim dead objects, then try once more.
-                    collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
+                    collect_garbage(reg_base + cur_frame_regs);
                     obj_id = heap.alloc_object(0u);
                 }
                 if (obj_id == NO_SLOT) {
@@ -623,7 +629,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                 u32 arr_id = heap.alloc_array(inst.b);
                 if (arr_id == NO_SLOT) {
                     // Reclaim dead arrays and old slices, then try once more.
-                    reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
+                    reclaim_array_storage(reg_base + cur_frame_regs);
                     arr_id = heap.alloc_array(inst.b);
                 }
                 if (arr_id == NO_SLOT) {
@@ -676,7 +682,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                 {
                     StoreResult stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
                     if (stored == StoreResult::HeapFull) {
-                        reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
+                        reclaim_array_storage(reg_base + cur_frame_regs);
                         stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
                     }
                     if (!store_ok(stored)) {
@@ -695,7 +701,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                 {
                     StoreResult stored = heap.push_array_elem(recv.payload(), R[inst.b]);
                     if (stored == StoreResult::HeapFull) {
-                        reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
+                        reclaim_array_storage(reg_base + cur_frame_regs);
                         stored = heap.push_array_elem(recv.payload(), R[inst.b]);
                     }
                     if (!store_ok(stored)) {
@@ -716,13 +722,22 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                     return AnvilValue::make_undefined();
                 }
                 const AnvilHeapFunction& fn = heap.functions()[fn_id];
-                if (static_cast<u32>(inst.c) + fn.arity > MAX_REGISTERS_PER_FRAME) {
+                if (static_cast<u32>(inst.c) + fn.arity > cur_frame_regs) {
                     fail(VM_STOP_UNSUPPORTED, "call arguments outside the caller's registers");
                     return AnvilValue::make_undefined();
                 }
-                const u32 next_base = reg_base + MAX_REGISTERS_PER_FRAME;
+                // The callee's window is its own register high-water, at least
+                // its parameter count and at least one slot.
+                u32 callee_regs = fn.local_count;
+                if (callee_regs < fn.arity) {
+                    callee_regs = fn.arity;
+                }
+                if (callee_regs == 0u) {
+                    callee_regs = 1u;
+                }
+                const u32 next_base = reg_base + cur_frame_regs;
                 // Grow the register and frame stacks for the callee before use.
-                if (!ensure_registers(next_base + MAX_REGISTERS_PER_FRAME) ||
+                if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
                     return AnvilValue::make_undefined();
@@ -731,8 +746,10 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = regs[reg_base + inst.c + a_idx];
                 }
-                frames()[frame_count++] = AnvilCallFrame{fn_id, pc, reg_base, inst.a};
+                frames()[frame_count++] =
+                    AnvilCallFrame{fn_id, pc, reg_base, cur_frame_regs, static_cast<u8>(inst.a)};
                 reg_base = next_base;
+                cur_frame_regs = callee_regs;
                 pc = fn.code_start;
                 break;
             }
@@ -768,6 +785,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
                 }
                 const AnvilCallFrame caller = frames()[--frame_count];
                 reg_base = caller.reg_base;
+                cur_frame_regs = caller.caller_frame_regs;
                 pc = caller.return_pc;
                 registers()[reg_base + caller.dst_reg] = ret_val;
                 break;

@@ -1842,6 +1842,8 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
         }
         last_reg = g_compiler.compile_statement();
     }
+    // The top-level code's register high-water is the first frame's size.
+    ctx.program.top_frame_regs = g_compiler.high_reg;
     ctx.program.emit(AnvilInstruction::make_abc(AnvilOpcode::Halt, last_reg, 0u, 0u));
     if (!ctx.program.compile_ok) {
         if (ctx.program.overflow == VM_REFUSE_CONSTANTS) {

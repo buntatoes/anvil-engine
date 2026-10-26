@@ -983,6 +983,10 @@ struct AnvilCallFrame {
     u32 fn_id;
     u32 return_pc;
     u32 reg_base;
+    // The caller's register-window size, so Return restores the stride the
+    // caller ran with. Frames are no longer a fixed stride apart: each function
+    // advances the register base by its own register count.
+    u32 caller_frame_regs;
     u8 dst_reg;
 };
 
@@ -992,6 +996,9 @@ struct AnvilBytecodeProgram {
     u32 code_off;
     u32 code_cap;
     u32 code_len;
+    // Registers the top-level code uses, so execution knows the first frame's
+    // size (each function's own size is kept with the function).
+    u32 top_frame_regs;
     // The constant pool grows in the shared arena; `arena` points at it, set by
     // init() each run (like the heap's own base pointer).
     AnvilArena* arena;
@@ -1053,6 +1060,7 @@ struct AnvilBytecodeProgram {
         code_off = 0u;
         code_cap = 0u;
         code_len = 0u;
+        top_frame_regs = 0u;
         constants_off = 0u;
         constants_cap = 0u;
         const_len = 0u;
@@ -1195,6 +1203,7 @@ struct AnvilVmContext {
     bool paused;
     u32 resume_pc;
     u32 resume_reg_base;
+    u32 resume_frame_regs;
 
     // Steps this run may take before it stops: the configured budget, or the
     // built-in default when none was set.
@@ -1258,7 +1267,7 @@ struct AnvilVmContext {
     AnvilValue resume() noexcept;
     // The shared instruction loop, entered fresh by execute() and continued by
     // resume(). Returns the result, or undefined when it pauses at a yield.
-    AnvilValue run_loop(u32 pc, u32 reg_base) noexcept;
+    AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
     void fill_exports(AnvilVmTelemetryC* out) const noexcept;
 };

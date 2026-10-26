@@ -646,3 +646,31 @@ fn more_than_512_constants_compile() {
         .expect("more than 512 constants compile and run");
     assert_eq!(value, expected);
 }
+
+// ---- Dynamic per-function frame stride -----------------------------------
+
+/// Each frame takes only the registers its function needs (a dynamic stride),
+/// so a wide-frame function and a narrow one compose correctly across a call,
+/// and a deep recursion restores each caller's window. Before this the stride
+/// was a fixed 64 registers per frame.
+#[test]
+fn dynamic_frame_stride_composes_across_calls() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let wide = "function narrow(x) { return x + x; }
+                function wide(n) {
+                    let a = n + 1; let b = a + 1; let c = b + 1; let d = c + 1;
+                    let e = d + 1; let f = e + 1; let g = f + 1; let h = g + 1;
+                    return narrow(a + b + c + d + e + f + g + h);
+                }
+                wide(0);";
+    let (value, _) =
+        anvil_script::eval_cpp_vm_request_configured(5_000_000, wide).expect("wide/narrow compose");
+    assert_eq!(value, 72.0);
+
+    let deep = "function rec(n) { let a = n; let b = a + 1; if (n <= 0) { return 0; } return rec(n - 1) + 1; } rec(9000);";
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, deep)
+        .expect("deep multi-local recursion");
+    assert_eq!(value, 9000.0);
+}
