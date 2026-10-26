@@ -270,7 +270,7 @@ pub fn convert_nv12_to_rgba_bt709(
             width,
             height,
         );
-        return out;
+        out
     }
     #[cfg(not(anvil_cpp_accel))]
     {
@@ -437,9 +437,9 @@ fn font_fingerprint(font: &TtfFont) -> u64 {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    h ^= u64::from(font.units_per_em) << 32 | u64::from(font.line_gap as u16);
+    h ^= (u64::from(font.units_per_em) << 32) | u64::from(font.line_gap as u16);
     h = h.wrapping_mul(0x0100_0000_01b3);
-    h ^= (font.ascender as u16 as u64) << 16 | (font.descender as u16 as u64);
+    h ^= ((font.ascender as u16 as u64) << 16) | (font.descender as u16 as u64);
     h
 }
 
@@ -903,7 +903,6 @@ impl Framebuffer {
                 color.b,
                 color.a,
             );
-            return;
         }
         #[cfg(not(anvil_cpp_accel))]
         self.fill_span_cpu(x0, y0, x1, y1, color);
@@ -1085,7 +1084,6 @@ impl Framebuffer {
                 border_color.b,
                 border_color.a,
             );
-            return;
         }
         #[cfg(not(anvil_cpp_accel))]
         {
@@ -1229,7 +1227,6 @@ impl Framebuffer {
                 color.b,
                 color.a,
             );
-            return;
         }
         #[cfg(not(anvil_cpp_accel))]
         for py in y0..y1 {
@@ -1394,7 +1391,6 @@ impl Framebuffer {
                 border_color.b,
                 border_color.a,
             );
-            return;
         }
         #[cfg(not(anvil_cpp_accel))]
         {
@@ -1484,7 +1480,7 @@ impl Framebuffer {
                 color.b,
                 color.a,
             );
-            return Some(bmp.advance_px);
+            Some(bmp.advance_px)
         }
         #[cfg(not(anvil_cpp_accel))]
         {
@@ -1540,7 +1536,7 @@ impl Framebuffer {
                 color.b,
                 color.a,
             );
-            return Some(bmp.advance_px);
+            Some(bmp.advance_px)
         }
         #[cfg(not(anvil_cpp_accel))]
         {
@@ -1609,7 +1605,6 @@ impl Framebuffer {
                 y1,
                 radius,
             );
-            return;
         }
         #[cfg(not(anvil_cpp_accel))]
         {
@@ -1699,7 +1694,6 @@ impl Framebuffer {
                 dst_h,
                 border_radius,
             );
-            return;
         }
         #[cfg(not(anvil_cpp_accel))]
         {
@@ -1854,7 +1848,7 @@ impl Framebuffer {
                 self.width,
                 self.height,
             );
-            return out;
+            out
         }
         #[cfg(not(anvil_cpp_accel))]
         {
