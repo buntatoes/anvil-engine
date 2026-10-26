@@ -430,3 +430,71 @@ fn constant_pool_grows_in_the_arena() {
     let (value, _) = eval_cpp_vm_script(&source).expect("runs");
     assert_eq!(value, 199.5);
 }
+
+// ---- Heap frames ---------------------------------------------------------
+
+/// Recursion runs on the heap frame stack. fib(25) makes far more nested and
+/// repeated calls than the old 64-frame stack allowed, so this needs frames in
+/// the arena.
+#[test]
+fn fib_25_runs_on_heap_frames() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source =
+        "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(25);";
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, source).expect("runs");
+    assert_eq!(value, 75025.0);
+}
+
+/// A recursion 9,999 frames deep runs to the end, well past the old frame cap,
+/// because the register and frame stacks grow in the arena.
+#[test]
+fn recursion_9999_deep_runs() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "function rec(n) { if (n <= 0) { return 0; } return rec(n - 1) + 1; } rec(9999);";
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, source).expect("runs");
+    assert_eq!(value, 9999.0);
+}
+
+/// Past the default 10,000 depth the run stops with the depth in the reason,
+/// not a fixed frame-cap message.
+#[test]
+fn recursion_past_the_depth_limit_stops() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "function rec(n) { if (n <= 0) { return 1; } return rec(n - 1); } rec(20000);";
+    let error = anvil_script::eval_cpp_vm_request_configured(5_000_000, source).unwrap_err();
+    assert_eq!(
+        error.message,
+        "call depth limit reached: 10000 nested calls"
+    );
+}
+
+/// The depth is a setting: a Configure request lowers it and the run stops at
+/// the configured depth.
+#[test]
+fn a_configured_call_depth_stops_sooner() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "function rec(n) { if (n <= 0) { return 1; } return rec(n - 1); } rec(500);";
+    let error = anvil_script::eval_cpp_vm_request_depth(100, 5_000_000, source).unwrap_err();
+    assert_eq!(error.message, "call depth limit reached: 100 nested calls");
+}
+
+/// A Configure request can also raise the depth, so a recursion deeper than the
+/// default runs when the setting allows it.
+#[test]
+fn a_raised_call_depth_lets_a_deeper_recursion_run() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "function rec(n) { if (n <= 0) { return 0; } return rec(n - 1) + 1; } rec(11000);";
+    let (value, _) =
+        anvil_script::eval_cpp_vm_request_depth(12000, 5_000_000, source).expect("runs");
+    assert_eq!(value, 11000.0);
+}

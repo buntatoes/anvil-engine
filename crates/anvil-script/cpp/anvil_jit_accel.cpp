@@ -132,6 +132,7 @@ bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, boo
 namespace {
 constexpr u32 INIT_GLOBAL_TABLE = 16u;
 constexpr u32 INIT_CONSTANT_TABLE = 64u;
+constexpr u32 INIT_FRAME_STACK = 8u;
 } // namespace
 
 bool AnvilVmContext::ensure_globals(u32 need) noexcept {
@@ -199,9 +200,12 @@ void AnvilVmContext::init() noexcept {
     heap.init(arena_base, ANVIL_ARENA_RESERVE_BYTES, budget);
     ic.init(&heap.arena);
     program.init(&heap.arena);
-    for (u32 i = 0; i < MAX_TOTAL_REGISTERS; ++i) {
-        registers[i] = AnvilValue::make_undefined();
-    }
+    registers_off = 0u;
+    registers_cap = 0u;
+    frames_off = 0u;
+    frames_cap = 0u;
+    ensure_registers(INIT_FRAME_STACK * MAX_REGISTERS_PER_FRAME);
+    ensure_frames(INIT_FRAME_STACK);
     globals_off = 0u;
     globals_cap = 0u;
     global_count = 0u;
@@ -267,11 +271,70 @@ bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
     return true;
 }
 
+bool AnvilVmContext::ensure_registers(u32 need) noexcept {
+    if (need <= registers_cap) {
+        return true;
+    }
+    u32 new_cap = registers_cap == 0u ? (INIT_FRAME_STACK * MAX_REGISTERS_PER_FRAME) : registers_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilValue* dst = reinterpret_cast<AnvilValue*>(heap.arena.at(new_off));
+    const AnvilValue* src = registers();
+    for (u32 i = 0u; i < registers_cap; ++i) {
+        dst[i] = src[i];
+    }
+    for (u32 i = registers_cap; i < new_cap; ++i) {
+        dst[i] = AnvilValue::make_undefined();
+    }
+    const u32 old_off = registers_off;
+    const u32 old_cap = registers_cap;
+    registers_off = new_off;
+    registers_cap = new_cap;
+    if (old_cap != 0u) {
+        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilValue)));
+    }
+    return true;
+}
+
+bool AnvilVmContext::ensure_frames(u32 need) noexcept {
+    if (need <= frames_cap) {
+        return true;
+    }
+    u32 new_cap = frames_cap == 0u ? INIT_FRAME_STACK : frames_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilCallFrame)), &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilCallFrame* dst = reinterpret_cast<AnvilCallFrame*>(heap.arena.at(new_off));
+    const AnvilCallFrame* src = frames();
+    for (u32 i = 0u; i < frame_count; ++i) {
+        dst[i] = src[i];
+    }
+    const u32 old_off = frames_off;
+    const u32 old_cap = frames_cap;
+    frames_off = new_off;
+    frames_cap = new_cap;
+    if (old_cap != 0u) {
+        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilCallFrame)));
+    }
+    return true;
+}
+
 void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
     heap.clear_marks();
-    const u32 top = reg_top < MAX_TOTAL_REGISTERS ? reg_top : MAX_TOTAL_REGISTERS;
+    const u32 top = reg_top < registers_cap ? reg_top : registers_cap;
     for (u32 i = 0; i < top; ++i) {
-        heap.mark_value(registers[i]);
+        heap.mark_value(registers()[i]);
     }
     for (u32 i = 0; i < global_count; ++i) {
         if (globals()[i].occupied) {
@@ -300,7 +363,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
         }
 
         const AnvilInstruction inst = program.code[pc++];
-        AnvilValue* R = &registers[reg_base];
+        AnvilValue* R = &registers()[reg_base];
 
         // Strings and objects in arithmetic or ordering need conversions
         // the VM does not make, apart from joining two strings with +.
@@ -623,9 +686,8 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                     R[inst.a] = AnvilValue::make_null();
                     break;
                 }
-                if (frame_count + 1u >= MAX_CALL_FRAMES ||
-                    reg_base + (MAX_REGISTERS_PER_FRAME * 2u) > MAX_TOTAL_REGISTERS) {
-                    fail_limit(VM_STOP_CALL_DEPTH, "call depth", MAX_CALL_DEPTH, "nested calls");
+                if (frame_count + 1u > effective_call_depth()) {
+                    fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
                     return AnvilValue::make_undefined();
                 }
                 const AnvilHeapFunction& fn = heap.functions()[fn_id];
@@ -634,10 +696,17 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                     return AnvilValue::make_undefined();
                 }
                 const u32 next_base = reg_base + MAX_REGISTERS_PER_FRAME;
-                for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
-                    registers[next_base + a_idx] = R[inst.c + a_idx];
+                // Grow the register and frame stacks for the callee before use.
+                if (!ensure_registers(next_base + MAX_REGISTERS_PER_FRAME) ||
+                    !ensure_frames(frame_count + 1u)) {
+                    fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
+                    return AnvilValue::make_undefined();
                 }
-                frames[frame_count++] = AnvilCallFrame{fn_id, pc, reg_base, inst.a};
+                AnvilValue* regs = registers();
+                for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
+                    regs[next_base + a_idx] = regs[reg_base + inst.c + a_idx];
+                }
+                frames()[frame_count++] = AnvilCallFrame{fn_id, pc, reg_base, inst.a};
                 reg_base = next_base;
                 pc = fn.code_start;
                 break;
@@ -672,10 +741,10 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 if (frame_count == 0u) {
                     return ret_val;
                 }
-                const AnvilCallFrame caller = frames[--frame_count];
+                const AnvilCallFrame caller = frames()[--frame_count];
                 reg_base = caller.reg_base;
                 pc = caller.return_pc;
-                registers[reg_base + caller.dst_reg] = ret_val;
+                registers()[reg_base + caller.dst_reg] = ret_val;
                 break;
             }
 
@@ -686,7 +755,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 break;
         }
     }
-    return registers[0];
+    return registers()[0];
 }
 
 void AnvilVmContext::fill_telemetry(AnvilVmTelemetryC* out) const noexcept {

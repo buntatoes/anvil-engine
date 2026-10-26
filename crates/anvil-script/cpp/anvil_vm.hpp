@@ -32,11 +32,10 @@ namespace anvil_vm {
 
 constexpr u32 ANVIL_VM_KERNEL_VERSION    = 18u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
-constexpr u32 MAX_CALL_FRAMES           = 64u;
+// Each call frame owns one window of this many registers. The register stack
+// and the frame stack grow in the arena, so the number of frames is bounded by
+// the call-depth setting, not a fixed array.
 constexpr u32 MAX_REGISTERS_PER_FRAME   = 64u;
-// One 64-register window per call frame, so calls can nest until the
-// frame stack is full.
-constexpr u32 MAX_TOTAL_REGISTERS       = MAX_CALL_FRAMES * MAX_REGISTERS_PER_FRAME;
 // The managed heap lives in an arena that Rust allocates after the context
 // header (see anvil_cpp_vm_context_bytes). The arena is reserved up front but
 // only touched as it is used; one byte budget, set by Configure, caps how
@@ -44,17 +43,14 @@ constexpr u32 MAX_TOTAL_REGISTERS       = MAX_CALL_FRAMES * MAX_REGISTERS_PER_FR
 // growable heap tables all draw from it, so these counts are no longer fixed.
 constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
 constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
+// Default nesting depth for calls; a Configure request may raise or lower it.
+constexpr u32 ANVIL_DEFAULT_CALL_DEPTH  = 10000u;
 // An object keeps a shared hidden class (AnvilShape) until it has this many
 // named properties; past it the object switches to its own property map
 // (dictionary mode), so there is no fixed cap on how many properties an object
 // may hold. Shapes, the transition table and the object table all grow in the
 // arena, so their counts are bounded only by the byte budget.
 constexpr u32 DICT_THRESHOLD            = 64u;
-// Calls nest until the frame stack or the register file runs out.
-constexpr u32 MAX_CALL_DEPTH =
-    (MAX_CALL_FRAMES - 1u) < (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u)
-        ? (MAX_CALL_FRAMES - 1u)
-        : (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u);
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
@@ -1085,7 +1081,18 @@ struct AnvilVmContext {
     AnvilHeap heap;
     AnvilIcTable ic;
     AnvilBytecodeProgram program;
-    AnvilValue registers[MAX_TOTAL_REGISTERS];
+    // The register stack and the frame stack live in the arena and grow with
+    // the call depth, so neither the depth nor the register count is capped by
+    // a fixed array any more. Each frame owns MAX_REGISTERS_PER_FRAME slots.
+    u32 registers_off;
+    u32 registers_cap;
+    AnvilValue* registers() noexcept {
+        return reinterpret_cast<AnvilValue*>(heap.arena.at(registers_off));
+    }
+    const AnvilValue* registers() const noexcept {
+        return reinterpret_cast<const AnvilValue*>(heap.arena.at(registers_off));
+    }
+    bool ensure_registers(u32 need) noexcept;
     u32 globals_off;
     u32 globals_cap;
     u32 global_count;
@@ -1096,8 +1103,16 @@ struct AnvilVmContext {
         return reinterpret_cast<const AnvilGlobalBinding*>(heap.arena.at(globals_off));
     }
     bool ensure_globals(u32 need) noexcept;
-    AnvilCallFrame frames[MAX_CALL_FRAMES];
+    u32 frames_off;
+    u32 frames_cap;
     u32 frame_count;
+    AnvilCallFrame* frames() noexcept {
+        return reinterpret_cast<AnvilCallFrame*>(heap.arena.at(frames_off));
+    }
+    const AnvilCallFrame* frames() const noexcept {
+        return reinterpret_cast<const AnvilCallFrame*>(heap.arena.at(frames_off));
+    }
+    bool ensure_frames(u32 need) noexcept;
     u32 steps_executed;
     u32 hot_loops_accelerated;
     u32 native_compilations;
@@ -1123,6 +1138,12 @@ struct AnvilVmContext {
     // built-in default when none was set.
     u32 effective_step_limit() const noexcept {
         return step_limit != 0u ? step_limit : MAX_VM_STEPS;
+    }
+
+    // Nesting depth this run may reach before it stops: the configured budget,
+    // or the built-in default when none was set.
+    u32 effective_call_depth() const noexcept {
+        return call_depth_limit != 0u ? call_depth_limit : ANVIL_DEFAULT_CALL_DEPTH;
     }
 
     void init() noexcept;

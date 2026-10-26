@@ -684,6 +684,36 @@ pub fn eval_cpp_vm_request_heap_budget(
     }
 }
 
+/// Run `source` with a call-depth limit and a step budget set by a Configure
+/// request first (0 keeps the built-in default for either). The frame stack
+/// grows in the heap arena, so this lets a test drive deep recursion and check
+/// the depth limit is reported, not a fixed frame cap.
+pub fn eval_cpp_vm_request_depth(
+    call_depth_limit: u32,
+    step_budget: u32,
+    source: &str,
+) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let mut runtime = ScriptRuntime::new();
+    let configure = vm_request::configure(step_budget, 0, 0, call_depth_limit);
+    let _ = runtime.try_owned_vm(&configure);
+    let run = vm_request::run(trimmed.as_bytes());
+    match runtime.try_owned_vm(&run) {
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
+    }
+}
+
 pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
     let trimmed = source.trim();
     if trimmed.is_empty() {

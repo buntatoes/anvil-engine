@@ -145,7 +145,7 @@ fn run_limits_stop_with_a_reason() {
         (
             "function d(n) { return d(n); } d(1);",
             2,
-            "call depth limit reached: 63 nested calls",
+            "call depth limit reached: 10000 nested calls",
         ),
     ];
     for (source, code, message) in cases {
@@ -304,15 +304,20 @@ fn calls_pass_their_arguments() {
 }
 
 #[test]
-fn calls_nest_until_the_frame_stack_is_full() {
+fn calls_nest_on_the_heap_frame_stack() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let deep = "function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(62);";
-    assert_eq!(cpp(deep), Some(62.0));
+    // The frame and register stacks grow in the arena, so calls nest well past
+    // the old fixed frame cap; the depth limit is now 10,000.
+    let deep = "function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(500);";
+    assert_eq!(cpp(deep), Some(500.0));
     let error =
-        vm_error("function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(63);");
-    assert_eq!(error.message, "call depth limit reached: 63 nested calls");
+        vm_error("function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(20000);");
+    assert_eq!(
+        error.message,
+        "call depth limit reached: 10000 nested calls"
+    );
 }
 
 #[test]
