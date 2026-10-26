@@ -2505,10 +2505,9 @@ fn parse_calc(expr: &str) -> Option<Size> {
             Size::Em(n.trim().parse::<f32>().ok()?)
         } else if let Some(n) = term_str.strip_suffix("px") {
             Size::Px(n.trim().parse::<f32>().ok()?)
-        } else if let Some(n) = term_str.strip_suffix('%') {
-            Size::Percent(n.trim().parse::<f32>().ok()?)
         } else {
-            return None;
+            let n = term_str.strip_suffix('%')?;
+            Size::Percent(n.trim().parse::<f32>().ok()?)
         };
         match term {
             Size::Px(v) => px += v * scale,
