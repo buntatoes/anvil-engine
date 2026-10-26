@@ -351,21 +351,27 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
             return false;
         }
         if (inst.op == AnvilOpcode::LoadConst) {
-            const u16 idx = inst.imm16();
+            const u32 idx = inst.imm32();
             if (idx >= program.const_len || !program.constants()[idx].is_number()) {
                 return false;
             }
         }
         if (inst.op == AnvilOpcode::Jump || inst.op == AnvilOpcode::JumpIfFalse ||
             inst.op == AnvilOpcode::JumpIfTrue) {
-            if (inst.imm16() >= program.code_len) {
+            if (inst.imm32() >= program.code_len) {
                 return false;
             }
         }
-        if (inst.op == AnvilOpcode::HostSetText && inst.imm16() >= 8u) {
+        if (inst.op == AnvilOpcode::HostSetText && inst.imm32() >= 8u) {
             return false;
         }
-        if (inst.a >= kRegSlots) {
+        // Every register operand must land in the JIT's fixed register file.
+        // Now that operands are 16 bits wide, a function may use more registers
+        // than the JIT can hold; decline it to the interpreter rather than index
+        // past the file. The immediate-form operands (b and c unused) are zero,
+        // and the only non-register use of b is CallMath's small op selector, so
+        // this never turns away a function the JIT could otherwise take.
+        if (inst.a >= kRegSlots || inst.b >= kRegSlots || inst.c >= kRegSlots) {
             return false;
         }
         // Native code keeps every value as a double, so true would read
@@ -595,7 +601,7 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 ok = ok && as.xorpd_xmm(0u) && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
             case AnvilOpcode::LoadConst: {
-                const f64 n = ctx->program.constants()[inst.imm16()].as_number();
+                const f64 n = ctx->program.constants()[inst.imm32()].as_number();
                 u64 bits = 0;
                 copy_bytes(&bits, &n, 8u);
                 // mov rax, bits ; movq xmm0, rax ; store
@@ -671,13 +677,13 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 break;
             }
             case AnvilOpcode::Jump:
-                ok = ok && as.jmp_rel32_to_pc(inst.imm16());
+                ok = ok && as.jmp_rel32_to_pc(inst.imm32());
                 break;
             case AnvilOpcode::JumpIfFalse:
                 // xorpd xmm1,xmm1 ; movsd xmm0, reg ; ucomisd ; jp taken ; je taken
                 ok = ok && as.xorpd_xmm(1u) && as.movsd_xmm_from_reg(0u, inst.a) && as.ucomisd_xmm0_xmm1();
-                ok = ok && as.jcc_rel32_to_pc(0x8A, inst.imm16()); // jp
-                ok = ok && as.jcc_rel32_to_pc(0x84, inst.imm16()); // je
+                ok = ok && as.jcc_rel32_to_pc(0x8A, inst.imm32()); // jp
+                ok = ok && as.jcc_rel32_to_pc(0x84, inst.imm32()); // je
                 break;
             case AnvilOpcode::JumpIfTrue: {
                 // Taken when not NaN and not zero. jp skip ; je skip ; jmp taken
@@ -690,15 +696,15 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 ok = ok && as.emit(0x7A) && as.emit(0x07);
                 // je rel8
                 ok = ok && as.emit(0x74) && as.emit(0x05);
-                ok = ok && as.jmp_rel32_to_pc(inst.imm16());
+                ok = ok && as.jmp_rel32_to_pc(inst.imm32());
                 break;
             }
             case AnvilOpcode::GetGlobal:
-                ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.imm16()) &&
+                ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.imm32()) &&
                      as.mov_rax_imm(load_fn) && as.call_rax() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
             case AnvilOpcode::SetGlobal:
-                ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm16()) &&
+                ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm32()) &&
                      as.mov_rax_imm(store_fn) && as.call_rax();
                 break;
             case AnvilOpcode::CallMath: {
@@ -715,7 +721,7 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.a) && as.mov_rax_imm(loop_fn) && as.call_rax();
                 break;
             case AnvilOpcode::HostSetText:
-                ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm16()) &&
+                ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm32()) &&
                      as.mov_rax_imm(reinterpret_cast<u64>(&host_set_text_bridge)) && as.call_rax();
                 break;
             case AnvilOpcode::Return:
