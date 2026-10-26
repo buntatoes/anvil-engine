@@ -592,39 +592,84 @@ fn a_2000_statement_script_compiles() {
     assert_eq!(value, 2000.0);
 }
 
-// ---- Guard the byte-wide inline-cache site index -------------------------
+// ---- Lift the register, site and program-size caps -----------------------
 
-/// Up to 256 distinct property-access sites address correctly; the 257th would
-/// wrap the byte-wide site operand, so the compiler refuses past that with a
-/// reason instead of reading the wrong property. (The wider encoding lifts this
-/// later.) Before the guard the over-256 case ran and returned a wrong value.
+/// Property-access sites past the old 256 cap now address correctly. The site
+/// index rides in a 16-bit operand, so 300 distinct sites (the case the earlier
+/// byte-wide guard refused) compile and return the right value. This replaces
+/// the earlier refusal test, whose premise (a byte-wide site operand) is gone.
 #[test]
-fn inline_cache_sites_are_correct_up_to_256_then_refused() {
+fn inline_cache_sites_past_the_old_256_cap_are_correct() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    // 200 distinct sites: well within the byte operand, correct value out.
-    let mut within = String::from("const o = {}; ");
-    for i in 0..200 {
-        within.push_str(&format!("o.p{i} = {i}; "));
-    }
-    within.push_str("o.p199;");
-    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &within)
-        .expect("200 property sites compile and run");
-    assert_eq!(value, 199.0);
-
-    // 300 distinct sites: past the byte operand, refused with a reason.
-    let mut over = String::from("const o = {}; ");
+    let mut source = String::from("const o = {}; ");
     for i in 0..300 {
-        over.push_str(&format!("o.p{i} = {i}; "));
+        source.push_str(&format!("o.p{i} = {i}; "));
     }
-    over.push_str("o.p299;");
-    let error = anvil_script::eval_cpp_vm_request_configured(5_000_000, &over).unwrap_err();
-    assert_eq!(
-        error.message,
-        "inline cache site limit reached: 256 sites per script"
-    );
-    assert!(error.is_limit() && error.refused());
+    source.push_str("o.p0 + o.p150 + o.p299;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("300 property sites compile and run");
+    assert_eq!(value, 0.0 + 150.0 + 299.0);
+}
+
+/// A 300-element array literal compiles and runs. Each element is freed after it
+/// is pushed, so the literal needs only a couple of registers, not one per
+/// element; before the register cap lifted this hit the 64-register limit.
+#[test]
+fn array_literal_of_300_elements_compiles() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let elems = (0..300)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("let a = [{elems}]; a[0] + a[299] + a.length;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("a 300-element array literal compiles and runs");
+    assert_eq!(value, 0.0 + 299.0 + 300.0);
+}
+
+/// A 1,000-property object literal compiles and runs. This needs both the lifted
+/// site cap (over a thousand inline-cache sites) and the temporary-freeing
+/// allocator (each value freed after its store).
+#[test]
+fn object_literal_of_1000_properties_compiles() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let props = (0..1000)
+        .map(|i| format!("p{i}: {i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("const o = {{{props}}}; o.p0 + o.p500 + o.p999;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("a 1000-property object literal compiles and runs");
+    assert_eq!(value, 0.0 + 500.0 + 999.0);
+}
+
+/// Deeply nested ifs compile. The condition is freed after each branch, so 2,000
+/// levels of nesting reuse one register slot instead of one per level; before
+/// this they hit the 64-register limit.
+#[test]
+fn deeply_nested_ifs_compile() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let depth = 2000;
+    let mut source = String::from("let x = 1; let r = 0; ");
+    for _ in 0..depth {
+        source.push_str("if (x) { ");
+    }
+    source.push_str("r = 7; ");
+    for _ in 0..depth {
+        source.push('}');
+    }
+    source.push_str(" r;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("2000-deep nested ifs compile and run");
+    assert_eq!(value, 7.0);
 }
 
 /// More than 512 distinct numeric constants in one script.

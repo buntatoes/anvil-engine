@@ -778,12 +778,11 @@ struct AnvilCompiler {
             reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
-        // The instruction operand is now wide enough for far more sites, but the
-        // 256-site cap stays until it is lifted together with
-        // the register and jump caps. Past it, refuse with a reason rather than
-        // address a site the rest of the pipeline is not yet exercised for.
-        if (site > 0xFFu) {
-            reject_limit(VM_REFUSE_SITES, "inline cache site", 256u, "sites per script");
+        // The site index rides in a 16-bit operand, so a script may address up to
+        // 65,535 inline-cache sites. Past that, refuse with a reason rather than
+        // let the index wrap onto another site.
+        if (site > 0xFFFFu) {
+            reject_limit(VM_REFUSE_SITES, "inline cache site", 0xFFFFu, "sites per script");
             return 0u;
         }
         return site;
@@ -965,6 +964,10 @@ struct AnvilCompiler {
             // Object literal `{ key: expr, ... }` lowered to `NewObject` + `SetPropIC`.
             advance();
             const u16 obj_reg = alloc_reg();
+            // Each property value is a temporary once it is stored, so free the
+            // registers above the object after every store. A literal with many
+            // properties then needs only a couple of registers, not one per key.
+            const u16 obj_mark = next_reg;
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewObject, obj_reg, 0u, 0u));
             while (peek().kind != TokenKind::RBrace && peek().kind != TokenKind::Eof && !had_error) {
                 const Token& key_tok = advance();
@@ -982,6 +985,9 @@ struct AnvilCompiler {
                     val_reg,
                     static_cast<u16>(ic_site)
                 ));
+                if (next_reg > obj_mark) {
+                    next_reg = obj_mark;
+                }
                 if (!match(TokenKind::Comma)) {
                     break;
                 }
@@ -993,10 +999,16 @@ struct AnvilCompiler {
             // Array literal `[e0, e1, ...]` lowered to `NewArray` + `ArrayPush`.
             advance();
             const u16 arr_reg = alloc_reg();
+            // As with object literals, each element is a temporary once pushed,
+            // so free the registers above the array after every push.
+            const u16 arr_mark = next_reg;
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewArray, arr_reg, 8u, 0u));
             while (peek().kind != TokenKind::RBracket && peek().kind != TokenKind::Eof && !had_error) {
                 const u16 elem_reg = compile_expr();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ArrayPush, arr_reg, elem_reg, 0u));
+                if (next_reg > arr_mark) {
+                    next_reg = arr_mark;
+                }
                 if (!match(TokenKind::Comma)) {
                     break;
                 }
@@ -1048,14 +1060,14 @@ struct AnvilCompiler {
                 // Every argument is compiled first. Their values are then
                 // copied into a run of registers above all of them, so an
                 // argument's temporaries cannot overwrite an earlier one.
-                u16 arg_regs[MAX_REGISTERS_PER_FRAME];
+                u16 arg_regs[MAX_CALL_ARGS];
                 u32 argc = 0u;
                 while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
                     const u16 arg_r = compile_expr();
-                    if (argc < MAX_REGISTERS_PER_FRAME) {
+                    if (argc < MAX_CALL_ARGS) {
                         arg_regs[argc] = arg_r;
                     } else {
-                        reject_limit(VM_REFUSE_REGISTERS, "register", MAX_REGISTERS_PER_FRAME, "registers per function");
+                        reject_limit(VM_REFUSE_REGISTERS, "call argument", MAX_CALL_ARGS, "arguments per call");
                     }
                     ++argc;
                     if (!match(TokenKind::Comma)) {
@@ -1516,11 +1528,18 @@ struct AnvilCompiler {
 
         if (match(TokenKind::KwIf)) {
             expect(TokenKind::LParen);
+            // The condition is a temporary consumed by the branch below, so free
+            // it before compiling the body. Nested ifs then reuse one slot
+            // instead of holding one register per level of nesting.
+            const u16 cond_mark = next_reg;
             const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             const u32 jfalse_pc = ctx->program.emit(
                 AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u)
             );
+            if (next_reg > cond_mark) {
+                next_reg = cond_mark;
+            }
             u16 last_reg = compile_statement();
             if (match(TokenKind::KwElse)) {
                 const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));

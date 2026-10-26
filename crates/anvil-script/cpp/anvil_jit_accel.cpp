@@ -205,7 +205,7 @@ void AnvilVmContext::init() noexcept {
     registers_cap = 0u;
     frames_off = 0u;
     frames_cap = 0u;
-    ensure_registers(INIT_FRAME_STACK * MAX_REGISTERS_PER_FRAME);
+    ensure_registers(INIT_FRAME_STACK * INIT_REGISTERS_PER_FRAME);
     ensure_frames(INIT_FRAME_STACK);
     globals_off = 0u;
     globals_cap = 0u;
@@ -280,7 +280,7 @@ bool AnvilVmContext::ensure_registers(u32 need) noexcept {
     if (need <= registers_cap) {
         return true;
     }
-    u32 new_cap = registers_cap == 0u ? (INIT_FRAME_STACK * MAX_REGISTERS_PER_FRAME) : registers_cap;
+    u32 new_cap = registers_cap == 0u ? (INIT_FRAME_STACK * INIT_REGISTERS_PER_FRAME) : registers_cap;
     while (new_cap < need) {
         new_cap *= 2u;
     }

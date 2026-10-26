@@ -32,10 +32,18 @@ namespace anvil_vm {
 
 constexpr u32 ANVIL_VM_KERNEL_VERSION    = 18u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
-// Each call frame owns one window of this many registers. The register stack
-// and the frame stack grow in the arena, so the number of frames is bounded by
-// the call-depth setting, not a fixed array.
-constexpr u32 MAX_REGISTERS_PER_FRAME   = 64u;
+// The most registers one function may use. Operands are 16-bit, so this is the
+// encoding limit; a function that needs more is refused. The register stack and
+// the frame stack grow in the arena, and each frame advances by the function's
+// own register count (not a fixed window), so the memory a run uses is bounded
+// by its byte budget, not by this number.
+constexpr u32 MAX_REGISTERS_PER_FRAME   = 65535u;
+// Registers the runtime register stack reserves per frame to start with; it
+// grows from there as functions use more. Only the initial size, not a cap.
+constexpr u32 INIT_REGISTERS_PER_FRAME  = 64u;
+// The most arguments one call may pass. They are staged in a small array while
+// compiling the call, so this bounds that array rather than the register file.
+constexpr u32 MAX_CALL_ARGS             = 256u;
 // The managed heap lives in an arena that Rust allocates after the context
 // header (see anvil_cpp_vm_context_bytes). The arena is reserved up front but
 // only touched as it is used; one byte budget, set by Configure, caps how
@@ -55,9 +63,10 @@ constexpr u32 DICT_THRESHOLD            = 64u;
 // a program longer than this (the interpreter runs it instead).
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
 // The interpreter's bytecode grows in the arena, so a program is no longer
-// capped at a small fixed array. The ceiling is the 16-bit jump field: a jump
-// target must fit in it until the wider encoding lands.
-constexpr u32 ANVIL_MAX_PROGRAM_INSTRUCTIONS = 65535u;
+// capped at a small fixed array, and jump targets are 32-bit. This ceiling is a
+// backstop against a runaway program; the compiler arena's byte budget is the
+// real limit, stopping an over-large source with the heap-limit reason first.
+constexpr u32 ANVIL_MAX_PROGRAM_INSTRUCTIONS = 16777215u;
 // Instructions the code block holds to start with; it doubles from here.
 constexpr u32 INIT_CODE_BUFFER = 256u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
@@ -1154,7 +1163,8 @@ struct AnvilVmContext {
     AnvilBytecodeProgram program;
     // The register stack and the frame stack live in the arena and grow with
     // the call depth, so neither the depth nor the register count is capped by
-    // a fixed array any more. Each frame owns MAX_REGISTERS_PER_FRAME slots.
+    // a fixed array any more. Each frame advances by the function's own register
+    // count, not a fixed window.
     u32 registers_off;
     u32 registers_cap;
     AnvilValue* registers() noexcept {

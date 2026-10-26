@@ -184,14 +184,22 @@ fn compile_limits_refuse_with_a_reason() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    // The function, global, constant, IC-site and token limits all grow in the
-    // arena now, so those refusals are gone. What the compiler still refuses is
-    // its own per-function register limit, lifted later in the new front end.
+    // The function, global, constant, IC-site, token and per-function register
+    // limits all grow or lift now, so a deeply parenthesised expression that once
+    // hit the 64-register cap compiles and runs.
     let nested = format!("{}1{};", "(1 + ".repeat(70), ")".repeat(70));
-    let error = vm_error(&nested);
+    assert_eq!(cpp(&nested), Some(71.0));
+
+    // What the compiler still refuses with a reason is a call that passes more
+    // arguments than it can stage.
+    let args = (0..300)
+        .map(|i| format!("a{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let error = vm_error(&format!("function f() {{ return 0; }} f({args});"));
     assert_eq!(
         (error.code, error.message.as_str()),
-        (40, "register limit reached: 64 registers per function")
+        (40, "call argument limit reached: 256 arguments per call")
     );
     assert!(error.is_limit() && error.refused());
 }
