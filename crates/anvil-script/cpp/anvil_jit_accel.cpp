@@ -461,6 +461,10 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                     return AnvilValue::make_undefined();
                 }
                 const AnvilHeapFunction& fn = heap.functions[fn_id];
+                if (static_cast<u32>(inst.c) + fn.arity > MAX_REGISTERS_PER_FRAME) {
+                    fail(VM_STOP_UNSUPPORTED, "call arguments outside the caller's registers");
+                    return AnvilValue::make_undefined();
+                }
                 const u32 next_base = reg_base + MAX_REGISTERS_PER_FRAME;
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     registers[next_base + a_idx] = R[inst.c + a_idx];

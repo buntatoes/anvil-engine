@@ -769,13 +769,17 @@ struct AnvilCompiler {
                 } else if (find_local(sym) >= 0) {
                     reject_name(VM_REFUSE_UNSUPPORTED, "call through a variable", id_tok);
                 }
-                const u8 call_base = next_reg;
-                u8 argc = 0u;
+                // Every argument is compiled first. Their values are then
+                // copied into a run of registers above all of them, so an
+                // argument's temporaries cannot overwrite an earlier one.
+                u8 arg_regs[MAX_REGISTERS_PER_FRAME];
+                u32 argc = 0u;
                 while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
                     const u8 arg_r = compile_expr();
-                    const u8 slot_r = alloc_reg();
-                    if (arg_r != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_r, 0u));
+                    if (argc < MAX_REGISTERS_PER_FRAME) {
+                        arg_regs[argc] = arg_r;
+                    } else {
+                        reject_limit(VM_REFUSE_REGISTERS, "register", MAX_REGISTERS_PER_FRAME, "registers per function");
                     }
                     ++argc;
                     if (!match(TokenKind::Comma)) {
@@ -783,6 +787,20 @@ struct AnvilCompiler {
                     }
                 }
                 expect(TokenKind::RParen);
+                // Extra arguments are evaluated and dropped. Missing ones
+                // are filled in.
+                const u32 arity = (target_fn < ctx->heap.function_count) ? ctx->heap.functions[target_fn].arity : 0u;
+                const u8 call_base = next_reg;
+                for (u32 i = 0u; i < arity && !had_error; ++i) {
+                    const u8 slot_r = alloc_reg();
+                    if (i < argc) {
+                        if (arg_regs[i] != slot_r) {
+                            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        }
+                    } else {
+                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, slot_r, 0u, 0u));
+                    }
+                }
                 const u8 dst = alloc_reg();
                 if (target_fn != 0xFFFFFFFFu) {
                     ctx->program.emit(AnvilInstruction::make_abc(

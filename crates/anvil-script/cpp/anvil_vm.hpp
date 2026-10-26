@@ -34,7 +34,9 @@ constexpr u32 ANVIL_VM_KERNEL_VERSION    = 18u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
 constexpr u32 MAX_CALL_FRAMES           = 64u;
 constexpr u32 MAX_REGISTERS_PER_FRAME   = 64u;
-constexpr u32 MAX_TOTAL_REGISTERS       = 1024u;
+// One 64-register window per call frame, so calls can nest until the
+// frame stack is full.
+constexpr u32 MAX_TOTAL_REGISTERS       = MAX_CALL_FRAMES * MAX_REGISTERS_PER_FRAME;
 constexpr u32 MAX_INTERNED_STRINGS      = 512u;
 constexpr u32 MAX_STRING_BYTES          = 16384u;
 constexpr u32 MAX_SHAPES                = 256u;

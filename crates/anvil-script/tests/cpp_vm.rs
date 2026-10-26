@@ -145,7 +145,7 @@ fn run_limits_stop_with_a_reason() {
         (
             "function d(n) { return d(n); } d(1);",
             2,
-            "call depth limit reached: 15 nested calls",
+            "call depth limit reached: 63 nested calls",
         ),
         (
             "let head = null; let i = 0; while (i < 600) { head = {next: head}; i = i + 1; } 1;",
@@ -324,4 +324,48 @@ fn a_vm_limit_leaves_the_script_to_the_interpreter() {
     assert!(rt.last_vm_error().is_none());
     let out = doc.get_element_by_id("out").expect("out");
     assert_eq!(doc.text_content(out), "total 9000");
+}
+
+#[test]
+fn calls_pass_their_arguments() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let cases = [
+        ("function add(a, b) { return a + b; } add(2, 3);", 5.0),
+        (
+            "function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(50);",
+            50.0,
+        ),
+        (
+            "function add(a, b) { return a + b; } add(add(1, 2), add(3, 4));",
+            10.0,
+        ),
+        (
+            "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(15);",
+            610.0,
+        ),
+        (
+            "function sub(a, b) { return a - b; } let x = 10; sub(x * 2, x - 3);",
+            13.0,
+        ),
+        ("function first(a, b) { return a; } first(4);", 4.0),
+        ("function first(a) { return a; } first(1, 2, 3);", 1.0),
+        ("function none() { return 7; } none(1);", 7.0),
+    ];
+    for (source, want) in cases {
+        assert_eq!(cpp(source), Some(want), "{source}");
+    }
+}
+
+#[test]
+fn calls_nest_until_the_frame_stack_is_full() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let deep = "function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(62);";
+    assert_eq!(cpp(deep), Some(62.0));
+    let error =
+        vm_error("function d(n) { if (n === 0) { return 0; } return 1 + d(n - 1); } d(63);");
+    assert_eq!(error.message, "call depth limit reached: 63 nested calls");
 }
