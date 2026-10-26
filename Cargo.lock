@@ -12,11 +12,11 @@ version = "0.22.0"
 
 [[package]]
 name = "anvil-gpu"
-version = "0.7.0"
+version = "0.9.0"
 
 [[package]]
 name = "anvil-image"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anvil-compress",
 ]
@@ -72,4 +72,4 @@ dependencies = [
 
 [[package]]
 name = "anvil-ttf"
-version = "0.7.0"
+version = "0.8.0"
