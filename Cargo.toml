@@ -31,7 +31,7 @@ members = [
 [workspace.package]
 version = "0.23.2"
 edition = "2024"
-rust-version = "1.85.1"
+rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]
 description = "HTML, CSS, layout, raster, and a budgeted script runtime."
 license = "LicenseRef-Proprietary"

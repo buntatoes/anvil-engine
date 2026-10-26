@@ -128,7 +128,7 @@ Clone this repository and the libraries below as sibling directories. You don't 
 
 `anvil-image` links `anvil-compress`.
 
-Rust 1.85.1 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
+Rust 1.99.1 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
 
 ```text
 cargo test

@@ -1,5 +1,5 @@
 # Build, test, lint, and release-build anvil-engine on Linux and Windows, and
-# build and test it with Rust 1.85.1 on Linux.
+# build and test it with Rust 1.99.1 on Linux.
 #
 # Path dependencies point at sibling directories, so the job checks this
 # repository out into its own folder and clones each sibling next to it.
@@ -83,9 +83,9 @@ jobs:
         run: cargo build --offline --workspace --release
 
   msrv:
-    # Rust 1.85.1 is the oldest toolchain the README promises. Build and test
+    # Rust 1.99.1 is the oldest toolchain the README promises. Build and test
     # the whole workspace with it so newer syntax or library calls show up here.
-    name: rust 1.85.1
+    name: rust 1.99.1
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -104,10 +104,10 @@ jobs:
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
-      - name: Install Rust 1.85.1
+      - name: Install Rust 1.99.1
         run: |
-          rustup toolchain install 1.85.1 --profile minimal
-          rustup default 1.85.1
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
           rustc --version
           cargo --version
 
