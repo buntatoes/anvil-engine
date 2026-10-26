@@ -1196,21 +1196,44 @@ pub fn parse_css_with_media(input: &str, media: Option<&str>) -> Stylesheet {
 /// their byte offsets.
 ///
 /// Quotes and everything inside them are skipped, and so is a backslash
-/// with the character it escapes, inside or outside a string. A string
+/// with the character it escapes, inside or outside a string. The body of
+/// an unquoted `url(...)` is skipped too; its parentheses are kept. A string
 /// ends at its closing quote, at an unescaped newline, or at the end of the
 /// input, as in CSS syntax. [`Unquoted::in_string`] says whether the input
 /// ended inside a string.
 pub(crate) struct Unquoted<'a> {
+    src: &'a str,
     chars: std::str::CharIndices<'a>,
     quote: Option<char>,
+    in_url: bool,
 }
 
 impl<'a> Unquoted<'a> {
     pub(crate) fn new(src: &'a str) -> Self {
         Unquoted {
+            src,
             chars: src.char_indices(),
             quote: None,
+            in_url: false,
         }
+    }
+
+    /// True when the `(` at byte `open` starts an unquoted `url(`, whose
+    /// body runs to the next unescaped `)` and may hold `;`, `{` or `}`.
+    fn opens_unquoted_url(&self, open: usize) -> bool {
+        let before = &self.src[..open];
+        let Some(head) = before.len().checked_sub(3).and_then(|i| before.get(i..)) else {
+            return false;
+        };
+        if !head.eq_ignore_ascii_case("url") {
+            return false;
+        }
+        let word_start = before[..before.len() - 3]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_'));
+        let body = self.src[open + 1..].trim_start();
+        word_start && !body.starts_with(['"', '\''])
     }
 
     /// True while the scan is inside a string.
@@ -1225,6 +1248,19 @@ impl Iterator for Unquoted<'_> {
     fn next(&mut self) -> Option<(usize, char)> {
         loop {
             let (idx, ch) = self.chars.next()?;
+            if self.in_url {
+                match ch {
+                    '\\' => {
+                        self.chars.next();
+                    }
+                    ')' => {
+                        self.in_url = false;
+                        return Some((idx, ch));
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match self.quote {
                 Some(quote) => {
                     if ch == '\\' {
@@ -1238,6 +1274,10 @@ impl Iterator for Unquoted<'_> {
                         self.chars.next();
                     }
                     '"' | '\'' => self.quote = Some(ch),
+                    '(' if self.opens_unquoted_url(idx) => {
+                        self.in_url = true;
+                        return Some((idx, ch));
+                    }
                     _ => return Some((idx, ch)),
                 },
             }

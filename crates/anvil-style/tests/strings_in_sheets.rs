@@ -185,3 +185,27 @@ fn odd_endings_do_not_panic() {
         let _ = parse_declarations(css);
     }
 }
+
+#[test]
+fn brace_and_semicolon_in_an_unquoted_url_stay_in_the_value() {
+    let css = "p { background-image: url(a;b}c.png); color: #00ff00 } div { color: #0000ff }";
+    let sheet = parse_css(css);
+    assert_eq!(sheet.rules.len(), 2);
+    assert_eq!(
+        declarations(&sheet, 0),
+        [
+            pair("background-image", "url(a;b}c.png)"),
+            pair("color", "#00ff00")
+        ]
+    );
+    assert_eq!(color_of(PAGE, css, "p"), color("#00ff00"));
+    assert_eq!(color_of(PAGE, css, "d"), color("#0000ff"));
+}
+
+#[test]
+fn escaped_paren_in_an_unquoted_url_does_not_end_it() {
+    let css = "p { background-image: URL(x\\)}.png); color: #00ff00 } div { color: #0000ff }";
+    assert_eq!(parse_css(css).rules.len(), 2);
+    assert_eq!(color_of(PAGE, css, "p"), color("#00ff00"));
+    assert_eq!(color_of(PAGE, css, "d"), color("#0000ff"));
+}
