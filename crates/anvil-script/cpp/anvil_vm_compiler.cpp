@@ -497,7 +497,7 @@ struct BlockScope {
 
 struct LocalBinding {
     u32 name_sym;
-    u8 reg;
+    u16 reg;
 };
 
 struct AnvilCompiler {
@@ -510,15 +510,21 @@ struct AnvilCompiler {
     AnvilArena arena;
     AnvilLexer lexer;
     u32 cursor;
-    LocalBinding locals[MAX_REGISTERS_PER_FRAME];
+    // The locals table is a block in the compiler arena (like the token
+    // buffer), grown as a function declares more. `local_count` is how many are
+    // live; `local_floor` is the first index the function being compiled owns,
+    // so an inner function sees only its own locals, not the enclosing ones.
+    u32 locals_off;
+    u32 locals_cap;
     u32 local_count;
-    u8 next_reg;
+    u32 local_floor;
+    u16 next_reg;
     // Registers below this hold the current function's parameters and
     // locals. Registers from here up are temporaries, free again after
     // each statement.
-    u8 reg_floor;
+    u16 reg_floor;
     // Highest register count the current function has used.
-    u8 high_reg;
+    u16 high_reg;
     u32 next_loop_id;
     // Loops around the statement being compiled.
     LoopJumps loops[MAX_LOOP_NESTING];
@@ -571,7 +577,7 @@ struct AnvilCompiler {
         return peek(8u).kind == TokenKind::Assign;
     }
 
-    u8 compile_host_text() noexcept {
+    u16 compile_host_text() noexcept {
         advance();
         advance();
         advance();
@@ -601,7 +607,7 @@ struct AnvilCompiler {
         }
         ctx->host_ids[slot][id_tok.length] = '\0';
         ctx->host_id_lens[slot] = id_tok.length;
-        const u8 rhs = compile_expr();
+        const u16 rhs = compile_expr();
         ctx->program.emit(AnvilInstruction::make_abx(
             AnvilOpcode::HostSetText,
             rhs,
@@ -802,38 +808,78 @@ struct AnvilCompiler {
         }
     }
 
-    u8 alloc_reg() noexcept {
+    u16 alloc_reg() noexcept {
         if (next_reg >= MAX_REGISTERS_PER_FRAME) {
             reject_limit(VM_REFUSE_REGISTERS, "register", MAX_REGISTERS_PER_FRAME, "registers per function");
             return MAX_REGISTERS_PER_FRAME - 1u;
         }
-        const u8 r = next_reg++;
+        const u16 r = next_reg++;
         if (next_reg > high_reg) {
             high_reg = next_reg;
         }
         return r;
     }
 
+    LocalBinding* locals() noexcept {
+        return reinterpret_cast<LocalBinding*>(arena.at(locals_off));
+    }
+    const LocalBinding* locals() const noexcept {
+        return reinterpret_cast<const LocalBinding*>(arena.at(locals_off));
+    }
+
+    // Grow the locals block to hold at least `need` entries, copying what is
+    // there and returning the old block to the free list. False when the
+    // compiler arena cannot grow any further.
+    bool ensure_locals(u32 need) noexcept {
+        if (need <= locals_cap) {
+            return true;
+        }
+        u32 new_cap = locals_cap == 0u ? 16u : locals_cap;
+        while (new_cap < need) {
+            new_cap *= 2u;
+        }
+        bool over = false;
+        const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(LocalBinding)), &over);
+        if (new_off == NO_SLOT) {
+            return false;
+        }
+        LocalBinding* dst = reinterpret_cast<LocalBinding*>(arena.at(new_off));
+        const LocalBinding* old = reinterpret_cast<const LocalBinding*>(arena.at(locals_off));
+        for (u32 i = 0u; i < local_count; ++i) {
+            dst[i] = old[i];
+        }
+        const u32 old_off = locals_off;
+        const u32 old_cap = locals_cap;
+        locals_off = new_off;
+        locals_cap = new_cap;
+        if (old_cap != 0u) {
+            arena.free(old_off, old_cap * static_cast<u32>(sizeof(LocalBinding)));
+        }
+        return true;
+    }
+
     i32 find_local(u32 sym) const noexcept {
-        for (i32 i = static_cast<i32>(local_count) - 1; i >= 0; --i) {
-            if (locals[i].name_sym == sym) {
-                return static_cast<i32>(locals[i].reg);
+        for (i32 i = static_cast<i32>(local_count) - 1; i >= static_cast<i32>(local_floor); --i) {
+            if (locals()[i].name_sym == sym) {
+                return static_cast<i32>(locals()[i].reg);
             }
         }
         return -1;
     }
 
-    u8 declare_local(u32 sym) noexcept {
+    u16 declare_local(u32 sym) noexcept {
         const i32 existing = find_local(sym);
         if (existing >= 0) {
-            return static_cast<u8>(existing);
+            return static_cast<u16>(existing);
         }
-        const u8 r = alloc_reg();
-        if (local_count < MAX_REGISTERS_PER_FRAME) {
-            locals[local_count++] = LocalBinding{sym, r};
+        const u16 r = alloc_reg();
+        if (ensure_locals(local_count + 1u)) {
+            locals()[local_count++] = LocalBinding{sym, r};
+        } else {
+            reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
         }
         if (r + 1u > reg_floor) {
-            reg_floor = static_cast<u8>(r + 1u);
+            reg_floor = static_cast<u16>(r + 1u);
         }
         return r;
     }
@@ -856,12 +902,12 @@ struct AnvilCompiler {
         return sym;
     }
 
-    void emit_load_undefined(u8 dst) noexcept {
+    void emit_load_undefined(u16 dst) noexcept {
         const u16 cidx = ctx->program.add_constant(AnvilValue::make_undefined());
         ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
     }
 
-    void emit_load_number(u8 dst, f64 n) noexcept {
+    void emit_load_number(u16 dst, f64 n) noexcept {
         const i32 as_int = (n >= -32768.0 && n <= 32767.0) ? static_cast<i32>(n) : 0x7FFFFFFF;
         if (static_cast<f64>(as_int) == n) {
             ctx->program.emit(AnvilInstruction::make_abx(
@@ -875,50 +921,50 @@ struct AnvilCompiler {
         }
     }
 
-    u8 compile_primary() noexcept {
+    u16 compile_primary() noexcept {
         const Token& t = peek();
         if (t.kind == TokenKind::Number) {
             advance();
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             emit_load_number(dst, t.num_val);
             return dst;
         }
         if (t.kind == TokenKind::KwTrue) {
             advance();
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadTrue, dst, 0u, 0u));
             return dst;
         }
         if (t.kind == TokenKind::KwFalse) {
             advance();
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadFalse, dst, 0u, 0u));
             return dst;
         }
         if (t.kind == TokenKind::KwNull) {
             advance();
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, dst, 0u, 0u));
             return dst;
         }
         if (t.kind == TokenKind::String) {
             advance();
             const u32 sym = token_sym(t);
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             const u16 cidx = ctx->program.add_constant(AnvilValue::make_string(sym));
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
             return dst;
         }
         if (t.kind == TokenKind::LParen) {
             advance();
-            const u8 inner = compile_expr();
+            const u16 inner = compile_expr();
             expect(TokenKind::RParen);
             return inner;
         }
         if (t.kind == TokenKind::LBrace) {
             // Object literal `{ key: expr, ... }` lowered to `NewObject` + `SetPropIC`.
             advance();
-            const u8 obj_reg = alloc_reg();
+            const u16 obj_reg = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewObject, obj_reg, 0u, 0u));
             while (peek().kind != TokenKind::RBrace && peek().kind != TokenKind::Eof && !had_error) {
                 const Token& key_tok = advance();
@@ -928,7 +974,7 @@ struct AnvilCompiler {
                 }
                 const u32 prop_sym = token_sym(key_tok);
                 expect(TokenKind::Colon);
-                const u8 val_reg = compile_expr();
+                const u16 val_reg = compile_expr();
                 const u32 ic_site = new_site(prop_sym);
                 ctx->program.emit(AnvilInstruction::make_abc(
                     AnvilOpcode::SetPropIC,
@@ -946,10 +992,10 @@ struct AnvilCompiler {
         if (t.kind == TokenKind::LBracket) {
             // Array literal `[e0, e1, ...]` lowered to `NewArray` + `ArrayPush`.
             advance();
-            const u8 arr_reg = alloc_reg();
+            const u16 arr_reg = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewArray, arr_reg, 8u, 0u));
             while (peek().kind != TokenKind::RBracket && peek().kind != TokenKind::Eof && !had_error) {
-                const u8 elem_reg = compile_expr();
+                const u16 elem_reg = compile_expr();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ArrayPush, arr_reg, elem_reg, 0u));
                 if (!match(TokenKind::Comma)) {
                     break;
@@ -975,9 +1021,9 @@ struct AnvilCompiler {
                     reject_name(VM_REFUSE_UNSUPPORTED, "unsupported Math function", m_tok);
                 }
                 expect(TokenKind::LParen);
-                const u8 arg_reg = compile_expr();
+                const u16 arg_reg = compile_expr();
                 expect(TokenKind::RParen);
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallMath, dst, math_op, arg_reg));
                 return dst;
             }
@@ -1002,10 +1048,10 @@ struct AnvilCompiler {
                 // Every argument is compiled first. Their values are then
                 // copied into a run of registers above all of them, so an
                 // argument's temporaries cannot overwrite an earlier one.
-                u8 arg_regs[MAX_REGISTERS_PER_FRAME];
+                u16 arg_regs[MAX_REGISTERS_PER_FRAME];
                 u32 argc = 0u;
                 while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
-                    const u8 arg_r = compile_expr();
+                    const u16 arg_r = compile_expr();
                     if (argc < MAX_REGISTERS_PER_FRAME) {
                         arg_regs[argc] = arg_r;
                     } else {
@@ -1020,9 +1066,9 @@ struct AnvilCompiler {
                 // Extra arguments are evaluated and dropped. Missing ones
                 // are filled in.
                 const u32 arity = (target_fn < ctx->heap.function_count) ? ctx->heap.functions()[target_fn].arity : 0u;
-                const u8 call_base = next_reg;
+                const u16 call_base = next_reg;
                 for (u32 i = 0u; i < arity && !had_error; ++i) {
-                    const u8 slot_r = alloc_reg();
+                    const u16 slot_r = alloc_reg();
                     if (i < argc) {
                         if (arg_regs[i] != slot_r) {
                             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
@@ -1031,7 +1077,7 @@ struct AnvilCompiler {
                         emit_load_undefined(slot_r);
                     }
                 }
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 if (target_fn != 0xFFFFFFFFu) {
                     ctx->program.emit(AnvilInstruction::make_abc(
                         AnvilOpcode::Call,
@@ -1046,13 +1092,13 @@ struct AnvilCompiler {
             // Variable read (local register or global binding)
             const i32 local_r = find_local(sym);
             if (local_r < 0 && match_kw(&src[id_tok.offset], id_tok.length, "undefined", 9)) {
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 emit_load_undefined(dst);
                 return compile_postfix(dst, sym, -1);
             }
-            u8 base_reg = 0u;
+            u16 base_reg = 0u;
             if (local_r >= 0) {
-                base_reg = static_cast<u8>(local_r);
+                base_reg = static_cast<u16>(local_r);
             } else {
                 base_reg = alloc_reg();
                 const u16 g_slot = global_slot(sym);
@@ -1062,13 +1108,13 @@ struct AnvilCompiler {
         }
 
         reject_syntax();
-        const u8 fallback = alloc_reg();
+        const u16 fallback = alloc_reg();
         ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, fallback, 0u, 0u));
         return fallback;
     }
 
-    u8 compile_postfix(u8 base_reg, u32 ident_sym, i32 local_r) noexcept {
-        u8 cur = base_reg;
+    u16 compile_postfix(u16 base_reg, u32 ident_sym, i32 local_r) noexcept {
+        u16 cur = base_reg;
         while (!had_error) {
             if (match(TokenKind::Dot)) {
                 const Token prop_tok = advance();
@@ -1079,12 +1125,12 @@ struct AnvilCompiler {
                 const u32 prop_sym = token_sym(prop_tok);
                 // Check for `arr.push(expr)` method call.
                 if (match_kw(&src[prop_tok.offset], prop_tok.length, "push", 4) && match(TokenKind::LParen)) {
-                    const u8 val_reg = compile_expr();
+                    const u16 val_reg = compile_expr();
                     expect(TokenKind::RParen);
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ArrayPush, cur, val_reg, 0u));
                     // push gives the new length.
                     const u32 len_site = new_site(intern_name("length", 6u));
-                    const u8 len_reg = alloc_reg();
+                    const u16 len_reg = alloc_reg();
                     ctx->program.emit(AnvilInstruction::make_abc(
                         AnvilOpcode::GetPropIC,
                         len_reg,
@@ -1101,7 +1147,7 @@ struct AnvilCompiler {
                 }
                 // Check for property assignment `obj.prop = expr`.
                 if (match(TokenKind::Assign)) {
-                    const u8 rhs = compile_expr();
+                    const u16 rhs = compile_expr();
                     const u32 ic_site = new_site(prop_sym);
                     ctx->program.emit(AnvilInstruction::make_abc(
                         AnvilOpcode::SetPropIC,
@@ -1113,7 +1159,7 @@ struct AnvilCompiler {
                     continue;
                 }
                 const u32 ic_site = new_site(prop_sym);
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(
                     AnvilOpcode::GetPropIC,
                     dst,
@@ -1124,10 +1170,10 @@ struct AnvilCompiler {
                 continue;
             }
             if (match(TokenKind::LBracket)) {
-                const u8 idx_reg = compile_expr();
+                const u16 idx_reg = compile_expr();
                 expect(TokenKind::RBracket);
                 if (match(TokenKind::Assign)) {
-                    const u8 rhs = compile_expr();
+                    const u16 rhs = compile_expr();
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetElem, cur, idx_reg, rhs));
                     cur = rhs;
                     continue;
@@ -1136,7 +1182,7 @@ struct AnvilCompiler {
                     reject_here(VM_REFUSE_UNSUPPORTED, "unsupported call through an element");
                     break;
                 }
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, dst, cur, idx_reg));
                 cur = dst;
                 continue;
@@ -1150,13 +1196,13 @@ struct AnvilCompiler {
                 }
                 const bool is_inc = advance().kind == TokenKind::PlusPlus;
                 // The value of `x++` is the old value as a number.
-                const u8 zero_reg = alloc_reg();
+                const u16 zero_reg = alloc_reg();
                 emit_load_number(zero_reg, 0.0);
-                const u8 old_reg = alloc_reg();
+                const u16 old_reg = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Sub, old_reg, cur, zero_reg));
-                const u8 one_reg = alloc_reg();
+                const u16 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(
                     is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub,
                     dst,
@@ -1172,12 +1218,12 @@ struct AnvilCompiler {
         return cur;
     }
 
-    void store_back_ident(u32 sym, i32 local_r, u8 src_reg) noexcept {
+    void store_back_ident(u32 sym, i32 local_r, u16 src_reg) noexcept {
         if (local_r >= 0) {
-            if (static_cast<u8>(local_r) != src_reg) {
+            if (static_cast<u16>(local_r) != src_reg) {
                 ctx->program.emit(AnvilInstruction::make_abc(
                     AnvilOpcode::Move,
-                    static_cast<u8>(local_r),
+                    static_cast<u16>(local_r),
                     src_reg,
                     0u
                 ));
@@ -1188,30 +1234,30 @@ struct AnvilCompiler {
         }
     }
 
-    u8 compile_unary() noexcept {
+    u16 compile_unary() noexcept {
         if (match(TokenKind::Minus)) {
-            const u8 operand = compile_unary();
-            const u8 dst = alloc_reg();
+            const u16 operand = compile_unary();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Neg, dst, operand, 0u));
             return dst;
         }
         if (match(TokenKind::Bang)) {
-            const u8 operand = compile_unary();
-            const u8 dst = alloc_reg();
+            const u16 operand = compile_unary();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Not, dst, operand, 0u));
             return dst;
         }
         return compile_primary();
     }
 
-    u8 compile_mul() noexcept {
-        u8 lhs = compile_unary();
+    u16 compile_mul() noexcept {
+        u16 lhs = compile_unary();
         while (peek().kind == TokenKind::Star ||
                peek().kind == TokenKind::Slash ||
                peek().kind == TokenKind::Percent) {
             const TokenKind op = advance().kind;
-            const u8 rhs = compile_unary();
-            const u8 dst = alloc_reg();
+            const u16 rhs = compile_unary();
+            const u16 dst = alloc_reg();
             const AnvilOpcode opc = (op == TokenKind::Star)
                 ? AnvilOpcode::Mul
                 : (op == TokenKind::Slash ? AnvilOpcode::Div : AnvilOpcode::Mod);
@@ -1221,12 +1267,12 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_add() noexcept {
-        u8 lhs = compile_mul();
+    u16 compile_add() noexcept {
+        u16 lhs = compile_mul();
         while (peek().kind == TokenKind::Plus || peek().kind == TokenKind::Minus) {
             const TokenKind op = advance().kind;
-            const u8 rhs = compile_mul();
-            const u8 dst = alloc_reg();
+            const u16 rhs = compile_mul();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(
                 op == TokenKind::Plus ? AnvilOpcode::Add : AnvilOpcode::Sub,
                 dst,
@@ -1238,14 +1284,14 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_shift() noexcept {
-        u8 lhs = compile_add();
+    u16 compile_shift() noexcept {
+        u16 lhs = compile_add();
         while (peek().kind == TokenKind::Shl ||
                peek().kind == TokenKind::Shr ||
                peek().kind == TokenKind::UShr) {
             const TokenKind op = advance().kind;
-            const u8 rhs = compile_add();
-            const u8 dst = alloc_reg();
+            const u16 rhs = compile_add();
+            const u16 dst = alloc_reg();
             const AnvilOpcode opc = (op == TokenKind::Shl)
                 ? AnvilOpcode::Shl
                 : (op == TokenKind::Shr ? AnvilOpcode::Shr : AnvilOpcode::UShr);
@@ -1255,15 +1301,15 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_relational() noexcept {
-        u8 lhs = compile_shift();
+    u16 compile_relational() noexcept {
+        u16 lhs = compile_shift();
         while (peek().kind == TokenKind::Lt ||
                peek().kind == TokenKind::Le ||
                peek().kind == TokenKind::Gt ||
                peek().kind == TokenKind::Ge) {
             const TokenKind op = advance().kind;
-            const u8 rhs = compile_shift();
-            const u8 dst = alloc_reg();
+            const u16 rhs = compile_shift();
+            const u16 dst = alloc_reg();
             AnvilOpcode opc = AnvilOpcode::CmpLt;
             if (op == TokenKind::Le) opc = AnvilOpcode::CmpLe;
             else if (op == TokenKind::Gt) opc = AnvilOpcode::CmpGt;
@@ -1274,13 +1320,13 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_equality() noexcept {
-        u8 lhs = compile_relational();
+    u16 compile_equality() noexcept {
+        u16 lhs = compile_relational();
         while (peek().kind == TokenKind::EqEq || peek().kind == TokenKind::BangEq ||
                peek().kind == TokenKind::LooseEq || peek().kind == TokenKind::LooseNe) {
             const TokenKind op = advance().kind;
-            const u8 rhs = compile_relational();
-            const u8 dst = alloc_reg();
+            const u16 rhs = compile_relational();
+            const u16 dst = alloc_reg();
             AnvilOpcode opc = AnvilOpcode::CmpEq;
             if (op == TokenKind::BangEq) {
                 opc = AnvilOpcode::CmpNe;
@@ -1295,14 +1341,14 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_bitwise() noexcept {
-        u8 lhs = compile_equality();
+    u16 compile_bitwise() noexcept {
+        u16 lhs = compile_equality();
         while (peek().kind == TokenKind::Amp ||
                peek().kind == TokenKind::Caret ||
                peek().kind == TokenKind::Pipe) {
             const TokenKind op = advance().kind;
-            const u8 rhs = compile_equality();
-            const u8 dst = alloc_reg();
+            const u16 rhs = compile_equality();
+            const u16 dst = alloc_reg();
             const AnvilOpcode opc = (op == TokenKind::Amp)
                 ? AnvilOpcode::BitAnd
                 : (op == TokenKind::Caret ? AnvilOpcode::BitXor : AnvilOpcode::BitOr);
@@ -1312,18 +1358,18 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_logical() noexcept {
-        u8 lhs = compile_bitwise();
+    u16 compile_logical() noexcept {
+        u16 lhs = compile_bitwise();
         while (peek().kind == TokenKind::AndAnd || peek().kind == TokenKind::OrOr) {
             const bool is_and = advance().kind == TokenKind::AndAnd;
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, lhs, 0u));
             const u32 patch_pc = ctx->program.emit(AnvilInstruction::make_abx(
                 is_and ? AnvilOpcode::JumpIfFalse : AnvilOpcode::JumpIfTrue,
                 dst,
                 0u
             ));
-            const u8 rhs = compile_bitwise();
+            const u16 rhs = compile_bitwise();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, rhs, 0u));
             ctx->program.code()[patch_pc] = AnvilInstruction::make_abx(
                 is_and ? AnvilOpcode::JumpIfFalse : AnvilOpcode::JumpIfTrue,
@@ -1335,14 +1381,14 @@ struct AnvilCompiler {
         return lhs;
     }
 
-    u8 compile_expr() noexcept {
-        const u8 cond_or_val = compile_logical();
+    u16 compile_expr() noexcept {
+        const u16 cond_or_val = compile_logical();
         if (match(TokenKind::Question)) {
-            const u8 dst = alloc_reg();
+            const u16 dst = alloc_reg();
             const u32 jfalse_pc = ctx->program.emit(
                 AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_or_val, 0u)
             );
-            const u8 then_reg = compile_expr();
+            const u16 then_reg = compile_expr();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, then_reg, 0u));
             const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
             expect(TokenKind::Colon);
@@ -1351,7 +1397,7 @@ struct AnvilCompiler {
                 cond_or_val,
                 ctx->program.code_len
             );
-            const u8 else_reg = compile_expr();
+            const u16 else_reg = compile_expr();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, else_reg, 0u));
             ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
@@ -1366,15 +1412,15 @@ struct AnvilCompiler {
     // No temporary outlives the statement that made it, so the registers
     // above the locals are free again once a statement is compiled. The
     // returned register is only read by the final Halt.
-    u8 compile_statement() noexcept {
-        const u8 result = compile_statement_body();
+    u16 compile_statement() noexcept {
+        const u16 result = compile_statement_body();
         if (next_reg > reg_floor) {
             next_reg = reg_floor;
         }
         return result;
     }
 
-    u8 compile_statement_body() noexcept {
+    u16 compile_statement_body() noexcept {
         while (match(TokenKind::Semicolon)) {}
         const Token& t = peek();
         if (t.kind == TokenKind::Eof || t.kind == TokenKind::RBrace) {
@@ -1383,7 +1429,7 @@ struct AnvilCompiler {
 
         if (match(TokenKind::LBrace)) {
             const BlockScope scope(block_depth);
-            u8 last_reg = 0u;
+            u16 last_reg = 0u;
             while (peek().kind != TokenKind::RBrace && peek().kind != TokenKind::Eof && !had_error) {
                 last_reg = compile_statement();
             }
@@ -1407,7 +1453,7 @@ struct AnvilCompiler {
                 // A top-level name lives only in its global slot, so a
                 // function that reads or writes it sees the same value as
                 // the top-level code does.
-                u8 val_reg = 0u;
+                u16 val_reg = 0u;
                 if (match(TokenKind::Assign)) {
                     val_reg = compile_expr();
                 } else {
@@ -1434,9 +1480,9 @@ struct AnvilCompiler {
                 match(TokenKind::Semicolon);
                 return val_reg;
             }
-            const u8 dst = declare_local(sym);
+            const u16 dst = declare_local(sym);
             if (match(TokenKind::Assign)) {
-                const u8 val_reg = compile_expr();
+                const u16 val_reg = compile_expr();
                 reject_if_expression_continues();
                 if (val_reg != dst) {
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, val_reg, 0u));
@@ -1453,7 +1499,7 @@ struct AnvilCompiler {
                 reject_here(VM_REFUSE_SYNTAX, "return outside a function");
                 return 0u;
             }
-            u8 ret_reg = 0u;
+            u16 ret_reg = 0u;
             if (peek().kind != TokenKind::Semicolon &&
                 peek().kind != TokenKind::RBrace &&
                 peek().kind != TokenKind::Eof) {
@@ -1470,12 +1516,12 @@ struct AnvilCompiler {
 
         if (match(TokenKind::KwIf)) {
             expect(TokenKind::LParen);
-            const u8 cond_reg = compile_expr();
+            const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             const u32 jfalse_pc = ctx->program.emit(
                 AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u)
             );
-            u8 last_reg = compile_statement();
+            u16 last_reg = compile_statement();
             if (match(TokenKind::KwElse)) {
                 const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
                 ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
@@ -1521,11 +1567,11 @@ struct AnvilCompiler {
             if (!begin_loop()) {
                 return 0u;
             }
-            const u8 body_reg = compile_statement();
+            const u16 body_reg = compile_statement();
             expect(TokenKind::KwWhile);
             expect(TokenKind::LParen);
             const u32 cond_pc = ctx->program.code_len;
-            const u8 cond_reg = compile_expr();
+            const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             match(TokenKind::Semicolon);
             ctx->program.emit(AnvilInstruction::make_abx(
@@ -1547,7 +1593,7 @@ struct AnvilCompiler {
                 0u
             ));
             expect(TokenKind::LParen);
-            const u8 cond_reg = compile_expr();
+            const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             const u32 jexit_pc = ctx->program.emit(
                 AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u)
@@ -1555,7 +1601,7 @@ struct AnvilCompiler {
             if (!begin_loop()) {
                 return 0u;
             }
-            const u8 body_reg = compile_statement();
+            const u16 body_reg = compile_statement();
             ctx->program.emit(AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
@@ -1585,7 +1631,7 @@ struct AnvilCompiler {
                 0u,
                 0u
             ));
-            u8 cond_reg = 0u;
+            u16 cond_reg = 0u;
             bool has_cond = false;
             if (!match(TokenKind::Semicolon)) {
                 cond_reg = compile_expr();
@@ -1612,7 +1658,7 @@ struct AnvilCompiler {
             if (!begin_loop()) {
                 return 0u;
             }
-            const u8 body_reg = compile_statement();
+            const u16 body_reg = compile_statement();
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(step_pc)));
 
             if (has_cond) {
@@ -1635,18 +1681,18 @@ struct AnvilCompiler {
             const u32 fn_sym = token_sym(fn_tok);
             expect(TokenKind::LParen);
 
-            // Save enclosing compiler state.
-            LocalBinding saved_locals[MAX_REGISTERS_PER_FRAME];
-            for (u32 i = 0; i < local_count; ++i) {
-                saved_locals[i] = locals[i];
-            }
+            // Save enclosing compiler state. The enclosing locals stay in the
+            // arena; the function's own locals are appended above local_floor
+            // and dropped when its local_count is restored, so an inner
+            // function never sees or disturbs them.
             const u32 saved_local_count = local_count;
-            const u8 saved_next_reg = next_reg;
-            const u8 saved_reg_floor = reg_floor;
-            const u8 saved_high_reg = high_reg;
+            const u32 saved_local_floor = local_floor;
+            const u16 saved_next_reg = next_reg;
+            const u16 saved_reg_floor = reg_floor;
+            const u16 saved_high_reg = high_reg;
             const bool saved_in_fn = in_function;
 
-            local_count = 0u;
+            local_floor = local_count;
             next_reg = 0u;
             reg_floor = 0u;
             high_reg = 0u;
@@ -1678,7 +1724,7 @@ struct AnvilCompiler {
             }
 
             compile_statement();
-            const u8 fallthrough_reg = alloc_reg();
+            const u16 fallthrough_reg = alloc_reg();
             emit_load_undefined(fallthrough_reg);
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, fallthrough_reg, 0u, 0u));
 
@@ -1692,11 +1738,10 @@ struct AnvilCompiler {
                 ctx->program.code_len
             );
 
-            // Restore enclosing compiler state.
-            for (u32 i = 0; i < saved_local_count; ++i) {
-                locals[i] = saved_locals[i];
-            }
+            // Restore enclosing compiler state; the function's locals above
+            // local_floor fall away as local_count returns to its old value.
             local_count = saved_local_count;
+            local_floor = saved_local_floor;
             next_reg = saved_next_reg;
             reg_floor = saved_reg_floor;
             high_reg = saved_high_reg;
@@ -1704,13 +1749,13 @@ struct AnvilCompiler {
             return 0u;
         }
 
-        const u8 res = compile_statement_or_assign_no_semi();
+        const u16 res = compile_statement_or_assign_no_semi();
         reject_if_expression_continues();
         match(TokenKind::Semicolon);
         return res;
     }
 
-    u8 compile_statement_or_assign_no_semi() noexcept {
+    u16 compile_statement_or_assign_no_semi() noexcept {
         if (looks_like_host_text()) {
             return compile_host_text();
         }
@@ -1726,17 +1771,17 @@ struct AnvilCompiler {
                 const bool is_inc = advance().kind == TokenKind::PlusPlus;
                 const u32 sym = token_sym(id_tok);
                 const i32 local_r = find_local(sym);
-                u8 cur_reg = 0u;
+                u16 cur_reg = 0u;
                 if (local_r >= 0) {
-                    cur_reg = static_cast<u8>(local_r);
+                    cur_reg = static_cast<u16>(local_r);
                 } else {
                     cur_reg = alloc_reg();
                     const u16 g_slot = global_slot(sym);
                     ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::GetGlobal, cur_reg, g_slot));
                 }
-                const u8 one_reg = alloc_reg();
+                const u16 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(
                     is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub,
                     dst,
@@ -1756,22 +1801,22 @@ struct AnvilCompiler {
                 const TokenKind assign_kind = advance().kind;
                 const u32 sym = token_sym(id_tok);
                 const i32 local_r = find_local(sym);
-                const u8 rhs = compile_expr();
+                const u16 rhs = compile_expr();
 
                 if (assign_kind == TokenKind::Assign) {
                     store_back_ident(sym, local_r, rhs);
                     return rhs;
                 }
 
-                u8 cur_reg = 0u;
+                u16 cur_reg = 0u;
                 if (local_r >= 0) {
-                    cur_reg = static_cast<u8>(local_r);
+                    cur_reg = static_cast<u16>(local_r);
                 } else {
                     cur_reg = alloc_reg();
                     const u16 g_slot = global_slot(sym);
                     ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::GetGlobal, cur_reg, g_slot));
                 }
-                const u8 dst = alloc_reg();
+                const u16 dst = alloc_reg();
                 const AnvilOpcode opc = (assign_kind == TokenKind::PlusEq)
                     ? AnvilOpcode::Add
                     : (assign_kind == TokenKind::MinusEq ? AnvilOpcode::Sub : AnvilOpcode::Mul);
@@ -1808,7 +1853,10 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.ctx = &ctx;
     g_compiler.src = src;
     g_compiler.cursor = 0u;
+    g_compiler.locals_off = 0u;
+    g_compiler.locals_cap = 0u;
     g_compiler.local_count = 0u;
+    g_compiler.local_floor = 0u;
     g_compiler.next_reg = 0u;
     g_compiler.reg_floor = 0u;
     g_compiler.high_reg = 0u;
@@ -1831,7 +1879,7 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     }
     g_compiler.hoist_functions();
 
-    u8 last_reg = 0u;
+    u16 last_reg = 0u;
     while (g_compiler.peek().kind != TokenKind::Eof && !g_compiler.had_error) {
         if (g_compiler.peek().kind == TokenKind::RBrace) {
             // A '}' with no open block. compile_statement returns without
