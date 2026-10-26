@@ -521,14 +521,35 @@ struct AnvilValue {
 // 3. Hidden Classes (AnvilShape) & Managed Mark-Sweep Heap (AnvilHeap)
 // ============================================================================
 
+// Blocks are sized to a power of two (at least 8 bytes, so a freed block can
+// hold the u32 link below). One free list per size class lets freed blocks be
+// handed out again instead of being abandoned, so growth and churn reuse the
+// arena. `used` is the bump frontier and never retreats; the byte budget caps
+// how far it may reach, and reuse keeps it from reaching as far.
+constexpr u32 ARENA_SIZE_CLASSES = 32u;
+
 struct AnvilArena {
     // Recomputed from the context pointer at every init(), so nothing inside
     // the arena is a raw pointer and the whole region stays relocatable.
     u8* base;
-    u32 used;      // bytes handed out so far
+    u32 used;      // bump frontier
     u32 reserve;   // total bytes the arena may ever use
-    u32 budget;    // the byte budget: handing out past it fails the run
+    u32 budget;    // the byte budget: bumping past it fails the run
     u32 high_water;
+    u32 free_list[ARENA_SIZE_CLASSES]; // head block offset per class, or NO_SLOT
+
+    // Smallest class whose block is at least `bytes` (and at least 8).
+    static u32 size_class(u32 bytes) noexcept {
+        u32 need = bytes < 8u ? 8u : bytes;
+        u32 c = 3u;
+        u32 sz = 8u;
+        while (sz < need) {
+            sz <<= 1u;
+            ++c;
+        }
+        return c;
+    }
+    static u32 class_bytes(u32 c) noexcept { return 1u << c; }
 
     void init(u8* b, u32 reserve_bytes, u32 budget_bytes) noexcept {
         base = b;
@@ -537,13 +558,26 @@ struct AnvilArena {
         budget = (budget_bytes == 0u || budget_bytes > reserve_bytes) ? reserve_bytes
                                                                       : budget_bytes;
         high_water = 0u;
+        for (u32 i = 0u; i < ARENA_SIZE_CLASSES; ++i) {
+            free_list[i] = NO_SLOT;
+        }
     }
 
-    // Hand out `bytes` rounded up to 8, or NO_SLOT when that would pass the
-    // budget. `*over` (when given) is set on failure so the caller can report
-    // the heap limit.
+    // Hand out a block big enough for `bytes`: a freed one of the right class
+    // if there is one, otherwise a fresh bump. NO_SLOT (and `*over` set) when a
+    // fresh block would pass the budget.
     u32 alloc(u32 bytes, bool* over) noexcept {
-        const u32 need = (bytes + 7u) & ~7u;
+        const u32 c = size_class(bytes);
+        if (free_list[c] != NO_SLOT) {
+            const u32 off = free_list[c];
+            u32 next = 0u;
+            const u8* link = base + off;
+            next = static_cast<u32>(link[0]) | (static_cast<u32>(link[1]) << 8u) |
+                   (static_cast<u32>(link[2]) << 16u) | (static_cast<u32>(link[3]) << 24u);
+            free_list[c] = next;
+            return off;
+        }
+        const u32 need = class_bytes(c);
         if (need > budget - used) {
             if (over) {
                 *over = true;
@@ -556,6 +590,22 @@ struct AnvilArena {
             high_water = used;
         }
         return off;
+    }
+
+    // Return a block to its class free list. `bytes` must be what it was
+    // allocated for, so it lands in the same class it came from.
+    void free(u32 off, u32 bytes) noexcept {
+        if (off == NO_SLOT) {
+            return;
+        }
+        const u32 c = size_class(bytes);
+        u8* link = base + off;
+        const u32 next = free_list[c];
+        link[0] = static_cast<u8>(next & 0xFFu);
+        link[1] = static_cast<u8>((next >> 8u) & 0xFFu);
+        link[2] = static_cast<u8>((next >> 16u) & 0xFFu);
+        link[3] = static_cast<u8>((next >> 24u) & 0xFFu);
+        free_list[c] = off;
     }
 
     u8* at(u32 off) noexcept { return base + off; }
@@ -604,7 +654,7 @@ struct AnvilHeapArray {
     bool active;
     bool marked;
     u32 length;
-    u32 start_index;
+    u32 storage_off; // arena block holding AnvilValue[capacity], or NO_SLOT
     u32 capacity;
 };
 
@@ -658,16 +708,13 @@ struct AnvilHeap {
     AnvilHeapFunction functions[MAX_FUNCTIONS];
     u32 function_count;
 
-    // Arrays and their element storage live in the arena and grow as needed,
-    // so neither the number of arrays nor their length is capped any more.
-    // Element slices are offsets into array_storage; array_storage itself moves
-    // as a whole when it grows, so the slice offsets stay valid.
+    // Arrays and their element storage live in the arena and grow as needed, so
+    // neither the number of arrays nor their length is capped any more. Each
+    // array owns its element block; growth allocates a larger block and frees
+    // the old one, and a swept array frees its block to the arena free list.
     u32 arrays_off;
     u32 arrays_cap;
     u32 array_count;
-    u32 array_storage_off;
-    u32 array_storage_cap;
-    u32 array_storage_used;
 
     AnvilHeapArray* arrays() noexcept {
         return reinterpret_cast<AnvilHeapArray*>(arena.at(arrays_off));
@@ -675,14 +722,14 @@ struct AnvilHeap {
     const AnvilHeapArray* arrays() const noexcept {
         return reinterpret_cast<const AnvilHeapArray*>(arena.at(arrays_off));
     }
-    AnvilValue* array_storage() noexcept {
-        return reinterpret_cast<AnvilValue*>(arena.at(array_storage_off));
+    // Elements of one array, its own arena block.
+    AnvilValue* array_elems(u32 off) noexcept {
+        return reinterpret_cast<AnvilValue*>(arena.at(off));
     }
-    const AnvilValue* array_storage() const noexcept {
-        return reinterpret_cast<const AnvilValue*>(arena.at(array_storage_off));
+    const AnvilValue* array_elems(u32 off) const noexcept {
+        return reinterpret_cast<const AnvilValue*>(arena.at(off));
     }
     bool ensure_arrays(u32 need) noexcept;
-    bool ensure_array_storage(u32 need) noexcept;
 
     // Heap & GC telemetry
     u32 live_objects;
@@ -713,9 +760,6 @@ struct AnvilHeap {
     // Intern the concatenation of two pooled strings, built in place at the
     // end of the pool. NO_SLOT when the pool has no room for it.
     u32 intern_concat(u32 sym_a, u32 sym_b) noexcept;
-    // Move the live arrays down to the start of array storage so the space
-    // of freed arrays and of grown arrays' old slices can be used again.
-    void compact_array_storage() noexcept;
 
     void mark_value(AnvilValue v) noexcept;
     void mark_object(u32 obj_id) noexcept;

@@ -181,8 +181,9 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
 }
 
 void AnvilVmContext::reclaim_array_storage(u32 reg_top) noexcept {
+    // Each array owns its element block now, so a collection frees the blocks
+    // of unreachable arrays straight to the arena free list; no compaction.
     collect_garbage(reg_top);
-    heap.compact_array_storage();
 }
 
 bool AnvilVmContext::store_ok(StoreResult stored) noexcept {

@@ -257,3 +257,25 @@ fn a_small_budget_stops_a_growing_array() {
     let error = anvil_script::eval_cpp_vm_request_heap_budget(32 * 1024, source).unwrap_err();
     assert_eq!(error.message, "heap limit reached: 32768 bytes");
 }
+
+// ---- Arena free list -----------------------------------------------------
+
+/// Heavy array churn under a tight budget: each loop makes an array, grows it,
+/// then drops it. Only reusing the blocks of swept arrays keeps the run inside
+/// the budget, so this would hit the heap limit if freed blocks were abandoned.
+#[test]
+fn array_churn_reuses_freed_blocks_under_a_tight_budget() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "let total = 0; let i = 0; \
+                  while (i < 500) { const a = []; let j = 0; \
+                  while (j < 200) { a[j] = j; j = j + 1; } \
+                  total = total + a[199]; i = i + 1; } total;";
+    // 512 KiB holds only a handful of these arrays at once; the whole run
+    // allocates far more than that, so it only fits if blocks are reused.
+    let (value, telemetry) =
+        anvil_script::eval_cpp_vm_request_tuned(50_000_000, 512 * 1024, source).expect("runs");
+    assert_eq!(value, 99_500.0);
+    assert!(telemetry.gc_collections >= 1);
+}
