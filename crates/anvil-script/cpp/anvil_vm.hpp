@@ -37,8 +37,13 @@ constexpr u32 MAX_REGISTERS_PER_FRAME   = 64u;
 // One 64-register window per call frame, so calls can nest until the
 // frame stack is full.
 constexpr u32 MAX_TOTAL_REGISTERS       = MAX_CALL_FRAMES * MAX_REGISTERS_PER_FRAME;
-constexpr u32 MAX_INTERNED_STRINGS      = 512u;
-constexpr u32 MAX_STRING_BYTES          = 16384u;
+// The managed heap lives in an arena that Rust allocates after the context
+// header (see anvil_cpp_vm_context_bytes). The arena is reserved up front but
+// only touched as it is used; one byte budget, set by Configure, caps how
+// much of it a run may hand out. The string pool, interned-string table and
+// growable heap tables all draw from it, so these counts are no longer fixed.
+constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
+constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
 constexpr u32 MAX_SHAPES                = 256u;
 constexpr u32 MAX_SHAPE_PROPS           = 32u;
 constexpr u32 MAX_SHAPE_TRANSITIONS     = 512u;
@@ -78,6 +83,7 @@ enum VmErrorCode : u32 {
     VM_STOP_PROPERTIES      = 8u,
     VM_STOP_SHAPES          = 9u,
     VM_STOP_UNSUPPORTED     = 10u,
+    VM_STOP_HEAP            = 11u,
     VM_REFUSE_SYNTAX        = 32u,
     VM_REFUSE_UNSUPPORTED   = 33u,
     VM_REFUSE_UNKNOWN_NAME  = 34u,
@@ -91,6 +97,7 @@ enum VmErrorCode : u32 {
     VM_REFUSE_STRINGS       = 47u,
     VM_REFUSE_HOST_SLOTS    = 48u,
     VM_REFUSE_LOOPS         = 49u,
+    VM_REFUSE_HEAP          = 50u,
 };
 
 constexpr u32 MAX_ERROR_TEXT = 160u;
@@ -515,6 +522,47 @@ struct AnvilValue {
 // 3. Hidden Classes (AnvilShape) & Managed Mark-Sweep Heap (AnvilHeap)
 // ============================================================================
 
+struct AnvilArena {
+    // Recomputed from the context pointer at every init(), so nothing inside
+    // the arena is a raw pointer and the whole region stays relocatable.
+    u8* base;
+    u32 used;      // bytes handed out so far
+    u32 reserve;   // total bytes the arena may ever use
+    u32 budget;    // the byte budget: handing out past it fails the run
+    u32 high_water;
+
+    void init(u8* b, u32 reserve_bytes, u32 budget_bytes) noexcept {
+        base = b;
+        used = 0u;
+        reserve = reserve_bytes;
+        budget = (budget_bytes == 0u || budget_bytes > reserve_bytes) ? reserve_bytes
+                                                                      : budget_bytes;
+        high_water = 0u;
+    }
+
+    // Hand out `bytes` rounded up to 8, or NO_SLOT when that would pass the
+    // budget. `*over` (when given) is set on failure so the caller can report
+    // the heap limit.
+    u32 alloc(u32 bytes, bool* over) noexcept {
+        const u32 need = (bytes + 7u) & ~7u;
+        if (need > budget - used) {
+            if (over) {
+                *over = true;
+            }
+            return NO_SLOT;
+        }
+        const u32 off = used;
+        used += need;
+        if (used > high_water) {
+            high_water = used;
+        }
+        return off;
+    }
+
+    u8* at(u32 off) noexcept { return base + off; }
+    const u8* at(u32 off) const noexcept { return base + off; }
+};
+
 struct AnvilInternedString {
     u64 hash;
     u32 offset;
@@ -572,11 +620,33 @@ struct AnvilHeapFunction {
 };
 
 struct AnvilHeap {
-    // Interned string pool
-    char string_bytes[MAX_STRING_BYTES];
+    // The arena every growable region is carved from.
+    AnvilArena arena;
+
+    // Interned string pool: a byte region and a table, both in the arena and
+    // grown as needed. Offsets are relative to the arena base; byte offsets in
+    // the table entries are relative to str_pool_off.
+    u32 str_pool_off;
+    u32 str_pool_cap;
     u32 string_bytes_used;
-    AnvilInternedString strings[MAX_INTERNED_STRINGS];
+    u32 strings_off;
+    u32 strings_cap;
     u32 string_count;
+
+    // Typed views on the two string regions.
+    char* string_bytes() noexcept { return reinterpret_cast<char*>(arena.at(str_pool_off)); }
+    const char* string_bytes() const noexcept {
+        return reinterpret_cast<const char*>(arena.at(str_pool_off));
+    }
+    AnvilInternedString* strings() noexcept {
+        return reinterpret_cast<AnvilInternedString*>(arena.at(strings_off));
+    }
+    const AnvilInternedString* strings() const noexcept {
+        return reinterpret_cast<const AnvilInternedString*>(arena.at(strings_off));
+    }
+    // Grow a region to at least `need` bytes/entries; false on heap limit.
+    bool ensure_string_bytes(u32 need) noexcept;
+    bool ensure_string_table(u32 need) noexcept;
 
     // Hidden classes (Shapes) & transition table
     AnvilShape shapes[MAX_SHAPES];
@@ -599,7 +669,7 @@ struct AnvilHeap {
     u32 gc_collections;
     u32 shape_transitions_count;
 
-    void init() noexcept;
+    void init(u8* arena_base, u32 reserve, u32 budget) noexcept;
     u32 intern_string(const char* str, u32 len) noexcept;
     const char* get_string_ptr(u32 sym, u32* len_out) const noexcept;
     bool string_equals(u32 sym_a, u32 sym_b) const noexcept;

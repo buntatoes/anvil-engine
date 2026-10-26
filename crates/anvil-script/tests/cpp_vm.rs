@@ -130,7 +130,7 @@ fn run_limits_stop_with_a_reason() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let cases: [(&str, u32, &str); 9] = [
+    let cases: [(&str, u32, &str); 8] = [
         (
             // Numeric, so the native loop counts the steps.
             "let i = 0; while (i < 1000000) { i = i + 1; } i;",
@@ -167,11 +167,6 @@ fn run_limits_stop_with_a_reason() {
             "let a = []; let i = 0; while (i < 300) { a[i] = i; i = i + 1; } 1;",
             6,
             "array length limit reached: 256 elements per array",
-        ),
-        (
-            "let s = 'x'; let i = 0; while (i < 20) { s = s + s; i = i + 1; } 1;",
-            7,
-            "string pool limit reached: 16384 bytes",
         ),
         (
             "let i = 0; while (i < 512) { let o = {}; \

@@ -626,6 +626,35 @@ type VmBindings = (f64, Vec<(String, f64)>, AnvilVmTelemetry);
 
 /// Run `source` on the C++ VM and return numeric globals along with the halt value.
 /// `None` when the compiler rejects the script.
+/// Run `source` on a context that a Configure request first gave a heap byte
+/// budget (0 keeps the built-in default). The one budget stands in for the
+/// fixed table caps the VM used to carry, so a run that needs more heap than
+/// the budget stops with `heap limit reached: N bytes`.
+pub fn eval_cpp_vm_request_heap_budget(
+    heap_byte_budget: u32,
+    source: &str,
+) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let mut runtime = ScriptRuntime::new();
+    let configure = vm_request::configure(0, 0, heap_byte_budget, 0);
+    let _ = runtime.try_owned_vm(&configure);
+    let run = vm_request::run(trimmed.as_bytes());
+    match runtime.try_owned_vm(&run) {
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
+    }
+}
+
 pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
     let trimmed = source.trim();
     if trimmed.is_empty() {

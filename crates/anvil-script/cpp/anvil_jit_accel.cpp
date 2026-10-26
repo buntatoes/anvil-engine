@@ -130,7 +130,12 @@ bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, boo
 } // namespace
 
 void AnvilVmContext::init() noexcept {
-    heap.init();
+    // The arena is the bytes Rust allocated after this header (see
+    // anvil_cpp_vm_context_bytes). heap_byte_budget, kept across runs by a
+    // Configure request, caps how much of it a run may use; 0 means default.
+    u8* arena_base = reinterpret_cast<u8*>(this) + sizeof(AnvilVmContext);
+    const u32 budget = heap_byte_budget != 0u ? heap_byte_budget : ANVIL_DEFAULT_HEAP_BUDGET;
+    heap.init(arena_base, ANVIL_ARENA_RESERVE_BYTES, budget);
     ic.init();
     program.init();
     for (u32 i = 0; i < MAX_TOTAL_REGISTERS; ++i) {
@@ -292,7 +297,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 if (lhs.is_string() && rhs.is_string()) {
                     const u32 sym = heap.intern_concat(lhs.payload(), rhs.payload());
                     if (sym == NO_SLOT) {
-                        fail_limit(VM_STOP_STRINGS, "string pool", MAX_STRING_BYTES, "bytes");
+                        fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
                         return AnvilValue::make_undefined();
                     }
                     R[inst.a] = AnvilValue::make_string(sym);
@@ -813,7 +818,9 @@ i64 anvil_cpp_jit_sum_range_i64(i64 start, i64 end_exclusive, i64 step) noexcept
 
 // The caller owns the context bytes. This file does not keep a process-global VM.
 extern "C" u32 anvil_cpp_vm_context_bytes() {
-    return static_cast<u32>(sizeof(anvil_vm::AnvilVmContext));
+    // The context header followed by the heap arena Rust zero-allocates in one
+    // block. The arena is reserved but only touched as a run uses it.
+    return static_cast<u32>(sizeof(anvil_vm::AnvilVmContext)) + anvil_vm::ANVIL_ARENA_RESERVE_BYTES;
 }
 
 extern "C" u32 anvil_cpp_vm_context_align() {

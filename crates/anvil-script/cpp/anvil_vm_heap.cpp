@@ -20,16 +20,71 @@ inline bool bytes_equal(const char* a, const char* b, u32 len) noexcept {
 
 } // namespace
 
-void AnvilHeap::init() noexcept {
-    string_bytes_used = 0u;
-    string_count = 0u;
-    for (u32 i = 0; i < MAX_INTERNED_STRINGS; ++i) {
-        strings[i].hash = 0ULL;
-        strings[i].offset = 0u;
-        strings[i].length = 0u;
-        strings[i].marked = false;
-        strings[i].active = false;
+namespace {
+constexpr u32 INIT_STR_POOL_BYTES = 1024u;
+constexpr u32 INIT_STR_TABLE = 64u;
+} // namespace
+
+bool AnvilHeap::ensure_string_bytes(u32 need) noexcept {
+    if (need <= str_pool_cap) {
+        return true;
     }
+    u32 new_cap = str_pool_cap == 0u ? INIT_STR_POOL_BYTES : str_pool_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 new_off = arena.alloc(new_cap, &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    char* dst = reinterpret_cast<char*>(arena.at(new_off));
+    const char* src = string_bytes();
+    for (u32 i = 0u; i < string_bytes_used; ++i) {
+        dst[i] = src[i];
+    }
+    str_pool_off = new_off;
+    str_pool_cap = new_cap;
+    return true;
+}
+
+bool AnvilHeap::ensure_string_table(u32 need) noexcept {
+    if (need <= strings_cap) {
+        return true;
+    }
+    u32 new_cap = strings_cap == 0u ? INIT_STR_TABLE : strings_cap;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    bool over = false;
+    const u32 bytes = new_cap * static_cast<u32>(sizeof(AnvilInternedString));
+    const u32 new_off = arena.alloc(bytes, &over);
+    if (new_off == NO_SLOT) {
+        return false;
+    }
+    AnvilInternedString* dst = reinterpret_cast<AnvilInternedString*>(arena.at(new_off));
+    const AnvilInternedString* src = strings();
+    for (u32 i = 0u; i < string_count; ++i) {
+        dst[i] = src[i];
+    }
+    strings_off = new_off;
+    strings_cap = new_cap;
+    return true;
+}
+
+void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
+    arena.init(arena_base, reserve, budget);
+    str_pool_off = 0u;
+    str_pool_cap = 0u;
+    string_bytes_used = 0u;
+    strings_off = 0u;
+    strings_cap = 0u;
+    string_count = 0u;
+    // Reserve the first blocks for the string pool and table. On a budget too
+    // small for even these, the regions stay empty and interning fails with a
+    // heap-limit stop, which is what a run on such a budget should get.
+    ensure_string_bytes(INIT_STR_POOL_BYTES);
+    ensure_string_table(INIT_STR_TABLE);
 
     // Shape 0 is the empty root hidden class.
     shape_count = 1u;
@@ -98,63 +153,76 @@ u32 AnvilHeap::intern_string(const char* str, u32 len) noexcept {
     }
     const u64 h = fnv1a_hash_bytes(str, len);
     for (u32 i = 0; i < string_count; ++i) {
-        if (strings[i].active && strings[i].hash == h && strings[i].length == len) {
-            if (len == 0u || bytes_equal(&string_bytes[strings[i].offset], str, len)) {
+        const AnvilInternedString& e = strings()[i];
+        if (e.active && e.hash == h && e.length == len) {
+            if (len == 0u || bytes_equal(&string_bytes()[e.offset], str, len)) {
                 return i;
             }
         }
     }
-    if (string_count >= MAX_INTERNED_STRINGS || len > MAX_STRING_BYTES - string_bytes_used) {
+    // Grow the table and the byte pool first. When `str` points into the pool
+    // (the intern_concat path) the caller has already reserved the bytes, so
+    // neither grow fires here and `str` stays valid across the copy below.
+    if (!ensure_string_table(string_count + 1u)) {
+        return NO_SLOT;
+    }
+    if (!ensure_string_bytes(string_bytes_used + len)) {
         return NO_SLOT;
     }
     const u32 sym = string_count++;
     const u32 off = string_bytes_used;
+    char* pool = string_bytes();
     for (u32 i = 0; i < len; ++i) {
-        string_bytes[off + i] = str[i];
+        pool[off + i] = str[i];
     }
     string_bytes_used += len;
-    strings[sym].hash = h;
-    strings[sym].offset = off;
-    strings[sym].length = len;
-    strings[sym].marked = true;
-    strings[sym].active = true;
-    bytes_allocated += sizeof(AnvilInternedString) + len;
+    AnvilInternedString& e = strings()[sym];
+    e.hash = h;
+    e.offset = off;
+    e.length = len;
+    e.marked = true;
+    e.active = true;
+    bytes_allocated += static_cast<u32>(sizeof(AnvilInternedString)) + len;
     return sym;
 }
 
 u32 AnvilHeap::intern_concat(u32 sym_a, u32 sym_b) noexcept {
     u32 len_a = 0u;
     u32 len_b = 0u;
-    const char* ptr_a = get_string_ptr(sym_a, &len_a);
-    const char* ptr_b = get_string_ptr(sym_b, &len_b);
-    if (len_a > MAX_STRING_BYTES - string_bytes_used ||
-        len_b > MAX_STRING_BYTES - string_bytes_used - len_a) {
+    (void) get_string_ptr(sym_a, &len_a);
+    (void) get_string_ptr(sym_b, &len_b);
+    // Reserve room for the joined bytes first, so the pool does not move again
+    // while the parts are copied in. Both parts live below string_bytes_used,
+    // so building the result above it does not overwrite them. intern_string
+    // keeps the bytes in place when the result is new and leaves them unused
+    // when it is not.
+    if (!ensure_string_bytes(string_bytes_used + len_a + len_b)) {
         return NO_SLOT;
     }
-    // Both parts live below string_bytes_used, so building the result
-    // above it does not overwrite them. intern_string keeps the bytes in
-    // place when the result is new and leaves them unused when it is not.
     const u32 off = string_bytes_used;
+    char* pool = string_bytes();
+    const char* ptr_a = get_string_ptr(sym_a, nullptr);
     for (u32 i = 0u; i < len_a; ++i) {
-        string_bytes[off + i] = ptr_a[i];
+        pool[off + i] = ptr_a[i];
     }
+    const char* ptr_b = get_string_ptr(sym_b, nullptr);
     for (u32 i = 0u; i < len_b; ++i) {
-        string_bytes[off + len_a + i] = ptr_b[i];
+        pool[off + len_a + i] = ptr_b[i];
     }
-    return intern_string(&string_bytes[off], len_a + len_b);
+    return intern_string(&pool[off], len_a + len_b);
 }
 
 const char* AnvilHeap::get_string_ptr(u32 sym, u32* len_out) const noexcept {
-    if (sym >= string_count || !strings[sym].active) {
+    if (sym >= string_count || !strings()[sym].active) {
         if (len_out) {
             *len_out = 0u;
         }
         return "";
     }
     if (len_out) {
-        *len_out = strings[sym].length;
+        *len_out = strings()[sym].length;
     }
-    return &string_bytes[strings[sym].offset];
+    return &string_bytes()[strings()[sym].offset];
 }
 
 bool AnvilHeap::string_equals(u32 sym_a, u32 sym_b) const noexcept {
@@ -164,12 +232,12 @@ bool AnvilHeap::string_equals(u32 sym_a, u32 sym_b) const noexcept {
     if (sym_a >= string_count || sym_b >= string_count) {
         return false;
     }
-    const AnvilInternedString& a = strings[sym_a];
-    const AnvilInternedString& b = strings[sym_b];
+    const AnvilInternedString& a = strings()[sym_a];
+    const AnvilInternedString& b = strings()[sym_b];
     if (a.hash != b.hash || a.length != b.length) {
         return false;
     }
-    return bytes_equal(&string_bytes[a.offset], &string_bytes[b.offset], a.length);
+    return bytes_equal(&string_bytes()[a.offset], &string_bytes()[b.offset], a.length);
 }
 
 i32 AnvilHeap::lookup_shape_slot(u32 shape_id, u32 prop_sym) const noexcept {
@@ -413,7 +481,7 @@ void AnvilHeap::mark_value(AnvilValue v) noexcept {
         case ValueTag::String: {
             const u32 sym = v.payload();
             if (sym < string_count) {
-                strings[sym].marked = true;
+                strings()[sym].marked = true;
             }
             break;
         }

@@ -119,3 +119,68 @@ fn a_configured_budget_leaves_work_under_it_alone() {
             .expect("runs");
     assert_eq!(value, 6.0);
 }
+
+// ---- One heap on a byte budget ------------------------------------------
+
+/// Build a string past the old 16 KiB string-pool cap, by doubling with `+=`
+/// until it is at least 1 MiB. It used to stop at the fixed pool; now the
+/// growable pool in the arena carries it and the run finishes.
+#[test]
+fn a_big_string_builds_past_the_old_pool_cap() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // "x" doubled 20 times is 2^20 = 1,048,576 bytes.
+    let source = "let s = \"x\"; for (let i = 0; i < 20; i = i + 1) { s = s + s; } let r = 7; r;";
+    let (value, telemetry) = eval_cpp_vm_script(source).expect("runs to the end");
+    assert_eq!(value, 7.0);
+    assert!(telemetry.stop_reason().is_none());
+    // The interned bytes alone are well past the old 16 KiB pool.
+    assert!(telemetry.heap_bytes_allocated > 1_000_000);
+}
+
+/// Interning still dedups across a string larger than 1 MiB: two copies built
+/// the same way are the same interned string, so `===` is true.
+#[test]
+fn interning_dedups_a_large_string() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "let s = \"ab\"; for (let i = 0; i < 19; i = i + 1) { s = s + s; } \
+                  let t = \"ab\"; for (let i = 0; i < 19; i = i + 1) { t = t + t; } \
+                  let r = (s === t) ? 1 : 0; r;";
+    let (value, _) = eval_cpp_vm_script(source).expect("runs");
+    assert_eq!(value, 1.0);
+}
+
+/// A tiny heap byte budget, set by Configure, stops a string that would
+/// otherwise fit, and reports the budget in the reason.
+#[test]
+fn a_small_heap_budget_reports_the_limit() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // 64 KiB budget: building a ~1 MiB string must stop with the heap limit.
+    let source = "let s = \"x\"; for (let i = 0; i < 20; i = i + 1) { s = s + s; } let r = 7; r;";
+    let error = anvil_script::eval_cpp_vm_request_heap_budget(64 * 1024, source).unwrap_err();
+    assert_eq!(error.message, "heap limit reached: 65536 bytes");
+}
+
+/// The default budget leaves ordinary scripts alone, and a generous explicit
+/// budget runs the same work the same way.
+#[test]
+fn a_generous_heap_budget_runs_normally() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (value, _) =
+        anvil_script::eval_cpp_vm_request_heap_budget(0, "const o = {a: 1, b: 2}; o.a + o.b;")
+            .expect("runs on the default budget");
+    assert_eq!(value, 3.0);
+    let (value, _) = anvil_script::eval_cpp_vm_request_heap_budget(
+        128 * 1024 * 1024,
+        "const o = {a: 1, b: 2}; o.a + o.b;",
+    )
+    .expect("runs on a large budget");
+    assert_eq!(value, 3.0);
+}

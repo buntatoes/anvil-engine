@@ -787,7 +787,7 @@ struct AnvilCompiler {
     u32 intern_name(const char* name, u32 len) noexcept {
         const u32 sym = ctx->heap.intern_string(name, len);
         if (sym == NO_SLOT) {
-            reject_limit(VM_REFUSE_STRINGS, "string pool", MAX_STRING_BYTES, "bytes");
+            reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
         return sym;
@@ -796,7 +796,7 @@ struct AnvilCompiler {
     u32 token_sym(const Token& t) noexcept {
         const u32 sym = ctx->heap.intern_string(&src[t.offset], t.length);
         if (sym == NO_SLOT) {
-            reject_limit(VM_REFUSE_STRINGS, "string pool", MAX_STRING_BYTES, "bytes");
+            reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return 0u;
         }
         return sym;
