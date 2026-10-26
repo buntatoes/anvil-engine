@@ -23,6 +23,21 @@ mod html;
 
 pub use html::{MAX_ATTRS_PER_ELEMENT, MAX_DOM_DEPTH, MAX_DOM_NODES, parse_html};
 
+/// One style sheet the document names, from [`Document::style_sheets`].
+///
+/// `media` is the trimmed `media` attribute, or `None` when there is none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StyleSheetSource {
+    /// `<link rel=stylesheet href>`. The browser fetches `href` itself.
+    Link {
+        href: String,
+        integrity: Option<String>,
+        media: Option<String>,
+    },
+    /// A `<style>` element and its text.
+    Style { css: String, media: Option<String> },
+}
+
 /// Index of a node inside one [`Document`]'s node list.
 ///
 /// The id is a copy of the slot index. It does not own the node. An id from
@@ -1194,6 +1209,18 @@ impl Document {
         blocks
     }
 
+    /// Every stylesheet `<link>` and `<style>` element, in tree order.
+    ///
+    /// Links follow the same rules as [`Self::stylesheet_links_with_integrity`]
+    /// and styles the same rules as [`Self::embedded_css`]: an empty `style`
+    /// element is skipped. Each entry keeps its `media` attribute, so the
+    /// cascade can see document order and media together.
+    pub fn style_sheets(&self) -> Vec<StyleSheetSource> {
+        let mut sheets = Vec::new();
+        self.collect_style_sheets(self.root(), &mut sheets);
+        sheets
+    }
+
     /// Owned `href` of every stylesheet `<link>`, in tree order.
     /// Integrity metadata is dropped. See [`Self::stylesheet_links_with_integrity`].
     pub fn stylesheet_links(&self) -> Vec<String> {
@@ -1360,6 +1387,41 @@ impl Document {
         }
         for child in self.children(id) {
             self.collect_style(*child, out);
+        }
+    }
+
+    /// Record `<link rel=stylesheet>` and `<style>` in tree order. A `style`
+    /// element's children are not walked again.
+    fn collect_style_sheets(&self, id: NodeId, out: &mut Vec<StyleSheetSource>) {
+        let data = self.get(id).data();
+        let media = || data.attr("media").map(|m| m.trim().to_string());
+        match data.tag() {
+            Some("style") => {
+                let css = self.text_content(id);
+                if !css.is_empty() {
+                    out.push(StyleSheetSource::Style {
+                        css,
+                        media: media(),
+                    });
+                }
+                return;
+            }
+            Some("link") => {
+                let mut links = Vec::new();
+                self.collect_stylesheet_links(id, &mut links);
+                if let Some((href, integrity)) = links.into_iter().next() {
+                    out.push(StyleSheetSource::Link {
+                        href,
+                        integrity,
+                        media: media(),
+                    });
+                }
+                return;
+            }
+            _ => {}
+        }
+        for child in self.children(id) {
+            self.collect_style_sheets(*child, out);
         }
     }
 
@@ -2006,6 +2068,38 @@ mod tests {
         assert_eq!(doc.text_content(text).trim(), "Tom's & tea");
         assert!(doc.get_element_by_id("player-placeholder").is_some());
         assert_eq!(doc.scripts(), vec!["var ready = 1;"]);
+    }
+
+    #[test]
+    fn lists_links_and_styles_in_document_order_with_media() {
+        let doc = parse_html(
+            "<head><link rel=stylesheet href=a.css media=' print '><style>p{}</style>\
+             <style></style><link rel=icon href=i.png></head>\
+             <body><style media=screen>b{}</style><link rel='Stylesheet alternate' href=b.css></body>",
+        );
+        assert_eq!(
+            doc.style_sheets(),
+            vec![
+                StyleSheetSource::Link {
+                    href: "a.css".to_string(),
+                    integrity: None,
+                    media: Some("print".to_string()),
+                },
+                StyleSheetSource::Style {
+                    css: "p{}".to_string(),
+                    media: None,
+                },
+                StyleSheetSource::Style {
+                    css: "b{}".to_string(),
+                    media: Some("screen".to_string()),
+                },
+                StyleSheetSource::Link {
+                    href: "b.css".to_string(),
+                    integrity: None,
+                    media: None,
+                },
+            ]
+        );
     }
 
     #[test]

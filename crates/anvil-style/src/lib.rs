@@ -71,6 +71,15 @@ pub struct Stylesheet {
     pub keyframes: Vec<KeyframesRule>,
 }
 
+impl Stylesheet {
+    /// Move the rules and keyframes of `later` after this sheet's own, as if
+    /// its text came after this one in the same sheet.
+    pub fn append(&mut self, later: Stylesheet) {
+        self.rules.extend(later.rules);
+        self.keyframes.extend(later.keyframes);
+    }
+}
+
 /// Media queries attached to a rule.
 ///
 /// Holds one or more media query lists. Each list matches when any query in
@@ -1167,9 +1176,19 @@ const FALLBACK: ComputedStyle = ComputedStyle::initial();
 /// `@keyframes` blocks go to [`Stylesheet::keyframes`]. Other at-rules are
 /// skipped. The input is borrowed.
 pub fn parse_css(input: &str) -> Stylesheet {
+    parse_css_with_media(input, None)
+}
+
+/// Parse `input` as a sheet that only applies under `media`, the text of a
+/// `media` attribute on `<link>` or `<style>`.
+///
+/// Every rule gets that query, combined with any `@media` around it. `None`
+/// is the same as [`parse_css`]. `@keyframes` blocks are kept either way,
+/// as they are inside `@media`.
+pub fn parse_css_with_media(input: &str, media: Option<&str>) -> Stylesheet {
     let input = strip_comments(input);
     let mut sheet = Stylesheet::default();
-    parse_css_rules(&input, None, &mut sheet);
+    parse_css_rules(&input, media.map(MediaQuery::parse), &mut sheet);
     sheet
 }
 
