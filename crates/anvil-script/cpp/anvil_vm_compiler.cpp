@@ -78,7 +78,12 @@ struct Token {
     f64 num_val;
 };
 
-constexpr u32 MAX_TOKENS = 2048u;
+// The lexer's tokens live in a compiler-side arena, not a fixed array, so a
+// script is no longer capped at a token count. The arena is reserved after the
+// compiler struct and, like the heap arena, only pages what a compile touches.
+constexpr u32 ANVIL_COMPILER_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
+// Tokens the arena holds to start with; it doubles from here as needed.
+constexpr u32 INIT_TOKEN_BUFFER = 1024u;
 
 inline bool is_space(char c) noexcept {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
@@ -162,8 +167,50 @@ f64 parse_f64_slice(const char* s, u32 len) noexcept {
 }
 
 struct AnvilLexer {
-    Token tokens[MAX_TOKENS];
+    // The token buffer is a block in the compiler arena, grown as the source
+    // needs. `arena` is set by the compiler before tokenizing.
+    AnvilArena* arena;
+    u32 tokens_off;
+    u32 tokens_cap;
     u32 count;
+
+    Token* tokens() noexcept {
+        return reinterpret_cast<Token*>(arena->at(tokens_off));
+    }
+    const Token* tokens() const noexcept {
+        return reinterpret_cast<const Token*>(arena->at(tokens_off));
+    }
+
+    // Grow the token block to hold at least `need` tokens, copying what is
+    // there and returning the old block to the free list. False when the
+    // compiler arena cannot grow any further.
+    bool ensure_tokens(u32 need) noexcept {
+        if (need <= tokens_cap) {
+            return true;
+        }
+        u32 new_cap = tokens_cap == 0u ? INIT_TOKEN_BUFFER : tokens_cap;
+        while (new_cap < need) {
+            new_cap *= 2u;
+        }
+        bool over = false;
+        const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(Token)), &over);
+        if (new_off == NO_SLOT) {
+            return false;
+        }
+        Token* dst = reinterpret_cast<Token*>(arena->at(new_off));
+        const Token* old = reinterpret_cast<const Token*>(arena->at(tokens_off));
+        for (u32 i = 0u; i < count; ++i) {
+            dst[i] = old[i];
+        }
+        const u32 old_off = tokens_off;
+        const u32 old_cap = tokens_cap;
+        tokens_off = new_off;
+        tokens_cap = new_cap;
+        if (old_cap != 0u) {
+            arena->free(old_off, old_cap * static_cast<u32>(sizeof(Token)));
+        }
+        return true;
+    }
     // Why tokenize returned false, and the source bytes it stopped at.
     u32 fail_code;
     const char* fail_text;
@@ -180,14 +227,16 @@ struct AnvilLexer {
 
     bool tokenize(const char* src, u32 len) noexcept {
         count = 0u;
+        tokens_off = 0u;
+        tokens_cap = 0u;
         fail_code = VM_OK;
         fail_text = "";
         fail_offset = 0u;
         fail_len = 0u;
         u32 pos = 0u;
         while (pos < len) {
-            if (count + 1u >= MAX_TOKENS) {
-                return fail(VM_REFUSE_TOKENS, "token", pos, 0u);
+            if (!ensure_tokens(count + 2u)) {
+                return fail(VM_REFUSE_TOKENS, "source", pos, 0u);
             }
             const char c = src[pos];
             if (is_space(c)) {
@@ -227,7 +276,7 @@ struct AnvilLexer {
                     }
                     return fail(VM_REFUSE_UNSUPPORTED, "unsupported number", start, pos - start);
                 }
-                tokens[count++] = Token{
+                tokens()[count++] = Token{
                     TokenKind::Number,
                     start,
                     pos - start,
@@ -258,7 +307,7 @@ struct AnvilLexer {
                     return fail(VM_REFUSE_SYNTAX, "unterminated string", start - 1u, pos - start + 1u);
                 }
                 ++pos;
-                tokens[count++] = Token{TokenKind::String, start, str_len, 0.0};
+                tokens()[count++] = Token{TokenKind::String, start, str_len, 0.0};
                 continue;
             }
 
@@ -289,7 +338,7 @@ struct AnvilLexer {
                 if (is_event_loop_word(s, id_len) || is_unsupported_word(s, id_len)) {
                     return fail(VM_REFUSE_UNSUPPORTED, "unsupported word", start, id_len);
                 }
-                tokens[count++] = Token{kind, start, id_len, 0.0};
+                tokens()[count++] = Token{kind, start, id_len, 0.0};
                 continue;
             }
 
@@ -303,82 +352,82 @@ struct AnvilLexer {
                 return fail(VM_REFUSE_UNSUPPORTED, "unsupported operator", pos, 2u);
             }
             if (c == '=' && n1 == '=' && n2 == '=') {
-                tokens[count++] = Token{TokenKind::EqEq, pos, 3u, 0.0};
+                tokens()[count++] = Token{TokenKind::EqEq, pos, 3u, 0.0};
                 pos += 3u;
                 continue;
             }
             if (c == '!' && n1 == '=' && n2 == '=') {
-                tokens[count++] = Token{TokenKind::BangEq, pos, 3u, 0.0};
+                tokens()[count++] = Token{TokenKind::BangEq, pos, 3u, 0.0};
                 pos += 3u;
                 continue;
             }
             if (c == '>' && n1 == '>' && n2 == '>') {
-                tokens[count++] = Token{TokenKind::UShr, pos, 3u, 0.0};
+                tokens()[count++] = Token{TokenKind::UShr, pos, 3u, 0.0};
                 pos += 3u;
                 continue;
             }
             if (c == '=' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::LooseEq, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::LooseEq, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '!' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::LooseNe, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::LooseNe, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '<' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::Le, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::Le, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '>' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::Ge, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::Ge, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '<' && n1 == '<') {
-                tokens[count++] = Token{TokenKind::Shl, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::Shl, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '>' && n1 == '>') {
-                tokens[count++] = Token{TokenKind::Shr, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::Shr, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '&' && n1 == '&') {
-                tokens[count++] = Token{TokenKind::AndAnd, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::AndAnd, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '|' && n1 == '|') {
-                tokens[count++] = Token{TokenKind::OrOr, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::OrOr, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '+' && n1 == '+') {
-                tokens[count++] = Token{TokenKind::PlusPlus, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::PlusPlus, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '-' && n1 == '-') {
-                tokens[count++] = Token{TokenKind::MinusMinus, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::MinusMinus, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '+' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::PlusEq, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::PlusEq, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '-' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::MinusEq, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::MinusEq, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
             if (c == '*' && n1 == '=') {
-                tokens[count++] = Token{TokenKind::StarEq, pos, 2u, 0.0};
+                tokens()[count++] = Token{TokenKind::StarEq, pos, 2u, 0.0};
                 pos += 2u;
                 continue;
             }
@@ -410,10 +459,10 @@ struct AnvilLexer {
                 case '>': single = TokenKind::Gt; break;
                 default: return fail(VM_REFUSE_UNSUPPORTED, "unsupported character", pos, 1u);
             }
-            tokens[count++] = Token{single, pos, 1u, 0.0};
+            tokens()[count++] = Token{single, pos, 1u, 0.0};
             ++pos;
         }
-        tokens[count++] = Token{TokenKind::Eof, len, 0u, 0.0};
+        tokens()[count++] = Token{TokenKind::Eof, len, 0u, 0.0};
         return true;
     }
 };
@@ -454,6 +503,11 @@ struct LocalBinding {
 struct AnvilCompiler {
     AnvilVmContext* ctx;
     const char* src;
+    // Compile-time storage (the token buffer, and later the syntax tree) lives
+    // in this arena, which sits in the compiler memory after the struct. It is
+    // separate from the runtime heap, so a large source does not eat the run's
+    // heap budget.
+    AnvilArena arena;
     AnvilLexer lexer;
     u32 cursor;
     LocalBinding locals[MAX_REGISTERS_PER_FRAME];
@@ -476,7 +530,7 @@ struct AnvilCompiler {
 
     const Token& peek(u32 ahead = 0u) const noexcept {
         const u32 idx = (cursor + ahead < lexer.count) ? (cursor + ahead) : (lexer.count - 1u);
-        return lexer.tokens[idx];
+        return lexer.tokens()[idx];
     }
 
     const Token& advance() noexcept {
@@ -665,7 +719,7 @@ struct AnvilCompiler {
     void hoist_functions() noexcept {
         u32 depth = 0u;
         for (u32 i = 0u; i < lexer.count && !had_error; ++i) {
-            const Token& t = lexer.tokens[i];
+            const Token& t = lexer.tokens()[i];
             if (t.kind == TokenKind::LBrace) {
                 ++depth;
                 continue;
@@ -679,18 +733,18 @@ struct AnvilCompiler {
             if (t.kind != TokenKind::KwFunction) {
                 continue;
             }
-            const TokenKind before = i > 0u ? lexer.tokens[i - 1u].kind : TokenKind::Semicolon;
+            const TokenKind before = i > 0u ? lexer.tokens()[i - 1u].kind : TokenKind::Semicolon;
             if (depth != 0u || (before != TokenKind::Semicolon && before != TokenKind::RBrace)) {
-                const Token& shown = (i + 1u < lexer.count) ? lexer.tokens[i + 1u] : t;
+                const Token& shown = (i + 1u < lexer.count) ? lexer.tokens()[i + 1u] : t;
                 reject_name(VM_REFUSE_UNSUPPORTED, "function declared inside a block or function", shown);
                 return;
             }
-            if (i + 2u >= lexer.count || lexer.tokens[i + 1u].kind != TokenKind::Ident ||
-                lexer.tokens[i + 2u].kind != TokenKind::LParen) {
+            if (i + 2u >= lexer.count || lexer.tokens()[i + 1u].kind != TokenKind::Ident ||
+                lexer.tokens()[i + 2u].kind != TokenKind::LParen) {
                 reject_name(VM_REFUSE_UNSUPPORTED, "unsupported function expression", t);
                 return;
             }
-            const Token& name = lexer.tokens[i + 1u];
+            const Token& name = lexer.tokens()[i + 1u];
             const u32 sym = token_sym(name);
             if (had_error) {
                 return;
@@ -700,8 +754,8 @@ struct AnvilCompiler {
                 return;
             }
             u32 arity = 0u;
-            for (u32 j = i + 3u; j < lexer.count && lexer.tokens[j].kind != TokenKind::RParen; ++j) {
-                if (lexer.tokens[j].kind == TokenKind::Ident) {
+            for (u32 j = i + 3u; j < lexer.count && lexer.tokens()[j].kind != TokenKind::RParen; ++j) {
+                if (lexer.tokens()[j].kind == TokenKind::Ident) {
                     ++arity;
                 }
             }
@@ -1330,7 +1384,7 @@ struct AnvilCompiler {
         }
 
         if (match(TokenKind::KwLet) || match(TokenKind::KwConst) || match(TokenKind::KwVar)) {
-            const bool is_var = lexer.tokens[cursor - 1u].kind == TokenKind::KwVar;
+            const bool is_var = lexer.tokens()[cursor - 1u].kind == TokenKind::KwVar;
             const Token id_tok = advance();
             if (id_tok.kind != TokenKind::Ident) {
                 reject_syntax();
@@ -1723,7 +1777,7 @@ struct AnvilCompiler {
 };
 
 extern "C" u32 anvil_cpp_vm_compiler_bytes() {
-    return static_cast<u32>(sizeof(AnvilCompiler));
+    return static_cast<u32>(sizeof(AnvilCompiler)) + ANVIL_COMPILER_ARENA_RESERVE_BYTES;
 }
 
 extern "C" u32 anvil_cpp_vm_compiler_align() {
@@ -1736,6 +1790,13 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     }
     // The caller owns this workspace. It is not a process-global compiler.
     auto& g_compiler = *static_cast<AnvilCompiler*>(compiler_memory);
+    // The arena is the reserved bytes right after the compiler struct.
+    g_compiler.arena.init(
+        static_cast<u8*>(compiler_memory) + sizeof(AnvilCompiler),
+        ANVIL_COMPILER_ARENA_RESERVE_BYTES,
+        ANVIL_COMPILER_ARENA_RESERVE_BYTES
+    );
+    g_compiler.lexer.arena = &g_compiler.arena;
     g_compiler.ctx = &ctx;
     g_compiler.src = src;
     g_compiler.cursor = 0u;
@@ -1752,7 +1813,9 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     if (!g_compiler.lexer.tokenize(src, len)) {
         const AnvilLexer& lex = g_compiler.lexer;
         if (lex.fail_code == VM_REFUSE_TOKENS) {
-            ctx.fail_limit(VM_REFUSE_TOKENS, "token", MAX_TOKENS, "tokens");
+            ctx.fail_limit(
+                VM_REFUSE_TOKENS, "source", ANVIL_COMPILER_ARENA_RESERVE_BYTES, "bytes"
+            );
         } else {
             ctx.fail_name(lex.fail_code, lex.fail_text, &src[lex.fail_offset], lex.fail_len);
         }

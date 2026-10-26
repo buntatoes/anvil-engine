@@ -564,3 +564,24 @@ fn seeded_random_stop_points_resume_to_the_same_result() {
         assert_eq!(resumed, expected, "yield interval {yield_interval}");
     }
 }
+
+// ---- The token buffer grows in the compiler arena ------------------------
+
+/// A script with far more than the old 2,048-token cap now compiles and runs,
+/// because the token buffer grows in the compiler arena instead of a fixed
+/// array. This chain of statements is well over 3,000 tokens.
+#[test]
+fn a_script_past_the_old_token_cap_compiles() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::from("let s = 0; ");
+    for _ in 0..500 {
+        source.push_str("s = s + 1; ");
+    }
+    source.push('s');
+    source.push(';');
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("compiles and runs past the old token cap");
+    assert_eq!(value, 500.0);
+}

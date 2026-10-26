@@ -184,25 +184,16 @@ fn compile_limits_refuse_with_a_reason() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    // The function, global, constant and IC-site tables all grow in the arena
-    // now, so those refusals are gone. What the compiler still refuses are its
-    // own front-end limits, lifted later in the new front end: too many
-    // registers in one function and too many tokens in one script.
+    // The function, global, constant, IC-site and token limits all grow in the
+    // arena now, so those refusals are gone. What the compiler still refuses is
+    // its own per-function register limit, lifted later in the new front end.
     let nested = format!("{}1{};", "(1 + ".repeat(70), ")".repeat(70));
-    let tokens = format!("let r = [{}];", vec!["1"; 1100].join(", "));
-    let cases = [
-        (
-            nested,
-            40,
-            "register limit reached: 64 registers per function",
-        ),
-        (tokens, 41, "token limit reached: 2048 tokens"),
-    ];
-    for (source, code, message) in cases {
-        let error = vm_error(&source);
-        assert_eq!((error.code, error.message.as_str()), (code, message));
-        assert!(error.is_limit() && error.refused());
-    }
+    let error = vm_error(&nested);
+    assert_eq!(
+        (error.code, error.message.as_str()),
+        (40, "register limit reached: 64 registers per function")
+    );
+    assert!(error.is_limit() && error.refused());
 }
 
 #[test]
