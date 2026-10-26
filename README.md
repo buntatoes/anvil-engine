@@ -98,7 +98,7 @@ Clone this repository, `anvil-browser`, and the libraries below as sibling direc
 
 `anvil-image` links `anvil-compress`.
 
-Rust 1.85 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
+Rust 1.85.1 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
 
 ```text
 cargo test
@@ -112,6 +112,7 @@ This engine is private. You may read it to audit it and use it as part of Anvil 
 | --- | --- |
 | This one (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Audit and use only. Not redistributable on its own |
 | `anvil-browser` | Apache-2.0. Not this file |
-| `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories |
+| `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories. The engine links these |
+| `anvil-cipher`, `anvil-hpack`, `anvil-pqc`, `anvil-video` | MPL-2.0, in those repositories. The engine does not link these |
 
 Revisions of these crates that were already published in `anvil-browser` under the Apache License 2.0 stay under that license for those revisions only.
