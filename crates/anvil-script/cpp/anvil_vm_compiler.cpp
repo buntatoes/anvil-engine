@@ -64,6 +64,9 @@ enum class TokenKind : u8 {
     Ge         = 51u,
     AndAnd     = 52u,
     OrOr       = 53u,
+    KwDo       = 54u,
+    KwBreak    = 55u,
+    KwContinue = 56u,
 };
 
 struct Token {
@@ -121,8 +124,7 @@ inline bool is_unsupported_word(const char* s, u32 len) noexcept {
     static const char* const words[] = {
         "this", "typeof", "instanceof", "in", "delete", "void", "throw", "try",
         "catch", "finally", "switch", "case", "default", "class", "extends",
-        "super", "with", "yield", "import", "export", "debugger", "enum", "do",
-        "break", "continue",
+        "super", "with", "yield", "import", "export", "debugger", "enum",
     };
     for (const char* w : words) {
         u32 w_len = 0u;
@@ -279,6 +281,9 @@ struct AnvilLexer {
                 else if (match_kw(s, id_len, "false", 5)) kind = TokenKind::KwFalse;
                 else if (match_kw(s, id_len, "null", 4)) kind = TokenKind::KwNull;
                 else if (match_kw(s, id_len, "new", 3)) kind = TokenKind::KwNew;
+                else if (match_kw(s, id_len, "do", 2)) kind = TokenKind::KwDo;
+                else if (match_kw(s, id_len, "break", 5)) kind = TokenKind::KwBreak;
+                else if (match_kw(s, id_len, "continue", 8)) kind = TokenKind::KwContinue;
                 if (is_event_loop_word(s, id_len) || is_unsupported_word(s, id_len)) {
                     return fail(VM_REFUSE_UNSUPPORTED, "unsupported word", start, id_len);
                 }
@@ -413,6 +418,19 @@ struct AnvilLexer {
 
 constexpr u32 NO_DEPTH = 0xFFFFFFFFu;
 
+// Loops nested inside each other, and `break` or `continue` jumps in one
+// loop, that the compiler keeps track of.
+constexpr u32 MAX_LOOP_NESTING = 16u;
+constexpr u32 MAX_LOOP_JUMPS = 32u;
+
+// Jumps out of one loop that wait for their target to be known.
+struct LoopJumps {
+    u32 breaks[MAX_LOOP_JUMPS];
+    u32 break_count;
+    u32 continues[MAX_LOOP_JUMPS];
+    u32 continue_count;
+};
+
 // Counts one level of block scope for as long as it is in scope.
 struct BlockScope {
     u32& depth;
@@ -446,6 +464,9 @@ struct AnvilCompiler {
     // Highest register count the current function has used.
     u8 high_reg;
     u32 next_loop_id;
+    // Loops around the statement being compiled.
+    LoopJumps loops[MAX_LOOP_NESTING];
+    u32 loop_depth;
     bool in_function;
     bool had_error;
     // Globals given a value by a top-level `let`, `const` or `var`. The VM
@@ -577,6 +598,61 @@ struct AnvilCompiler {
     void reject_limit(u32 code, const char* what, u32 limit, const char* unit) noexcept {
         had_error = true;
         ctx->fail_limit(code, what, limit, unit);
+    }
+
+    bool begin_loop() noexcept {
+        if (loop_depth >= MAX_LOOP_NESTING) {
+            reject_limit(VM_REFUSE_LOOPS, "loop nesting", MAX_LOOP_NESTING, "loops");
+            return false;
+        }
+        loops[loop_depth].break_count = 0u;
+        loops[loop_depth].continue_count = 0u;
+        ++loop_depth;
+        return true;
+    }
+
+    // Point the loop's `continue` jumps at continue_pc and its `break`
+    // jumps at the current end of the code.
+    void end_loop(u32 continue_pc) noexcept {
+        if (loop_depth == 0u) {
+            return;
+        }
+        --loop_depth;
+        const LoopJumps& jumps = loops[loop_depth];
+        const u16 break_pc = static_cast<u16>(ctx->program.code_len);
+        for (u32 i = 0u; i < jumps.break_count && i < MAX_LOOP_JUMPS; ++i) {
+            if (jumps.breaks[i] < ctx->program.code_len) {
+                ctx->program.code[jumps.breaks[i]] = AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, break_pc);
+            }
+        }
+        for (u32 i = 0u; i < jumps.continue_count && i < MAX_LOOP_JUMPS; ++i) {
+            if (jumps.continues[i] < ctx->program.code_len) {
+                ctx->program.code[jumps.continues[i]] =
+                    AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(continue_pc));
+            }
+        }
+    }
+
+    // `break` or `continue`: a jump whose target end_loop fills in.
+    void compile_loop_jump(bool is_break) noexcept {
+        if (loop_depth == 0u) {
+            reject_here(VM_REFUSE_SYNTAX, is_break ? "break outside a loop" : "continue outside a loop");
+            return;
+        }
+        if (peek().kind == TokenKind::Ident) {
+            reject_here(VM_REFUSE_UNSUPPORTED, "labels are not compiled");
+            return;
+        }
+        LoopJumps& jumps = loops[loop_depth - 1u];
+        u32& count = is_break ? jumps.break_count : jumps.continue_count;
+        if (count >= MAX_LOOP_JUMPS) {
+            reject_limit(VM_REFUSE_LOOPS, is_break ? "break" : "continue", MAX_LOOP_JUMPS, "jumps per loop");
+            return;
+        }
+        const u32 pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+        (is_break ? jumps.breaks : jumps.continues)[count] = pc;
+        ++count;
+        match(TokenKind::Semicolon);
     }
 
     u32 find_function(u32 sym) const noexcept {
@@ -1332,6 +1408,44 @@ struct AnvilCompiler {
             return last_reg;
         }
 
+        if (match(TokenKind::KwBreak)) {
+            compile_loop_jump(true);
+            return 0u;
+        }
+
+        if (match(TokenKind::KwContinue)) {
+            compile_loop_jump(false);
+            return 0u;
+        }
+
+        if (match(TokenKind::KwDo)) {
+            const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
+            const u32 loop_head_pc = ctx->program.code_len;
+            ctx->program.emit(AnvilInstruction::make_abc(
+                AnvilOpcode::LoopHeader,
+                static_cast<u8>(loop_id),
+                0u,
+                0u
+            ));
+            if (!begin_loop()) {
+                return 0u;
+            }
+            const u8 body_reg = compile_statement();
+            expect(TokenKind::KwWhile);
+            expect(TokenKind::LParen);
+            const u32 cond_pc = ctx->program.code_len;
+            const u8 cond_reg = compile_expr();
+            expect(TokenKind::RParen);
+            match(TokenKind::Semicolon);
+            ctx->program.emit(AnvilInstruction::make_abx(
+                AnvilOpcode::JumpIfTrue,
+                cond_reg,
+                static_cast<u16>(loop_head_pc)
+            ));
+            end_loop(cond_pc);
+            return body_reg;
+        }
+
         if (match(TokenKind::KwWhile)) {
             const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
             const u32 loop_head_pc = ctx->program.code_len;
@@ -1347,6 +1461,9 @@ struct AnvilCompiler {
             const u32 jexit_pc = ctx->program.emit(
                 AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u)
             );
+            if (!begin_loop()) {
+                return 0u;
+            }
             const u8 body_reg = compile_statement();
             ctx->program.emit(AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
@@ -1358,6 +1475,7 @@ struct AnvilCompiler {
                 cond_reg,
                 static_cast<u16>(ctx->program.code_len)
             );
+            end_loop(loop_head_pc);
             return body_reg;
         }
 
@@ -1400,6 +1518,9 @@ struct AnvilCompiler {
                 0u,
                 static_cast<u16>(ctx->program.code_len)
             );
+            if (!begin_loop()) {
+                return 0u;
+            }
             const u8 body_reg = compile_statement();
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(step_pc)));
 
@@ -1410,6 +1531,7 @@ struct AnvilCompiler {
                     static_cast<u16>(ctx->program.code_len)
                 );
             }
+            end_loop(step_pc);
             return body_reg;
         }
 
@@ -1561,6 +1683,7 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.reg_floor = 0u;
     g_compiler.high_reg = 0u;
     g_compiler.next_loop_id = 0u;
+    g_compiler.loop_depth = 0u;
     g_compiler.in_function = false;
     g_compiler.had_error = false;
     for (u32 i = 0u; i < MAX_GLOBALS; ++i) {

@@ -101,7 +101,7 @@ fn scripts_with_unknown_names_are_left_to_the_interpreter() {
         "function f(x) { return x; } let g = 1; g(2);",
         "let r = 1; (r)(2); r;",
         "let r = 0; try { r = 1; } finally { r = 2; } r;",
-        "let r = 0; do { r = r + 1; } while (r < 3); r;",
+        "let r = 0; switch (r) { case 0: r = 1; } r;",
         "let f = (x) => x; 1;",
         "let s = 'a\\nb'; 1;",
         "let n = 1e3; n;",
@@ -583,4 +583,94 @@ fn values_the_vm_cannot_convert_go_to_the_interpreter() {
     rt.eval_script(&mut doc, "document.getElementById('out').textContent = n;");
     let out = doc.get_element_by_id("out").expect("out");
     assert_eq!(doc.text_content(out), "4");
+}
+
+#[test]
+fn loops_can_break_continue_and_run_do_while() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let cases = [
+        (
+            "let s = 0; for (let i = 0; i < 10; i++) { if (i === 5) { break; } s += i; } s;",
+            10.0,
+        ),
+        (
+            "let s = 0; for (let i = 0; i < 10; i++) { if (i % 2 === 0) { continue; } s += i; } s;",
+            25.0,
+        ),
+        (
+            "let s = 0; let i = 0; while (i < 10) { i++; if (i === 3) { continue; } if (i === 8) { break; } s += i; } s;",
+            25.0,
+        ),
+        ("let n = 0; do { n++; } while (n < 5); n;", 5.0),
+        ("let n = 10; do { n++; } while (n < 5); n;", 11.0),
+        (
+            "let n = 0; let s = 0; do { n++; if (n === 2) { continue; } if (n > 4) { break; } s += n; } while (n < 100); s;",
+            8.0,
+        ),
+        (
+            "let s = 0; for (let i = 0; i < 4; i++) { for (let j = 0; j < 4; j++) { if (j > i) { break; } s += 1; } } s;",
+            10.0,
+        ),
+        (
+            "let s = 0; while (true) { s++; if (s >= 7) { break; } } s;",
+            7.0,
+        ),
+        (
+            "function f(n) { let c = 0; while (true) { if (n <= 1) { break; } n = n / 2; c++; } return c; } f(64);",
+            6.0,
+        ),
+        (
+            "let o = {n: 0}; for (let i = 0; i < 50; i++) { if (i === 20) { break; } o.n = o.n + 1; } o.n;",
+            20.0,
+        ),
+    ];
+    for (source, want) in cases {
+        assert_eq!(cpp(source), Some(want), "{source}");
+    }
+}
+
+#[test]
+fn loop_jumps_the_vm_cannot_place_are_refused() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let error = vm_error("let x = 1; break;");
+    assert_eq!(error.code, 32);
+    assert!(
+        error.message.contains("break outside a loop"),
+        "{}",
+        error.message
+    );
+    let error = vm_error("let x = 1; continue;");
+    assert!(
+        error.message.contains("continue outside a loop"),
+        "{}",
+        error.message
+    );
+    let error = vm_error("let i = 0; while (i < 3) { i++; break outer; }");
+    assert_eq!(error.code, 33);
+    assert!(error.message.contains("labels"), "{}", error.message);
+
+    let mut nested = String::from("let n = 0; ");
+    for _ in 0..17 {
+        nested.push_str("while (n < 1) { ");
+    }
+    nested.push_str("n++; ");
+    for _ in 0..17 {
+        nested.push_str("} ");
+    }
+    let error = vm_error(&nested);
+    assert_eq!(error.code, 49);
+    assert_eq!(error.message, "loop nesting limit reached: 16 loops");
+    assert!(error.is_limit());
+
+    let mut jumps = String::from("let i = 0; while (i < 3) { i++; ");
+    for _ in 0..33 {
+        jumps.push_str("if (i > 5) { break; } ");
+    }
+    jumps.push('}');
+    let error = vm_error(&jumps);
+    assert_eq!(error.message, "break limit reached: 32 jumps per loop");
 }

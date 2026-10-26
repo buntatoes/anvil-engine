@@ -282,7 +282,7 @@ impl VmError {
     /// True when a fixed VM limit was reached, as opposed to code the VM
     /// does not compile or run.
     pub fn is_limit(&self) -> bool {
-        matches!(self.code, 1..=9 | 40..=48)
+        matches!(self.code, 1..=9 | 40..=49)
     }
 }
 

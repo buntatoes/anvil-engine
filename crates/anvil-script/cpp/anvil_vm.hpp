@@ -90,6 +90,7 @@ enum VmErrorCode : u32 {
     VM_REFUSE_SITES         = 46u,
     VM_REFUSE_STRINGS       = 47u,
     VM_REFUSE_HOST_SLOTS    = 48u,
+    VM_REFUSE_LOOPS         = 49u,
 };
 
 constexpr u32 MAX_ERROR_TEXT = 160u;
