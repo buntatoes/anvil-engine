@@ -43,7 +43,8 @@
 //! `@keyframes` blocks are kept on the [`Stylesheet`], whether or not they sit
 //! inside `@media`. Other at-rules are skipped. The cascade is user-agent defaults, then author
 //! rules by specificity `(ids, classes, types)` and source order, then the
-//! `style` attribute, which always wins.
+//! `style` attribute, then `!important` author rules in the same order, then
+//! `!important` declarations in the `style` attribute.
 
 use anvil_dom::{Document, NodeData, NodeId};
 use std::collections::HashMap;
@@ -250,11 +251,16 @@ impl Selector {
 }
 
 /// One CSS declaration. `name` is owned and lowercase. `value` is owned
-/// and still unparsed.
+/// and still unparsed, with any trailing `!important` taken off.
+///
+/// `important` is true when the value ended in `!important`. Important
+/// declarations win over normal ones in the cascade, whatever their
+/// specificity or order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Declaration {
     pub name: String,
     pub value: String,
+    pub important: bool,
 }
 
 /// sRGB color. Channels are 0–255. `a` is 255 when the source omitted alpha.
@@ -1318,25 +1324,18 @@ fn cascade_element(
         parent_font_px,
         cx.root_font_px,
     );
-    if let Some(inline_css) = doc.get(id).data().attr("style") {
-        for declaration in parse_declarations(inline_css) {
-            apply_declaration(
-                &mut style,
-                vars,
-                &declaration,
-                parent_font_px,
-                cx.root_font_px,
-            );
-        }
-    }
     style
 }
 
-/// Apply author rules that match `id`, in specificity order, then source order.
+/// Apply author rules that match `id` and then its inline `style` attribute.
 ///
 /// A rule whose `@media` does not match `viewport_width` is skipped. Only the
-/// winning selector's specificity is kept per rule. Declarations are applied
-/// in rule order after the sort, so a later tied rule overrides an earlier one.
+/// winning selector's specificity is kept per rule. Rules are sorted by
+/// specificity, then source order, so a later tied rule overrides an earlier
+/// one. Declarations are applied in four groups, each later group winning:
+/// normal author declarations, normal inline ones, important author ones,
+/// and important inline ones. Custom properties are resolved in the same
+/// order before any other property is applied.
 fn apply_author(
     style: &mut ComputedStyle,
     vars: &mut HashMap<String, String>,
@@ -1365,30 +1364,37 @@ fn apply_author(
         }
     }
     matched.sort_by_key(|(specificity, order, _)| (*specificity, *order));
-    for (_, _, rule) in &matched {
-        for declaration in &rule.declarations {
-            if declaration.name.starts_with("--") {
-                let resolved = resolve_css_vars(declaration.value.trim(), vars);
-                if !resolved.is_empty() {
-                    vars.insert(declaration.name.clone(), resolved);
-                }
+    let inline = doc
+        .get(id)
+        .data()
+        .attr("style")
+        .map(parse_declarations)
+        .unwrap_or_default();
+    let mut ordered: Vec<&Declaration> = Vec::new();
+    for important in [false, true] {
+        for (_, _, rule) in &matched {
+            ordered.extend(
+                rule.declarations
+                    .iter()
+                    .filter(|declaration| declaration.important == important),
+            );
+        }
+        ordered.extend(
+            inline
+                .iter()
+                .filter(|declaration| declaration.important == important),
+        );
+    }
+    for declaration in &ordered {
+        if declaration.name.starts_with("--") {
+            let resolved = resolve_css_vars(declaration.value.trim(), vars);
+            if !resolved.is_empty() {
+                vars.insert(declaration.name.clone(), resolved);
             }
         }
     }
-    if let Some(inline_css) = doc.get(id).data().attr("style") {
-        for declaration in parse_declarations(inline_css) {
-            if declaration.name.starts_with("--") {
-                let resolved = resolve_css_vars(declaration.value.trim(), vars);
-                if !resolved.is_empty() {
-                    vars.insert(declaration.name, resolved);
-                }
-            }
-        }
-    }
-    for (_, _, rule) in matched {
-        for declaration in &rule.declarations {
-            apply_declaration(style, vars, declaration, parent_font_px, root_font_px);
-        }
+    for declaration in ordered {
+        apply_declaration(style, vars, declaration, parent_font_px, root_font_px);
     }
 }
 
@@ -2776,23 +2782,71 @@ fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
 
 /// Parse `name: value` pairs separated by `;`.
 ///
-/// Names are owned and lowercased. Values are owned and trimmed. A pair with
-/// an empty name or value is dropped. `!important` is left in the value and
-/// is not special. `source` is borrowed.
+/// Names are owned and lowercased. Values are owned and trimmed. A trailing
+/// `!important` (any case, with optional space after the `!`) is taken off
+/// the value and sets [`Declaration::important`]. A pair with an empty name,
+/// or with an empty value once the flag is gone, is dropped. `source` is
+/// borrowed.
 pub fn parse_declarations(source: &str) -> Vec<Declaration> {
     source
         .split(';')
         .filter_map(|part| {
             let (name, value) = part.split_once(':')?;
             let name = name.trim().to_ascii_lowercase();
-            let value = value.trim().to_string();
+            let (value, important) = split_important(value.trim());
             if name.is_empty() || value.is_empty() {
                 None
             } else {
-                Some(Declaration { name, value })
+                Some(Declaration {
+                    name,
+                    value: value.to_string(),
+                    important,
+                })
             }
         })
         .collect()
+}
+
+/// Split a trailing `!important` off `value`.
+///
+/// Only a `!` outside quotes and parentheses counts, so text such as
+/// `"a !important"` or `url(x!important)` stays in the value. The flag
+/// must be the last thing in the value: `red !important x` is returned
+/// unchanged and not important, and fails later as an unknown value. The
+/// returned value is trimmed.
+fn split_important(value: &str) -> (&str, bool) {
+    let mut bang = None;
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut chars = value.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '\\' => {
+                    chars.next();
+                }
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                '!' if depth == 0 => bang = Some(idx),
+                _ => {}
+            },
+        }
+    }
+    let Some(bang) = bang else {
+        return (value, false);
+    };
+    if quote.is_some() || !value[bang + 1..].trim().eq_ignore_ascii_case("important") {
+        return (value, false);
+    }
+    (value[..bang].trim(), true)
 }
 
 /// Copy `input` with `/* ... */` comments replaced by one space.
@@ -3585,7 +3639,8 @@ mod tests {
             sheet.keyframes[0].frames[1].declarations,
             [Declaration {
                 name: "margin-left".to_string(),
-                value: "10px".to_string()
+                value: "10px".to_string(),
+                important: false,
             }]
         );
 

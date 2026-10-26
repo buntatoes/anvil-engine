@@ -861,7 +861,11 @@ pub(crate) fn parse_keyframes(prelude: &str, body: &str) -> Option<KeyframesRule
         let selector = &rest[..open];
         let after = &rest[open + 1..];
         let close = after.find('}').unwrap_or(after.len());
-        let declarations = parse_declarations(&after[..close]);
+        // Important declarations inside a keyframe are ignored.
+        let declarations: Vec<_> = parse_declarations(&after[..close])
+            .into_iter()
+            .filter(|declaration| !declaration.important)
+            .collect();
         rest = after.get(close + 1..).unwrap_or("");
         let offsets: Option<Vec<u32>> = selector.split(',').map(parse_keyframe_offset).collect();
         for offset in offsets.unwrap_or_default() {
