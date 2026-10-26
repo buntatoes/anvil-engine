@@ -23,7 +23,7 @@ There are no crates.io dependencies.
 | `anvil-style` | CSS cascade and media queries |
 | `anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
 | `anvil-paint` | Display list and zoom |
-| `anvil-raster` | RGBA framebuffer. Shadows, rounded boxes, and gradients use the software draw device |
+| `anvil-raster` | RGBA framebuffer. Shadows and gradients run through `anvil_gpu::Compositor` (GPU or CPU); rounded boxes use `anvil_gpu::GpuDevice` |
 | `anvil-script` | Budgeted script runtime and the numeric x86-64 compiler |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.

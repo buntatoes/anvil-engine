@@ -52,7 +52,11 @@ impl Rng {
 
     /// Value in `0..n`. Returns 0 when `n` is 0.
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
 
     fn byte(&mut self) -> u8 {
@@ -151,7 +155,10 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let _ = handle.join();
-            panic!("{label}: case {case} panicked on input {}", preview(&shared));
+            panic!(
+                "{label}: case {case} panicked on input {}",
+                preview(&shared)
+            );
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             panic!(
@@ -164,7 +171,12 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
 }
 
 /// Generate cases from `seed` until the budget is spent and check each one.
-fn run_cases(label: &str, seed: u64, mut generate: impl FnMut(&mut Rng) -> Vec<u8>, target: fn(&[u8])) {
+fn run_cases(
+    label: &str,
+    seed: u64,
+    mut generate: impl FnMut(&mut Rng) -> Vec<u8>,
+    target: fn(&[u8]),
+) {
     let mut rng = Rng::new(seed);
     let budget = test_budget();
     let started = Instant::now();
@@ -184,14 +196,52 @@ const TAGS: &[&str] = &[
 ];
 
 const ATTRS: &[&str] = &[
-    "id", "class", "href", "src", "style", "type", "value", "checked", "selected", "name",
-    "action", "method", "integrity", "rel", "content", "http-equiv", "data-x", "onclick",
+    "id",
+    "class",
+    "href",
+    "src",
+    "style",
+    "type",
+    "value",
+    "checked",
+    "selected",
+    "name",
+    "action",
+    "method",
+    "integrity",
+    "rel",
+    "content",
+    "http-equiv",
+    "data-x",
+    "onclick",
 ];
 
 const TEXT: &[&str] = &[
-    "hello", " ", "\n", "\t", "&amp;", "&lt;", "&#39;", "&#x1F600;", "&#0;", "&#xD800;",
-    "&#99999999999;", "&bogus;", "&", ";", "\u{e9}", "\u{1F600}", "\u{0}", ">", "\"", "'", "=",
-    "/", "-->", "]]>", "\r\n",
+    "hello",
+    " ",
+    "\n",
+    "\t",
+    "&amp;",
+    "&lt;",
+    "&#39;",
+    "&#x1F600;",
+    "&#0;",
+    "&#xD800;",
+    "&#99999999999;",
+    "&bogus;",
+    "&",
+    ";",
+    "\u{e9}",
+    "\u{1F600}",
+    "\u{0}",
+    ">",
+    "\"",
+    "'",
+    "=",
+    "/",
+    "-->",
+    "]]>",
+    "\r\n",
 ];
 
 /// Random but tag-shaped HTML.
@@ -238,7 +288,9 @@ fn parse_and_query(input: &[u8]) {
     let _ = doc.scripts();
     let _ = doc.images();
     let _ = doc.meta_csp();
-    for selector in ["div", "#a", ".b", "div > p", "a[href]", "*", "", ">>", "[", ":not(", "td + td"] {
+    for selector in [
+        "div", "#a", ".b", "div > p", "a[href]", "*", "", ">>", "[", ":not(", "td + td",
+    ] {
         let _ = doc.query_selector_all(selector);
     }
     // Reparsing the serialized body must not panic either.
@@ -264,7 +316,12 @@ fn walk(doc: &Document) {
 
 #[test]
 fn tag_soup_does_not_panic() {
-    run_cases("html-soup", 41, |rng| html_soup(rng).into_bytes(), parse_and_query);
+    run_cases(
+        "html-soup",
+        41,
+        |rng| html_soup(rng).into_bytes(),
+        parse_and_query,
+    );
 }
 
 #[test]
@@ -274,10 +331,15 @@ fn random_bytes_do_not_panic() {
 
 #[test]
 fn mutated_documents_do_not_panic() {
-    run_cases("html-mutated", 43, |rng| {
-        let soup = html_soup(rng);
-        mutate(rng, soup.as_bytes())
-    }, parse_and_query);
+    run_cases(
+        "html-mutated",
+        43,
+        |rng| {
+            let soup = html_soup(rng);
+            mutate(rng, soup.as_bytes())
+        },
+        parse_and_query,
+    );
 }
 
 #[test]
@@ -295,20 +357,30 @@ fn deep_and_wide_documents_stay_capped() {
 
 #[test]
 fn stray_less_than_does_not_hang() {
-    run_cases("html-stray-lt", 44, |rng| {
-        let mut out = html_soup(rng);
-        let at = rng.below(out.len() + 1);
-        if out.is_char_boundary(at) {
-            out.insert_str(at, rng.pick(&["<", "< ", "<1", "<<", "a < b", "<\u{e9}"]));
-        }
-        out.into_bytes()
-    }, parse_and_query);
+    run_cases(
+        "html-stray-lt",
+        44,
+        |rng| {
+            let mut out = html_soup(rng);
+            let at = rng.below(out.len() + 1);
+            if out.is_char_boundary(at) {
+                out.insert_str(at, rng.pick(&["<", "< ", "<1", "<<", "a < b", "<\u{e9}"]));
+            }
+            out.into_bytes()
+        },
+        parse_and_query,
+    );
 }
 
 #[test]
 fn non_ascii_bytes_inside_a_start_tag_are_skipped() {
     // Each of these once stepped one byte into a multi-byte character.
-    for html in ["<a \u{e9}>x</a>", "<p \u{1F600}=1 id=k>y</p>", "<b\u{e9}>z", "<i ==\u{e9}\u{e9}>"] {
+    for html in [
+        "<a \u{e9}>x</a>",
+        "<p \u{1F600}=1 id=k>y</p>",
+        "<b\u{e9}>z",
+        "<i ==\u{e9}\u{e9}>",
+    ] {
         let doc = parse_html(html);
         walk(&doc);
     }

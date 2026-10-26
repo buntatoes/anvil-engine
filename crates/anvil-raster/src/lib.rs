@@ -6,7 +6,9 @@
 //! blits the pixels into the window. The buffer is top-down RGBA8 in this
 //! `rasterize_quad_on_device` shades one quad through the anvil-gpu tile device.
 //!
-//! Rounded boxes, box shadows, and linear gradients call the C++20 scanline
+//! Box shadows and unrounded linear gradients run through `anvil_gpu::Compositor`
+//! (OpenGL 3.3 on Linux or Direct3D 11 on Windows when its self-test matches the
+//! CPU, and software otherwise), while rounded boxes use `anvil_gpu::GpuDevice`.
 //! and compositor helpers when `anvil_cpp_accel` is linked, or fall back to the
 //! CPU helpers in `anvil-gpu` (`sdf_rounded_box`, `sdf_box_shadow_alpha`, and
 //! `sample_linear_gradient`). Images are `anvil-image` buffers. `draw_image`
@@ -693,6 +695,35 @@ impl Framebuffer {
         if width <= 0.0 || height <= 0.0 || color.a == 0 {
             return;
         }
+        let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+        if cx0 < cx1 && cy0 < cy1 {
+            let desc = anvil_gpu::ShadowDesc {
+                rect: anvil_gpu::GpuRect::new(x, y, width, height),
+                corner_radius: radius.max(0.0),
+                offset_x,
+                offset_y,
+                blur_radius: blur_radius.clamp(0.0, anvil_gpu::MAX_BLUR_RADIUS),
+                spread: spread_radius,
+                color: anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
+                clip: Some(anvil_gpu::GpuRect::new(
+                    cx0 as f32,
+                    cy0 as f32,
+                    (cx1 - cx0) as f32,
+                    (cy1 - cy0) as f32,
+                )),
+            };
+            if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                (self.width as usize) * 4,
+            ) && anvil_gpu::Compositor::open()
+                .box_shadow(&mut target, &desc)
+                .is_ok()
+            {
+                return;
+            }
+        }
         let quad = anvil_gpu::GpuQuad::box_shadow(
             anvil_gpu::GpuRect::new(x, y, width, height),
             offset_x,
@@ -786,6 +817,70 @@ impl Framebuffer {
     ) {
         if width <= 0.0 || height <= 0.0 {
             return;
+        }
+        if radius <= 0.0 && border_width <= 0.0 {
+            let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+            let gx0 = (x.floor() as i32).max(cx0);
+            let gy0 = (y.floor() as i32).max(cy0);
+            let gx1 = ((x + width).ceil() as i32).min(cx1);
+            let gy1 = ((y + height).ceil() as i32).min(cy1);
+            if gx0 < gx1 && gy0 < gy1 {
+                let rad = angle_deg.to_radians();
+                let dx = rad.sin();
+                let dy = -rad.cos();
+                let half_w = width * 0.5;
+                let half_h = height * 0.5;
+                let max_proj = (half_w * dx.abs() + half_h * dy.abs()).max(0.001);
+                let cx = x + half_w;
+                let cy = y + half_h;
+                let stops = [
+                    anvil_gpu::GpuGradientStop::new(
+                        0.0,
+                        anvil_gpu::GpuColor::rgba(
+                            start_color.r,
+                            start_color.g,
+                            start_color.b,
+                            start_color.a,
+                        ),
+                    ),
+                    anvil_gpu::GpuGradientStop::new(
+                        1.0,
+                        anvil_gpu::GpuColor::rgba(
+                            end_color.r,
+                            end_color.g,
+                            end_color.b,
+                            end_color.a,
+                        ),
+                    ),
+                ];
+                let desc = anvil_gpu::GradientDesc {
+                    rect: anvil_gpu::GpuRect::new(x, y, width, height),
+                    shape: anvil_gpu::GradientShape::Linear {
+                        start_x: cx - dx * max_proj,
+                        start_y: cy - dy * max_proj,
+                        end_x: cx + dx * max_proj,
+                        end_y: cy + dy * max_proj,
+                    },
+                    stops: &stops,
+                    clip: Some(anvil_gpu::GpuRect::new(
+                        cx0 as f32,
+                        cy0 as f32,
+                        (cx1 - cx0) as f32,
+                        (cy1 - cy0) as f32,
+                    )),
+                };
+                if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+                    &mut self.pixels,
+                    self.width,
+                    self.height,
+                    (self.width as usize) * 4,
+                ) && anvil_gpu::Compositor::open()
+                    .fill_gradient(&mut target, &desc)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
         }
         let mut quad = anvil_gpu::GpuQuad::linear_gradient(
             anvil_gpu::GpuRect::new(x, y, width, height),
@@ -2103,7 +2198,9 @@ fn item_screen_bounds(
             spread_radius,
             ..
         } => {
-            let pad = blur_radius.max(0.0) + spread_radius.abs();
+            let pad = 1.0
+                + 3.0 * (anvil_gpu::shadow_pass_radius(*blur_radius) as f32)
+                + spread_radius.abs();
             Some((
                 *x + *offset_x - pad,
                 *y - dy + *offset_y - pad,

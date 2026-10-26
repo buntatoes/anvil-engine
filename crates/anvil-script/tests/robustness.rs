@@ -55,7 +55,11 @@ impl Rng {
 
     /// Value in `0..n`. Returns 0 when `n` is 0.
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
 
     fn byte(&mut self) -> u8 {
@@ -154,7 +158,10 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let _ = handle.join();
-            panic!("{label}: case {case} panicked on input {}", preview(&shared));
+            panic!(
+                "{label}: case {case} panicked on input {}",
+                preview(&shared)
+            );
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             panic!(
@@ -167,7 +174,12 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
 }
 
 /// Generate cases from `seed` until the budget is spent and check each one.
-fn run_cases(label: &str, seed: u64, mut generate: impl FnMut(&mut Rng) -> Vec<u8>, target: fn(&[u8])) {
+fn run_cases(
+    label: &str,
+    seed: u64,
+    mut generate: impl FnMut(&mut Rng) -> Vec<u8>,
+    target: fn(&[u8]),
+) {
     let mut rng = Rng::new(seed);
     let budget = test_budget();
     let started = Instant::now();
@@ -181,16 +193,104 @@ fn run_cases(label: &str, seed: u64, mut generate: impl FnMut(&mut Rng) -> Vec<u
 }
 
 const TOKENS: &[&str] = &[
-    "let ", "const ", "var ", "x", "y", "i", "f", "o", "a", "=", "==", "===", "!=", "+", "-", "*",
-    "/", "%", "**", "<", ">", "<=", "&&", "||", "!", "?", ":", "(", ")", "{", "}", "[", "]", ";",
-    ",", ".", "=>", "0", "1", "-1", "1e308", "0.1", "NaN", "Infinity", "\"s\"", "'t'", "`u${x}`",
-    "\"\u{e9}\u{1F600}\"", "true", "false", "null", "undefined", "if ", "else ", "while ",
-    "for ", "return ", "break", "continue", "function ", "new ", "typeof ", "this", "try ",
-    "catch ", "finally ", "throw ", "async ", "await ", "document", "getElementById('p')",
-    "querySelector('div')", "textContent", "innerHTML", "createElement('b')", "appendChild",
-    "console.log", "JSON.parse", "JSON.stringify", "Math.max", "parseInt", "setTimeout",
-    "Promise.resolve()", "localStorage", "setItem", "getItem", "fetch('/x')", "length", "push",
-    "map", "join", "split", " ", "\n", "\\", "/*", "*/", "//",
+    "let ",
+    "const ",
+    "var ",
+    "x",
+    "y",
+    "i",
+    "f",
+    "o",
+    "a",
+    "=",
+    "==",
+    "===",
+    "!=",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "**",
+    "<",
+    ">",
+    "<=",
+    "&&",
+    "||",
+    "!",
+    "?",
+    ":",
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    ";",
+    ",",
+    ".",
+    "=>",
+    "0",
+    "1",
+    "-1",
+    "1e308",
+    "0.1",
+    "NaN",
+    "Infinity",
+    "\"s\"",
+    "'t'",
+    "`u${x}`",
+    "\"\u{e9}\u{1F600}\"",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "if ",
+    "else ",
+    "while ",
+    "for ",
+    "return ",
+    "break",
+    "continue",
+    "function ",
+    "new ",
+    "typeof ",
+    "this",
+    "try ",
+    "catch ",
+    "finally ",
+    "throw ",
+    "async ",
+    "await ",
+    "document",
+    "getElementById('p')",
+    "querySelector('div')",
+    "textContent",
+    "innerHTML",
+    "createElement('b')",
+    "appendChild",
+    "console.log",
+    "JSON.parse",
+    "JSON.stringify",
+    "Math.max",
+    "parseInt",
+    "setTimeout",
+    "Promise.resolve()",
+    "localStorage",
+    "setItem",
+    "getItem",
+    "fetch('/x')",
+    "length",
+    "push",
+    "map",
+    "join",
+    "split",
+    " ",
+    "\n",
+    "\\",
+    "/*",
+    "*/",
+    "//",
 ];
 
 const SAMPLES: &[&str] = &[
@@ -263,22 +363,32 @@ fn token_soup_does_not_panic() {
 
 #[test]
 fn mutated_samples_do_not_panic() {
-    run_cases("script-mutated", 62, |rng| {
-        let sample = rng_sample(rng);
-        mutate(rng, sample.as_bytes())
-    }, run_script);
+    run_cases(
+        "script-mutated",
+        62,
+        |rng| {
+            let sample = rng_sample(rng);
+            mutate(rng, sample.as_bytes())
+        },
+        run_script,
+    );
 }
 
 #[test]
 fn spliced_samples_do_not_panic() {
-    run_cases("script-spliced", 63, |rng| {
-        // Cut two samples at random char boundaries and join the halves.
-        let left = rng_sample(rng);
-        let right = rng_sample(rng);
-        let cut_left = boundary(left, rng.below(left.len() + 1));
-        let cut_right = boundary(right, rng.below(right.len() + 1));
-        format!("{}{}", &left[..cut_left], &right[cut_right..]).into_bytes()
-    }, run_script);
+    run_cases(
+        "script-spliced",
+        63,
+        |rng| {
+            // Cut two samples at random char boundaries and join the halves.
+            let left = rng_sample(rng);
+            let right = rng_sample(rng);
+            let cut_left = boundary(left, rng.below(left.len() + 1));
+            let cut_right = boundary(right, rng.below(right.len() + 1));
+            format!("{}{}", &left[..cut_left], &right[cut_right..]).into_bytes()
+        },
+        run_script,
+    );
 }
 
 #[test]
@@ -295,7 +405,12 @@ fn runaway_scripts_are_stopped_by_the_budget() {
         "function m() { Promise.resolve().then(m); } m();",
     ];
     for (index, source) in runaway.iter().enumerate() {
-        check_case("script-runaway", index, source.as_bytes().to_vec(), run_script);
+        check_case(
+            "script-runaway",
+            index,
+            source.as_bytes().to_vec(),
+            run_script,
+        );
     }
 }
 
@@ -364,7 +479,10 @@ fn string_growth_is_capped() {
     // Ordinary concatenation is untouched.
     let mut doc = parse_html(PAGE);
     let mut runtime = ScriptRuntime::with_jit_enabled(false);
-    runtime.eval_script(&mut doc, "let s = 'a' + 'b'; s += `c${s}`; document.getElementById('p').textContent = s;");
+    runtime.eval_script(
+        &mut doc,
+        "let s = 'a' + 'b'; s += `c${s}`; document.getElementById('p').textContent = s;",
+    );
     assert!(!runtime.was_aborted());
     let p = doc.get_element_by_id("p").unwrap();
     assert_eq!(doc.text_content(p), "abcab");
@@ -374,7 +492,13 @@ fn string_growth_is_capped() {
 fn stray_closing_brace_does_not_stall_the_compiler() {
     // The numeric compiler's top-level loop once sat forever on a `}` with
     // no open block. Such a script must be rejected and fall back.
-    let sources = ["}", "1 }", "let s = 1; }", "let s nnerHTML = '<b>t</b>'; }, 0);", "}}{"];
+    let sources = [
+        "}",
+        "1 }",
+        "let s = 1; }",
+        "let s nnerHTML = '<b>t</b>'; }, 0);",
+        "}}{",
+    ];
     for (index, source) in sources.iter().enumerate() {
         check_case("script-brace", index, source.as_bytes().to_vec(), |input| {
             let source = String::from_utf8_lossy(input);

@@ -9,8 +9,7 @@
 
 use anvil_dom::parse_html;
 use anvil_style::{
-    Color, MediaQuery, compute_styles, compute_styles_for_viewport, parse_css,
-    parse_declarations,
+    Color, MediaQuery, compute_styles, compute_styles_for_viewport, parse_css, parse_declarations,
 };
 
 // ---- shared harness (same text in each repo's robustness test) ----
@@ -55,7 +54,11 @@ impl Rng {
 
     /// Value in `0..n`. Returns 0 when `n` is 0.
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
     }
 
     fn byte(&mut self) -> u8 {
@@ -154,7 +157,10 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let _ = handle.join();
-            panic!("{label}: case {case} panicked on input {}", preview(&shared));
+            panic!(
+                "{label}: case {case} panicked on input {}",
+                preview(&shared)
+            );
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             panic!(
@@ -167,7 +173,12 @@ fn check_case(label: &str, case: usize, input: Vec<u8>, target: fn(&[u8])) {
 }
 
 /// Generate cases from `seed` until the budget is spent and check each one.
-fn run_cases(label: &str, seed: u64, mut generate: impl FnMut(&mut Rng) -> Vec<u8>, target: fn(&[u8])) {
+fn run_cases(
+    label: &str,
+    seed: u64,
+    mut generate: impl FnMut(&mut Rng) -> Vec<u8>,
+    target: fn(&[u8]),
+) {
     let mut rng = Rng::new(seed);
     let budget = test_budget();
     let started = Instant::now();
@@ -181,27 +192,121 @@ fn run_cases(label: &str, seed: u64, mut generate: impl FnMut(&mut Rng) -> Vec<u
 }
 
 const SELECTORS: &[&str] = &[
-    "div", "p", "*", "#main", ".note", "div > p", "ul li", "a[href]", "a[href^=\"http\"]",
-    "input[type=checkbox]:checked", "li:first-child", "li:nth-child(2n+1)", ":not(p)", "p::before",
-    "h1, h2", "td + td", "td ~ td", ":hover", ":root", "[", "]", "::", "#", ".", ">", "+",
+    "div",
+    "p",
+    "*",
+    "#main",
+    ".note",
+    "div > p",
+    "ul li",
+    "a[href]",
+    "a[href^=\"http\"]",
+    "input[type=checkbox]:checked",
+    "li:first-child",
+    "li:nth-child(2n+1)",
+    ":not(p)",
+    "p::before",
+    "h1, h2",
+    "td + td",
+    "td ~ td",
+    ":hover",
+    ":root",
+    "[",
+    "]",
+    "::",
+    "#",
+    ".",
+    ">",
+    "+",
 ];
 
 const PROPERTIES: &[&str] = &[
-    "color", "background", "background-color", "display", "margin", "padding", "border",
-    "border-radius", "width", "height", "min-width", "max-height", "font-size", "font-weight",
-    "line-height", "position", "top", "left", "z-index", "flex", "flex-direction", "flex-wrap",
-    "justify-content", "align-items", "gap", "grid-template-columns", "overflow", "opacity",
-    "box-shadow", "transform", "text-align", "white-space", "--custom", "",
+    "color",
+    "background",
+    "background-color",
+    "display",
+    "margin",
+    "padding",
+    "border",
+    "border-radius",
+    "width",
+    "height",
+    "min-width",
+    "max-height",
+    "font-size",
+    "font-weight",
+    "line-height",
+    "position",
+    "top",
+    "left",
+    "z-index",
+    "flex",
+    "flex-direction",
+    "flex-wrap",
+    "justify-content",
+    "align-items",
+    "gap",
+    "grid-template-columns",
+    "overflow",
+    "opacity",
+    "box-shadow",
+    "transform",
+    "text-align",
+    "white-space",
+    "--custom",
+    "",
 ];
 
 const VALUES: &[&str] = &[
-    "0", "1px", "-1px", "2.5em", "3rem", "50%", "100vw", "100vh", "10vmin", "1e9px", "-1e39px",
-    "NaN", "inf", "red", "#fff", "#ffffffff", "#12", "rgb(1,2,3)", "rgba(1, 2, 3, 0.5)",
-    "rgb(300,-1,1e9)", "hsl(120, 50%, 50%)", "transparent", "linear-gradient(red, blue)",
-    "linear-gradient(", "calc(100% - 10px)", "calc(", "var(--custom)", "repeat(3, 1fr)",
-    "minmax(10px, 1fr)", "auto", "none", "inherit", "initial", "flex", "grid", "block",
-    "0 0 4px rgba(0,0,0,.5)", "1px solid red", "!important", "\"\u{e9}\"", "url(x.png)", "\\",
-    "\u{0}", ";", ":", "{", "}", "/*", "*/",
+    "0",
+    "1px",
+    "-1px",
+    "2.5em",
+    "3rem",
+    "50%",
+    "100vw",
+    "100vh",
+    "10vmin",
+    "1e9px",
+    "-1e39px",
+    "NaN",
+    "inf",
+    "red",
+    "#fff",
+    "#ffffffff",
+    "#12",
+    "rgb(1,2,3)",
+    "rgba(1, 2, 3, 0.5)",
+    "rgb(300,-1,1e9)",
+    "hsl(120, 50%, 50%)",
+    "transparent",
+    "linear-gradient(red, blue)",
+    "linear-gradient(",
+    "calc(100% - 10px)",
+    "calc(",
+    "var(--custom)",
+    "repeat(3, 1fr)",
+    "minmax(10px, 1fr)",
+    "auto",
+    "none",
+    "inherit",
+    "initial",
+    "flex",
+    "grid",
+    "block",
+    "0 0 4px rgba(0,0,0,.5)",
+    "1px solid red",
+    "!important",
+    "\"\u{e9}\"",
+    "url(x.png)",
+    "\\",
+    "\u{0}",
+    ";",
+    ":",
+    "{",
+    "}",
+    "/*",
+    "*/",
 ];
 
 /// Random but CSS-shaped text: rules, declarations, `@media`, and other at-rules.
@@ -210,7 +315,9 @@ fn css_soup(rng: &mut Rng) -> String {
     for _ in 0..rng.below(12) {
         match rng.below(6) {
             0 => out.push_str(&format!("@media (max-width: {}px) {{ ", rng.below(2000))),
-            1 => out.push_str(rng.pick(&["@import x;", "@font-face { src: x }", "@media", "}", "{"])),
+            1 => {
+                out.push_str(rng.pick(&["@import x;", "@font-face { src: x }", "@media", "}", "{"]))
+            }
             _ => {
                 out.push_str(rng.pick(SELECTORS));
                 out.push_str(" { ");
@@ -252,7 +359,12 @@ fn parse_and_cascade(input: &[u8]) {
 
 #[test]
 fn css_soup_does_not_panic() {
-    run_cases("css-soup", 51, |rng| css_soup(rng).into_bytes(), parse_and_cascade);
+    run_cases(
+        "css-soup",
+        51,
+        |rng| css_soup(rng).into_bytes(),
+        parse_and_cascade,
+    );
 }
 
 #[test]
@@ -262,36 +374,48 @@ fn random_bytes_do_not_panic() {
 
 #[test]
 fn mutated_sheets_do_not_panic() {
-    run_cases("css-mutated", 53, |rng| {
-        let soup = css_soup(rng);
-        mutate(rng, soup.as_bytes())
-    }, parse_and_cascade);
+    run_cases(
+        "css-mutated",
+        53,
+        |rng| {
+            let soup = css_soup(rng);
+            mutate(rng, soup.as_bytes())
+        },
+        parse_and_cascade,
+    );
 }
 
 #[test]
 fn single_values_do_not_panic() {
-    run_cases("css-values", 54, |rng| {
-        let mut out = String::new();
-        for _ in 0..1 + rng.below(4) {
-            out.push_str(rng.pick(VALUES));
-        }
-        out.into_bytes()
-    }, |input| {
-        let value = String::from_utf8_lossy(input);
-        let _ = Color::parse(&value);
-        for property in PROPERTIES {
-            let _ = parse_declarations(&format!("{property}: {value}"));
-        }
-        let style = format!("<p style=\"color: {value}; width: {value}; margin: {value}\">x</p>");
-        let doc = parse_html(&style);
-        let _ = compute_styles(&doc, &parse_css(""));
-    });
+    run_cases(
+        "css-values",
+        54,
+        |rng| {
+            let mut out = String::new();
+            for _ in 0..1 + rng.below(4) {
+                out.push_str(rng.pick(VALUES));
+            }
+            out.into_bytes()
+        },
+        |input| {
+            let value = String::from_utf8_lossy(input);
+            let _ = Color::parse(&value);
+            for property in PROPERTIES {
+                let _ = parse_declarations(&format!("{property}: {value}"));
+            }
+            let style =
+                format!("<p style=\"color: {value}; width: {value}; margin: {value}\">x</p>");
+            let doc = parse_html(&style);
+            let _ = compute_styles(&doc, &parse_css(""));
+        },
+    );
 }
 
 #[test]
 fn deeply_nested_blocks_do_not_overflow() {
     for depth in [100usize, 2_000] {
-        let media = "@media (min-width: 1px) { ".repeat(depth) + "p { color: red }" + &"}".repeat(depth);
+        let media =
+            "@media (min-width: 1px) { ".repeat(depth) + "p { color: red }" + &"}".repeat(depth);
         let braces = "p { ".repeat(depth) + &"}".repeat(depth);
         let unclosed = "a { b { c { ".repeat(depth);
         for css in [media, braces, unclosed] {
@@ -304,8 +428,15 @@ fn deeply_nested_blocks_do_not_overflow() {
 fn non_ascii_lengths_do_not_panic() {
     // Byte 5 of these values falls inside a multi-byte character, which the
     // `calc(` prefix check used to slice through.
-    for value in ["calc\u{e9}x)", "abcd\u{e9})", "1\u{1F600}px", "calc(\u{e9})"] {
-        let css = format!("p {{ width: {value}; grid-template-columns: {value} {value}; margin: {value} }}");
+    for value in [
+        "calc\u{e9}x)",
+        "abcd\u{e9})",
+        "1\u{1F600}px",
+        "calc(\u{e9})",
+    ] {
+        let css = format!(
+            "p {{ width: {value}; grid-template-columns: {value} {value}; margin: {value} }}"
+        );
         parse_and_cascade(css.as_bytes());
     }
 }
