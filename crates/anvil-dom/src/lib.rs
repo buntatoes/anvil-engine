@@ -16,8 +16,11 @@
 //! and [`MAX_ATTRS_PER_ELEMENT`] is 128 attributes on one start tag.
 //! Nodes detached by edits stay in the list until the document is dropped.
 //!
-//! Selectors here are a single compound: a tag, `#id`, `.class`, `tag#id`,
-//! or `tag.class`. Descendant combinators and the cascade live in anvil-style.
+//! The selectors here are the small set scripts use. [`Document::query_selector`]
+//! and its siblings take one compound: a tag, `#id`, `.class`, `tag#id`, or
+//! `tag.class`. [`Document::matches_selector`] and [`Document::closest`] also
+//! take `[attr]`, `[attr=value]`, descendant and child combinators, and comma
+//! lists. The full selector engine and the cascade live in anvil-style.
 
 mod html;
 

@@ -6,10 +6,12 @@
 //! is it valid, and which elements does it match. A list with one invalid
 //! selector is dropped whole by the caller.
 //!
-//! Matching runs right to left. The descendant and subsequent-sibling
-//! combinators remember what they found per element, so a long chain of
-//! descendant compounds stays linear in the size of the document. `:has()`
-//! and `nth-child(... of S)` cache their answers the same way. Nothing here
+//! Matching runs right to left. A descendant or child walk stops as soon as
+//! no ancestor further up can match the rest of the selector, and in the
+//! cascade a filter of the names above each element rules most walks out
+//! before they start. The subsequent-sibling combinator remembers what it
+//! found per element, and `:has()` and `nth-child(... of S)` cache their
+//! answers the same way. Nothing here
 //! recurses on the depth of the document: walks up, sideways, and into a
 //! subtree use loops and explicit stacks. Recursion follows the selector only,
 //! and that is bounded by [`MAX_SELECTOR_NESTING`] and

@@ -21,11 +21,11 @@ There are no crates.io dependencies.
 
 | Crate | What it is |
 | --- | --- |
-| `anvil-dom` | HTML tree, `<script>` comment-preserving tokenizer, and CSS selectors |
-| `anvil-style` | CSS cascade, media queries, animations, and multi-core subtree cascade (`compute_styles_parallel`) |
+| `anvil-dom` | HTML tree, `<script>` comment-preserving tokenizer, and the simple selector matcher scripts use |
+| `anvil-style` | CSS parsing, selectors, cascade, media queries, animations, and a multi-core cascade (`compute_styles_parallel`) that the browser doesn't use |
 | `anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
 | `anvil-paint` | Display list and zoom |
-| `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients), bounded LRU glyph coverage cache (`RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
+| `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients), bounded LRU glyph coverage cache (sizes in `RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
 | `anvil-script` | Budgeted JavaScript runtime, WebAssembly 1.0 (`WASM`) decoder/validator/stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), and the numeric x86-64 compiler |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
@@ -38,7 +38,7 @@ Supported:
 
 - WebAssembly 1.0 (`\0asm` version `1`) binary module decoding (`WasmModule::decode`), validation (`validate_wasm`), bounded 64 KiB page linear memory (`WasmMemory`, up to 256 pages / 16 MiB), and stack machine execution (`WasmInstance::instantiate`, `call_export`, `get_exported_global`, `set_exported_global`) covering `i32`, `i64`, `f32`, and `f64` arithmetic, bitwise, comparison, conversion, load/store, `memory.size`, `memory.grow`, `memory.copy`, `memory.fill`, and structured control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `call`, `call_indirect`, `return`)
 - JavaScript `WebAssembly` API: `WebAssembly.validate`, `WebAssembly.compile`, `WebAssembly.compileStreaming`, `WebAssembly.instantiate`, `WebAssembly.instantiateStreaming`, `new WebAssembly.Module`, `new WebAssembly.Instance`, `new WebAssembly.Memory`, `new WebAssembly.Global`, `new WebAssembly.Table`, calling exported WASM functions (`instance.exports.<fn>(...)`), and `memory.grow(delta)`
-- `TypedArray` and binary web APIs: `Uint8Array`, `Uint8ClampedArray`, `Int8Array`, `Uint16Array`, `Int16Array`, `Uint32Array`, `Int32Array`, `Float32Array`, `Float64Array` (including views over `WasmMemory` buffers), `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `URLSearchParams`, `DOMParser`, `AbortController`, `MutationObserver`, `IntersectionObserver`, `ResizeObserver`, `Event`, and `CustomEvent`
+- `TypedArray` and binary web APIs: `Uint8Array`, `Uint8ClampedArray`, `Int8Array`, `Uint16Array`, `Int16Array`, `Uint32Array`, `Int32Array`, `Float32Array`, `Float64Array` (including views over `WasmMemory` buffers), `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `URLSearchParams`, `DOMParser`, `AbortController`, `Event`, and `CustomEvent`
 - Interactive hydration (`ScriptRuntime::hydrate_interactive_bindings`) for documents returned from `--tab-worker`, preserving `onclick` attributes, `addEventListener('click', ...)` listeners, and declared functions/classes in the browser window without re-running initial DOM mutations
 - `new Promise`, `then`, `catch`, `finally`, and `Promise.resolve`, `reject`, `all`, `allSettled`, `race`, `any`
 - A promise resolved with another promise follows it. A class instance with a `then` method is called like one
@@ -58,12 +58,34 @@ Not supported, or different:
 - `async` class methods return a promise, but their awaits wait in place
 - A callback created inside an async function gets a copy of that function's locals, not a live link
 - No `unhandledrejection` event
+- `MutationObserver`, `IntersectionObserver`, and `ResizeObserver` are placeholders. You can create one, but `observe`, `unobserve`, and `disconnect` do nothing, so the callback never runs
 
 Limits: a turn spends at most 200,000 steps (`MAX_EXECUTION_STEPS`), script source and `fetch()` bodies are capped at 256 KiB, and WebAssembly calls are bounded at 500,000 instructions (`MAX_WASM_STEPS`), 64 call frames (`MAX_WASM_CALL_DEPTH`), and 256 linear-memory pages (16 MiB). Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 128 timers and 8,192 queued microtasks are kept at once. Scripts that use the event loop, DOM, or `WebAssembly` always run on the Rust interpreter.
 
 ## CSS support
 
 The crate docs list every property. These are the newer parts and their limits.
+
+### Parsing and the cascade
+
+- Order: user-agent defaults, then author rules by specificity and source order, then the `style` attribute, then `!important` author rules, then `!important` in the `style` attribute.
+- A rule whose selector list holds one invalid selector is dropped whole.
+- Strings, backslash escapes, and the body of an unquoted `url(...)` are skipped when looking for `{`, `}`, and `;`, so a brace or semicolon inside them doesn't break the sheet.
+- `@media` reads `min-width`, `max-width`, and `prefers-color-scheme` (only `dark` matches). The page is a `screen`, so `all` and `screen` match and `print` doesn't. `not`, `only`, `and`, and comma lists work, and nested `@media` is combined with the outer one.
+- `Document::style_sheets` lists every `<link>` and `<style>` in document order with its `media` attribute. `parse_css_with_media` parses one sheet under that media, and `Stylesheet::append` puts sheets together in order.
+
+### Selectors
+
+- Supported: all four combinators; attribute selectors with every operator and the `i` and `s` flags; `:is()`, `:where()`, `:not()`, and `:has()`; `:nth-child()`, `:nth-last-child()`, `:nth-of-type()`, and `:nth-last-of-type()`, with `of S` on the child ones; the structural pseudo-classes (`:root`, `:empty`, `:first-child`, and the rest); `:link` and `:any-link`; the form states (`:checked`, `:default`, `:disabled`, `:enabled`, `:required`, `:optional`, `:read-only`, `:read-write`, `:placeholder-shown`, `:indeterminate` on `progress`); `:open`, `:closed`, `:defined`, `:lang()`, and `:dir()`; and CSS escapes. Specificity follows the selector spec.
+- Valid but never match: pseudo-elements; namespace prefixes other than `*|`, since `@namespace` isn't read; and states a static page never has, such as `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within`, `:visited`, `:target`, `:valid`, `:invalid`, `:user-valid`, `:user-invalid`, `:in-range`, `:out-of-range`, `:autofill`, `:fullscreen`, `:modal`, `:popover-open`, the media playback states, `:host`, and `:state()`. The full list is on `Selector`. `:indeterminate` on radio buttons doesn't match either, and `:dir(auto)` reads as left to right.
+- Not valid: `&` (nesting). A selector nested more than 16 deep (`MAX_SELECTOR_NESTING`) or longer than 64 compounds (`MAX_SELECTOR_COMPOUNDS`) drops its list.
+- Scripts don't use this matcher. `querySelector` and `querySelectorAll` take one compound (`tag`, `#id`, `.class`, `tag#id`, `tag.class`), and `matches` and `closest` add `[attr]`, `[attr=value]`, descendant and child combinators, and comma lists.
+
+### Gaps and sizes
+
+- `row-gap`, `column-gap`, `gap`, and the old `grid-` names take lengths (including `ch`), percentages, `calc()`, and `normal`. Grid uses them between tracks. Flex rows use `column-gap` between items and `row-gap` between lines; flex columns use `row-gap`. A `row-gap` percentage counts as 0 when the container's height isn't set.
+- A set `height` is the height. Content that doesn't fit overflows, and is clipped when `overflow` is `hidden`, `auto`, or `scroll`.
+- Attributes on the `html`, `head`, and `body` tags are kept, so `<body style>`, `<body class>`, and `<html lang>` work.
 
 ### Grid
 
@@ -73,7 +95,8 @@ The crate docs list every property. These are the newer parts and their limits.
 ### `ch`
 
 - Supported on `width`, `height`, `max-width`, and the offsets. One `ch` is the advance of `0` in the system font when anvil-ttf loads one (Linux and Windows); otherwise it is half the font size, the advance layout uses for every character.
-- Not supported: `ch` in margin, padding, border, `gap`, `font-size`, or `calc()`.
+- Also supported on `row-gap`, `column-gap`, and `gap`.
+- Not supported: `ch` in margin, padding, border, `font-size`, or `calc()`.
 
 ### `position: sticky`
 
@@ -87,7 +110,7 @@ The crate docs list every property. These are the newer parts and their limits.
 
 ### Opacity, transitions, and animations
 
-- Supported: `opacity` (one group per box); `transition` and its longhands; `animation` and its longhands with `@keyframes`, iteration counts including `infinite`, all four directions, and all four fill modes; `ease`, `linear`, `ease-in`, `ease-out`, `ease-in-out`, `cubic-bezier()`, `steps()`, `step-start`, and `step-end`. Lengths, colors, opacity, and transforms blend, along with margins, padding, `border-radius`, `font-size`, and `gap`. They run through `compute_styles_animated` with an `Animator`, whose `tick(now_ms)` takes the time from any clock and says whether another frame is needed.
+- Supported: `opacity` (one group per box); `transition` and its longhands; `animation` and its longhands with `@keyframes`, iteration counts including `infinite`, all four directions, and all four fill modes; `ease`, `linear`, `ease-in`, `ease-out`, `ease-in-out`, `cubic-bezier()`, `steps()`, `step-start`, and `step-end`. Lengths, colors, opacity, and transforms blend, along with margins, padding, `border-radius`, `font-size`, `row-gap`, and `column-gap`. They run through `compute_styles_animated` with an `Animator`, whose `tick(now_ms)` takes the time from any clock and says whether another frame is needed.
 - Not supported: transition and animation events, `animation-play-state`, `animation-composition`, `transition-behavior`, shortened reverse transitions, and blending `auto` with a length. `compute_styles` and the other plain cascade functions do not animate. At most 8 transitions and 4 animations per element.
 
 ## Build

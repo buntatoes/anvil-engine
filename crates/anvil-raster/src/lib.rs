@@ -3,15 +3,18 @@
 //! CPU RGBA framebuffer and signed-distance rasterizer.
 //!
 //! `anvil-browser` calls [`rasterize`] with a `anvil-paint` display list, then
-//! blits the pixels into the window. The buffer is top-down RGBA8 in this
-//! `rasterize_quad_on_device` shades one quad through the anvil-gpu tile device.
+//! blits the pixels into the window. The buffer is RGBA8, four bytes per
+//! pixel, with the top row first. [`rasterize_quad_on_device`] shades one quad
+//! through the anvil-gpu tile device.
 //!
-//! Box shadows and unrounded linear gradients run through `anvil_gpu::Compositor`
+//! Box shadows, unrounded linear gradients, and rounded boxes that are filled,
+//! or have an opaque border and fill, run through `anvil_gpu::Compositor`
 //! (OpenGL 3.3 on Linux or Direct3D 11 on Windows when its self-test matches the
-//! CPU, and software otherwise), while rounded boxes use `anvil_gpu::GpuDevice`.
-//! and compositor helpers when `anvil_cpp_accel` is linked, or fall back to the
-//! CPU helpers in `anvil-gpu` (`sdf_rounded_box`, `sdf_box_shadow_alpha`, and
-//! `sample_linear_gradient`). Images are `anvil-image` buffers. `draw_image`
+//! CPU, and software otherwise). Other rounded boxes and gradients, and
+//! anything the compositor turns down, are drawn as quads on
+//! `anvil_gpu::GpuDevice`. Plain rectangles, image blits, blurs, and the
+//! bottom-up BGRA copy use the C++20 helpers when `anvil_cpp_accel` is linked,
+//! and Rust loops otherwise. Images are `anvil-image` buffers. `draw_image`
 //! resizes with that crate's bilinear filter and samples the result. This
 //! crate does not call `anvil-video`. A video frame is drawn only after the
 //! browser has already copied the surface into an `Image` on the display list.
