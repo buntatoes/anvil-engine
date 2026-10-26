@@ -534,6 +534,31 @@ struct AnvilCompiler {
     // Braces and for-loop headers around the statement being compiled.
     u32 block_depth;
 
+    // Native-stack guard for the recursive descent. stack_base is the stack
+    // address where the compile began; stack_budget is how far below it the
+    // parse may grow before it is refused as too deeply nested. The stack
+    // grows down, so the bytes used are stack_base minus the current frame's
+    // address.
+    u64 stack_base;
+    u32 stack_budget;
+
+    bool within_stack_budget() noexcept {
+        char probe;
+        const u64 here = reinterpret_cast<u64>(&probe);
+        return here >= stack_base ? true : (stack_base - here) < stack_budget;
+    }
+
+    // Refuse a script whose nesting has grown the native stack past its
+    // budget, so a pathologically deep input stops with a reason rather than
+    // overflowing the stack. Returns true when it tripped.
+    bool refuse_if_too_deep() noexcept {
+        if (within_stack_budget()) {
+            return false;
+        }
+        reject_limit(VM_REFUSE_NESTING, "nesting", stack_budget, "bytes of compiler stack");
+        return true;
+    }
+
     const Token& peek(u32 ahead = 0u) const noexcept {
         const u32 idx = (cursor + ahead < lexer.count) ? (cursor + ahead) : (lexer.count - 1u);
         return lexer.tokens()[idx];
@@ -1247,6 +1272,9 @@ struct AnvilCompiler {
     }
 
     u16 compile_unary() noexcept {
+        if (refuse_if_too_deep()) {
+            return 0u;
+        }
         if (match(TokenKind::Minus)) {
             const u16 operand = compile_unary();
             const u16 dst = alloc_reg();
@@ -1433,6 +1461,9 @@ struct AnvilCompiler {
     }
 
     u16 compile_statement_body() noexcept {
+        if (refuse_if_too_deep()) {
+            return 0u;
+        }
         while (match(TokenKind::Semicolon)) {}
         const Token& t = peek();
         if (t.kind == TokenKind::Eof || t.kind == TokenKind::RBrace) {
@@ -1884,6 +1915,12 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.in_function = false;
     g_compiler.had_error = false;
     g_compiler.block_depth = 0u;
+    // Anchor the native-stack guard at the compile entry: the recursive
+    // descent grows the stack down from here, and a parse that grows past
+    // the budget is refused instead of overflowing the stack.
+    char stack_anchor;
+    g_compiler.stack_base = reinterpret_cast<u64>(&stack_anchor);
+    g_compiler.stack_budget = ctx.effective_parse_stack_budget();
 
     if (!g_compiler.lexer.tokenize(src, len)) {
         const AnvilLexer& lex = g_compiler.lexer;

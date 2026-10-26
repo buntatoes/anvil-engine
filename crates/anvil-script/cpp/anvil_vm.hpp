@@ -53,6 +53,14 @@ constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
 constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
 // Default nesting depth for calls; a Configure request may raise or lower it.
 constexpr u32 ANVIL_DEFAULT_CALL_DEPTH  = 10000u;
+// The recursive-descent front end spends native stack per level of nesting
+// (more for a nested expression than for a nested statement). So a
+// pathologically deep script refuses cleanly instead of overflowing the
+// native stack, the compiler measures how far the stack has grown from where
+// the compile began and refuses past this many bytes. The default stays well
+// within a small (2 MiB) thread stack; a Configure request may raise it for a
+// caller on a larger stack, or lower it.
+constexpr u32 ANVIL_DEFAULT_PARSE_STACK_BUDGET = 1024u * 1024u;
 // An object keeps a shared hidden class (AnvilShape) until it has this many
 // named properties; past it the object switches to its own property map
 // (dictionary mode), so there is no fixed cap on how many properties an object
@@ -108,6 +116,7 @@ enum VmErrorCode : u32 {
     VM_REFUSE_HOST_SLOTS    = 48u,
     VM_REFUSE_LOOPS         = 49u,
     VM_REFUSE_HEAP          = 50u,
+    VM_REFUSE_NESTING       = 51u,
 };
 
 constexpr u32 MAX_ERROR_TEXT = 160u;
@@ -1228,6 +1237,11 @@ struct AnvilVmContext {
     u32 resume_reg_base;
     u32 resume_frame_regs;
 
+    // Compiler native-stack budget in bytes (measured from the compile
+    // entry) before a deeply nested script is refused rather than overflowing
+    // the stack. A Configure setting kept across runs; 0 means the default.
+    u32 parse_stack_budget;
+
     // Steps this run may take before it stops: the configured budget, or the
     // built-in default when none was set.
     u32 effective_step_limit() const noexcept {
@@ -1238,6 +1252,13 @@ struct AnvilVmContext {
     // or the built-in default when none was set.
     u32 effective_call_depth() const noexcept {
         return call_depth_limit != 0u ? call_depth_limit : ANVIL_DEFAULT_CALL_DEPTH;
+    }
+
+    // Native-stack budget the compiler's recursive descent may grow before a
+    // too-deeply nested script is refused: the configured budget, or the
+    // built-in default when none was set.
+    u32 effective_parse_stack_budget() const noexcept {
+        return parse_stack_budget != 0u ? parse_stack_budget : ANVIL_DEFAULT_PARSE_STACK_BUDGET;
     }
 
     void init() noexcept;

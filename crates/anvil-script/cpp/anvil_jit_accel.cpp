@@ -1079,7 +1079,9 @@ static u32 run_request(
         );
     }
     if (op == anvil_vm::AVK_OP_CONFIGURE) {
-        // The payload is four u32 limits. A zero leaves that limit as it was.
+        // The payload is the limits as u32s (step, script size, heap, call
+        // depth, then the optional yield interval and compiler stack budget). A
+        // zero leaves that limit as it was (except the yield interval).
         // The settings stay on the context for the runs that follow.
         if (len >= pos + 16u) {
             const u32 step = anvil_vm::read_u32_le(src + pos);
@@ -1102,6 +1104,14 @@ static u32 run_request(
             // turns pausing off, so it is not treated as "leave unchanged".
             if (len >= pos + 20u) {
                 ctx.yield_interval = anvil_vm::read_u32_le(src + pos + 16u);
+            }
+            // The compiler's native-stack budget (bytes); 0 leaves it as it
+            // was, like the other limits above.
+            if (len >= pos + 24u) {
+                const u32 parse_stack = anvil_vm::read_u32_le(src + pos + 20u);
+                if (parse_stack != 0u) {
+                    ctx.parse_stack_budget = parse_stack;
+                }
             }
         }
         ctx.fill_telemetry(telemetry_out);

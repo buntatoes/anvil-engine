@@ -657,19 +657,30 @@ fn deeply_nested_ifs_compile() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let depth = 2000;
-    let mut source = String::from("let x = 1; let r = 0; ");
-    for _ in 0..depth {
-        source.push_str("if (x) { ");
-    }
-    source.push_str("r = 7; ");
-    for _ in 0..depth {
-        source.push('}');
-    }
-    source.push_str(" r;");
-    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
-        .expect("2000-deep nested ifs compile and run");
-    assert_eq!(value, 7.0);
+    // Nesting this deep spends more native stack than libtest's 2 MiB test
+    // thread, and the default compiler-stack budget refuses it, so the body runs
+    // on a larger stack with the budget raised to match.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let depth = 2000;
+            let mut source = String::from("let x = 1; let r = 0; ");
+            for _ in 0..depth {
+                source.push_str("if (x) { ");
+            }
+            source.push_str("r = 7; ");
+            for _ in 0..depth {
+                source.push('}');
+            }
+            source.push_str(" r;");
+            let (value, _) =
+                anvil_script::eval_cpp_vm_request_parse_stack(32 * 1024 * 1024, 5_000_000, &source)
+                    .expect("2000-deep nested ifs compile and run");
+            assert_eq!(value, 7.0);
+        })
+        .expect("spawn a large-stack thread")
+        .join()
+        .expect("the compile thread does not panic");
 }
 
 /// A nested-if script about 64 KiB of source compiles and runs. The program-size
@@ -677,7 +688,8 @@ fn deeply_nested_ifs_compile() {
 /// through the compiler instead of being refused. The front end is
 /// recursive-descent, so a chain this deep needs more native stack than libtest's
 /// default test thread (2 MiB); real embedders (the host runner, the browser) run
-/// it on a normal stack, so the body runs on a thread sized to match.
+/// it on a normal stack, so the body runs on a thread sized to match with the
+/// compiler-stack budget raised to suit.
 #[test]
 fn a_64_kib_nested_if_script_compiles() {
     if !is_cpp_jit_kernel_active() {
@@ -701,13 +713,139 @@ fn a_64_kib_nested_if_script_compiles() {
                 "source is {} bytes",
                 source.len()
             );
-            let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
-                .expect("a 64 KiB nested-if script compiles and runs");
+            let (value, _) =
+                anvil_script::eval_cpp_vm_request_parse_stack(64 * 1024 * 1024, 5_000_000, &source)
+                    .expect("a 64 KiB nested-if script compiles and runs");
             assert_eq!(value, 9.0);
         })
         .expect("spawn a large-stack thread")
         .join()
         .expect("the compile thread does not panic");
+}
+
+/// A script nested past the default compiler-stack budget is refused with a
+/// clear reason rather than overflowing the native stack. This runs on
+/// libtest's normal (2 MiB) test thread: before the guard a chain this deep
+/// aborted the process; now it is a clean refusal.
+#[test]
+fn a_deeply_nested_if_past_the_default_refuses() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let depth = 8000;
+    let mut source = String::from("let x = 1; let r = 0; ");
+    for _ in 0..depth {
+        source.push_str("if (x) { ");
+    }
+    source.push_str("r = 7; ");
+    for _ in 0..depth {
+        source.push('}');
+    }
+    source.push_str(" r;");
+    let error = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source).unwrap_err();
+    assert_eq!(
+        error.code, 51,
+        "expected the nesting refusal code, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("nesting"),
+        "expected a nesting reason, got: {}",
+        error.message
+    );
+}
+
+/// A deeply nested expression (nested parentheses) is refused the same way. An
+/// expression nests through more compiler frames per level than a statement, so
+/// it trips the budget at a shallower depth; the guard measures stack bytes, not
+/// a depth count, so both are covered. Also on the normal test thread.
+#[test]
+fn a_deeply_nested_expression_past_the_default_refuses() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let depth = 5000;
+    let mut source = String::from("let r = ");
+    for _ in 0..depth {
+        source.push('(');
+    }
+    source.push('1');
+    for _ in 0..depth {
+        source.push(')');
+    }
+    source.push_str("; r;");
+    let error = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source).unwrap_err();
+    assert_eq!(
+        error.code, 51,
+        "expected the nesting refusal code, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("nesting"),
+        "expected a nesting reason, got: {}",
+        error.message
+    );
+}
+
+/// Raising the compiler-stack budget (with a native stack to match) lets a
+/// script compile that the default budget refuses, so the limit is a setting,
+/// not a hard cap.
+#[test]
+fn a_raised_parse_stack_budget_allows_deeper_nesting() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let depth = 8000;
+            let mut source = String::from("let x = 1; let r = 0; ");
+            for _ in 0..depth {
+                source.push_str("if (x) { ");
+            }
+            source.push_str("r = 7; ");
+            for _ in 0..depth {
+                source.push('}');
+            }
+            source.push_str(" r;");
+            // The default budget refuses this depth (see the test above); a
+            // raised budget on a matching stack compiles it.
+            let (value, _) =
+                anvil_script::eval_cpp_vm_request_parse_stack(32 * 1024 * 1024, 5_000_000, &source)
+                    .expect("8000-deep nested ifs compile once the budget is raised");
+            assert_eq!(value, 7.0);
+        })
+        .expect("spawn a large-stack thread")
+        .join()
+        .expect("the compile thread does not panic");
+}
+
+/// Lowering the budget refuses a nesting the default would accept, so the
+/// setting works in both directions.
+#[test]
+fn a_lowered_parse_stack_budget_refuses_sooner() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let depth = 400;
+    let mut source = String::from("let x = 1; let r = 0; ");
+    for _ in 0..depth {
+        source.push_str("if (x) { ");
+    }
+    source.push_str("r = 7; ");
+    for _ in 0..depth {
+        source.push('}');
+    }
+    source.push_str(" r;");
+    // 400-deep compiles comfortably under the default budget.
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("400-deep nested ifs compile under the default budget");
+    assert_eq!(value, 7.0);
+    // With a 64 KiB budget the same script is refused.
+    let error =
+        anvil_script::eval_cpp_vm_request_parse_stack(64 * 1024, 5_000_000, &source).unwrap_err();
+    assert_eq!(
+        error.code, 51,
+        "expected the nesting refusal code, got: {error:?}"
+    );
 }
 
 /// A source about 1 MiB long compiles and runs rather than being refused for its

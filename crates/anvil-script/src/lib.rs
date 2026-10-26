@@ -361,6 +361,27 @@ mod vm_request {
         bytes
     }
 
+    /// A Configure request that also sets the compiler's native-stack budget
+    /// (the sixth field, after the yield interval). A budget of 0 leaves it as
+    /// it was. The yield interval is written as 0, which turns pausing off.
+    pub fn configure_with_parse_stack(
+        step_budget: u32,
+        script_size_limit: u32,
+        heap_byte_budget: u32,
+        call_depth_limit: u32,
+        parse_stack_budget: u32,
+    ) -> Vec<u8> {
+        let mut bytes = configure_with_yield(
+            step_budget,
+            script_size_limit,
+            heap_byte_budget,
+            call_depth_limit,
+            0,
+        );
+        bytes.extend_from_slice(&parse_stack_budget.to_le_bytes());
+        bytes
+    }
+
     /// Request op: continue a run that paused at a yield.
     pub const OP_RESUME: u32 = 3;
 
@@ -688,6 +709,38 @@ pub fn eval_cpp_vm_request_tuned(
 /// budget (0 keeps the built-in default). The one budget stands in for the
 /// fixed table caps the VM used to carry, so a run that needs more heap than
 /// the budget stops with `heap limit reached: N bytes`.
+/// Run `source` with the compiler's native-stack budget set first by a
+/// Configure request (0 keeps the built-in default). A deeply nested script
+/// that would grow the native stack past the budget is refused with a reason
+/// instead of overflowing. A larger budget needs a larger native stack to
+/// match, so callers raise both together.
+pub fn eval_cpp_vm_request_parse_stack(
+    parse_stack_budget: u32,
+    step_budget: u32,
+    source: &str,
+) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let mut runtime = ScriptRuntime::new();
+    let configure =
+        vm_request::configure_with_parse_stack(step_budget, 0, 0, 0, parse_stack_budget);
+    let _ = runtime.try_owned_vm(&configure);
+    let run = vm_request::run(trimmed.as_bytes());
+    match runtime.try_owned_vm(&run) {
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
+    }
+}
+
 pub fn eval_cpp_vm_request_heap_budget(
     heap_byte_budget: u32,
     source: &str,
