@@ -17,7 +17,7 @@
 //! - [`MAX_DOM_NODES`] (50_000) stops allocation. Leftover input is ignored.
 //! - [`MAX_ATTRS_PER_ELEMENT`] (128) drops further attributes on one start tag.
 
-use crate::{Document, NodeId};
+use crate::{Document, NodeData, NodeId};
 
 /// Open-element stack limit. A start tag past this depth is still created,
 /// but it is not pushed, so following tokens stay under the current parent.
@@ -42,7 +42,9 @@ const HEAD_TAGS: &[&str] = &["base", "link", "meta", "style", "title"];
 /// `input` is borrowed for the scan. The returned [`Document`] owns every
 /// tag, attribute, and text string. `script` and `style` keep their raw text,
 /// including a `<` that would otherwise look like a tag. Void tags do not
-/// take children. Comments and `<!` / `<?` markup are skipped. Tag names are
+/// take children. Attributes on `html`, `head`, and `body` tags go on the
+/// elements the document starts with; one already there is kept. Comments
+/// and `<!` / `<?` markup are skipped. Tag names are
 /// stored in ASCII lowercase. An unknown entity is left in the text. Decimal
 /// (`&#39;`) and hex (`&#x27;`) references are decoded in text and attributes.
 ///
@@ -81,16 +83,22 @@ pub fn parse_html(input: &str) -> Document {
                 continue;
             }
             if name == "html" {
+                let html = doc.html();
+                merge_attributes(&mut doc, html, attrs);
                 continue;
             }
             if name == "head" {
+                let head = doc.head();
+                merge_attributes(&mut doc, head, attrs);
                 stack.clear();
-                stack.push(doc.head());
+                stack.push(head);
                 continue;
             }
             if name == "body" {
+                let body = doc.body();
+                merge_attributes(&mut doc, body, attrs);
                 stack.clear();
-                stack.push(doc.body());
+                stack.push(body);
                 continue;
             }
 
@@ -224,6 +232,23 @@ fn placement_parent(doc: &Document, stack: &[NodeId], tag: &str) -> NodeId {
         }
     }
     stack.last().copied().unwrap_or_else(|| doc.body())
+}
+
+/// Copy attributes from an `html`, `head`, or `body` start tag onto the
+/// element [`Document::new`] already made. An attribute the element has
+/// already got keeps its value, so a second `<body>` only adds new ones.
+/// The element never ends up with more than [`MAX_ATTRS_PER_ELEMENT`].
+fn merge_attributes(doc: &mut Document, id: NodeId, attrs: Vec<(String, String)>) {
+    for (name, value) in attrs {
+        let data = doc.get(id).data();
+        let count = match data {
+            NodeData::Element { attrs, .. } => attrs.len(),
+            _ => return,
+        };
+        if data.attr(&name).is_none() && count < MAX_ATTRS_PER_ELEMENT {
+            doc.set_attribute(id, &name, &value);
+        }
+    }
 }
 
 /// Pop the open stack through the matching start tag.
