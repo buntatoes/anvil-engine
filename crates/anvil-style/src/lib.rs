@@ -1015,6 +1015,142 @@ pub fn compute_styles_for_viewport(
     cascade_document(doc, sheet, viewport_width, viewport_height, None)
 }
 
+/// Cascade `sheet` onto `doc` across multiple CPU cores when `body` has independent child subtrees.
+///
+/// Produces bit-exact output matching [`compute_styles_for_viewport`].
+pub fn compute_styles_parallel(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> StyleMap {
+    let viewport_width = viewport_width.max(0.0);
+    let viewport_height = viewport_height.max(0.0);
+    let total_nodes = doc_len(doc);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    let body_id = doc.body();
+    let body_children: Vec<NodeId> = doc.children(body_id).to_vec();
+    if workers <= 1 || body_children.len() < 2 {
+        return compute_styles_for_viewport(doc, sheet, viewport_width, viewport_height);
+    }
+    let mut styles = vec![ComputedStyle::initial(); total_nodes];
+    let html_id = doc.html();
+    let mut root_vars = HashMap::new();
+    let mut cx = Cascade {
+        sheet,
+        viewport_width,
+        root_font_px: 16.0,
+        animator: None,
+    };
+    if let NodeData::Element { tag, .. } = doc.get(html_id).data() {
+        let html_style = cascade_element(
+            doc,
+            html_id,
+            tag,
+            &ComputedStyle::initial(),
+            &mut root_vars,
+            &cx,
+        );
+        if tag == "html" {
+            cx.root_font_px = html_style.font_size;
+        }
+        if let Some(slot) = styles.get_mut(html_id.index()) {
+            *slot = html_style;
+        }
+        for &child in doc.children(html_id) {
+            if child != body_id {
+                walk(
+                    doc,
+                    child,
+                    &html_style,
+                    &html_style,
+                    &root_vars,
+                    &mut cx,
+                    &mut styles,
+                );
+            }
+        }
+        let mut body_vars = root_vars.clone();
+        let body_style = match doc.get(body_id).data() {
+            NodeData::Element { tag: btag, .. } => {
+                cascade_element(doc, body_id, btag, &html_style, &mut body_vars, &cx)
+            }
+            _ => html_style,
+        };
+        if let Some(slot) = styles.get_mut(body_id.index()) {
+            *slot = body_style;
+        }
+        let root_font_px = cx.root_font_px;
+        let chunk_size = body_children.len().div_ceil(workers);
+        let branch_results: Vec<Vec<(usize, ComputedStyle)>> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for chunk in body_children.chunks(chunk_size) {
+                let body_vars_ref = &body_vars;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    let worker_cx = Cascade {
+                        sheet,
+                        viewport_width,
+                        root_font_px,
+                        animator: None,
+                    };
+                    for &child_id in chunk {
+                        walk_subtree_into(
+                            doc,
+                            child_id,
+                            &body_style,
+                            body_vars_ref,
+                            &worker_cx,
+                            &mut local,
+                        );
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        for group in branch_results {
+            for (idx, st) in group {
+                if let Some(slot) = styles.get_mut(idx) {
+                    *slot = st;
+                }
+            }
+        }
+        return StyleMap {
+            styles,
+            root_font_px,
+            viewport_width,
+            viewport_height,
+        };
+    }
+    compute_styles_for_viewport(doc, sheet, viewport_width, viewport_height)
+}
+
+fn walk_subtree_into(
+    doc: &Document,
+    id: NodeId,
+    parent: &ComputedStyle,
+    parent_vars: &HashMap<String, String>,
+    cx: &Cascade,
+    out: &mut Vec<(usize, ComputedStyle)>,
+) {
+    let mut vars = parent_vars.clone();
+    let style = match doc.get(id).data() {
+        NodeData::Element { tag, .. } => cascade_element(doc, id, tag, parent, &mut vars, cx),
+        _ => *parent,
+    };
+    out.push((id.index(), style));
+    for &child in doc.children(id) {
+        walk_subtree_into(doc, child, &style, &vars, cx, out);
+    }
+}
+
 /// Like [`compute_styles_for_viewport`], with transitions run by `animator`
 /// at its current time.
 ///
@@ -3572,6 +3708,22 @@ mod tests {
         assert_eq!(left(5000.0, "a"), -370.0);
         // Played backward, the fill keeps the `from` value.
         assert_eq!(left(5000.0, "b"), 1e30);
+        assert!(!animator.is_animating());
+
+        let html = "<style>
+            :root { --accent: #2266aa; }
+            .card { width: 120px; padding: 8px; color: var(--accent); }
+            .card p { font-size: 14px; margin: 4px; }
+        </style>
+        <div class=\"card\" id=\"c1\"><p>One</p></div>
+        <div class=\"card\" id=\"c2\"><p>Two</p></div>
+        <div class=\"card\" id=\"c3\"><p>Three</p></div>
+        <div class=\"card\" id=\"c4\"><p>Four</p></div>";
+        let parallel_doc = parse_html(html);
+        let parallel_sheet = parse_css(&parallel_doc.embedded_css());
+        let sequential = compute_styles_for_viewport(&parallel_doc, &parallel_sheet, 800.0, 600.0);
+        let parallel = compute_styles_parallel(&parallel_doc, &parallel_sheet, 800.0, 600.0);
+        assert_eq!(parallel, sequential);
         assert!(!animator.is_animating());
     }
 }

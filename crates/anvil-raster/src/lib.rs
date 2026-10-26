@@ -304,6 +304,347 @@ const PAPER: Color = Color {
     a: 255,
 };
 
+/// Default memory budget for the raster glyph coverage cache (2 MiB).
+pub const DEFAULT_GLYPH_CACHE_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum number of glyph bitmaps retained in the LRU cache.
+pub const MAX_GLYPH_CACHE_ENTRIES: usize = 2048;
+
+thread_local! {
+    static THREAD_COMPOSITOR: std::cell::RefCell<Option<anvil_gpu::Compositor>> =
+        const { std::cell::RefCell::new(None) };
+    static THREAD_GPU_DEVICE: std::cell::RefCell<Option<anvil_gpu::GpuDevice>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's persistent [`anvil_gpu::Compositor`], opening it on first use.
+pub fn with_thread_compositor<R>(f: impl FnOnce(&mut anvil_gpu::Compositor) -> R) -> R {
+    THREAD_COMPOSITOR.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let comp = borrow.get_or_insert_with(anvil_gpu::Compositor::open);
+        f(comp)
+    })
+}
+
+fn with_thread_gpu_device<R>(f: impl FnOnce(&anvil_gpu::GpuDevice) -> R) -> R {
+    THREAD_GPU_DEVICE.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let dev = borrow.get_or_insert_with(anvil_gpu::GpuDevice::open);
+        f(dev)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GlyphCacheKey {
+    font_fp: u64,
+    ch: char,
+    size_qpx: u32,
+    subpixel: bool,
+}
+
+#[derive(Clone, Debug)]
+enum CachedGlyph {
+    Gray(anvil_ttf::GlyphBitmap),
+    Subpixel(anvil_ttf::SubpixelGlyphBitmap),
+}
+
+impl CachedGlyph {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Gray(bmp) => 24 + bmp.coverage.len(),
+            Self::Subpixel(bmp) => 24 + bmp.rgb_coverage.len(),
+        }
+    }
+}
+
+struct GlyphLruCache {
+    entries: std::collections::VecDeque<(GlyphCacheKey, CachedGlyph)>,
+    used_bytes: usize,
+    budget_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl GlyphLruCache {
+    const fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            used_bytes: 0,
+            budget_bytes: DEFAULT_GLYPH_CACHE_BUDGET_BYTES,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, key: &GlyphCacheKey) -> Option<CachedGlyph> {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == key) {
+            let pair = self.entries.remove(pos)?;
+            let out = pair.1.clone();
+            self.entries.push_back(pair);
+            self.hits += 1;
+            Some(out)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    fn insert(&mut self, key: GlyphCacheKey, glyph: CachedGlyph) {
+        let cost = glyph.byte_len();
+        if cost > self.budget_bytes || self.budget_bytes == 0 {
+            return;
+        }
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+            if let Some((_, old)) = self.entries.remove(pos) {
+                self.used_bytes = self.used_bytes.saturating_sub(old.byte_len());
+            }
+        }
+        while (self.used_bytes + cost > self.budget_bytes
+            || self.entries.len() >= MAX_GLYPH_CACHE_ENTRIES)
+            && let Some((_, evicted)) = self.entries.pop_front()
+        {
+            self.used_bytes = self.used_bytes.saturating_sub(evicted.byte_len());
+        }
+        self.used_bytes += cost;
+        self.entries.push_back((key, glyph));
+    }
+
+    fn trim_to_budget(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        while self.used_bytes > self.budget_bytes
+            && let Some((_, evicted)) = self.entries.pop_front()
+        {
+            self.used_bytes = self.used_bytes.saturating_sub(evicted.byte_len());
+        }
+        self.entries.shrink_to_fit();
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.entries.shrink_to_fit();
+        self.used_bytes = 0;
+    }
+}
+
+static GLYPH_CACHE: std::sync::Mutex<GlyphLruCache> = std::sync::Mutex::new(GlyphLruCache::new());
+
+fn font_fingerprint(font: &TtfFont) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in font.family_name().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^= u64::from(font.units_per_em) << 32 | u64::from(font.line_gap as u16);
+    h = h.wrapping_mul(0x0100_0000_01b3);
+    h ^= (font.ascender as u16 as u64) << 16 | (font.descender as u16 as u64);
+    h
+}
+
+fn cached_rasterize_glyph(
+    font: &TtfFont,
+    ch: char,
+    font_size: f32,
+) -> Option<anvil_ttf::GlyphBitmap> {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return None;
+    }
+    let key = GlyphCacheKey {
+        font_fp: font_fingerprint(font),
+        ch,
+        size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
+        subpixel: false,
+    };
+    if let Ok(mut guard) = GLYPH_CACHE.lock()
+        && let Some(CachedGlyph::Gray(bmp)) = guard.get(&key)
+    {
+        return Some(bmp);
+    }
+    let bmp = font.rasterize_glyph(ch, font_size)?;
+    if let Ok(mut guard) = GLYPH_CACHE.lock() {
+        guard.insert(key, CachedGlyph::Gray(bmp.clone()));
+    }
+    Some(bmp)
+}
+
+fn cached_rasterize_subpixel_glyph(
+    font: &TtfFont,
+    ch: char,
+    font_size: f32,
+) -> Option<anvil_ttf::SubpixelGlyphBitmap> {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return None;
+    }
+    let key = GlyphCacheKey {
+        font_fp: font_fingerprint(font),
+        ch,
+        size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
+        subpixel: true,
+    };
+    if let Ok(mut guard) = GLYPH_CACHE.lock()
+        && let Some(CachedGlyph::Subpixel(bmp)) = guard.get(&key)
+    {
+        return Some(bmp);
+    }
+    let bmp = font.rasterize_glyph_subpixel_lcd(ch, font_size)?;
+    if let Ok(mut guard) = GLYPH_CACHE.lock() {
+        guard.insert(key, CachedGlyph::Subpixel(bmp.clone()));
+    }
+    Some(bmp)
+}
+
+/// Snapshot of the rasterizer's bounded glyph cache and memory budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterMemoryStats {
+    /// Bytes currently held by cached glyph coverage bitmaps.
+    pub glyph_cache_bytes: usize,
+    /// Number of glyph bitmaps currently in the LRU cache.
+    pub glyph_cache_entries: usize,
+    /// Configured maximum byte budget for the glyph cache.
+    pub glyph_cache_budget_bytes: usize,
+    /// Total cache hits since process start.
+    pub glyph_cache_hits: u64,
+    /// Total cache misses since process start.
+    pub glyph_cache_misses: u64,
+}
+
+/// Current memory statistics for the rasterizer's glyph cache.
+pub fn raster_memory_stats() -> RasterMemoryStats {
+    let guard = GLYPH_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    RasterMemoryStats {
+        glyph_cache_bytes: guard.used_bytes,
+        glyph_cache_entries: guard.entries.len(),
+        glyph_cache_budget_bytes: guard.budget_bytes,
+        glyph_cache_hits: guard.hits,
+        glyph_cache_misses: guard.misses,
+    }
+}
+
+/// Set the maximum byte budget for the raster glyph coverage cache and evict oldest entries.
+pub fn set_raster_memory_budget(budget_bytes: usize) {
+    let mut guard = GLYPH_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.trim_to_budget(budget_bytes);
+}
+
+/// Clear cached glyph coverage bitmaps and release backing capacity.
+pub fn trim_raster_caches() {
+    let mut guard = GLYPH_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clear();
+}
+
+static RASTER_WORKER_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Maximum number of CPU worker threads used for parallel band and tile rasterization.
+pub const MAX_WORKER_THREADS: usize = 32;
+
+/// Default worker thread count derived from [`std::thread::available_parallelism`].
+pub fn default_raster_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, MAX_WORKER_THREADS)
+}
+
+/// Number of CPU worker threads used by [`rasterize_parallel`] and [`rasterize_incremental`].
+pub fn raster_worker_threads() -> usize {
+    let configured = RASTER_WORKER_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+    if configured == 0 {
+        default_raster_worker_threads()
+    } else {
+        configured.clamp(1, 32)
+    }
+}
+
+/// Configure the number of CPU worker threads used for parallel band and tile rasterization.
+/// Passing `0` resets to [`default_raster_worker_threads`].
+pub fn set_raster_worker_threads(threads: usize) {
+    let normalized = if threads == 0 {
+        0
+    } else {
+        threads.clamp(1, 32)
+    };
+    RASTER_WORKER_THREADS.store(normalized, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Persistent rasterizer engine holding a reusable [`anvil_gpu::Compositor`],
+/// worker thread count, and glyph cache budget.
+#[derive(Debug)]
+pub struct RasterEngine {
+    compositor: anvil_gpu::Compositor,
+    worker_threads: usize,
+    glyph_cache_budget_bytes: usize,
+}
+
+impl Default for RasterEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RasterEngine {
+    /// Open a persistent [`RasterEngine`] using the platform compositor and all available CPU cores.
+    pub fn new() -> Self {
+        Self {
+            compositor: anvil_gpu::Compositor::open(),
+            worker_threads: raster_worker_threads(),
+            glyph_cache_budget_bytes: DEFAULT_GLYPH_CACHE_BUDGET_BYTES,
+        }
+    }
+
+    /// Active backend kind (`Hardware` or `Software`) on the persistent [`anvil_gpu::Compositor`].
+    pub fn compositor_backend(&self) -> anvil_gpu::BackendKind {
+        self.compositor.active_backend()
+    }
+
+    /// Borrow the persistent [`anvil_gpu::Compositor`].
+    pub fn compositor_mut(&mut self) -> &mut anvil_gpu::Compositor {
+        &mut self.compositor
+    }
+
+    /// Configured CPU worker thread count.
+    pub fn worker_threads(&self) -> usize {
+        self.worker_threads
+    }
+
+    /// Set the CPU worker thread count for this engine and process.
+    pub fn set_worker_threads(&mut self, threads: usize) {
+        let count = if threads == 0 {
+            default_raster_worker_threads()
+        } else {
+            threads.clamp(1, 32)
+        };
+        self.worker_threads = count;
+        set_raster_worker_threads(count);
+    }
+
+    /// Set the glyph cache memory budget in bytes.
+    pub fn set_memory_budget(&mut self, budget_bytes: usize) {
+        self.glyph_cache_budget_bytes = budget_bytes;
+        set_raster_memory_budget(budget_bytes);
+    }
+
+    /// Rasterize `list` across the configured CPU worker threads.
+    pub fn rasterize(
+        &self,
+        list: &DisplayList,
+        width: u32,
+        height: u32,
+        scroll_y: f32,
+    ) -> Framebuffer {
+        if self.worker_threads > 1 && height > TILE_SIZE {
+            rasterize_parallel(list, width, height, scroll_y)
+        } else {
+            rasterize(list, width, height, scroll_y)
+        }
+    }
+}
+
 /// Top-down RGBA8 buffer plus a clip stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Framebuffer {
@@ -362,6 +703,17 @@ impl Framebuffer {
     /// Raw top-down RGBA bytes. Length is `width * height * 4`.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    /// Total heap bytes allocated by this framebuffer's pixel and clip storage.
+    pub fn byte_len(&self) -> usize {
+        self.pixels.capacity() + self.clips.capacity() * std::mem::size_of::<(i32, i32, i32, i32)>()
+    }
+
+    /// Release excess capacity in the pixel buffer and clip stack.
+    pub fn shrink_to_fit(&mut self) {
+        self.pixels.shrink_to_fit();
+        self.clips.shrink_to_fit();
     }
 
     /// Read one pixel. `None` when `x` or `y` is outside the buffer. Clips are ignored.
@@ -496,13 +848,15 @@ impl Framebuffer {
                 next
             })
             .collect();
-        let pixels = anvil_gpu::GpuDevice::open().render_quads(
-            tile_w,
-            tile_h,
-            anvil_gpu::GpuColor::rgba(0, 0, 0, 0),
-            &shifted,
-            None,
-        );
+        let pixels = with_thread_gpu_device(|dev| {
+            dev.render_quads(
+                tile_w,
+                tile_h,
+                anvil_gpu::GpuColor::rgba(0, 0, 0, 0),
+                &shifted,
+                None,
+            )
+        });
         for py in 0..tile_h {
             for px in 0..tile_w {
                 let index = ((py * tile_w + px) * 4) as usize;
@@ -579,6 +933,95 @@ impl Framebuffer {
     ) {
         if width <= 0.0 || height <= 0.0 {
             return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+        if cx0 < cx1 && cy0 < cy1 {
+            let clip_rect = Some(anvil_gpu::GpuRect::new(
+                cx0 as f32,
+                cy0 as f32,
+                (cx1 - cx0) as f32,
+                (cy1 - cy0) as f32,
+            ));
+            if border_width <= 0.0 && fill_color.a > 0 {
+                let desc = anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(x, y, width, height),
+                    corner_radius: radius.max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        fill_color.r,
+                        fill_color.g,
+                        fill_color.b,
+                        fill_color.a,
+                    ),
+                    clip: clip_rect,
+                };
+                if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+                    &mut self.pixels,
+                    self.width,
+                    self.height,
+                    (self.width as usize) * 4,
+                ) && with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok()
+                {
+                    return;
+                }
+            } else if border_width > 0.0
+                && fill_color.a == 255
+                && border_color.a == 255
+                && width > border_width * 2.0
+                && height > border_width * 2.0
+            {
+                let outer_desc = anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(x, y, width, height),
+                    corner_radius: radius.max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        border_color.r,
+                        border_color.g,
+                        border_color.b,
+                        border_color.a,
+                    ),
+                    clip: clip_rect,
+                };
+                let inner_desc = anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(
+                        x + border_width,
+                        y + border_width,
+                        width - border_width * 2.0,
+                        height - border_width * 2.0,
+                    ),
+                    corner_radius: (radius - border_width).max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        fill_color.r,
+                        fill_color.g,
+                        fill_color.b,
+                        fill_color.a,
+                    ),
+                    clip: clip_rect,
+                };
+                if let Ok(mut target) = anvil_gpu::RgbaTarget::new(
+                    &mut self.pixels,
+                    self.width,
+                    self.height,
+                    (self.width as usize) * 4,
+                ) && with_thread_compositor(|comp| {
+                    comp.box_shadow(&mut target, &outer_desc)
+                        .and_then(|()| comp.box_shadow(&mut target, &inner_desc))
+                })
+                .is_ok()
+                {
+                    return;
+                }
+            }
         }
         let mut quad = anvil_gpu::GpuQuad::solid(
             anvil_gpu::GpuRect::new(x, y, width, height),
@@ -717,9 +1160,7 @@ impl Framebuffer {
                 self.width,
                 self.height,
                 (self.width as usize) * 4,
-            ) && anvil_gpu::Compositor::open()
-                .box_shadow(&mut target, &desc)
-                .is_ok()
+            ) && with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok()
             {
                 return;
             }
@@ -874,8 +1315,7 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) && anvil_gpu::Compositor::open()
-                    .fill_gradient(&mut target, &desc)
+                ) && with_thread_compositor(|comp| comp.fill_gradient(&mut target, &desc))
                     .is_ok()
                 {
                     return;
@@ -1010,7 +1450,7 @@ impl Framebuffer {
         color: Color,
         font: &TtfFont,
     ) -> Option<f32> {
-        let bmp = font.rasterize_glyph(ch, font_size)?;
+        let bmp = cached_rasterize_glyph(font, ch, font_size)?;
         let baseline_y = y + (font.ascender as f32) * font_size / (font.units_per_em.max(1) as f32);
         let gx0 = (x.round() as i32) + bmp.bearing_x;
         let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
@@ -1066,7 +1506,7 @@ impl Framebuffer {
         color: Color,
         font: &TtfFont,
     ) -> Option<f32> {
-        let bmp = font.rasterize_glyph_subpixel_lcd(ch, font_size)?;
+        let bmp = cached_rasterize_subpixel_glyph(font, ch, font_size)?;
         let baseline_y = y + (font.ascender as f32) * font_size / (font.units_per_em.max(1) as f32);
         let gx0 = (x.round() as i32) + bmp.bearing_x;
         let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
@@ -1329,7 +1769,7 @@ impl Framebuffer {
         let baseline = y + f32::from(font.ascender) * scale;
         let mut pen = x;
         for ch in text.chars() {
-            if let Some(bmp) = font.rasterize_glyph(ch, font_size) {
+            if let Some(bmp) = cached_rasterize_glyph(font, ch, font_size) {
                 // Saturating math: a run placed far off the canvas must not overflow.
                 let origin_x = (pen.round() as i32).saturating_add(bmp.bearing_x);
                 let width = bmp.width as usize;
@@ -1380,9 +1820,13 @@ impl Framebuffer {
                     if (row_bits >> (4 - col_idx)) & 1 == 1 {
                         let gx = char_x.saturating_add(col_idx * scale);
                         let gy = base_y.saturating_add((row_idx as i32) * scale);
-                        for sy in 0..scale {
-                            for sx in 0..scale {
-                                self.set_pixel(gx.saturating_add(sx), gy.saturating_add(sy), color);
+                        let px0 = gx.max(0);
+                        let py0 = gy.max(0);
+                        let px1 = gx.saturating_add(scale).min(self.width as i32);
+                        let py1 = gy.saturating_add(scale).min(self.height as i32);
+                        for py in py0..py1 {
+                            for px in px0..px1 {
+                                self.set_pixel(px, py, color);
                             }
                         }
                     }
@@ -2053,10 +2497,7 @@ pub fn rasterize_parallel(
         return rasterize(list, width, height, scroll_y);
     }
     let canvas_bg = resolve_canvas_bg(list, width);
-    let max_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .clamp(2, 8) as u32;
+    let max_workers = raster_worker_threads() as u32;
     let total_tile_rows = height.div_ceil(TILE_SIZE);
     let workers = max_workers.min(total_tile_rows).max(1);
     if workers <= 1 {
@@ -2282,6 +2723,101 @@ pub fn rasterize_incremental(
         return 0;
     }
     let canvas_bg = resolve_canvas_bg(next_list, fb.width);
+    let dirty_rows: Vec<u32> = (0..grid.rows)
+        .filter(|&ty| (0..grid.cols).any(|tx| grid.dirty[(ty * grid.cols + tx) as usize]))
+        .collect();
+    let workers = raster_worker_threads().min(dirty_rows.len());
+    if workers > 1 && fb.width > 0 && fb.height > 0 {
+        let width = fb.width;
+        let height = fb.height;
+        let cols = grid.cols;
+        let dirty_ref = &grid.dirty;
+        let rows_per_worker = dirty_rows.len().div_ceil(workers);
+        let row_results: Vec<Vec<(u32, u32, Vec<u8>)>> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for chunk in dirty_rows.chunks(rows_per_worker) {
+                handles.push(s.spawn(move || {
+                    let mut rendered = Vec::with_capacity(chunk.len());
+                    for &ty in chunk {
+                        let y0_px = ty * TILE_SIZE;
+                        let row_h = (height - y0_px).min(TILE_SIZE);
+                        if row_h == 0 {
+                            continue;
+                        }
+                        let mut row_fb = Framebuffer::new(width, row_h, canvas_bg);
+                        let all_cols_dirty =
+                            (0..cols).all(|tx| dirty_ref[(ty * cols + tx) as usize]);
+                        if all_cols_dirty {
+                            paint_list_with_band_offset(
+                                &mut row_fb,
+                                next_list,
+                                next_scroll_y,
+                                y0_px as f32,
+                                viewport_h,
+                            );
+                        } else {
+                            for tx in 0..cols {
+                                if !dirty_ref[(ty * cols + tx) as usize] {
+                                    continue;
+                                }
+                                let x0 = (tx * TILE_SIZE) as f32;
+                                let tw = TILE_SIZE as f32;
+                                let th = row_h as f32;
+                                row_fb.clips.clear();
+                                row_fb.push_clip(x0, 0.0, tw, th);
+                                row_fb.fill_rect(x0, 0.0, tw, th, canvas_bg);
+                                paint_list_with_band_offset(
+                                    &mut row_fb,
+                                    next_list,
+                                    next_scroll_y,
+                                    y0_px as f32,
+                                    viewport_h,
+                                );
+                                row_fb.clips.clear();
+                            }
+                        }
+                        rendered.push((ty, row_h, row_fb.pixels));
+                    }
+                    rendered
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let stride = (fb.width as usize) * 4;
+        for group in row_results {
+            for (ty, row_h, row_pixels) in group {
+                let y0_px = (ty * TILE_SIZE) as usize;
+                let all_cols_dirty =
+                    (0..grid.cols).all(|tx| grid.dirty[(ty * grid.cols + tx) as usize]);
+                if all_cols_dirty {
+                    let dst_start = y0_px * stride;
+                    let byte_len = (row_h as usize) * stride;
+                    fb.pixels[dst_start..dst_start + byte_len]
+                        .copy_from_slice(&row_pixels[..byte_len]);
+                } else {
+                    for tx in 0..grid.cols {
+                        if !grid.dirty[(ty * grid.cols + tx) as usize] {
+                            continue;
+                        }
+                        let x0_px = (tx * TILE_SIZE) as usize;
+                        let x1_px = ((tx + 1) * TILE_SIZE).min(fb.width) as usize;
+                        let span_bytes = (x1_px - x0_px) * 4;
+                        for py in 0..(row_h as usize) {
+                            let src_off = py * stride + x0_px * 4;
+                            let dst_off = (y0_px + py) * stride + x0_px * 4;
+                            fb.pixels[dst_off..dst_off + span_bytes]
+                                .copy_from_slice(&row_pixels[src_off..src_off + span_bytes]);
+                        }
+                    }
+                }
+            }
+        }
+        fb.clips.clear();
+        return dirty_total;
+    }
     for ty in 0..grid.rows {
         for tx in 0..grid.cols {
             if !grid.dirty[(ty * grid.cols + tx) as usize] {
@@ -2454,7 +2990,7 @@ pub fn rasterize_quad_on_device(
         anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
     );
     let clear = anvil_gpu::GpuColor::rgba(0, 0, 0, 255);
-    anvil_gpu::GpuDevice::open().render_quads(width, height, clear, &[quad], None)
+    with_thread_gpu_device(|dev| dev.render_quads(width, height, clear, &[quad], None))
 }
 
 /// Fill, scroll, clip, fixed layers, shadows, gradients, blits, and NV12 conversion tests.
@@ -3022,5 +3558,66 @@ mod tests {
         assert_eq!(draw(&doc, &mut animator), (true, Some(30)));
         clock.advance(50.0);
         assert_eq!(draw(&doc, &mut animator), (false, Some(40)));
+    }
+
+    #[test]
+    fn compositor_rounded_rects_raster_engine_and_memory_budget_work() {
+        let mut engine = RasterEngine::new();
+        assert!(engine.worker_threads() >= 1);
+        engine.set_worker_threads(4);
+        assert_eq!(engine.worker_threads(), 4);
+
+        let fill = Color {
+            r: 40,
+            g: 140,
+            b: 240,
+            a: 255,
+        };
+        let border = Color {
+            r: 250,
+            g: 200,
+            b: 50,
+            a: 255,
+        };
+        let list = DisplayList {
+            items: vec![
+                DisplayItem::RoundedRect {
+                    x: 4.0,
+                    y: 4.0,
+                    width: 24.0,
+                    height: 16.0,
+                    radius: 4.0,
+                    border_width: 0.0,
+                    fill_color: fill,
+                    border_color: Color::BLACK,
+                },
+                DisplayItem::RoundedRect {
+                    x: 4.0,
+                    y: 28.0,
+                    width: 24.0,
+                    height: 20.0,
+                    radius: 4.0,
+                    border_width: 2.0,
+                    fill_color: fill,
+                    border_color: border,
+                },
+            ],
+            layers: Vec::new(),
+        };
+        let mut fb = engine.rasterize(&list, 64, 128, 0.0);
+        assert_eq!(fb.pixel(16, 12), Some(fill));
+        assert_eq!(fb.pixel(16, 38), Some(fill));
+        assert_eq!(fb.pixel(16, 28), Some(border));
+
+        fb.push_clip(0.0, 0.0, 32.0, 32.0);
+        fb.pop_clip();
+        fb.shrink_to_fit();
+        assert_eq!(fb.byte_len(), 64 * 128 * 4);
+
+        set_raster_memory_budget(512 * 1024);
+        assert_eq!(raster_memory_stats().glyph_cache_budget_bytes, 512 * 1024);
+        trim_raster_caches();
+        assert_eq!(raster_memory_stats().glyph_cache_bytes, 0);
+        set_raster_memory_budget(DEFAULT_GLYPH_CACHE_BUDGET_BYTES);
     }
 }

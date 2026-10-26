@@ -2,7 +2,7 @@
   <h1>Anvil Engine</h1>
   <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.22-ff6b24?style=flat-square" alt="v.22" />
+    <img src="https://img.shields.io/badge/release-v.23-ff6b24?style=flat-square" alt="v.23" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
@@ -11,7 +11,7 @@
   </p>
 </div>
 
-Version 0.22. Author: Buntato.
+Version 0.23. Author: Buntato.
 
 The source is public, so anyone can read it, audit it, and use it as part of Anvil Browser. It's still proprietary, though, not open source: you can't redistribute it on its own or use it to build a different product. [Anvil Browser](https://github.com/buntatoes/anvil-browser) and the nine companion libraries can be redistributed without it, under their own licenses. See [License](#license).
 
@@ -22,10 +22,10 @@ There are no crates.io dependencies.
 | Crate | What it is |
 | --- | --- |
 | `anvil-dom` | HTML tree and selectors |
-| `anvil-style` | CSS cascade and media queries |
+| `anvil-style` | CSS cascade, media queries, animations, and multi-core subtree cascade (`compute_styles_parallel`) |
 | `anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
 | `anvil-paint` | Display list and zoom |
-| `anvil-raster` | RGBA framebuffer. Shadows and gradients run through `anvil_gpu::Compositor` (GPU or CPU); rounded boxes use `anvil_gpu::GpuDevice` |
+| `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients), bounded LRU glyph coverage cache (`RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
 | `anvil-script` | Budgeted script runtime and the numeric x86-64 compiler |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
