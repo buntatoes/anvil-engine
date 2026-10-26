@@ -41,7 +41,9 @@
 //!
 //! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
 //! Only `dark` matches a color scheme; `light` and any other value do not.
-//! An inner `@media` replaces the outer query instead of combining with it.
+//! The page is a `screen`: `all` and `screen` match, `print` and other media
+//! types do not. `not`, `only`, `and`, and comma lists work, and an inner
+//! `@media` is combined with the outer one. See [`MediaQuery`].
 //! `@keyframes` blocks are kept on the [`Stylesheet`], whether or not they sit
 //! inside `@media`. Other at-rules are skipped. The cascade is user-agent defaults, then author
 //! rules by specificity `(ids, classes, types)` and source order, then the
@@ -69,78 +71,322 @@ pub struct Stylesheet {
     pub keyframes: Vec<KeyframesRule>,
 }
 
-/// Viewport tests attached to a rule. Absent fields are unconstrained.
+/// Media queries attached to a rule.
 ///
-/// `color_scheme` is owned lowercase text from the query. Widths are CSS
-/// pixels rounded from the parsed number. A query with no recognized tests
-/// matches every viewport.
+/// Holds one or more media query lists. Each list matches when any query in
+/// it matches (a comma is OR), and the whole value matches only when every
+/// list does. A rule inside nested `@media` blocks gets one list per level,
+/// so the levels combine with AND.
+///
+/// The page is always treated as a `screen`. Media types `all` and `screen`
+/// match, `print` and every other type do not. `not` negates one query and
+/// `only` is accepted and ignored. Features supported: `min-width` and
+/// `max-width` in CSS pixels (rounded to whole pixels), and
+/// `prefers-color-scheme`, which matches `dark` only. Other features, and
+/// feature values that do not parse, are ignored and do not stop a query from
+/// matching. A query with a syntax error matches nothing, while the other
+/// queries in its list still count. An empty query text matches everything.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaQuery {
-    pub min_width_px: Option<u32>,
-    pub max_width_px: Option<u32>,
-    pub color_scheme: Option<String>,
+    lists: Vec<Vec<SingleMediaQuery>>,
 }
 
-impl MediaQuery {
-    /// Parse parenthesized features out of an `@media` condition.
-    ///
-    /// `cond` is borrowed. The result owns any color-scheme string. Unknown
-    /// features are ignored. A condition with no closing `)` stops at the
-    /// broken parenthesis. Width values may include a `px` suffix.
-    pub fn parse(cond: &str) -> Self {
-        let mut mq = Self::default();
-        let lower = cond.to_ascii_lowercase();
-        let mut rest = lower.as_str();
-        while let Some(open) = rest.find('(') {
-            let after_open = &rest[open + 1..];
-            let Some(close) = after_open.find(')') else {
-                break;
-            };
-            let expr = after_open[..close].trim();
-            if let Some((k, v)) = expr.split_once(':') {
-                let key = k.trim();
-                let val = v.trim().trim_end_matches("px").trim();
-                match key {
-                    "min-width" => {
-                        mq.min_width_px = val.parse::<f32>().ok().map(|f| f.round() as u32);
-                    }
-                    "max-width" => {
-                        mq.max_width_px = val.parse::<f32>().ok().map(|f| f.round() as u32);
-                    }
-                    "prefers-color-scheme" => {
-                        mq.color_scheme = Some(val.to_string());
+/// One query from a comma-separated list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SingleMediaQuery {
+    /// Did not parse. Matches nothing, even with `not`.
+    Invalid,
+    Query {
+        negated: bool,
+        /// `None` when the query is only a condition, which means `all`.
+        media_type: Option<MediaType>,
+        condition: Option<MediaCondition>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaType {
+    All,
+    Screen,
+    /// `print` and any other type name. Never matches a page on screen.
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MediaCondition {
+    MinWidth(u32),
+    MaxWidth(u32),
+    ColorScheme(String),
+    /// A feature that is not supported here. Treated as true.
+    Ignored,
+    Not(Box<MediaCondition>),
+    And(Vec<MediaCondition>),
+    Or(Vec<MediaCondition>),
+}
+
+impl MediaCondition {
+    fn matches(&self, vw: u32) -> bool {
+        match self {
+            MediaCondition::MinWidth(min_w) => vw >= *min_w,
+            MediaCondition::MaxWidth(max_w) => vw <= *max_w,
+            MediaCondition::ColorScheme(scheme) => scheme.eq_ignore_ascii_case("dark"),
+            MediaCondition::Ignored => true,
+            MediaCondition::Not(inner) => !inner.matches(vw),
+            MediaCondition::And(parts) => parts.iter().all(|part| part.matches(vw)),
+            MediaCondition::Or(parts) => parts.iter().any(|part| part.matches(vw)),
+        }
+    }
+}
+
+impl SingleMediaQuery {
+    fn matches(&self, vw: u32) -> bool {
+        let SingleMediaQuery::Query {
+            negated,
+            media_type,
+            condition,
+        } = self
+        else {
+            return false;
+        };
+        let type_matches = !matches!(media_type, Some(MediaType::Other));
+        let result = type_matches && condition.as_ref().is_none_or(|c| c.matches(vw));
+        result != *negated
+    }
+
+    /// Parse one query. `src` is lowercase and trimmed.
+    fn parse(src: &str) -> Self {
+        let Some(tokens) = media_tokens(src) else {
+            return SingleMediaQuery::Invalid;
+        };
+        let mut pos = 0;
+        let mut negated = false;
+        let mut media_type = None;
+        if let Some(MediaToken::Word(word)) = tokens.first() {
+            let mut type_at = 0;
+            if word == "not" || word == "only" {
+                negated = word == "not";
+                type_at = 1;
+            }
+            match tokens.get(type_at) {
+                Some(MediaToken::Word(name)) => {
+                    media_type = Some(match name.as_str() {
+                        "all" => MediaType::All,
+                        "screen" => MediaType::Screen,
+                        "and" | "or" | "not" | "only" | "layer" => {
+                            return SingleMediaQuery::Invalid;
+                        }
+                        _ => MediaType::Other,
+                    });
+                    pos = type_at + 1;
+                }
+                // `not (...)` with no type is a negated condition.
+                Some(MediaToken::Group(_)) if negated => {
+                    negated = false;
+                    pos = 0;
+                }
+                _ => return SingleMediaQuery::Invalid,
+            }
+        }
+        let condition = if pos == tokens.len() {
+            None
+        } else {
+            if media_type.is_some() {
+                // A type can only be followed by `and` and a condition
+                // without `or`.
+                if !matches!(tokens.get(pos), Some(MediaToken::Word(word)) if word == "and") {
+                    return SingleMediaQuery::Invalid;
+                }
+                pos += 1;
+            }
+            match parse_media_condition(&tokens[pos..], media_type.is_none(), 0) {
+                Some(c) => Some(c),
+                None => return SingleMediaQuery::Invalid,
+            }
+        };
+        if media_type.is_some() && condition.is_none() && pos != tokens.len() {
+            return SingleMediaQuery::Invalid;
+        }
+        SingleMediaQuery::Query {
+            negated,
+            media_type,
+            condition,
+        }
+    }
+}
+
+/// A word or a parenthesized group in a media query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MediaToken {
+    Word(String),
+    /// Text inside the parentheses, without them.
+    Group(String),
+}
+
+/// Split a query into words and top-level parenthesized groups.
+/// `None` when the parentheses do not balance or a stray character appears.
+fn media_tokens(src: &str) -> Option<Vec<MediaToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = src.char_indices().peekable();
+    while let Some(&(idx, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+        } else if ch == '(' {
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in chars.by_ref() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
                     }
                     _ => {}
                 }
             }
-            rest = &after_open[close + 1..];
+            let end = end?;
+            tokens.push(MediaToken::Group(src[idx + 1..end].trim().to_string()));
+        } else if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+            let mut word = String::new();
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    word.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(MediaToken::Word(word));
+        } else {
+            return None;
         }
-        mq
+    }
+    Some(tokens)
+}
+
+/// Deepest nesting of parenthesized conditions that is read. Deeper input is
+/// treated as a syntax error, which keeps hostile sheets from using the stack.
+const MAX_MEDIA_NESTING: usize = 16;
+
+/// Parse `not (..)`, or groups joined by only `and` or only `or`.
+/// `allow_or` is false right after a media type. `depth` counts the
+/// parentheses already entered.
+fn parse_media_condition(
+    tokens: &[MediaToken],
+    allow_or: bool,
+    depth: usize,
+) -> Option<MediaCondition> {
+    if depth > MAX_MEDIA_NESTING {
+        return None;
+    }
+    match tokens {
+        [MediaToken::Word(word), MediaToken::Group(inner)] if word == "not" => Some(
+            MediaCondition::Not(Box::new(parse_media_in_parens(inner, depth)?)),
+        ),
+        [MediaToken::Group(first), rest @ ..] => {
+            let mut parts = vec![parse_media_in_parens(first, depth)?];
+            let mut joiner: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(token) = iter.next() {
+                let MediaToken::Word(word) = token else {
+                    return None;
+                };
+                if word != "and" && !(word == "or" && allow_or) {
+                    return None;
+                }
+                if joiner.is_some_and(|j| j != word) {
+                    return None;
+                }
+                joiner = Some(word);
+                let Some(MediaToken::Group(next)) = iter.next() else {
+                    return None;
+                };
+                parts.push(parse_media_in_parens(next, depth)?);
+            }
+            Some(match (joiner, parts.len()) {
+                (_, 1) => parts.remove(0),
+                (Some("or"), _) => MediaCondition::Or(parts),
+                _ => MediaCondition::And(parts),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse the inside of one `( ... )`: a nested condition or a feature.
+fn parse_media_in_parens(inner: &str, depth: usize) -> Option<MediaCondition> {
+    if inner.starts_with('(') || inner.starts_with("not ") || inner.starts_with("not(") {
+        if depth >= MAX_MEDIA_NESTING {
+            return None;
+        }
+        let tokens = media_tokens(inner)?;
+        return parse_media_condition(&tokens, true, depth + 1);
+    }
+    if inner.is_empty() {
+        return None;
+    }
+    let Some((k, v)) = inner.split_once(':') else {
+        return Some(MediaCondition::Ignored);
+    };
+    let key = k.trim();
+    let val = v.trim().trim_end_matches("px").trim();
+    let px = || val.parse::<f32>().ok().map(|f| f.round() as u32);
+    Some(match key {
+        "min-width" => px().map_or(MediaCondition::Ignored, MediaCondition::MinWidth),
+        "max-width" => px().map_or(MediaCondition::Ignored, MediaCondition::MaxWidth),
+        "prefers-color-scheme" => MediaCondition::ColorScheme(val.to_string()),
+        _ => MediaCondition::Ignored,
+    })
+}
+
+impl MediaQuery {
+    /// Parse the text of an `@media` prelude or a `media` attribute.
+    ///
+    /// `cond` is borrowed and read without regard to case. Commas split it
+    /// into queries; see [`MediaQuery`] for what each one can say. Commas
+    /// inside parentheses do not split.
+    pub fn parse(cond: &str) -> Self {
+        let lower = cond.to_ascii_lowercase();
+        let trimmed = lower.trim();
+        if trimmed.is_empty() {
+            return Self::default();
+        }
+        let mut list = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0;
+        for (idx, ch) in trimmed.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    list.push(SingleMediaQuery::parse(trimmed[start..idx].trim()));
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        list.push(SingleMediaQuery::parse(trimmed[start..].trim()));
+        Self { lists: vec![list] }
     }
 
-    /// True when `viewport_width` is inside the min and max, and the color
-    /// scheme is unset or `dark`.
+    /// Both `self` and `inner` must match, as for `@media` inside `@media`.
+    pub fn and(mut self, inner: &MediaQuery) -> Self {
+        self.lists.extend(inner.lists.iter().cloned());
+        self
+    }
+
+    /// True when every list has a matching query for a screen
+    /// `viewport_width` CSS pixels wide.
     ///
-    /// Width is rounded to a `u32` after clamping at 0. Any other color scheme,
-    /// including `light`, returns false. The query is borrowed.
+    /// Width is rounded to a `u32` after clamping at 0. The query is
+    /// borrowed.
     pub fn matches(&self, viewport_width: f32) -> bool {
         let vw = viewport_width.max(0.0).round() as u32;
-        if let Some(min_w) = self.min_width_px {
-            if vw < min_w {
-                return false;
-            }
-        }
-        if let Some(max_w) = self.max_width_px {
-            if vw > max_w {
-                return false;
-            }
-        }
-        if let Some(scheme) = &self.color_scheme {
-            if !scheme.eq_ignore_ascii_case("dark") {
-                return false;
-            }
-        }
-        true
+        self.lists
+            .iter()
+            .all(|list| list.iter().any(|query| query.matches(vw)))
     }
 }
 
@@ -917,7 +1163,7 @@ const FALLBACK: ComputedStyle = ComputedStyle::initial();
 /// Parse `input` into an owned style sheet.
 ///
 /// Comments (`/* */`) are replaced with a space. Rules inside `@media` keep
-/// that query. An inner `@media` does not combine with the outer one.
+/// that query. An inner `@media` is combined with the outer one.
 /// `@keyframes` blocks go to [`Stylesheet::keyframes`]. Other at-rules are
 /// skipped. The input is borrowed.
 pub fn parse_css(input: &str) -> Stylesheet {
@@ -1011,8 +1257,8 @@ pub(crate) fn find_matching_brace(src: &str) -> usize {
 
 /// Split `rest` into rules and keyframes, appending to `sheet`.
 ///
-/// `active_media` is cloned onto each rule. `@media` replaces it for the
-/// nested body instead of intersecting the two queries. A prelude that starts
+/// `active_media` is cloned onto each rule. A nested `@media` is combined
+/// with it, so both must match. A prelude that starts
 /// with `@` and is not `@media` or `@keyframes` is dropped, body included.
 /// A rule whose selector list has an invalid selector is dropped too.
 fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
@@ -1036,7 +1282,11 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
         };
         if let Some(cond) = selector_src.strip_prefix("@media") {
             let mq = MediaQuery::parse(cond);
-            parse_css_rules(body_src, Some(mq), sheet);
+            let combined = match &active_media {
+                Some(outer) => outer.clone().and(&mq),
+                None => mq,
+            };
+            parse_css_rules(body_src, Some(combined), sheet);
             continue;
         }
         if let Some(name) = selector_src.strip_prefix("@keyframes") {
