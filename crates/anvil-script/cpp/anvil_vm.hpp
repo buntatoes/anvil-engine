@@ -102,6 +102,7 @@ enum VmErrorCode : u32 {
     VM_STOP_SHAPES          = 9u,
     VM_STOP_UNSUPPORTED     = 10u,
     VM_STOP_HEAP            = 11u,
+    VM_STOP_NOT_FUNCTION    = 12u,
     VM_REFUSE_SYNTAX        = 32u,
     VM_REFUSE_UNSUPPORTED   = 33u,
     VM_REFUSE_UNKNOWN_NAME  = 34u,
@@ -954,6 +955,8 @@ enum class AnvilOpcode : u8 {
     HostSetText  = 43u,
     CmpLooseEq   = 44u,  // R[a] = (R[b] == R[c])
     CmpLooseNe   = 45u,  // R[a] = (R[b] != R[c])
+    LoadFunc     = 46u,  // R[a] = function value for fn_id = imm32
+    CallValue    = 47u,  // R[a] = call(R[b], arg_base = c, argc = imm32)
 };
 
 struct AnvilInstruction {

@@ -987,3 +987,147 @@ fn dynamic_frame_stride_composes_across_calls() {
         .expect("deep multi-local recursion");
     assert_eq!(value, 9000.0);
 }
+
+// ---- Functions as values and call-of-value ---------------
+
+/// A function expression is a value that can be stored and then called.
+#[test]
+fn function_expression_is_a_value_that_can_be_called() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) = anvil_script::eval_cpp_vm_request_configured(
+        1_000_000,
+        "const f = function (x) { return x + 1; }; let r = f(1); r;",
+    )
+    .expect("a function expression compiles, runs and is callable");
+    assert_eq!(v, 2.0);
+}
+
+/// An arrow with a parenthesised parameter list is a function value.
+#[test]
+fn arrow_with_parens_is_a_value() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) =
+        anvil_script::eval_cpp_vm_request_configured(1_000_000, "const f = (x) => x * 2; f(21);")
+            .expect("a parenthesised arrow compiles and runs");
+    assert_eq!(v, 42.0);
+}
+
+/// An arrow with a single bare-identifier parameter is a function value.
+#[test]
+fn arrow_without_parens_is_a_value() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) =
+        anvil_script::eval_cpp_vm_request_configured(1_000_000, "const g = x => x + 10; g(5);")
+            .expect("a bare-identifier arrow compiles and runs");
+    assert_eq!(v, 15.0);
+}
+
+/// An arrow with a block body returns through `return`.
+#[test]
+fn arrow_with_a_block_body_returns() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) = anvil_script::eval_cpp_vm_request_configured(
+        1_000_000,
+        "const f = (a, b) => { let s = a + b; return s * 2; }; f(3, 4);",
+    )
+    .expect("an arrow with a block body compiles and runs");
+    assert_eq!(v, 14.0);
+}
+
+/// A function is passed as an argument and the parameter is called as a value.
+#[test]
+fn a_function_is_passed_as_an_argument_and_called() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) = anvil_script::eval_cpp_vm_request_configured(
+        1_000_000,
+        "function ap(g, v) { return g(v); } function inc(x) { return x + 1; } ap(inc, 4);",
+    )
+    .expect("a function passed as an argument is called through its value");
+    assert_eq!(v, 5.0);
+}
+
+/// A function value is returned from a call and then called.
+#[test]
+fn a_function_is_returned_and_called() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) = anvil_script::eval_cpp_vm_request_configured(
+        1_000_000,
+        "function mk() { return function (a) { return a * a; }; } let q = mk(); q(6);",
+    )
+    .expect("a returned function value is callable");
+    assert_eq!(v, 36.0);
+}
+
+/// Calling a value that is not a function stops with a reason, not a crash.
+#[test]
+fn calling_a_non_function_value_stops_with_a_reason() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let error =
+        anvil_script::eval_cpp_vm_request_configured(1_000_000, "let x = 3; x(1);").unwrap_err();
+    assert_eq!(
+        error.code, 12,
+        "expected the not-a-function stop, got: {error:?}"
+    );
+    assert!(
+        error.message.contains("not a function"),
+        "expected a not-a-function reason, got: {}",
+        error.message
+    );
+}
+
+/// A parameter the call omits is undefined in the callee.
+#[test]
+fn a_missing_argument_is_undefined() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) =
+        anvil_script::eval_cpp_vm_request_configured(1_000_000, "const f = (a, b) => a + b; f(5);")
+            .expect("a call with a missing argument runs");
+    assert!(v.is_nan(), "a + undefined is NaN, got {v}");
+}
+
+/// Arguments beyond the parameters are evaluated and dropped.
+#[test]
+fn extra_arguments_are_ignored() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let (v, _) =
+        anvil_script::eval_cpp_vm_request_configured(1_000_000, "const f = a => a; f(7, 8, 9);")
+            .expect("a call with extra arguments runs");
+    assert_eq!(v, 7.0);
+}
+
+/// A closure that reads an enclosing local is still refused (captured variables
+/// aren't supported yet); it is a clean refusal, and the Rust interpreter runs
+/// the script.
+#[test]
+fn a_closure_over_an_outer_local_is_refused_for_now() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let error = anvil_script::eval_cpp_vm_request_configured(
+        1_000_000,
+        "function mk() { let k = 5; return function () { return k; }; } mk()();",
+    )
+    .unwrap_err();
+    assert!(
+        error.code >= 32,
+        "expected a compile-time refusal, got: {error:?}"
+    );
+}

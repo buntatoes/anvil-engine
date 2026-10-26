@@ -754,6 +754,61 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                 break;
             }
 
+            case AnvilOpcode::LoadFunc: {
+                R[inst.a] = AnvilValue::make_function(inst.imm32());
+                break;
+            }
+
+            case AnvilOpcode::CallValue: {
+                const AnvilValue callee = R[inst.b];
+                if (!callee.is_function()) {
+                    fail(VM_STOP_NOT_FUNCTION, "called value is not a function");
+                    return AnvilValue::make_undefined();
+                }
+                const u32 fn_id = callee.payload();
+                if (fn_id >= heap.function_count || !heap.functions()[fn_id].active) {
+                    fail(VM_STOP_NOT_FUNCTION, "called value is not a function");
+                    return AnvilValue::make_undefined();
+                }
+                if (frame_count + 1u > effective_call_depth()) {
+                    fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
+                    return AnvilValue::make_undefined();
+                }
+                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const u32 argc = inst.imm32();
+                if (static_cast<u32>(inst.c) + argc > cur_frame_regs) {
+                    fail(VM_STOP_UNSUPPORTED, "call arguments outside the caller's registers");
+                    return AnvilValue::make_undefined();
+                }
+                u32 callee_regs = fn.local_count;
+                if (callee_regs < fn.arity) {
+                    callee_regs = fn.arity;
+                }
+                if (callee_regs == 0u) {
+                    callee_regs = 1u;
+                }
+                const u32 next_base = reg_base + cur_frame_regs;
+                if (!ensure_registers(next_base + callee_regs) ||
+                    !ensure_frames(frame_count + 1u)) {
+                    fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
+                    return AnvilValue::make_undefined();
+                }
+                AnvilValue* regs = registers();
+                // Copy the arguments the caller staged into the callee window,
+                // filling any parameter the call did not pass with undefined.
+                for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
+                    regs[next_base + a_idx] = (a_idx < argc)
+                        ? regs[reg_base + inst.c + a_idx]
+                        : AnvilValue::make_undefined();
+                }
+                frames()[frame_count++] =
+                    AnvilCallFrame{fn_id, pc, reg_base, cur_frame_regs, static_cast<u8>(inst.a)};
+                reg_base = next_base;
+                cur_frame_regs = callee_regs;
+                pc = fn.code_start;
+                break;
+            }
+
             case AnvilOpcode::CallMath: {
                 const f64 v = R[inst.c].as_number();
                 f64 out = v;

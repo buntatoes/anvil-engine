@@ -69,6 +69,7 @@ enum class TokenKind : u8 {
     KwContinue = 56u,
     LooseEq    = 57u,
     LooseNe    = 58u,
+    FatArrow   = 59u,
 };
 
 struct Token {
@@ -346,9 +347,14 @@ struct AnvilLexer {
             const char n1 = (pos + 1u < len) ? src[pos + 1u] : '\0';
             const char n2 = (pos + 2u < len) ? src[pos + 2u] : '\0';
 
-            // Arrows, optional chaining and `??` are not compiled. Reading
-            // them as `=`, `>` or `?` would change what the script means.
-            if ((c == '=' && n1 == '>') || (c == '?' && (n1 == '.' || n1 == '?'))) {
+            // `=>` is an arrow function. Optional chaining and `??` are not
+            // compiled; reading them as `?` would change what the script means.
+            if (c == '=' && n1 == '>') {
+                tokens()[count++] = Token{TokenKind::FatArrow, pos, 2u, 0.0};
+                pos += 2u;
+                continue;
+            }
+            if (c == '?' && (n1 == '.' || n1 == '?')) {
                 return fail(VM_REFUSE_UNSUPPORTED, "unsupported operator", pos, 2u);
             }
             if (c == '=' && n1 == '=' && n2 == '=') {
@@ -765,7 +771,18 @@ struct AnvilCompiler {
                 continue;
             }
             const TokenKind before = i > 0u ? lexer.tokens()[i - 1u].kind : TokenKind::Semicolon;
-            if (depth != 0u || (before != TokenKind::Semicolon && before != TokenKind::RBrace)) {
+            const bool stmt_pos =
+                (before == TokenKind::Semicolon || before == TokenKind::RBrace ||
+                 before == TokenKind::LBrace);
+            // A `function` that is not in statement position is a function
+            // expression (`= function...`, `return function...`, an argument).
+            // It is compiled where it appears, not hoisted, so skip it here.
+            if (!stmt_pos) {
+                continue;
+            }
+            // A declaration inside a block or another function captures its
+            // enclosing scope; that needs closures and is not compiled yet.
+            if (depth != 0u) {
                 const Token& shown = (i + 1u < lexer.count) ? lexer.tokens()[i + 1u] : t;
                 reject_name(VM_REFUSE_UNSUPPORTED, "function declared inside a block or function", shown);
                 return;
@@ -945,6 +962,119 @@ struct AnvilCompiler {
         }
     }
 
+    // peek() is '('. True when the matching ')' is followed by '=>', so this is
+    // an arrow function's parameter list rather than a parenthesised expression.
+    bool is_arrow_ahead() const noexcept {
+        u32 depth = 0u;
+        for (u32 k = 0u; cursor + k < lexer.count; ++k) {
+            const TokenKind kk = lexer.tokens()[cursor + k].kind;
+            if (kk == TokenKind::LParen) {
+                ++depth;
+            } else if (kk == TokenKind::RParen) {
+                if (depth > 0u) {
+                    --depth;
+                }
+                if (depth == 0u) {
+                    const u32 after = cursor + k + 1u;
+                    return after < lexer.count &&
+                           lexer.tokens()[after].kind == TokenKind::FatArrow;
+                }
+            } else if (kk == TokenKind::Eof) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    // Compile a function expression or arrow into a function value in a fresh
+    // register. The body is compiled inline and jumped over at run time, like a
+    // declaration, but the result is a value (LoadFunc) the caller can store,
+    // pass or call. The function sees its own parameters and locals and the
+    // globals; a reference to an enclosing local is left to the Rust
+    // interpreter (closures come later). `single_param_sym` is NO_SLOT unless
+    // this is a one-identifier arrow whose parameter was already consumed.
+    // `paren_params` means the parameters are still wrapped in ( ) to be read
+    // here; `is_arrow` allows a bare-expression body with an implicit return.
+    u16 compile_function_literal(bool is_arrow, bool paren_params, u32 single_param_sym) noexcept {
+        const u32 fn_id = ctx->heap.alloc_function(0xFFFFFFFFu, 0u, 0u, 0u, 0u);
+        if (fn_id == NO_SLOT) {
+            reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
+            return alloc_reg();
+        }
+
+        const u32 saved_local_count = local_count;
+        const u32 saved_local_floor = local_floor;
+        const u16 saved_next_reg = next_reg;
+        const u16 saved_reg_floor = reg_floor;
+        const u16 saved_high_reg = high_reg;
+        const bool saved_in_fn = in_function;
+
+        local_floor = local_count;
+        next_reg = 0u;
+        reg_floor = 0u;
+        high_reg = 0u;
+        in_function = true;
+
+        u32 arity = 0u;
+        if (single_param_sym != NO_SLOT) {
+            declare_local(single_param_sym);
+            arity = 1u;
+        } else if (paren_params) {
+            expect(TokenKind::LParen);
+            while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
+                const Token p_tok = advance();
+                if (p_tok.kind != TokenKind::Ident) {
+                    reject_syntax();
+                    break;
+                }
+                declare_local(token_sym(p_tok));
+                ++arity;
+                if (!match(TokenKind::Comma)) {
+                    break;
+                }
+            }
+            expect(TokenKind::RParen);
+        }
+        if (is_arrow) {
+            expect(TokenKind::FatArrow);
+        }
+
+        const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+        const u32 fn_start_pc = ctx->program.code_len;
+        if (fn_id < ctx->heap.function_count) {
+            ctx->heap.functions()[fn_id].code_start = fn_start_pc;
+            ctx->heap.functions()[fn_id].arity = arity;
+        }
+
+        if (is_arrow && peek().kind != TokenKind::LBrace) {
+            const u16 r = compile_expr();
+            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, r, 0u, 0u));
+        } else {
+            compile_statement();
+            const u16 ft = alloc_reg();
+            emit_load_undefined(ft);
+            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, ft, 0u, 0u));
+        }
+
+        if (fn_id < ctx->heap.function_count) {
+            ctx->heap.functions()[fn_id].local_count = high_reg;
+            ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
+        }
+        ctx->program.code()[jskip_pc] =
+            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
+
+        local_count = saved_local_count;
+        local_floor = saved_local_floor;
+        next_reg = saved_next_reg;
+        reg_floor = saved_reg_floor;
+        high_reg = saved_high_reg;
+        in_function = saved_in_fn;
+
+        const u16 dst = alloc_reg();
+        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_id));
+        return dst;
+    }
+
     u16 compile_primary() noexcept {
         const Token& t = peek();
         if (t.kind == TokenKind::Number) {
@@ -979,7 +1109,21 @@ struct AnvilCompiler {
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
             return dst;
         }
+        if (t.kind == TokenKind::KwFunction) {
+            // Function expression `function (params) { body }` as a value. An
+            // optional name after `function` is a self-reference the compiler
+            // does not bind yet; skip it.
+            advance();
+            if (peek().kind == TokenKind::Ident) {
+                advance();
+            }
+            return compile_function_literal(false, true, NO_SLOT);
+        }
         if (t.kind == TokenKind::LParen) {
+            // `(params) => body` is an arrow function; `( expr )` is grouping.
+            if (is_arrow_ahead()) {
+                return compile_function_literal(true, true, NO_SLOT);
+            }
             advance();
             const u16 inner = compile_expr();
             expect(TokenKind::RParen);
@@ -1045,6 +1189,11 @@ struct AnvilCompiler {
             const Token id_tok = advance();
             const u32 sym = token_sym(id_tok);
 
+            // Single-parameter arrow `x => body`.
+            if (peek().kind == TokenKind::FatArrow) {
+                return compile_function_literal(true, false, sym);
+            }
+
             // Built-in `Math.<op>(arg)` intrinsic call lowering.
             if (match_kw(&src[id_tok.offset], id_tok.length, "Math", 4) && match(TokenKind::Dot)) {
                 const Token m_tok = advance();
@@ -1065,26 +1214,18 @@ struct AnvilCompiler {
                 return dst;
             }
 
-            // Function call `name(a, b, ...)`
+            // Function call `name(args)`. A name that is a function declared
+            // in this script, and not shadowed by a local, is called directly.
+            // A local or a declared global that holds a function value is
+            // called through the value with CallValue.
             if (match(TokenKind::LParen)) {
-                u32 target_fn = 0xFFFFFFFFu;
-                for (u32 fi = 0; fi < ctx->heap.function_count; ++fi) {
-                    if (ctx->heap.functions()[fi].name_sym == sym) {
-                        target_fn = fi;
-                        break;
-                    }
-                }
-                // A call to a name that is not a function declared in this
-                // script (console.log, a page function, a local holding a
-                // value) cannot run here.
-                if (target_fn == 0xFFFFFFFFu) {
-                    reject_name(VM_REFUSE_UNKNOWN_NAME, "call to a function not declared in this script", id_tok);
-                } else if (find_local(sym) >= 0) {
-                    reject_name(VM_REFUSE_UNSUPPORTED, "call through a variable", id_tok);
-                }
-                // Every argument is compiled first. Their values are then
-                // copied into a run of registers above all of them, so an
-                // argument's temporaries cannot overwrite an earlier one.
+                const i32 callee_local = find_local(sym);
+                const u32 target_fn = find_function(sym);
+                const bool direct = (target_fn != NO_SLOT && callee_local < 0);
+
+                // Every argument is compiled first, into scattered temporaries;
+                // they are copied into a contiguous run below so an argument's
+                // temporaries cannot overwrite an earlier one.
                 u16 arg_regs[MAX_CALL_ARGS];
                 u32 argc = 0u;
                 while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
@@ -1100,29 +1241,64 @@ struct AnvilCompiler {
                     }
                 }
                 expect(TokenKind::RParen);
-                // Extra arguments are evaluated and dropped. Missing ones
-                // are filled in.
-                const u32 arity = (target_fn < ctx->heap.function_count) ? ctx->heap.functions()[target_fn].arity : 0u;
-                const u16 call_base = next_reg;
-                for (u32 i = 0u; i < arity && !had_error; ++i) {
-                    const u16 slot_r = alloc_reg();
-                    if (i < argc) {
-                        if (arg_regs[i] != slot_r) {
-                            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+
+                if (direct) {
+                    // Stage exactly the callee's parameters; extra arguments are
+                    // evaluated and dropped, missing ones filled in.
+                    const u32 arity = ctx->heap.functions()[target_fn].arity;
+                    const u16 call_base = next_reg;
+                    for (u32 i = 0u; i < arity && !had_error; ++i) {
+                        const u16 slot_r = alloc_reg();
+                        if (i < argc) {
+                            if (arg_regs[i] != slot_r) {
+                                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                            }
+                        } else {
+                            emit_load_undefined(slot_r);
                         }
-                    } else {
-                        emit_load_undefined(slot_r);
+                    }
+                    const u16 dst = alloc_reg();
+                    ctx->program.emit(AnvilInstruction::make_abc(
+                        AnvilOpcode::Call, dst, static_cast<u16>(target_fn), call_base));
+                    return dst;
+                }
+
+                // Locate the callee value: a local, or a declared global.
+                u16 callee_reg = 0u;
+                bool have_callee = false;
+                if (callee_local >= 0) {
+                    callee_reg = static_cast<u16>(callee_local);
+                    have_callee = true;
+                } else {
+                    for (u32 gi = 0u; gi < ctx->global_count; ++gi) {
+                        if (ctx->globals()[gi].occupied && ctx->globals()[gi].name_sym == sym &&
+                            ctx->globals()[gi].declared) {
+                            callee_reg = alloc_reg();
+                            ctx->program.emit(AnvilInstruction::make_abx(
+                                AnvilOpcode::GetGlobal, callee_reg, static_cast<u16>(gi)));
+                            have_callee = true;
+                            break;
+                        }
+                    }
+                }
+                if (!have_callee) {
+                    reject_name(VM_REFUSE_UNKNOWN_NAME, "call to a function not declared in this script", id_tok);
+                    const u16 dst = alloc_reg();
+                    emit_load_undefined(dst);
+                    return dst;
+                }
+                // Stage the arguments contiguously; the callee's own arity,
+                // read at run time, decides how many parameters it takes.
+                const u16 call_base = next_reg;
+                for (u32 i = 0u; i < argc && !had_error; ++i) {
+                    const u16 slot_r = alloc_reg();
+                    if (arg_regs[i] != slot_r) {
+                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                if (target_fn != 0xFFFFFFFFu) {
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::Call,
-                        dst,
-                        static_cast<u16>(target_fn),
-                        call_base
-                    ));
-                }
+                ctx->program.emit(AnvilInstruction{
+                    AnvilOpcode::CallValue, 0u, dst, callee_reg, call_base, argc});
                 return dst;
             }
 
@@ -1132,6 +1308,16 @@ struct AnvilCompiler {
                 const u16 dst = alloc_reg();
                 emit_load_undefined(dst);
                 return compile_postfix(dst, sym, -1);
+            }
+            // A function declared in this script, used as a value (passed,
+            // returned or stored), loads as a function value.
+            if (local_r < 0) {
+                const u32 fn_as_value = find_function(sym);
+                if (fn_as_value != NO_SLOT) {
+                    const u16 dst = alloc_reg();
+                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_as_value));
+                    return compile_postfix(dst, sym, -1);
+                }
             }
             u16 base_reg = 0u;
             if (local_r >= 0) {
