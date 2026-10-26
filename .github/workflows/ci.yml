@@ -48,7 +48,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
           rustc --version
           cargo --version
@@ -74,7 +74,10 @@ jobs:
         run: cargo test --offline --workspace
 
       - name: Clippy
-        run: cargo clippy --offline --workspace --all-targets
+        run: cargo clippy --offline --workspace --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --all --check
 
       - name: Release build
         run: cargo build --offline --workspace --release
