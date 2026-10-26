@@ -58,6 +58,19 @@ fn temporaries_are_reused_between_statements() {
 }
 
 #[test]
+fn objects_held_only_by_top_level_variables_survive_collection() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "let keep = {v: 7}; let i = 0; \
+                  while (i < 600) { let t = {v: i}; i = i + 1; } keep.v;";
+    assert_eq!(cpp(source), Some(7.0));
+    let source = "let keep = [7]; let i = 0; \
+                  while (i < 300) { let t = [i]; i = i + 1; } keep[0];";
+    assert_eq!(cpp(source), Some(7.0));
+}
+
+#[test]
 fn console_log_is_not_dropped() {
     let rt = page("let x = 1; console.log(x);");
     assert_eq!(rt.console_logs(), ["1"]);

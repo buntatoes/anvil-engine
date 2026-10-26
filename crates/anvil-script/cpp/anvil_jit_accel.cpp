@@ -114,6 +114,20 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
     return slot;
 }
 
+void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
+    heap.clear_marks();
+    const u32 top = reg_top < MAX_TOTAL_REGISTERS ? reg_top : MAX_TOTAL_REGISTERS;
+    for (u32 i = 0; i < top; ++i) {
+        heap.mark_value(registers[i]);
+    }
+    for (u32 i = 0; i < global_count && i < MAX_GLOBALS; ++i) {
+        if (globals[i].occupied) {
+            heap.mark_value(globals[i].value);
+        }
+    }
+    heap.sweep_unmarked();
+}
+
 AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
     f64 native_out = 0.0;
     if (anvil_jit_try_run(this, entry_pc, &native_out)) {
@@ -329,7 +343,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::NewObject: {
                 if (heap.live_objects + 8u >= MAX_HEAP_OBJECTS) {
-                    heap.collect_garbage(registers, reg_base + MAX_REGISTERS_PER_FRAME);
+                    collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
                 }
                 R[inst.a] = AnvilValue::make_object(heap.alloc_object(0u));
                 break;
@@ -337,7 +351,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
             case AnvilOpcode::NewArray: {
                 if (heap.live_arrays + 4u >= MAX_HEAP_ARRAYS) {
-                    heap.collect_garbage(registers, reg_base + MAX_REGISTERS_PER_FRAME);
+                    collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
                 }
                 R[inst.a] = AnvilValue::make_array(heap.alloc_array(inst.b));
                 break;

@@ -474,13 +474,17 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
     return reclaimed;
 }
 
-u32 AnvilHeap::collect_garbage(const AnvilValue* roots, u32 root_count) noexcept {
+void AnvilHeap::clear_marks() noexcept {
     for (u32 i = 0; i < MAX_HEAP_OBJECTS; ++i) {
         objects[i].marked = false;
     }
     for (u32 i = 0; i < MAX_HEAP_ARRAYS; ++i) {
         arrays[i].marked = false;
     }
+}
+
+u32 AnvilHeap::collect_garbage(const AnvilValue* roots, u32 root_count) noexcept {
+    clear_marks();
     if (roots) {
         for (u32 i = 0; i < root_count; ++i) {
             mark_value(roots[i]);

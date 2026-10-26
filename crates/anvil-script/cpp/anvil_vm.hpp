@@ -356,6 +356,7 @@ struct AnvilHeap {
     void mark_value(AnvilValue v) noexcept;
     void mark_object(u32 obj_id) noexcept;
     void mark_array(u32 arr_id) noexcept;
+    void clear_marks() noexcept;
     u32 sweep_unmarked() noexcept;
     u32 collect_garbage(const AnvilValue* roots, u32 root_count) noexcept;
 };
@@ -588,6 +589,8 @@ struct AnvilVmContext {
 
     void init() noexcept;
     u16 resolve_global_slot(u32 name_sym) noexcept;
+    // Collect with the registers below `reg_top` and the globals as roots.
+    void collect_garbage(u32 reg_top) noexcept;
     AnvilValue execute(u32 entry_pc = 0u) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
 };
