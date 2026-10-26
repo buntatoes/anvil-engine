@@ -849,7 +849,7 @@ impl WasmInstance {
             match op {
                 0x00 => return Err(WasmError::Trap("unreachable executed")),
                 0x01 => {} // nop
-                0x02 | 0x03 | 0x04 => {
+                0x02..=0x04 => {
                     let block_ty = read_u8(code, &mut pc)?;
                     let arity = usize::from(block_ty != 0x40);
                     let (end_pc, else_pc) = scan_block_bounds(code, pc)?;
@@ -1528,7 +1528,7 @@ fn scan_block_bounds(code: &[u8], start_pc: usize) -> Result<(usize, Option<usiz
     while p < code.len() {
         let op = read_u8(code, &mut p)?;
         match op {
-            0x02 | 0x03 | 0x04 => {
+            0x02..=0x04 => {
                 let _ = read_u8(code, &mut p)?;
                 depth += 1;
             }

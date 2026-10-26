@@ -62,12 +62,15 @@ pub struct ScriptFetchReply {
     pub body: String,
 }
 
+/// Signature of the `fetch()` host. See [`FetchHost`].
+type FetchFn = dyn Fn(&str, &str) -> ScriptFetchReply + Send + Sync;
+
 /// Host callback for same-origin `fetch()`. The first argument is an absolute
 /// URL. The second is the page URL. The interpreter does not call this for a
 /// cross-origin URL or for a URL that has a registered mock.
 #[derive(Clone, Default)]
 struct FetchHost {
-    inner: Option<Arc<dyn Fn(&str, &str) -> ScriptFetchReply + Send + Sync>>,
+    inner: Option<Arc<FetchFn>>,
 }
 
 impl PartialEq for FetchHost {
@@ -323,11 +326,12 @@ pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, AnvilVmTelemetry)> {
     }
 }
 
+/// Halt value, numeric globals, and telemetry from [`eval_cpp_vm_script_bindings`].
+type VmBindings = (f64, Vec<(String, f64)>, AnvilVmTelemetry);
+
 /// Run `source` on the C++ VM and return numeric globals along with the halt value.
 /// `None` when the compiler rejects the script.
-pub fn eval_cpp_vm_script_bindings(
-    source: &str,
-) -> Option<(f64, Vec<(String, f64)>, AnvilVmTelemetry)> {
+pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return None;
@@ -375,7 +379,7 @@ pub fn eval_cpp_vm_script_bindings(
                 }
             }
         }
-        return Some((result, bindings, telemetry));
+        Some((result, bindings, telemetry))
     }
     #[cfg(not(anvil_cpp_jit))]
     {
@@ -428,7 +432,7 @@ pub fn eval_cpp_vector_reduce(op: u32, values: &[f64]) -> f64 {
     }
     #[cfg(anvil_cpp_jit)]
     unsafe {
-        return anvil_cpp_vm_vector_reduce(op, values.as_ptr(), values.len() as u32);
+        anvil_cpp_vm_vector_reduce(op, values.as_ptr(), values.len() as u32)
     }
     #[cfg(not(anvil_cpp_jit))]
     match op {
@@ -444,7 +448,7 @@ pub fn eval_cpp_vector_reduce(op: u32, values: &[f64]) -> f64 {
 pub fn eval_cpp_sum_range(start: i64, end_exclusive: i64, step: i64) -> i64 {
     #[cfg(anvil_cpp_jit)]
     unsafe {
-        return anvil_cpp_jit_sum_range_i64(start, end_exclusive, step);
+        anvil_cpp_jit_sum_range_i64(start, end_exclusive, step)
     }
     #[cfg(not(anvil_cpp_jit))]
     {
@@ -466,7 +470,7 @@ pub fn eval_cpp_sum_range(start: i64, end_exclusive: i64, step: i64) -> i64 {
 fn eval_jit_binary_op(opcode: u32, lhs: f64, rhs: f64) -> f64 {
     #[cfg(anvil_cpp_jit)]
     unsafe {
-        return anvil_cpp_jit_eval_binary(opcode, lhs, rhs);
+        anvil_cpp_jit_eval_binary(opcode, lhs, rhs)
     }
     #[cfg(not(anvil_cpp_jit))]
     match opcode {
@@ -1159,10 +1163,7 @@ impl ScriptRuntime {
     ///
     /// The host is not used for a cross-origin URL or for a URL passed to
     /// [`Self::register_fetch_response`]. The numeric VM does not call it.
-    pub fn set_fetch_host(
-        &mut self,
-        host: Arc<dyn Fn(&str, &str) -> ScriptFetchReply + Send + Sync>,
-    ) {
+    pub fn set_fetch_host(&mut self, host: Arc<FetchFn>) {
         self.fetch_host.inner = Some(host);
     }
 
@@ -2627,24 +2628,19 @@ impl ScriptRuntime {
             let cleaned = strip_comments(&script);
             for stmt in split_statements(&cleaned) {
                 let s = stmt.trim();
-                if s.starts_with("function ")
+                let declaration = s.starts_with("function ")
                     || s.starts_with("async function ")
-                    || s.starts_with("class ")
-                {
-                    self.exec_statement(doc, s);
-                } else if (s.starts_with("let ")
-                    || s.starts_with("const ")
-                    || s.starts_with("var "))
-                    && !s.contains("fetch(")
-                    && !s.contains("setTimeout(")
-                    && !s.contains("setInterval(")
-                    && !s.contains(".innerHTML")
-                    && !s.contains(".textContent")
-                {
-                    self.exec_statement(doc, s);
-                } else if s.contains(".addEventListener(")
-                    && (s.contains("'click'") || s.contains("\"click\""))
-                {
+                    || s.starts_with("class ");
+                let plain_binding =
+                    (s.starts_with("let ") || s.starts_with("const ") || s.starts_with("var "))
+                        && !s.contains("fetch(")
+                        && !s.contains("setTimeout(")
+                        && !s.contains("setInterval(")
+                        && !s.contains(".innerHTML")
+                        && !s.contains(".textContent");
+                let click_listener = s.contains(".addEventListener(")
+                    && (s.contains("'click'") || s.contains("\"click\""));
+                if declaration || plain_binding || click_listener {
                     self.exec_statement(doc, s);
                 }
             }
@@ -2791,11 +2787,11 @@ impl ScriptRuntime {
                     &mut result,
                 )
             };
-            return match code {
+            match code {
                 1 => VmRun::Value(result),
                 2 => VmRun::Aborted,
                 _ => VmRun::Rejected,
-            };
+            }
         }
         #[cfg(not(anvil_cpp_jit))]
         {
@@ -4515,7 +4511,7 @@ impl ScriptRuntime {
                 for pair in query.split('&').filter(|p| !p.is_empty()) {
                     let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
                     obj.insert(
-                        &k.replace("%20", " ").replace('+', " "),
+                        k.replace("%20", " ").replace('+', " "),
                         JsonValue::String(v.replace("%20", " ").replace('+', " ")),
                     );
                 }
@@ -5110,7 +5106,7 @@ impl ScriptRuntime {
                                 let v = v.trim().to_string();
                                 if !k.is_empty() {
                                     obj.insert(&k, JsonValue::String(v.clone()));
-                                    obj.insert(&kebab_to_camel(&k), JsonValue::String(v));
+                                    obj.insert(kebab_to_camel(&k), JsonValue::String(v));
                                 }
                             }
                         }
@@ -6002,9 +5998,6 @@ impl ScriptRuntime {
                             }
                             return out;
                         }
-                    }
-                    match method {
-                        _ => {}
                     }
                     if let Some(JsonValue::Number(inst_id_f)) = jval.get("__anvil_wasm_exports") {
                         let inst_id = *inst_id_f as usize;
@@ -7554,7 +7547,7 @@ fn strip_string_literals(source: &str) -> String {
     let mut chars = source.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '"' || ch == '\'' {
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == ch {
                     break;
                 }
@@ -7736,8 +7729,7 @@ fn blocked_ident(ident: &str, blocked: &[&str]) -> bool {
     if ident.is_empty() {
         return false;
     }
-    let found = blocked.iter().any(|word| *word == ident);
-    found
+    blocked.contains(&ident)
 }
 
 fn fetch_result_value(url: &str, status: u16, body: String) -> Value {
