@@ -3,6 +3,7 @@ name = "anvil-raster"
 description = "RGBA framebuffer. Optional C++ scanline helpers."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license = "LicenseRef-Proprietary"
 publish.workspace = true

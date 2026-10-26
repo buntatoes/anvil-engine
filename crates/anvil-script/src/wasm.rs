@@ -671,10 +671,10 @@ impl WasmInstance {
         let mut globals: Vec<WasmValue> = module.globals.iter().map(|g| g.init).collect();
         for (idx, imp) in module.imported_funcs.iter().enumerate() {
             let key = format!("{}.{}", imp.module, imp.name);
-            if let Some(&val) = host_constants.get(&key)
-                && idx < globals.len()
-            {
-                globals[idx] = WasmValue::F64(val);
+            if let Some(&val) = host_constants.get(&key) {
+                if idx < globals.len() {
+                    globals[idx] = WasmValue::F64(val);
+                }
             }
         }
         let mut table = vec![None; module.table_initial as usize];

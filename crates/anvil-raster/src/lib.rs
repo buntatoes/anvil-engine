@@ -399,10 +399,12 @@ impl GlyphLruCache {
                 self.used_bytes = self.used_bytes.saturating_sub(old.byte_len());
             }
         }
-        while (self.used_bytes + cost > self.budget_bytes
-            || self.entries.len() >= MAX_GLYPH_CACHE_ENTRIES)
-            && let Some((_, evicted)) = self.entries.pop_front()
+        while self.used_bytes + cost > self.budget_bytes
+            || self.entries.len() >= MAX_GLYPH_CACHE_ENTRIES
         {
+            let Some((_, evicted)) = self.entries.pop_front() else {
+                break;
+            };
             self.used_bytes = self.used_bytes.saturating_sub(evicted.byte_len());
         }
         self.used_bytes += cost;
@@ -411,9 +413,10 @@ impl GlyphLruCache {
 
     fn trim_to_budget(&mut self, budget_bytes: usize) {
         self.budget_bytes = budget_bytes;
-        while self.used_bytes > self.budget_bytes
-            && let Some((_, evicted)) = self.entries.pop_front()
-        {
+        while self.used_bytes > self.budget_bytes {
+            let Some((_, evicted)) = self.entries.pop_front() else {
+                break;
+            };
             self.used_bytes = self.used_bytes.saturating_sub(evicted.byte_len());
         }
         self.entries.shrink_to_fit();
@@ -454,10 +457,10 @@ fn cached_rasterize_glyph(
         size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
         subpixel: false,
     };
-    if let Ok(mut guard) = GLYPH_CACHE.lock()
-        && let Some(CachedGlyph::Gray(bmp)) = guard.get(&key)
-    {
-        return Some(bmp);
+    if let Ok(mut guard) = GLYPH_CACHE.lock() {
+        if let Some(CachedGlyph::Gray(bmp)) = guard.get(&key) {
+            return Some(bmp);
+        }
     }
     let bmp = font.rasterize_glyph(ch, font_size)?;
     if let Ok(mut guard) = GLYPH_CACHE.lock() {
@@ -480,10 +483,10 @@ fn cached_rasterize_subpixel_glyph(
         size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
         subpixel: true,
     };
-    if let Ok(mut guard) = GLYPH_CACHE.lock()
-        && let Some(CachedGlyph::Subpixel(bmp)) = guard.get(&key)
-    {
-        return Some(bmp);
+    if let Ok(mut guard) = GLYPH_CACHE.lock() {
+        if let Some(CachedGlyph::Subpixel(bmp)) = guard.get(&key) {
+            return Some(bmp);
+        }
     }
     let bmp = font.rasterize_glyph_subpixel_lcd(ch, font_size)?;
     if let Ok(mut guard) = GLYPH_CACHE.lock() {
@@ -963,9 +966,10 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) && with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok()
-                {
-                    return;
+                ) {
+                    if with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok() {
+                        return;
+                    }
                 }
             } else if border_width > 0.0
                 && fill_color.a == 255
@@ -1013,13 +1017,15 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) && with_thread_compositor(|comp| {
-                    comp.box_shadow(&mut target, &outer_desc)
-                        .and_then(|()| comp.box_shadow(&mut target, &inner_desc))
-                })
-                .is_ok()
-                {
-                    return;
+                ) {
+                    if with_thread_compositor(|comp| {
+                        comp.box_shadow(&mut target, &outer_desc)
+                            .and_then(|()| comp.box_shadow(&mut target, &inner_desc))
+                    })
+                    .is_ok()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -1160,9 +1166,10 @@ impl Framebuffer {
                 self.width,
                 self.height,
                 (self.width as usize) * 4,
-            ) && with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok()
-            {
-                return;
+            ) {
+                if with_thread_compositor(|comp| comp.box_shadow(&mut target, &desc)).is_ok() {
+                    return;
+                }
             }
         }
         let quad = anvil_gpu::GpuQuad::box_shadow(
@@ -1315,10 +1322,11 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) && with_thread_compositor(|comp| comp.fill_gradient(&mut target, &desc))
-                    .is_ok()
-                {
-                    return;
+                ) {
+                    if with_thread_compositor(|comp| comp.fill_gradient(&mut target, &desc)).is_ok()
+                    {
+                        return;
+                    }
                 }
             }
         }

@@ -6,6 +6,7 @@ name = "anvil-paint"
 description = "Display list and zoom."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license = "LicenseRef-Proprietary"
 publish.workspace = true

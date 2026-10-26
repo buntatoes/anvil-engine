@@ -8503,7 +8503,7 @@ fn decode_wasm_text_bytes(s: &str) -> Vec<u8> {
     }
     let trimmed = s.trim();
     if trimmed.len() >= 16
-        && trimmed.len().is_multiple_of(2)
+        && trimmed.len() % 2 == 0
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
     {
         let mut out = Vec::with_capacity(trimmed.len() / 2);
