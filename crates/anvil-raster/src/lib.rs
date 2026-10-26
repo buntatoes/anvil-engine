@@ -1776,9 +1776,11 @@ impl Framebuffer {
                 let origin_x = (pen.round() as i32).saturating_add(bmp.bearing_x);
                 let width = bmp.width as usize;
                 for row in 0..bmp.height {
+                    // Row 0 is the top of the glyph, `bearing_y` above the baseline,
+                    // and the framebuffer's y grows downward.
                     let screen_y = (baseline.round() as i32)
-                        .saturating_add(bmp.bearing_y)
-                        .saturating_sub(row as i32);
+                        .saturating_sub(bmp.bearing_y)
+                        .saturating_add(row as i32);
                     for col in 0..bmp.width {
                         let cov = bmp.coverage[row as usize * width + col as usize];
                         if cov == 0 {
@@ -3065,6 +3067,35 @@ mod tests {
 
         let bgra = scrolled.to_bgra_bottom_up();
         assert_eq!(bgra.len(), 64 * 32 * 4);
+    }
+
+    #[test]
+    fn text_is_drawn_upright_below_its_top() {
+        // A `T` has its widest row at the top, whichever font draws it.
+        let ink = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let mut fb = Framebuffer::new(64, 64, Color::WHITE);
+        fb.draw_text(8.0, 10.0, "T", 32.0, ink);
+        let row_ink: Vec<usize> = (0..64)
+            .map(|y| {
+                (0..64)
+                    .filter(|&x| fb.pixel(x, y).is_some_and(|c| c.r < 128))
+                    .count()
+            })
+            .collect();
+        let top = row_ink.iter().position(|&n| n > 0).expect("some ink");
+        let bottom = row_ink.iter().rposition(|&n| n > 0).expect("some ink");
+        assert!(top >= 10, "ink starts above the text box at row {top}");
+        assert!(bottom < 10 + 32 + 8, "ink ends too low at row {bottom}");
+        let widest = (top..=bottom).max_by_key(|&y| row_ink[y]).unwrap();
+        assert!(
+            widest < (top + bottom) / 2,
+            "the bar of the T is at row {widest}, in the lower half of {top}..={bottom}"
+        );
     }
 
     #[test]
