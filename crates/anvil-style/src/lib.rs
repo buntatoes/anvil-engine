@@ -12,7 +12,9 @@
 //! [`Size::Auto`]. `font-size` accepts `px`, `%`, `em`, and `rem` and resolves
 //! them here: `%` and `em` use the parent font size, and `rem` uses the
 //! `html` font size (16px until that element sets one). Margin, padding,
-//! border, and `gap` still accept only `px` and `0`. `calc()` does not mix
+//! and border still accept only `px` and `0`. `row-gap`, `column-gap`, and
+//! the `gap` shorthand keep lengths, percentages, `calc()`, and `normal`;
+//! flex and grid layout use them, and multi-column layout does not exist. `calc()` does not mix
 //! viewport units or `ch`. `display` accepts `block`, `inline`, `inline-block`,
 //! `list-item`, `flow-root`, `flex`, `inline-flex`, `grid`, `inline-grid`,
 //! and `none`. Selectors take all four combinators, attribute selectors with
@@ -943,7 +945,16 @@ pub struct ComputedStyle {
     pub grid_column: GridPlacement,
     /// Placement from `grid-row` and its longhands. Not inherited.
     pub grid_row: GridPlacement,
-    pub gap: f32,
+    /// `row-gap`: space between grid rows and between flex lines (between
+    /// items in a column flex container). `normal` is stored as `0px`. A
+    /// percentage is of the container's content height and counts as 0 when
+    /// that height is not definite. Not inherited.
+    pub row_gap: Size,
+    /// `column-gap`: space between grid columns and between items in a flex
+    /// row. `normal` is stored as `0px`. A percentage is of the container's
+    /// content width. Multi-column layout does not exist here, so its
+    /// `normal` (1em) never applies. Not inherited.
+    pub column_gap: Size,
     /// `transform`. Not inherited. See [`TransformList`].
     pub transform: TransformList,
     /// `transform-origin`. Not inherited.
@@ -1003,7 +1014,8 @@ impl ComputedStyle {
                 start: GridLine::Auto,
                 end: GridLine::Auto,
             },
-            gap: 0.0,
+            row_gap: Size::Px(0.0),
+            column_gap: Size::Px(0.0),
             transform: TransformList::NONE,
             transform_origin: TransformOrigin::CENTER,
             opacity: 1.0,
@@ -1877,8 +1889,9 @@ fn is_block_tag(tag: &str) -> bool {
 /// `width`, `height`, `max-width`, and the offsets, `px`, `%`, `em`, `rem`,
 /// `vw`, `vh`, `vmin`, and `vmax` are kept. Another unit becomes
 /// [`Size::Auto`]. `ch` is kept for layout. `font-size` resolves `%` and `em` against `parent_font_px`,
-/// and `rem` against `root_font_px`. Margin, padding, border, and `gap` still
-/// accept only `px` and `0`. `overflow` values `scroll` and
+/// and `rem` against `root_font_px`. Margin, padding, and border still
+/// accept only `px` and `0`. `row-gap`, `column-gap`, and `gap` keep any
+/// length, a percentage, or `calc()`. `overflow` values `scroll` and
 /// `auto` are stored as [`Overflow::Hidden`].
 fn apply_declaration(
     style: &mut ComputedStyle,
@@ -2207,9 +2220,26 @@ fn apply_declaration(
                 style.grid_auto_rows = track;
             }
         }
+        "row-gap" | "grid-row-gap" => {
+            if let Some(gap) = parse_gap(value) {
+                style.row_gap = gap;
+            }
+        }
+        "column-gap" | "grid-column-gap" => {
+            if let Some(gap) = parse_gap(value) {
+                style.column_gap = gap;
+            }
+        }
         "gap" | "grid-gap" => {
-            if let Some(px) = parse_px(value) {
-                style.gap = px.max(0.0);
+            let parts = split_css_tokens(value);
+            let (row, column) = match parts.as_slice() {
+                [both] => (parse_gap(both), parse_gap(both)),
+                [row, column] => (parse_gap(row), parse_gap(column)),
+                _ => (None, None),
+            };
+            if let (Some(row), Some(column)) = (row, column) {
+                style.row_gap = row;
+                style.column_gap = column;
             }
         }
         _ => {}
@@ -2883,8 +2913,33 @@ fn parse_transform_origin(value: &str) -> Option<TransformOrigin> {
     }
 }
 
+/// One `row-gap` or `column-gap` value: `normal` (stored as `0px`), a
+/// length, a percentage, or a `calc()` of them. `None` for anything else
+/// and for a negative value, so the declaration is ignored.
+fn parse_gap(value: &str) -> Option<Size> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("normal") {
+        return Some(Size::Px(0.0));
+    }
+    let size = parse_length(value)?;
+    let negative = match size {
+        Size::Auto => true,
+        Size::Px(v)
+        | Size::Percent(v)
+        | Size::Em(v)
+        | Size::Rem(v)
+        | Size::Vw(v)
+        | Size::Vh(v)
+        | Size::Vmin(v)
+        | Size::Vmax(v)
+        | Size::Ch(v) => v < 0.0 || !v.is_finite(),
+        Size::Calc { .. } => false,
+    };
+    (!negative).then_some(size)
+}
+
 /// Parse `0` or a number with a `px` suffix. `%`, `em`, `rem`, and other units
-/// return `None`, so margin, padding, border, and `gap` leave the previous value.
+/// return `None`, so margin, padding, and border leave the previous value.
 fn parse_px(value: &str) -> Option<f32> {
     match parse_length(value) {
         Some(Size::Px(value)) => Some(value),
@@ -3274,7 +3329,8 @@ mod tests {
         let card = doc.get_element_by_id("card").unwrap();
         let lead = doc.query_selector(".lead").unwrap();
         assert_eq!(styles.get(card).display, Display::Flex);
-        assert_eq!(styles.get(card).gap, 12.0);
+        assert_eq!(styles.get(card).row_gap, Size::Px(12.0));
+        assert_eq!(styles.get(card).column_gap, Size::Px(12.0));
         assert_eq!(styles.get(card).border, Edge::all(2.0));
         assert_eq!(
             styles.get(card).border_color,
@@ -3405,7 +3461,8 @@ mod tests {
         let card_id = doc.get_element_by_id("card").unwrap();
 
         assert_eq!(styles.get(grid_id).display, Display::Grid);
-        assert_eq!(styles.get(grid_id).gap, 16.0);
+        assert_eq!(styles.get(grid_id).row_gap, Size::Px(16.0));
+        assert_eq!(styles.get(grid_id).column_gap, Size::Px(16.0));
         assert_eq!(
             styles.get(grid_id).grid_tracks(),
             &[GridTrack::Px(120.0), GridTrack::Fr(1.0), GridTrack::Fr(1.0)]

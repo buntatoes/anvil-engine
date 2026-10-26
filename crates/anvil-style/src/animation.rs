@@ -189,6 +189,10 @@ pub enum AnimProperty {
     PaddingLeft,
     BorderRadius,
     FontSize,
+    RowGap,
+    ColumnGap,
+    /// The `gap` shorthand in a `transition` list: it stands for
+    /// [`Self::RowGap`] and [`Self::ColumnGap`] and has no value of its own.
     Gap,
     /// A name this engine does not animate. It still takes its place in
     /// the list so durations line up.
@@ -196,7 +200,7 @@ pub enum AnimProperty {
 }
 
 /// Every property [`AnimProperty::All`] covers, in a fixed order.
-pub const ANIMATABLE: [AnimProperty; 23] = [
+pub const ANIMATABLE: [AnimProperty; 24] = [
     AnimProperty::Opacity,
     AnimProperty::Transform,
     AnimProperty::Color,
@@ -219,7 +223,8 @@ pub const ANIMATABLE: [AnimProperty; 23] = [
     AnimProperty::PaddingLeft,
     AnimProperty::BorderRadius,
     AnimProperty::FontSize,
-    AnimProperty::Gap,
+    AnimProperty::RowGap,
+    AnimProperty::ColumnGap,
 ];
 
 impl AnimProperty {
@@ -249,7 +254,9 @@ impl AnimProperty {
             "padding-left" => Self::PaddingLeft,
             "border-radius" => Self::BorderRadius,
             "font-size" => Self::FontSize,
-            "gap" => Self::Gap,
+            "row-gap" | "grid-row-gap" => Self::RowGap,
+            "column-gap" | "grid-column-gap" => Self::ColumnGap,
+            "gap" | "grid-gap" => Self::Gap,
             _ => Self::Other,
         }
     }
@@ -298,10 +305,12 @@ impl Transitions {
     /// How `property` transitions, from the last list entry naming it or
     /// `all`. `None` when no entry applies or the duration is 0.
     pub fn spec_for(&self, property: AnimProperty) -> Option<TransitionSpec> {
-        let index = self
-            .properties()
-            .iter()
-            .rposition(|p| *p == property || *p == AnimProperty::All)?;
+        let index = self.properties().iter().rposition(|p| {
+            *p == property
+                || *p == AnimProperty::All
+                || (*p == AnimProperty::Gap
+                    && matches!(property, AnimProperty::RowGap | AnimProperty::ColumnGap))
+        })?;
         let pick = |count: u8| index % usize::from(count.max(1));
         let spec = TransitionSpec {
             duration_ms: self.durations_ms[pick(self.duration_count)],
@@ -475,7 +484,7 @@ pub fn read_value(style: &ComputedStyle, property: AnimProperty) -> Option<AnimV
     use AnimProperty as P;
     use AnimValue as V;
     Some(match property {
-        P::All | P::Other => return None,
+        P::All | P::Other | P::Gap => return None,
         P::Opacity => V::Number(style.opacity),
         P::Transform => V::Transform(style.transform),
         P::Color => V::Color(Some(style.color)),
@@ -503,7 +512,8 @@ pub fn read_value(style: &ComputedStyle, property: AnimProperty) -> Option<AnimV
         P::PaddingLeft => V::Number(style.padding.left),
         P::BorderRadius => V::Number(style.border_radius),
         P::FontSize => V::Number(style.font_size),
-        P::Gap => V::Number(style.gap),
+        P::RowGap => V::Length(style.row_gap),
+        P::ColumnGap => V::Length(style.column_gap),
     })
 }
 
@@ -540,7 +550,8 @@ pub fn write_value(style: &mut ComputedStyle, property: AnimProperty, value: Ani
         }
         (P::BorderRadius, V::Number(v)) => style.border_radius = v.max(0.0),
         (P::FontSize, V::Number(v)) => style.font_size = v.max(0.0),
-        (P::Gap, V::Number(v)) => style.gap = v.max(0.0),
+        (P::RowGap, V::Length(s)) => style.row_gap = s,
+        (P::ColumnGap, V::Length(s)) => style.column_gap = s,
         _ => {}
     }
 }
@@ -1184,6 +1195,7 @@ fn declared_properties(name: &str) -> Vec<AnimProperty> {
             vec![P::BorderColor]
         }
         "background-image" => vec![P::BackgroundColor],
+        "gap" | "grid-gap" => vec![P::RowGap, P::ColumnGap],
         _ => match AnimProperty::from_name(name) {
             P::All | P::Other => Vec::new(),
             property => vec![property],

@@ -776,6 +776,27 @@ fn used_length(
     }
 }
 
+/// Used `(row-gap, column-gap)` of a flex or grid container in pixels.
+/// A row-gap percentage needs a definite content height and is 0 without
+/// one; a column-gap percentage is of the content width. Negative results
+/// are 0.
+fn used_gaps(
+    style: &ComputedStyle,
+    content_width: f32,
+    content_height: Option<f32>,
+    styles: &StyleMap,
+) -> (f32, f32) {
+    let px = |size: Size, basis: Option<f32>| {
+        used_length(size, basis, style, styles)
+            .unwrap_or(0.0)
+            .max(0.0)
+    };
+    (
+        px(style.row_gap, content_height),
+        px(style.column_gap, Some(content_width)),
+    )
+}
+
 /// Border-box width from `width` and `max-width`.
 ///
 /// A definite `width` is the content width; padding and border are added.
@@ -1823,7 +1844,8 @@ fn place_grid_items(items: &[(AxisSpan, AxisSpan)], explicit_cols: usize) -> Vec
 /// `1fr` column. Rows come from `grid-template-rows`, then `grid-auto-rows`
 /// for every row past the explicit list. Items are laid out at their column
 /// width to measure their height, then rows are sized and items are moved
-/// into their rows. `gap` is used between both rows and columns.
+/// into their rows. `column-gap` goes between columns and `row-gap` between
+/// rows.
 /// `align-items: stretch` grows an `auto`-height item to its area height;
 /// `center` and `end` move it inside the area.
 fn layout_grid(
@@ -1911,19 +1933,20 @@ fn layout_grid(
             plan_track(track, Some(content_width), true)
         })
         .collect();
+    let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
     let col_widths = size_tracks(
         &col_plans,
         &vec![0.0; col_count],
         &[],
         Some(content_width),
-        style.gap,
+        column_gap,
     );
-    let col_offsets = track_offsets(&col_widths, content_x, style.gap);
+    let col_offsets = track_offsets(&col_widths, content_x, column_gap);
 
     // Lay each item out at its area width to learn its height.
     let mut boxes = Vec::with_capacity(in_flow.len());
     for (&cid, area) in in_flow.iter().zip(&areas) {
-        let cell_w = span_size(&col_widths, area.col, area.col_span, style.gap);
+        let cell_w = span_size(&col_widths, area.col, area.col_span, column_gap);
         let child_box = layout_node(
             doc,
             styles,
@@ -1963,14 +1986,14 @@ fn layout_grid(
         &row_content,
         &row_spanning,
         specified_height,
-        style.gap,
+        row_gap,
     );
-    let row_offsets = track_offsets(&row_heights, content_y, style.gap);
+    let row_offsets = track_offsets(&row_heights, content_y, row_gap);
 
     let mut children = Vec::with_capacity(in_flow.len() + out_of_flow.len());
     for (mut item_box, area) in boxes.into_iter().zip(&areas) {
         let cstyle = styles.get(item_box.node);
-        let area_h = span_size(&row_heights, area.row, area.row_span, style.gap);
+        let area_h = span_size(&row_heights, area.row, area.row_span, row_gap);
         let outer_h = cstyle.margin.top + item_box.rect.height + cstyle.margin.bottom;
         let dy_in_area = match style.align_items {
             AlignItems::Start | AlignItems::Stretch => 0.0,
@@ -2043,7 +2066,7 @@ struct FlexItem {
 #[allow(clippy::too_many_arguments)]
 /// Flex layout.
 ///
-/// A column stacks children downward with `gap` between them and ignores
+/// A column stacks children downward with `row-gap` between them and ignores
 /// `justify-content`, `align-items`, `flex-wrap`, and `flex-grow`. A row
 /// measures each item once. `flex-wrap: wrap` starts a new line when the next
 /// item does not fit. `flex-grow` then shares positive free space on each line
@@ -2080,13 +2103,14 @@ fn layout_flex(
         .copied()
         .filter(|child| !is_skipped(doc, styles, *child))
         .collect();
+    let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
 
     if style.flex_direction == FlexDirection::Column {
         let mut cursor_y = content_y;
         let mut children = Vec::new();
         for (idx, child) in visible_children.iter().copied().enumerate() {
             if idx > 0 {
-                cursor_y += style.gap;
+                cursor_y += row_gap;
             }
             let child_box = layout_node(
                 doc,
@@ -2204,12 +2228,12 @@ fn layout_flex(
     let mut current: Vec<FlexItem> = Vec::new();
     let mut line_width = 0.0_f32;
     for item in items {
-        let gap = if current.is_empty() { 0.0 } else { style.gap };
+        let gap = if current.is_empty() { 0.0 } else { column_gap };
         if wrap && !current.is_empty() && line_width + gap + item.outer_w > content_width {
             lines.push(std::mem::take(&mut current));
             line_width = 0.0;
         }
-        let gap = if current.is_empty() { 0.0 } else { style.gap };
+        let gap = if current.is_empty() { 0.0 } else { column_gap };
         line_width += gap + item.outer_w;
         current.push(item);
     }
@@ -2225,12 +2249,12 @@ fn layout_flex(
     let mut lines_cross = 0.0_f32;
     for (line_index, line) in lines.iter_mut().enumerate() {
         if line_index > 0 {
-            cursor_y += style.gap;
-            lines_cross += style.gap;
+            cursor_y += row_gap;
+            lines_cross += row_gap;
         }
         let count = line.len();
         let gaps = if count > 1 {
-            style.gap * ((count - 1) as f32)
+            column_gap * ((count - 1) as f32)
         } else {
             0.0
         };
@@ -2249,13 +2273,13 @@ fn layout_flex(
         let used_after: f32 = line.iter().map(|item| item.outer_w).sum();
         let free_after = (content_width - used_after - gaps).max(0.0);
         let (mut cursor_x, step_gap) = match style.justify_content {
-            JustifyContent::Start => (content_x, style.gap),
-            JustifyContent::Center => (content_x + free_after * 0.5, style.gap),
-            JustifyContent::End => (content_x + free_after, style.gap),
+            JustifyContent::Start => (content_x, column_gap),
+            JustifyContent::Center => (content_x + free_after * 0.5, column_gap),
+            JustifyContent::End => (content_x + free_after, column_gap),
             JustifyContent::SpaceBetween if count > 1 => {
-                (content_x, style.gap + free_after / ((count - 1) as f32))
+                (content_x, column_gap + free_after / ((count - 1) as f32))
             }
-            JustifyContent::SpaceBetween => (content_x, style.gap),
+            JustifyContent::SpaceBetween => (content_x, column_gap),
         };
         let line_height = line.iter().map(|item| item.outer_h).fold(0.0_f32, f32::max);
         for item in line.iter_mut() {
