@@ -484,13 +484,12 @@ fn decode_one_entity(entity: &str) -> Option<char> {
             return None;
         }
         u32::from_str_radix(digits, 16).ok()?
-    } else if let Some(digits) = entity.strip_prefix('#') {
+    } else {
+        let digits = entity.strip_prefix('#')?;
         if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
         digits.parse::<u32>().ok()?
-    } else {
-        return None;
     };
     char::from_u32(code).filter(|ch| *ch != '\0')
 }

@@ -1118,10 +1118,10 @@ impl Document {
             SelectorCombinator::Descendant => {
                 let mut cursor = self.get(current_id).parent();
                 while let Some(anc) = cursor {
-                    if matches_simple_selector(self.get(anc).data(), target_compound) {
-                        if rest.is_empty() || self.match_ancestor_steps(anc, rest, *prev_comb) {
-                            return true;
-                        }
+                    if matches_simple_selector(self.get(anc).data(), target_compound)
+                        && (rest.is_empty() || self.match_ancestor_steps(anc, rest, *prev_comb))
+                    {
+                        return true;
                     }
                     cursor = self.get(anc).parent();
                 }
@@ -1476,14 +1476,12 @@ impl Document {
     /// the integrity string is present, then passes the body to `anvil-script`.
     fn collect_external_scripts(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
-        if data.tag() == Some("script") {
-            if is_javascript_type(data.attr("type")) {
-                if let Some(src) = data.attr("src") {
-                    let src = src.trim();
-                    if !src.is_empty() {
-                        let integrity = data.attr("integrity").map(|s| s.trim().to_string());
-                        out.push((src.to_string(), integrity));
-                    }
+        if data.tag() == Some("script") && is_javascript_type(data.attr("type")) {
+            if let Some(src) = data.attr("src") {
+                let src = src.trim();
+                if !src.is_empty() {
+                    let integrity = data.attr("integrity").map(|s| s.trim().to_string());
+                    out.push((src.to_string(), integrity));
                 }
             }
         }

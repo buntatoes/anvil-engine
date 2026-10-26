@@ -9,6 +9,7 @@
 //! gets its own test below.
 
 use anvil_dom::{Document, parse_html};
+use std::fmt::Write;
 
 // ---- shared harness (same text in each repo's robustness test) ----
 
@@ -350,7 +351,10 @@ fn deep_and_wide_documents_stay_capped() {
     let wide = "<br>".repeat(anvil_dom::MAX_DOM_NODES + 100);
     let doc = parse_html(&wide);
     assert!(doc.node_count() <= anvil_dom::MAX_DOM_NODES);
-    let attrs: String = (0..1_000).map(|i| format!(" a{i}=x")).collect();
+    let attrs = (0..1_000).fold(String::new(), |mut attrs, i| {
+        let _ = write!(attrs, " a{i}=x");
+        attrs
+    });
     let doc = parse_html(&format!("<p{attrs}>x</p>"));
     walk(&doc);
 }
