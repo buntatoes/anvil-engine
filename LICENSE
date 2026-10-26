@@ -49,7 +49,7 @@ This file does not license:
 
 - `anvil-browser` (the window, network stack, sandbox, built-in pages,
   and brand mark), which is Apache License 2.0
-- `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and
+- `anvil-cipher`, `anvil-gpu`, `anvil-hpack`, `anvil-image`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, `anvil-video`, and
   `anvil-compress`, which are separate Mozilla Public License 2.0
   repositories
 

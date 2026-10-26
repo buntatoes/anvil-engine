@@ -4,6 +4,8 @@
   <p>
     <img src="https://img.shields.io/badge/release-v.22-ff6b24?style=flat-square" alt="v.22" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
+    <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
+    <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Audit_and_use_only-e8c37a?style=flat-square" alt="Audit and use only" /></a>
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
   </p>
@@ -66,7 +68,7 @@ The crate docs list every property. These are the newer parts and their limits.
 
 ### `ch`
 
-- Supported on `width`, `height`, `max-width`, and the offsets. One `ch` is the advance of `0` in the system font when anvil-ttf loads one (Windows); otherwise it is half the font size, the advance layout uses for every character.
+- Supported on `width`, `height`, `max-width`, and the offsets. One `ch` is the advance of `0` in the system font when anvil-ttf loads one (Linux and Windows); otherwise it is half the font size, the advance layout uses for every character.
 - Not supported: `ch` in margin, padding, border, `gap`, `font-size`, or `calc()`.
 
 ### `position: sticky`
