@@ -43,6 +43,12 @@ constexpr u32 MAX_SHAPE_TRANSITIONS     = 512u;
 constexpr u32 MAX_HEAP_OBJECTS          = 512u;
 constexpr u32 MAX_HEAP_ARRAYS           = 256u;
 constexpr u32 MAX_ARRAY_ELEMENTS        = 2048u;
+constexpr u32 MAX_ARRAY_LENGTH          = 256u;
+// Calls nest until the frame stack or the register file runs out.
+constexpr u32 MAX_CALL_DEPTH =
+    (MAX_CALL_FRAMES - 1u) < (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u)
+        ? (MAX_CALL_FRAMES - 1u)
+        : (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u);
 constexpr u32 MAX_FUNCTIONS             = 128u;
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
 constexpr u32 MAX_CONSTANTS             = 512u;
@@ -50,6 +56,98 @@ constexpr u32 MAX_GLOBALS               = 256u;
 constexpr u32 MAX_IC_SITES              = 256u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
+
+// Returned by the allocators and tables when they are full.
+constexpr u32 NO_SLOT = 0xFFFFFFFFu;
+constexpr u16 NO_GLOBAL = 0xFFFFu;
+
+// Why a run stopped or the compiler refused a script. Codes below 32 stop
+// a run that has started; codes from 32 up refuse the script before it
+// runs. The Rust side reads these from the run telemetry.
+enum VmErrorCode : u32 {
+    VM_OK                   = 0u,
+    VM_STOP_STEPS           = 1u,
+    VM_STOP_CALL_DEPTH      = 2u,
+    VM_STOP_OBJECTS         = 3u,
+    VM_STOP_ARRAYS          = 4u,
+    VM_STOP_ARRAY_STORAGE   = 5u,
+    VM_STOP_ARRAY_LENGTH    = 6u,
+    VM_STOP_STRINGS         = 7u,
+    VM_STOP_PROPERTIES      = 8u,
+    VM_STOP_SHAPES          = 9u,
+    VM_STOP_UNSUPPORTED     = 10u,
+    VM_REFUSE_SYNTAX        = 32u,
+    VM_REFUSE_UNSUPPORTED   = 33u,
+    VM_REFUSE_UNKNOWN_NAME  = 34u,
+    VM_REFUSE_REGISTERS     = 40u,
+    VM_REFUSE_TOKENS        = 41u,
+    VM_REFUSE_CODE_SIZE     = 42u,
+    VM_REFUSE_CONSTANTS     = 43u,
+    VM_REFUSE_FUNCTIONS     = 44u,
+    VM_REFUSE_GLOBALS       = 45u,
+    VM_REFUSE_SITES         = 46u,
+    VM_REFUSE_STRINGS       = 47u,
+    VM_REFUSE_HOST_SLOTS    = 48u,
+};
+
+constexpr u32 MAX_ERROR_TEXT = 160u;
+
+// The first reason a run stopped or a script was refused, as plain text.
+struct AnvilVmError {
+    u32 code;
+    u32 len;
+    char text[MAX_ERROR_TEXT];
+
+    void clear() noexcept {
+        code = VM_OK;
+        len = 0u;
+        text[0] = '\0';
+    }
+
+    void add(const char* s) noexcept {
+        while (s && *s && len + 1u < MAX_ERROR_TEXT) {
+            text[len++] = *s++;
+        }
+        text[len] = '\0';
+    }
+
+    // Script text is copied as printable ASCII only and cut at 40 bytes.
+    void add_source(const char* s, u32 n) noexcept {
+        const u32 shown = n < 40u ? n : 40u;
+        for (u32 i = 0u; s && i < shown && len + 1u < MAX_ERROR_TEXT; ++i) {
+            const char c = s[i];
+            text[len++] = (c >= 0x20 && c < 0x7F) ? c : '?';
+        }
+        text[len] = '\0';
+        if (shown < n) {
+            add("...");
+        }
+    }
+
+    void add_u32(u32 v) noexcept {
+        char digits[10];
+        u32 n = 0u;
+        do {
+            digits[n++] = static_cast<char>('0' + v % 10u);
+            v /= 10u;
+        } while (v != 0u && n < 10u);
+        while (n > 0u && len + 1u < MAX_ERROR_TEXT) {
+            text[len++] = digits[--n];
+        }
+        text[len] = '\0';
+    }
+};
+
+// Result of a property or element store.
+enum class StoreResult : u32 {
+    Ok = 0u,
+    // Not an object or array, an inactive one, or a negative index.
+    NotStored = 1u,
+    TooManyProperties = 2u,
+    ShapesFull = 3u,
+    ArrayTooLong = 4u,
+    ArrayStorageFull = 5u,
+};
 
 // ============================================================================
 // 2. 64-Bit NaN-Boxed Value Representation (AnvilValue)
@@ -342,16 +440,23 @@ struct AnvilHeap {
     u32 transition_shape(u32 current_shape, u32 prop_sym) noexcept;
     i32 lookup_shape_slot(u32 shape_id, u32 prop_sym) const noexcept;
 
+    // These return NO_SLOT when the table or storage is full.
     u32 alloc_object(u32 initial_shape = 0u) noexcept;
     u32 alloc_array(u32 initial_capacity = 8u) noexcept;
     u32 alloc_function(u32 name_sym, u32 arity, u32 local_count, u32 code_start, u32 code_len) noexcept;
 
     AnvilValue get_object_prop(u32 obj_id, u32 prop_sym, u32* out_shape, i32* out_slot) const noexcept;
-    bool set_object_prop(u32 obj_id, u32 prop_sym, AnvilValue val, u32* out_shape, i32* out_slot) noexcept;
+    StoreResult set_object_prop(u32 obj_id, u32 prop_sym, AnvilValue val, u32* out_shape, i32* out_slot) noexcept;
 
     AnvilValue get_array_elem(u32 arr_id, i32 index) const noexcept;
-    bool set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept;
-    bool push_array_elem(u32 arr_id, AnvilValue val) noexcept;
+    StoreResult set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept;
+    StoreResult push_array_elem(u32 arr_id, AnvilValue val) noexcept;
+    // Intern the concatenation of two pooled strings, built in place at the
+    // end of the pool. NO_SLOT when the pool has no room for it.
+    u32 intern_concat(u32 sym_a, u32 sym_b) noexcept;
+    // Move the live arrays down to the start of array storage so the space
+    // of freed arrays and of grown arrays' old slices can be used again.
+    void compact_array_storage() noexcept;
 
     void mark_value(AnvilValue v) noexcept;
     void mark_object(u32 obj_id) noexcept;
@@ -404,9 +509,10 @@ struct AnvilIcTable {
     u32 dom_ic_misses;
 
     void init() noexcept;
+    // NO_SLOT when all sites are taken.
     u32 allocate_site(u32 prop_sym) noexcept;
     AnvilValue load_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym) noexcept;
-    bool store_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym, AnvilValue val) noexcept;
+    StoreResult store_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym, AnvilValue val) noexcept;
 
     i32 lookup_dom_selector(const char* selector, u32 len) noexcept;
     void record_dom_selector(const char* selector, u32 len, u32 node_id) noexcept;
@@ -514,6 +620,8 @@ struct AnvilBytecodeProgram {
     u32 const_len;
     u32 loop_trip_counts[64];
     bool compile_ok;
+    // VM_REFUSE_CODE_SIZE or VM_REFUSE_CONSTANTS once compile_ok is false.
+    u32 overflow;
 
     void init() noexcept {
         code_len = 0u;
@@ -522,10 +630,14 @@ struct AnvilBytecodeProgram {
             loop_trip_counts[i] = 0u;
         }
         compile_ok = true;
+        overflow = VM_OK;
     }
 
     u32 emit(AnvilInstruction inst) noexcept {
         if (code_len >= MAX_BYTECODE_INSTRUCTIONS) {
+            if (compile_ok) {
+                overflow = VM_REFUSE_CODE_SIZE;
+            }
             compile_ok = false;
             return 0u;
         }
@@ -541,6 +653,9 @@ struct AnvilBytecodeProgram {
             }
         }
         if (const_len >= MAX_CONSTANTS) {
+            if (compile_ok) {
+                overflow = VM_REFUSE_CONSTANTS;
+            }
             compile_ok = false;
             return 0u;
         }
@@ -566,7 +681,15 @@ struct AnvilVmTelemetryC {
     u32 polymorphic_ic_sites;
     u32 hot_loops_accelerated;
     u32 native_compilations;
+    // Why the run stopped or the script was refused: a VmErrorCode (0 when
+    // it ran to the end) and the reason, `stop_len` bytes with no NUL.
+    u32 stop_code;
+    u32 stop_len;
+    char stop_text[MAX_ERROR_TEXT];
 };
+
+// The Rust side (`AnvilVmTelemetry` in src/lib.rs) has the same layout.
+static_assert(sizeof(AnvilVmTelemetryC) == 11u * 4u + 8u + MAX_ERROR_TEXT, "telemetry layout");
 
 struct AnvilVmContext {
     AnvilHeap heap;
@@ -581,6 +704,7 @@ struct AnvilVmContext {
     u32 hot_loops_accelerated;
     u32 native_compilations;
     bool aborted;
+    AnvilVmError error;
     char host_ids[8][64];
     u32 host_id_lens[8];
     u32 host_id_count;
@@ -588,9 +712,48 @@ struct AnvilVmContext {
     void* host;
 
     void init() noexcept;
+    // NO_GLOBAL when all global slots are taken.
     u16 resolve_global_slot(u32 name_sym) noexcept;
+
+    // Record why the run stopped or the script was refused. Only the first
+    // reason is kept. A stop code also ends the run.
+    bool fail(u32 code, const char* text) noexcept {
+        if (code < VM_REFUSE_SYNTAX) {
+            aborted = true;
+        }
+        if (error.code != VM_OK) {
+            return false;
+        }
+        error.clear();
+        error.code = code;
+        error.add(text);
+        return true;
+    }
+
+    // "<what> limit reached: <limit> <unit>"
+    void fail_limit(u32 code, const char* what, u32 limit, const char* unit) noexcept {
+        if (fail(code, what)) {
+            error.add(" limit reached: ");
+            error.add_u32(limit);
+            error.add(" ");
+            error.add(unit);
+        }
+    }
+
+    // "<text> '<name>'"
+    void fail_name(u32 code, const char* text, const char* name, u32 name_len) noexcept {
+        if (fail(code, text)) {
+            error.add(" '");
+            error.add_source(name, name_len);
+            error.add("'");
+        }
+    }
     // Collect with the registers below `reg_top` and the globals as roots.
     void collect_garbage(u32 reg_top) noexcept;
+    // Collect, then compact array storage.
+    void reclaim_array_storage(u32 reg_top) noexcept;
+    // Record a stop for a store that hit a limit. False when the run stops.
+    bool store_ok(StoreResult stored) noexcept;
     AnvilValue execute(u32 entry_pc = 0u) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
 };

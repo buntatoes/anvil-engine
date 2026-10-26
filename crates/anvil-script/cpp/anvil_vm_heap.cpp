@@ -104,8 +104,8 @@ u32 AnvilHeap::intern_string(const char* str, u32 len) noexcept {
             }
         }
     }
-    if (string_count >= MAX_INTERNED_STRINGS || string_bytes_used + len > MAX_STRING_BYTES) {
-        return 0u;
+    if (string_count >= MAX_INTERNED_STRINGS || len > MAX_STRING_BYTES - string_bytes_used) {
+        return NO_SLOT;
     }
     const u32 sym = string_count++;
     const u32 off = string_bytes_used;
@@ -120,6 +120,28 @@ u32 AnvilHeap::intern_string(const char* str, u32 len) noexcept {
     strings[sym].active = true;
     bytes_allocated += sizeof(AnvilInternedString) + len;
     return sym;
+}
+
+u32 AnvilHeap::intern_concat(u32 sym_a, u32 sym_b) noexcept {
+    u32 len_a = 0u;
+    u32 len_b = 0u;
+    const char* ptr_a = get_string_ptr(sym_a, &len_a);
+    const char* ptr_b = get_string_ptr(sym_b, &len_b);
+    if (len_a > MAX_STRING_BYTES - string_bytes_used ||
+        len_b > MAX_STRING_BYTES - string_bytes_used - len_a) {
+        return NO_SLOT;
+    }
+    // Both parts live below string_bytes_used, so building the result
+    // above it does not overwrite them. intern_string keeps the bytes in
+    // place when the result is new and leaves them unused when it is not.
+    const u32 off = string_bytes_used;
+    for (u32 i = 0u; i < len_a; ++i) {
+        string_bytes[off + i] = ptr_a[i];
+    }
+    for (u32 i = 0u; i < len_b; ++i) {
+        string_bytes[off + len_a + i] = ptr_b[i];
+    }
+    return intern_string(&string_bytes[off], len_a + len_b);
 }
 
 const char* AnvilHeap::get_string_ptr(u32 sym, u32* len_out) const noexcept {
@@ -212,13 +234,13 @@ u32 AnvilHeap::alloc_object(u32 initial_shape) noexcept {
             return i;
         }
     }
-    return 0u;
+    return NO_SLOT;
 }
 
 u32 AnvilHeap::alloc_array(u32 initial_capacity) noexcept {
     const u32 cap = initial_capacity < 4u ? 4u : (initial_capacity > 128u ? 128u : initial_capacity);
-    if (array_storage_used + cap > MAX_ARRAY_ELEMENTS) {
-        return 0u;
+    if (cap > MAX_ARRAY_ELEMENTS - array_storage_used) {
+        return NO_SLOT;
     }
     for (u32 i = 0; i < MAX_HEAP_ARRAYS; ++i) {
         if (!arrays[i].active) {
@@ -236,7 +258,7 @@ u32 AnvilHeap::alloc_array(u32 initial_capacity) noexcept {
             return i;
         }
     }
-    return 0u;
+    return NO_SLOT;
 }
 
 u32 AnvilHeap::alloc_function(
@@ -247,7 +269,7 @@ u32 AnvilHeap::alloc_function(
     u32 code_len
 ) noexcept {
     if (function_count >= MAX_FUNCTIONS) {
-        return 0u;
+        return NO_SLOT;
     }
     const u32 id = function_count++;
     functions[id].active = true;
@@ -298,7 +320,7 @@ AnvilValue AnvilHeap::get_object_prop(
     return AnvilValue::make_undefined();
 }
 
-bool AnvilHeap::set_object_prop(
+StoreResult AnvilHeap::set_object_prop(
     u32 obj_id,
     u32 prop_sym,
     AnvilValue val,
@@ -309,11 +331,15 @@ bool AnvilHeap::set_object_prop(
         if (out_slot) {
             *out_slot = -1;
         }
-        return false;
+        return StoreResult::NotStored;
     }
     AnvilHeapObject& obj = objects[obj_id];
     i32 slot = lookup_shape_slot(obj.shape_id, prop_sym);
+    StoreResult full = StoreResult::NotStored;
     if (slot < 0) {
+        const bool props_full =
+            obj.shape_id < shape_count && shapes[obj.shape_id].prop_count >= MAX_SHAPE_PROPS;
+        full = props_full ? StoreResult::TooManyProperties : StoreResult::ShapesFull;
         const u32 new_shape = transition_shape(obj.shape_id, prop_sym);
         obj.shape_id = new_shape;
         slot = lookup_shape_slot(new_shape, prop_sym);
@@ -326,9 +352,9 @@ bool AnvilHeap::set_object_prop(
     }
     if (slot >= 0 && static_cast<u32>(slot) < MAX_SHAPE_PROPS) {
         obj.slots[slot] = val;
-        return true;
+        return StoreResult::Ok;
     }
-    return false;
+    return full;
 }
 
 AnvilValue AnvilHeap::get_array_elem(u32 arr_id, i32 index) const noexcept {
@@ -343,17 +369,20 @@ AnvilValue AnvilHeap::get_array_elem(u32 arr_id, i32 index) const noexcept {
     return array_storage[arr.start_index + u_idx];
 }
 
-bool AnvilHeap::set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept {
+StoreResult AnvilHeap::set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept {
     if (arr_id >= MAX_HEAP_ARRAYS || !arrays[arr_id].active || index < 0) {
-        return false;
+        return StoreResult::NotStored;
     }
     AnvilHeapArray& arr = arrays[arr_id];
     const u32 u_idx = static_cast<u32>(index);
     if (u_idx >= arr.capacity) {
         // Reallocate contiguous slice if capacity exceeded and storage permits.
-        const u32 new_cap = (u_idx + 8u) < 256u ? (u_idx + 8u) : 256u;
-        if (u_idx >= new_cap || array_storage_used + new_cap > MAX_ARRAY_ELEMENTS) {
-            return false;
+        if (u_idx >= MAX_ARRAY_LENGTH) {
+            return StoreResult::ArrayTooLong;
+        }
+        const u32 new_cap = (u_idx + 8u) < MAX_ARRAY_LENGTH ? (u_idx + 8u) : MAX_ARRAY_LENGTH;
+        if (new_cap > MAX_ARRAY_ELEMENTS - array_storage_used) {
+            return StoreResult::ArrayStorageFull;
         }
         const u32 new_start = array_storage_used;
         for (u32 k = 0; k < new_cap; ++k) {
@@ -368,12 +397,12 @@ bool AnvilHeap::set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept {
     if (u_idx >= arr.length) {
         arr.length = u_idx + 1u;
     }
-    return true;
+    return StoreResult::Ok;
 }
 
-bool AnvilHeap::push_array_elem(u32 arr_id, AnvilValue val) noexcept {
+StoreResult AnvilHeap::push_array_elem(u32 arr_id, AnvilValue val) noexcept {
     if (arr_id >= MAX_HEAP_ARRAYS || !arrays[arr_id].active) {
-        return false;
+        return StoreResult::NotStored;
     }
     const i32 idx = static_cast<i32>(arrays[arr_id].length);
     return set_array_elem(arr_id, idx, val);
@@ -472,6 +501,46 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
     }
     ++gc_collections;
     return reclaimed;
+}
+
+void AnvilHeap::compact_array_storage() noexcept {
+    // Slide the live slices down in address order. Each slice moves to a
+    // start no higher than its old one, so copying forward is safe.
+    bool moved[MAX_HEAP_ARRAYS];
+    for (u32 i = 0; i < MAX_HEAP_ARRAYS; ++i) {
+        moved[i] = false;
+    }
+    u32 next_start = 0u;
+    for (;;) {
+        u32 pick = NO_SLOT;
+        for (u32 i = 0; i < MAX_HEAP_ARRAYS; ++i) {
+            if (!arrays[i].active || moved[i]) {
+                continue;
+            }
+            if (pick == NO_SLOT || arrays[i].start_index < arrays[pick].start_index) {
+                pick = i;
+            }
+        }
+        if (pick == NO_SLOT) {
+            break;
+        }
+        moved[pick] = true;
+        AnvilHeapArray& arr = arrays[pick];
+        const u32 cap = arr.capacity;
+        if (arr.start_index < next_start || cap > MAX_ARRAY_ELEMENTS - arr.start_index) {
+            // Not a layout this heap makes. Leave storage as it is.
+            return;
+        }
+        for (u32 k = 0; k < cap; ++k) {
+            array_storage[next_start + k] = array_storage[arr.start_index + k];
+        }
+        arr.start_index = next_start;
+        next_start += cap;
+    }
+    for (u32 i = next_start; i < array_storage_used && i < MAX_ARRAY_ELEMENTS; ++i) {
+        array_storage[i] = AnvilValue::make_undefined();
+    }
+    array_storage_used = next_start;
 }
 
 void AnvilHeap::clear_marks() noexcept {

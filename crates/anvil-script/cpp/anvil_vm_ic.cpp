@@ -35,7 +35,7 @@ void AnvilIcTable::init() noexcept {
 
 u32 AnvilIcTable::allocate_site(u32 prop_sym) noexcept {
     if (site_count >= MAX_IC_SITES) {
-        return MAX_IC_SITES - 1u;
+        return NO_SLOT;
     }
     const u32 id = site_count++;
     sites[id].state = IcState::Uninitialized;
@@ -133,7 +133,7 @@ AnvilValue AnvilIcTable::load_property_ic(
     return val;
 }
 
-bool AnvilIcTable::store_property_ic(
+StoreResult AnvilIcTable::store_property_ic(
     AnvilHeap& heap,
     u32 site_id,
     AnvilValue receiver,
@@ -141,11 +141,11 @@ bool AnvilIcTable::store_property_ic(
     AnvilValue val
 ) noexcept {
     if (!receiver.is_object()) {
-        return false;
+        return StoreResult::NotStored;
     }
     const u32 obj_id = receiver.payload();
     if (obj_id >= MAX_HEAP_OBJECTS || !heap.objects[obj_id].active) {
-        return false;
+        return StoreResult::NotStored;
     }
 
     AnvilHeapObject& obj = heap.objects[obj_id];
@@ -157,14 +157,14 @@ bool AnvilIcTable::store_property_ic(
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
                 obj.slots[site.stubs[0].slot_offset] = val;
-                return true;
+                return StoreResult::Ok;
             }
         } else if (site.state == IcState::Polymorphic) {
             for (u8 i = 0u; i < site.count; ++i) {
                 if (site.stubs[i].shape_id == shape_id && site.stubs[i].slot_offset >= 0) {
                     ++ic_hits;
                     obj.slots[site.stubs[i].slot_offset] = val;
-                    return true;
+                    return StoreResult::Ok;
                 }
             }
         }
@@ -174,8 +174,8 @@ bool AnvilIcTable::store_property_ic(
     ++ic_misses;
     u32 new_shape = 0u;
     i32 slot = -1;
-    const bool ok = heap.set_object_prop(obj_id, prop_sym, val, &new_shape, &slot);
-    if (ok && site_id < site_count && slot >= 0) {
+    const StoreResult stored = heap.set_object_prop(obj_id, prop_sym, val, &new_shape, &slot);
+    if (stored == StoreResult::Ok && site_id < site_count && slot >= 0) {
         AnvilIcSite& site = sites[site_id];
         if (site.state == IcState::Uninitialized) {
             site.state = IcState::Monomorphic;
@@ -201,7 +201,7 @@ bool AnvilIcTable::store_property_ic(
             ++megamorphic_fallbacks;
         }
     }
-    return ok;
+    return stored;
 }
 
 i32 AnvilIcTable::lookup_dom_selector(const char* selector, u32 len) noexcept {

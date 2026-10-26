@@ -39,23 +39,6 @@ inline f64 fast_round(f64 x) noexcept {
     return x >= 0.0 ? fast_floor(x + 0.5) : fast_ceil(x - 0.5);
 }
 
-AnvilValue concat_strings(AnvilHeap& heap, u32 sym_a, u32 sym_b) noexcept {
-    u32 len_a = 0u;
-    u32 len_b = 0u;
-    const char* ptr_a = heap.get_string_ptr(sym_a, &len_a);
-    const char* ptr_b = heap.get_string_ptr(sym_b, &len_b);
-    char buf[512];
-    const u32 total = (len_a + len_b < 512u) ? (len_a + len_b) : 512u;
-    u32 pos = 0u;
-    for (u32 i = 0u; i < len_a && pos < total; ++i) {
-        buf[pos++] = ptr_a[i];
-    }
-    for (u32 i = 0u; i < len_b && pos < total; ++i) {
-        buf[pos++] = ptr_b[i];
-    }
-    return AnvilValue::make_string(heap.intern_string(buf, pos));
-}
-
 bool values_strictly_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b) noexcept {
     if (a.bits == b.bits) {
         return true;
@@ -89,6 +72,7 @@ void AnvilVmContext::init() noexcept {
     hot_loops_accelerated = 0u;
     native_compilations = 0u;
     aborted = false;
+    error.clear();
     host_id_count = 0u;
     host_set_text = nullptr;
     host = nullptr;
@@ -105,13 +89,39 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
         }
     }
     if (global_count >= MAX_GLOBALS) {
-        return static_cast<u16>(MAX_GLOBALS - 1u);
+        return NO_GLOBAL;
     }
     const u16 slot = static_cast<u16>(global_count++);
     globals[slot].name_sym = name_sym;
     globals[slot].value = AnvilValue::make_undefined();
     globals[slot].occupied = true;
     return slot;
+}
+
+void AnvilVmContext::reclaim_array_storage(u32 reg_top) noexcept {
+    collect_garbage(reg_top);
+    heap.compact_array_storage();
+}
+
+bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
+    switch (stored) {
+        case StoreResult::TooManyProperties:
+            fail_limit(VM_STOP_PROPERTIES, "property", MAX_SHAPE_PROPS, "properties per object");
+            return false;
+        case StoreResult::ShapesFull:
+            fail_limit(VM_STOP_SHAPES, "shape", MAX_SHAPES, "shapes");
+            return false;
+        case StoreResult::ArrayTooLong:
+            fail_limit(VM_STOP_ARRAY_LENGTH, "array length", MAX_ARRAY_LENGTH, "elements per array");
+            return false;
+        case StoreResult::ArrayStorageFull:
+            fail_limit(VM_STOP_ARRAY_STORAGE, "array storage", MAX_ARRAY_ELEMENTS, "elements");
+            return false;
+        case StoreResult::Ok:
+        case StoreResult::NotStored:
+            break;
+    }
+    return true;
 }
 
 void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
@@ -141,8 +151,8 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
     while (pc < program.code_len) {
         if (++steps_executed > MAX_VM_STEPS) {
-            aborted = true;
-            return AnvilValue::make_null();
+            fail_limit(VM_STOP_STEPS, "step", MAX_VM_STEPS, "steps");
+            return AnvilValue::make_undefined();
         }
 
         const AnvilInstruction inst = program.code[pc++];
@@ -189,7 +199,12 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                     }
                 }
                 if (lhs.is_string() && rhs.is_string()) {
-                    R[inst.a] = concat_strings(heap, lhs.payload(), rhs.payload());
+                    const u32 sym = heap.intern_concat(lhs.payload(), rhs.payload());
+                    if (sym == NO_SLOT) {
+                        fail_limit(VM_STOP_STRINGS, "string pool", MAX_STRING_BYTES, "bytes");
+                        return AnvilValue::make_undefined();
+                    }
+                    R[inst.a] = AnvilValue::make_string(sym);
                     break;
                 }
                 R[inst.a] = AnvilValue::make_number(lhs.as_number() + rhs.as_number());
@@ -345,7 +360,12 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 if (heap.live_objects + 8u >= MAX_HEAP_OBJECTS) {
                     collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
                 }
-                R[inst.a] = AnvilValue::make_object(heap.alloc_object(0u));
+                const u32 obj_id = heap.alloc_object(0u);
+                if (obj_id == NO_SLOT) {
+                    fail_limit(VM_STOP_OBJECTS, "object", MAX_HEAP_OBJECTS, "live objects");
+                    return AnvilValue::make_undefined();
+                }
+                R[inst.a] = AnvilValue::make_object(obj_id);
                 break;
             }
 
@@ -353,7 +373,20 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 if (heap.live_arrays + 4u >= MAX_HEAP_ARRAYS) {
                     collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
                 }
-                R[inst.a] = AnvilValue::make_array(heap.alloc_array(inst.b));
+                u32 arr_id = heap.alloc_array(inst.b);
+                if (arr_id == NO_SLOT) {
+                    reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
+                    arr_id = heap.alloc_array(inst.b);
+                }
+                if (arr_id == NO_SLOT) {
+                    if (heap.live_arrays >= MAX_HEAP_ARRAYS) {
+                        fail_limit(VM_STOP_ARRAYS, "array", MAX_HEAP_ARRAYS, "live arrays");
+                    } else {
+                        fail_limit(VM_STOP_ARRAY_STORAGE, "array storage", MAX_ARRAY_ELEMENTS, "elements");
+                    }
+                    return AnvilValue::make_undefined();
+                }
+                R[inst.a] = AnvilValue::make_array(arr_id);
                 break;
             }
 
@@ -367,7 +400,10 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
             case AnvilOpcode::SetPropIC: {
                 const u32 site_id = inst.c;
                 const u32 prop_sym = (site_id < ic.site_count) ? ic.sites[site_id].prop_sym : 0u;
-                ic.store_property_ic(heap, site_id, R[inst.a], prop_sym, R[inst.b]);
+                const StoreResult stored = ic.store_property_ic(heap, site_id, R[inst.a], prop_sym, R[inst.b]);
+                if (!store_ok(stored)) {
+                    return AnvilValue::make_undefined();
+                }
                 break;
             }
 
@@ -386,7 +422,14 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 const AnvilValue recv = R[inst.a];
                 const i32 idx = static_cast<i32>(R[inst.b].as_number());
                 if (recv.is_array()) {
-                    heap.set_array_elem(recv.payload(), idx, R[inst.c]);
+                    StoreResult stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
+                    if (stored == StoreResult::ArrayStorageFull) {
+                        reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
+                        stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
+                    }
+                    if (!store_ok(stored)) {
+                        return AnvilValue::make_undefined();
+                    }
                 }
                 break;
             }
@@ -394,7 +437,14 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
             case AnvilOpcode::ArrayPush: {
                 const AnvilValue recv = R[inst.a];
                 if (recv.is_array()) {
-                    heap.push_array_elem(recv.payload(), R[inst.b]);
+                    StoreResult stored = heap.push_array_elem(recv.payload(), R[inst.b]);
+                    if (stored == StoreResult::ArrayStorageFull) {
+                        reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
+                        stored = heap.push_array_elem(recv.payload(), R[inst.b]);
+                    }
+                    if (!store_ok(stored)) {
+                        return AnvilValue::make_undefined();
+                    }
                 }
                 break;
             }
@@ -407,8 +457,8 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 }
                 if (frame_count + 1u >= MAX_CALL_FRAMES ||
                     reg_base + (MAX_REGISTERS_PER_FRAME * 2u) > MAX_TOTAL_REGISTERS) {
-                    aborted = true;
-                    return AnvilValue::make_null();
+                    fail_limit(VM_STOP_CALL_DEPTH, "call depth", MAX_CALL_DEPTH, "nested calls");
+                    return AnvilValue::make_undefined();
                 }
                 const AnvilHeapFunction& fn = heap.functions[fn_id];
                 const u32 next_base = reg_base + MAX_REGISTERS_PER_FRAME;
@@ -482,6 +532,12 @@ void AnvilVmContext::fill_telemetry(AnvilVmTelemetryC* out) const noexcept {
     out->polymorphic_ic_sites = ic.polymorphic_upgrades;
     out->hot_loops_accelerated = hot_loops_accelerated;
     out->native_compilations = native_compilations;
+    out->stop_code = error.code;
+    const u32 n = error.len < MAX_ERROR_TEXT ? error.len : MAX_ERROR_TEXT;
+    out->stop_len = n;
+    for (u32 i = 0u; i < MAX_ERROR_TEXT; ++i) {
+        out->stop_text[i] = i < n ? error.text[i] : '\0';
+    }
 }
 
 } // namespace anvil_vm
@@ -577,14 +633,21 @@ u32 anvil_cpp_vm_run_script(
     anvil_vm::AnvilVmTelemetryC* telemetry_out,
     f64* numeric_result_out
 ) noexcept {
-    if (!context_memory || !compiler_memory || !source_ptr || source_len == 0u) {
+    if (!context_memory) {
         return 0u;
     }
     auto& ctx = *static_cast<anvil_vm::AnvilVmContext*>(context_memory);
     ctx.init();
+    // The telemetry also carries the reason when the script is refused.
+    if (!compiler_memory || !source_ptr || source_len == 0u) {
+        ctx.fail(anvil_vm::VM_REFUSE_SYNTAX, "empty script");
+        ctx.fill_telemetry(telemetry_out);
+        return 0u;
+    }
     ctx.host_set_text = g_text_host_fn;
     ctx.host = g_text_host;
     if (!anvil_vm::compile_js_to_bytecode(ctx, compiler_memory, source_ptr, source_len)) {
+        ctx.fill_telemetry(telemetry_out);
         return 0u;
     }
     const anvil_vm::AnvilValue res = ctx.execute(0u);
@@ -671,6 +734,9 @@ u32 anvil_cpp_vm_run_ic_benchmark(
             g_vm_ctx.heap.collect_garbage(nullptr, 0u);
         }
         const u32 obj_id = g_vm_ctx.heap.alloc_object(0u);
+        if (obj_id == anvil_vm::NO_SLOT) {
+            break;
+        }
         const anvil_vm::AnvilValue obj = anvil_vm::AnvilValue::make_object(obj_id);
 
         g_vm_ctx.ic.store_property_ic(g_vm_ctx.heap, site_set_x, obj, sym_x, anvil_vm::AnvilValue::make_smi(static_cast<i32>(i)));

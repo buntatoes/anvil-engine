@@ -121,6 +121,76 @@ pub struct AnvilVmTelemetry {
     pub polymorphic_ic_sites: u32,
     pub hot_loops_accelerated: u32,
     pub native_compilations: u32,
+    stop: VmStop,
+}
+
+impl AnvilVmTelemetry {
+    /// Why the C++ VM stopped this run or refused the script, `None` when
+    /// it ran to the end.
+    pub fn stop_reason(&self) -> Option<VmError> {
+        if self.stop.code == 0 {
+            return None;
+        }
+        let len = (self.stop.len as usize).min(self.stop.text.len());
+        Some(VmError {
+            code: self.stop.code,
+            message: String::from_utf8_lossy(&self.stop.text[..len]).into_owned(),
+        })
+    }
+}
+
+/// Length of the reason the C++ VM writes into [`AnvilVmTelemetry`].
+const VM_STOP_TEXT: usize = 160;
+
+// `AnvilVmTelemetryC` in `cpp/anvil_vm.hpp` has the same layout.
+const _: () = assert!(std::mem::size_of::<AnvilVmTelemetry>() == 11 * 4 + 8 + VM_STOP_TEXT);
+
+/// The stop code and reason at the end of the C++ telemetry struct.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VmStop {
+    code: u32,
+    len: u32,
+    text: [u8; VM_STOP_TEXT],
+}
+
+impl Default for VmStop {
+    fn default() -> Self {
+        Self {
+            code: 0,
+            len: 0,
+            text: [0; VM_STOP_TEXT],
+        }
+    }
+}
+
+/// Why the C++ VM refused a script or stopped running it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmError {
+    /// Code from the VM. Codes below 32 stop a run; codes from 32 up refuse
+    /// the script before it runs.
+    pub code: u32,
+    /// Plain text reason, for example `step limit reached: 100000 steps`.
+    pub message: String,
+}
+
+impl VmError {
+    /// True when the compiler refused the script, so nothing ran.
+    pub fn refused(&self) -> bool {
+        self.code >= 32
+    }
+
+    /// True when a fixed VM limit was reached, as opposed to code the VM
+    /// does not compile or run.
+    pub fn is_limit(&self) -> bool {
+        matches!(self.code, 1..=9 | 40..=48)
+    }
+}
+
+impl std::fmt::Display for VmError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 #[cfg(anvil_cpp_jit)]
@@ -290,7 +360,8 @@ impl VmOwner {
 
 /// Compile and execute a self-contained JS script inside a caller-owned C++20
 /// `AnvilVM`, returning `(numeric_result, telemetry)`. The compiler subset is
-/// numeric. This is not a general compiler.
+/// numeric. This is not a general compiler. `None` when the VM refused or
+/// stopped the script; [`eval_cpp_vm_script_checked`] says why.
 pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, AnvilVmTelemetry)> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
@@ -323,6 +394,26 @@ pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, AnvilVmTelemetry)> {
         let mut rt = ScriptRuntime::new();
         let val = rt.eval_expr(&mut doc, trimmed);
         val.as_number().map(|n| (n, AnvilVmTelemetry::default()))
+    }
+}
+
+/// Like [`eval_cpp_vm_script`], with the reason when the VM refused the
+/// script or stopped it at a limit.
+pub fn eval_cpp_vm_script_checked(source: &str) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    match ScriptRuntime::new().try_owned_vm(trimmed) {
+        VmRun::Value(result, telemetry) => Ok((result, telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
     }
 }
 
@@ -420,6 +511,7 @@ pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, AnvilVmTelemetry) {
                 polymorphic_ic_sites: 2,
                 hot_loops_accelerated: 1,
                 native_compilations: 0,
+                stop: VmStop::default(),
             },
         )
     }
@@ -905,6 +997,7 @@ pub struct ScriptRuntime {
     prelude_loaded: bool,
     last_script_used_vm: bool,
     last_vm_number: Option<f64>,
+    last_vm_error: Option<VmError>,
     in_rust_eval: bool,
     vm_owner: VmOwner,
     wasm_modules: Vec<WasmModule>,
@@ -950,6 +1043,7 @@ impl Default for ScriptRuntime {
             prelude_loaded: false,
             last_script_used_vm: false,
             last_vm_number: None,
+            last_vm_error: None,
             in_rust_eval: false,
             vm_owner: VmOwner::empty(),
             wasm_modules: Vec::new(),
@@ -1089,6 +1183,14 @@ impl ScriptRuntime {
     /// path ran and the compiler accepted the script.
     pub fn last_vm_number(&self) -> Option<f64> {
         self.last_vm_number
+    }
+
+    /// Why the C++ VM refused or stopped the previous top-level
+    /// [`Self::eval_script`], which then ran on the Rust interpreter. `None`
+    /// when the VM ran it, or the script was left to the interpreter before
+    /// the VM saw it.
+    pub fn last_vm_error(&self) -> Option<&VmError> {
+        self.last_vm_error.as_ref()
     }
 
     pub fn reset_execution_budget(&mut self) {
@@ -2697,19 +2799,23 @@ impl ScriptRuntime {
         let cleaned = strip_comments(source);
         // Nested calls are loop bodies and function bodies. They share the Rust
         // variable environment, so they stay on the Rust interpreter.
+        if !self.in_rust_eval {
+            self.last_vm_error = None;
+        }
         if !self.in_rust_eval && !script_stays_on_rust(&cleaned) {
+            // A VM run has no effect on the page, so a script the VM refuses
+            // or stops at a limit runs again from the start on the Rust
+            // interpreter. The reason is kept for last_vm_error.
             match self.try_owned_vm(&cleaned) {
-                VmRun::Value(number) => {
+                VmRun::Value(number, _) => {
                     self.last_script_used_vm = true;
                     self.last_vm_number = Some(number);
                     return;
                 }
-                VmRun::Aborted => {
-                    self.last_script_used_vm = true;
-                    self.aborted = true;
-                    return;
+                VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => {
+                    self.last_vm_error = Some(error);
                 }
-                VmRun::Rejected => {}
+                VmRun::Rejected(None) => {}
             }
         }
         let outer = self.in_rust_eval;
@@ -2768,12 +2874,12 @@ impl ScriptRuntime {
     fn try_owned_vm(&mut self, source: &str) -> VmRun {
         let trimmed = source.trim();
         if trimmed.is_empty() || trimmed.len() > u32::MAX as usize {
-            return VmRun::Rejected;
+            return VmRun::Rejected(None);
         }
         #[cfg(anvil_cpp_jit)]
         {
             if !is_cpp_jit_kernel_active() || !self.vm_owner.ensure() {
-                return VmRun::Rejected;
+                return VmRun::Rejected(None);
             }
             let mut result = 0.0_f64;
             let mut telemetry = AnvilVmTelemetry::default();
@@ -2787,16 +2893,22 @@ impl ScriptRuntime {
                     &mut result,
                 )
             };
+            let reason = || {
+                telemetry.stop_reason().unwrap_or(VmError {
+                    code: 32,
+                    message: "the VM gave no reason".to_string(),
+                })
+            };
             match code {
-                1 => VmRun::Value(result),
-                2 => VmRun::Aborted,
-                _ => VmRun::Rejected,
+                1 => VmRun::Value(result, telemetry),
+                2 => VmRun::Stopped(reason()),
+                _ => VmRun::Rejected(Some(reason())),
             }
         }
         #[cfg(not(anvil_cpp_jit))]
         {
             let _ = (self, trimmed);
-            VmRun::Rejected
+            VmRun::Rejected(None)
         }
     }
 
@@ -2997,6 +3109,11 @@ impl ScriptRuntime {
         let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
             return false;
         };
+        // A loop the VM stopped part way leaves partial values. The Rust
+        // loop runs it again and reports the limit.
+        if telemetry.stop_reason().is_some() {
+            return false;
+        }
         if telemetry.native_compilations == 0 {
             return false;
         }
@@ -3050,6 +3167,11 @@ impl ScriptRuntime {
         let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
             return false;
         };
+        // A loop the VM stopped part way leaves partial values. The Rust
+        // loop runs it again and reports the limit.
+        if telemetry.stop_reason().is_some() {
+            return false;
+        }
         if telemetry.native_compilations == 0 {
             return false;
         }
@@ -7467,11 +7589,11 @@ fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str
 #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
 enum VmRun {
     /// The compiler accepted the script and execution finished.
-    Value(f64),
-    /// The compiler accepted the script and the step budget aborted it.
-    Aborted,
-    /// The compiler rejected the script, or the VM is not linked.
-    Rejected,
+    Value(f64, AnvilVmTelemetry),
+    /// The compiler accepted the script and a limit stopped it.
+    Stopped(VmError),
+    /// The compiler rejected the script, or the VM is not linked (`None`).
+    Rejected(Option<VmError>),
 }
 
 /// True when `source` must stay on the Rust interpreter.

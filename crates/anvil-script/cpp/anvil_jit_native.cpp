@@ -367,7 +367,7 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
 
 int step_budget(AnvilVmContext* ctx) noexcept {
     if (++ctx->steps_executed > MAX_VM_STEPS) {
-        ctx->aborted = true;
+        ctx->fail_limit(VM_STOP_STEPS, "step", MAX_VM_STEPS, "steps");
         return 0;
     }
     return 1;
