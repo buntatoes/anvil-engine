@@ -2982,10 +2982,12 @@ impl ScriptRuntime {
             }
             match self.vars.iter().rev().find(|(key, _)| key == &name) {
                 Some((_, Value::Number(number))) => {
-                    prelude.push_str(&format!("{name} = {};", format_jit_number(*number)));
+                    prelude.push_str(&format!("let {name} = {};", format_jit_number(*number)));
                 }
                 Some(_) => return false,
-                None if runnable.contains(&format!("{name} =")) => {}
+                None if runnable.contains(&format!("{name} =")) => {
+                    prelude.push_str(&format!("let {name} = 0;"));
+                }
                 None => return false,
             }
         }
@@ -3035,10 +3037,12 @@ impl ScriptRuntime {
             }
             match self.vars.iter().rev().find(|(key, _)| key == &name) {
                 Some((_, Value::Number(number))) => {
-                    prelude.push_str(&format!("{name} = {};", format_jit_number(*number)));
+                    prelude.push_str(&format!("let {name} = {};", format_jit_number(*number)));
                 }
                 Some(_) => return false,
-                None if runnable.contains(&format!("{name} =")) => {}
+                None if runnable.contains(&format!("{name} =")) => {
+                    prelude.push_str(&format!("let {name} = 0;"));
+                }
                 None => return false,
             }
         }

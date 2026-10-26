@@ -114,6 +114,28 @@ inline bool is_event_loop_word(const char* s, u32 len) noexcept {
            match_kw(s, len, "requestAnimationFrame", 21);
 }
 
+// Words of the language this compiler does not implement. Without this
+// check they would read as plain names and the script would run with a
+// different meaning, so a script that uses one is rejected instead.
+inline bool is_unsupported_word(const char* s, u32 len) noexcept {
+    static const char* const words[] = {
+        "this", "typeof", "instanceof", "in", "delete", "void", "throw", "try",
+        "catch", "finally", "switch", "case", "default", "class", "extends",
+        "super", "with", "yield", "import", "export", "debugger", "enum", "do",
+        "break", "continue",
+    };
+    for (const char* w : words) {
+        u32 w_len = 0u;
+        while (w[w_len] != '\0') {
+            ++w_len;
+        }
+        if (match_kw(s, len, w, w_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 f64 parse_f64_slice(const char* s, u32 len) noexcept {
     f64 int_part = 0.0;
     u32 i = 0u;
@@ -170,8 +192,16 @@ struct AnvilLexer {
 
             if (is_digit(c)) {
                 const u32 start = pos;
+                u32 dots = 0u;
                 while (pos < len && (is_digit(src[pos]) || src[pos] == '.')) {
+                    if (src[pos] == '.') {
+                        ++dots;
+                    }
                     ++pos;
+                }
+                // Exponents, hex, separators and `1.2.3` are not read here.
+                if (dots > 1u || (pos < len && is_ident_cont(src[pos]))) {
+                    return false;
                 }
                 tokens[count++] = Token{
                     TokenKind::Number,
@@ -187,16 +217,18 @@ struct AnvilLexer {
                 ++pos;
                 const u32 start = pos;
                 while (pos < len && src[pos] != quote) {
-                    if (src[pos] == '\\' && pos + 1u < len) {
-                        pos += 2u;
-                    } else {
-                        ++pos;
+                    // The pool keeps the source bytes, so an escape would
+                    // keep its backslash. A line break ends the literal.
+                    if (src[pos] == '\\' || src[pos] == '\n') {
+                        return false;
                     }
-                }
-                const u32 str_len = pos - start;
-                if (pos < len && src[pos] == quote) {
                     ++pos;
                 }
+                const u32 str_len = pos - start;
+                if (pos >= len) {
+                    return false;
+                }
+                ++pos;
                 tokens[count++] = Token{TokenKind::String, start, str_len, 0.0};
                 continue;
             }
@@ -222,7 +254,7 @@ struct AnvilLexer {
                 else if (match_kw(s, id_len, "false", 5)) kind = TokenKind::KwFalse;
                 else if (match_kw(s, id_len, "null", 4)) kind = TokenKind::KwNull;
                 else if (match_kw(s, id_len, "new", 3)) kind = TokenKind::KwNew;
-                if (is_event_loop_word(s, id_len)) {
+                if (is_event_loop_word(s, id_len) || is_unsupported_word(s, id_len)) {
                     return false;
                 }
                 tokens[count++] = Token{kind, start, id_len, 0.0};
@@ -233,6 +265,11 @@ struct AnvilLexer {
             const char n1 = (pos + 1u < len) ? src[pos + 1u] : '\0';
             const char n2 = (pos + 2u < len) ? src[pos + 2u] : '\0';
 
+            // Arrows, optional chaining and `??` are not compiled. Reading
+            // them as `=`, `>` or `?` would change what the script means.
+            if ((c == '=' && n1 == '>') || (c == '?' && (n1 == '.' || n1 == '?'))) {
+                return false;
+            }
             if (c == '=' && n1 == '=' && n2 == '=') {
                 tokens[count++] = Token{TokenKind::EqEq, pos, 3u, 0.0};
                 pos += 3u;
@@ -371,6 +408,10 @@ struct AnvilCompiler {
     u32 next_loop_id;
     bool in_function;
     bool had_error;
+    // Globals given a value by a top-level `let`, `const` or `var`. The VM
+    // cannot see names the page defined in other scripts, so any other
+    // global name rejects the script.
+    bool global_declared[MAX_GLOBALS];
 
     const Token& peek(u32 ahead = 0u) const noexcept {
         const u32 idx = (cursor + ahead < lexer.count) ? (cursor + ahead) : (lexer.count - 1u);
@@ -456,6 +497,16 @@ struct AnvilCompiler {
         }
         had_error = true;
         return false;
+    }
+
+    // After a whole expression, a `(`, `[` or `.` would make it a call or a
+    // member access that this compiler did not read. Reject the script
+    // rather than run the rest as a separate statement.
+    void reject_if_expression_continues() noexcept {
+        const TokenKind k = peek().kind;
+        if (k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::Dot) {
+            had_error = true;
+        }
     }
 
     u8 alloc_reg() noexcept {
@@ -608,6 +659,9 @@ struct AnvilCompiler {
                 else if (match_kw(&src[m_tok.offset], m_tok.length, "ceil", 4)) math_op = 3u;
                 else if (match_kw(&src[m_tok.offset], m_tok.length, "round", 5)) math_op = 4u;
                 else if (match_kw(&src[m_tok.offset], m_tok.length, "sqrt", 4)) math_op = 5u;
+                if (math_op == 0u) {
+                    had_error = true;
+                }
                 expect(TokenKind::LParen);
                 const u8 arg_reg = compile_expr();
                 expect(TokenKind::RParen);
@@ -624,6 +678,12 @@ struct AnvilCompiler {
                         target_fn = fi;
                         break;
                     }
+                }
+                // A call to a name that is not a function declared in this
+                // script (console.log, a page function, a local holding a
+                // value) cannot run here.
+                if (target_fn == 0xFFFFFFFFu || find_local(sym) >= 0) {
+                    had_error = true;
                 }
                 const u8 call_base = next_reg;
                 u8 argc = 0u;
@@ -647,8 +707,6 @@ struct AnvilCompiler {
                         static_cast<u8>(target_fn & 0xFFu),
                         call_base
                     ));
-                } else {
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, dst, 0u, 0u));
                 }
                 return dst;
             }
@@ -689,6 +747,11 @@ struct AnvilCompiler {
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ArrayPush, cur, val_reg, 0u));
                     continue;
                 }
+                // Method calls other than push are not compiled.
+                if (peek().kind == TokenKind::LParen) {
+                    had_error = true;
+                    break;
+                }
                 // Check for property assignment `obj.prop = expr`.
                 if (match(TokenKind::Assign)) {
                     const u8 rhs = compile_expr();
@@ -721,6 +784,10 @@ struct AnvilCompiler {
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetElem, cur, idx_reg, rhs));
                     cur = rhs;
                     continue;
+                }
+                if (peek().kind == TokenKind::LParen) {
+                    had_error = true;
+                    break;
                 }
                 const u8 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, dst, cur, idx_reg));
@@ -979,7 +1046,11 @@ struct AnvilCompiler {
                     val_reg = alloc_reg();
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, val_reg, 0u, 0u));
                 }
+                reject_if_expression_continues();
                 const u16 g_slot = ctx->resolve_global_slot(sym);
+                if (g_slot < MAX_GLOBALS) {
+                    global_declared[g_slot] = true;
+                }
                 ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, val_reg, g_slot));
                 match(TokenKind::Semicolon);
                 return val_reg;
@@ -987,6 +1058,7 @@ struct AnvilCompiler {
             const u8 dst = declare_local(sym);
             if (match(TokenKind::Assign)) {
                 const u8 val_reg = compile_expr();
+                reject_if_expression_continues();
                 if (val_reg != dst) {
                     ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, val_reg, 0u));
                 }
@@ -998,11 +1070,16 @@ struct AnvilCompiler {
         }
 
         if (match(TokenKind::KwReturn)) {
+            if (!in_function) {
+                had_error = true;
+                return 0u;
+            }
             u8 ret_reg = 0u;
             if (peek().kind != TokenKind::Semicolon &&
                 peek().kind != TokenKind::RBrace &&
                 peek().kind != TokenKind::Eof) {
                 ret_reg = compile_expr();
+                reject_if_expression_continues();
             } else {
                 ret_reg = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, ret_reg, 0u, 0u));
@@ -1193,6 +1270,7 @@ struct AnvilCompiler {
         }
 
         const u8 res = compile_statement_or_assign_no_semi();
+        reject_if_expression_continues();
         match(TokenKind::Semicolon);
         return res;
     }
@@ -1263,6 +1341,9 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.next_loop_id = 0u;
     g_compiler.in_function = false;
     g_compiler.had_error = false;
+    for (u32 i = 0u; i < MAX_GLOBALS; ++i) {
+        g_compiler.global_declared[i] = false;
+    }
 
     if (!g_compiler.lexer.tokenize(src, len)) {
         return false;
@@ -1280,6 +1361,14 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
         last_reg = g_compiler.compile_statement();
     }
     ctx.program.emit(AnvilInstruction::make_abc(AnvilOpcode::Halt, last_reg, 0u, 0u));
+    // A global no top-level declaration gave a value belongs to another
+    // script or to the page (console, document, a library). Leave the whole
+    // script to the Rust interpreter, which can see those names.
+    for (u32 i = 0u; i < ctx.global_count && i < MAX_GLOBALS; ++i) {
+        if (!g_compiler.global_declared[i]) {
+            g_compiler.had_error = true;
+        }
+    }
     return !g_compiler.had_error && ctx.program.compile_ok;
 }
 
