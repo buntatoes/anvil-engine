@@ -292,6 +292,40 @@ impl std::fmt::Display for VmError {
     }
 }
 
+/// Builds requests for the C++ VM request protocol. A source that begins with
+/// the magic bytes is read as a request with a header, not as a plain script,
+/// so the existing plain-script callers keep the behaviour they had. This
+/// module is plain safe code; it only lays out bytes.
+mod vm_request {
+    /// Request op: compile and run the payload as a script.
+    pub const OP_RUN: u32 = 1;
+
+    /// The fixed request header: magic, op, flags, and the out-buffer size.
+    fn header(op: u32, flags: u32, out_cap: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(b"AVK1");
+        bytes.extend_from_slice(&op.to_le_bytes());
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.extend_from_slice(&out_cap.to_le_bytes());
+        bytes
+    }
+
+    /// A Run request that asks for an out buffer of `out_cap` bytes.
+    pub fn run_with_cap(source: &[u8], out_cap: u32) -> Vec<u8> {
+        let mut bytes = header(OP_RUN, 0, out_cap);
+        bytes.extend_from_slice(source);
+        bytes
+    }
+
+    /// A Run request sized for the whole telemetry struct.
+    pub fn run(source: &[u8]) -> Vec<u8> {
+        run_with_cap(source, super::DEFAULT_OUT_CAP)
+    }
+}
+
+/// Out-buffer size a request asks for by default: the whole telemetry struct.
+const DEFAULT_OUT_CAP: u32 = std::mem::size_of::<AnvilVmTelemetry>() as u32;
+
 #[cfg(anvil_cpp_jit)]
 unsafe extern "C" {
     fn anvil_cpp_jit_kernel_version() -> u32;
@@ -506,7 +540,31 @@ pub fn eval_cpp_vm_script_checked(source: &str) -> Result<(f64, AnvilVmTelemetry
             message: "empty script".to_string(),
         });
     }
-    match ScriptRuntime::new().try_owned_vm(trimmed) {
+    let request = vm_request::run(trimmed.as_bytes());
+    match ScriptRuntime::new().try_owned_vm(&request) {
+        VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
+        VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
+        VmRun::Rejected(None) => Err(VmError {
+            code: 33,
+            message: "the C++ VM is not available".to_string(),
+        }),
+    }
+}
+
+/// Run `source` through the C++ VM request protocol, asking for an out buffer
+/// of `out_cap` bytes. A buffer too small for the telemetry gives the error
+/// with code 4 and nothing is written. This is how the exchange-buffer path is
+/// exercised; plain-script callers go through [`eval_cpp_vm_script`].
+pub fn eval_cpp_vm_request(source: &str, out_cap: u32) -> Result<(f64, AnvilVmTelemetry), VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let request = vm_request::run_with_cap(trimmed.as_bytes(), out_cap);
+    match ScriptRuntime::new().try_owned_vm(&request) {
         VmRun::Value(result, telemetry) => Ok((result, *telemetry)),
         VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => Err(error),
         VmRun::Rejected(None) => Err(VmError {
@@ -2978,7 +3036,8 @@ impl ScriptRuntime {
             // A VM run has no effect on the page, so a script the VM refuses
             // or stops at a limit runs again from the start on the Rust
             // interpreter. The reason is kept for last_vm_error.
-            match self.try_owned_vm(&cleaned) {
+            let request = vm_request::run(cleaned.trim().as_bytes());
+            match self.try_owned_vm(&request) {
                 VmRun::Value(number, telemetry) => match telemetry.exported_globals() {
                     Ok(globals) => {
                         self.last_script_used_vm = true;
@@ -3061,8 +3120,8 @@ impl ScriptRuntime {
         }
     }
 
-    fn try_owned_vm(&mut self, source: &str) -> VmRun {
-        let trimmed = source.trim();
+    fn try_owned_vm(&mut self, request: &[u8]) -> VmRun {
+        let trimmed = request;
         if trimmed.is_empty() || trimmed.len() > u32::MAX as usize {
             return VmRun::Rejected(None);
         }
@@ -3092,6 +3151,16 @@ impl ScriptRuntime {
             match code {
                 1 => VmRun::Value(result, Box::new(telemetry)),
                 2 => VmRun::Stopped(reason()),
+                // Reserved for host calls, which aren't supported yet.
+                3 => VmRun::Stopped(VmError {
+                    code: 3,
+                    message: "stopped for a host call".to_string(),
+                }),
+                // The out buffer was too small; nothing was written.
+                4 => VmRun::Rejected(Some(VmError {
+                    code: 4,
+                    message: "out buffer too small".to_string(),
+                })),
                 _ => VmRun::Rejected(Some(reason())),
             }
         }

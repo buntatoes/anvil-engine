@@ -12,6 +12,35 @@ namespace anvil_vm {
 
 namespace {
 
+// Status codes returned by anvil_cpp_vm_run_script. 0 refused, 1 ran, 2
+// stopped at a limit. A request (below) can also return 3 (stopped for a
+// host call, reserved for later use) and 4 (the caller's out buffer
+// was too small, so nothing was written).
+constexpr u32 VM_RUN_REFUSED       = 0u;
+constexpr u32 VM_RUN_OK            = 1u;
+constexpr u32 VM_RUN_STOPPED       = 2u;
+constexpr u32 VM_RUN_HOST_CALL     = 3u;
+constexpr u32 VM_RUN_BUFFER_SMALL  = 4u;
+
+// A source that begins with these four bytes is a request with a header,
+// not a plain script. A plain script never starts with them, so every
+// existing caller keeps the behaviour it had.
+constexpr u32 AVK_HEADER_BYTES = 16u;
+constexpr u32 AVK_OP_RUN       = 1u;
+constexpr u32 AVK_OP_CONFIGURE = 2u;
+
+inline bool has_request_magic(const char* s, u32 n) noexcept {
+    return s && n >= 4u && s[0] == 'A' && s[1] == 'V' && s[2] == 'K' && s[3] == '1';
+}
+
+inline u32 read_u32_le(const char* p) noexcept {
+    return static_cast<u32>(static_cast<u8>(p[0])) |
+           (static_cast<u32>(static_cast<u8>(p[1])) << 8) |
+           (static_cast<u32>(static_cast<u8>(p[2])) << 16) |
+           (static_cast<u32>(static_cast<u8>(p[3])) << 24);
+}
+
+
 // Values whose as_number() is what JavaScript's ToNumber gives.
 inline bool numeric_operand(AnvilValue v) noexcept {
     return v.is_number() || v.is_bool() || v.is_null() || v.is_undefined();
@@ -803,9 +832,79 @@ extern "C" void anvil_cpp_vm_set_text_host(
     g_text_host = host;
 }
 
+// Compile and run plain script text in the caller-owned context, filling the
+// telemetry and numeric result. Shared by the plain path and the Run request.
+static u32 run_script_text(
+    anvil_vm::AnvilVmContext& ctx,
+    void* compiler_memory,
+    const char* script,
+    u32 script_len,
+    anvil_vm::AnvilVmTelemetryC* telemetry_out,
+    f64* numeric_result_out
+) noexcept {
+    // The telemetry also carries the reason when the script is refused.
+    if (!compiler_memory || !script || script_len == 0u) {
+        ctx.fail(anvil_vm::VM_REFUSE_SYNTAX, "empty script");
+        ctx.fill_telemetry(telemetry_out);
+        return anvil_vm::VM_RUN_REFUSED;
+    }
+    ctx.host_set_text = g_text_host_fn;
+    ctx.host = g_text_host;
+    if (!anvil_vm::compile_js_to_bytecode(ctx, compiler_memory, script, script_len)) {
+        ctx.fill_telemetry(telemetry_out);
+        return anvil_vm::VM_RUN_REFUSED;
+    }
+    const anvil_vm::AnvilValue res = ctx.execute(0u);
+    if (telemetry_out) {
+        ctx.fill_telemetry(telemetry_out);
+    }
+    if (numeric_result_out) {
+        *numeric_result_out = res.as_number();
+    }
+    return ctx.aborted ? anvil_vm::VM_RUN_STOPPED : anvil_vm::VM_RUN_OK;
+}
+
+// Handle a source that carries a request header:
+//     "AVK1" | op u32 | flags u32 | out_cap u32 | payload
+// The out buffer is the telemetry pointer. When it is smaller than the
+// telemetry needs, nothing is written and the status is 4, so the caller can
+// grow the buffer and ask again.
+static u32 run_request(
+    anvil_vm::AnvilVmContext& ctx,
+    void* compiler_memory,
+    const char* src,
+    u32 len,
+    anvil_vm::AnvilVmTelemetryC* telemetry_out,
+    f64* numeric_result_out
+) noexcept {
+    if (len < anvil_vm::AVK_HEADER_BYTES) {
+        ctx.fail(anvil_vm::VM_REFUSE_SYNTAX, "request header too short");
+        ctx.fill_telemetry(telemetry_out);
+        return anvil_vm::VM_RUN_REFUSED;
+    }
+    const u32 op = anvil_vm::read_u32_le(src + 4);
+    const u32 out_cap = anvil_vm::read_u32_le(src + 12);
+    // The out buffer must hold the whole telemetry struct. When it does not,
+    // write nothing and let the caller send a bigger one.
+    if (telemetry_out && out_cap < static_cast<u32>(sizeof(anvil_vm::AnvilVmTelemetryC))) {
+        return anvil_vm::VM_RUN_BUFFER_SMALL;
+    }
+    const u32 pos = anvil_vm::AVK_HEADER_BYTES;
+    if (op == anvil_vm::AVK_OP_RUN) {
+        return run_script_text(
+            ctx, compiler_memory, src + pos, len - pos, telemetry_out, numeric_result_out
+        );
+    }
+    // Any other op is not supported yet.
+    ctx.fail(anvil_vm::VM_REFUSE_UNSUPPORTED, "unsupported request op");
+    ctx.fill_telemetry(telemetry_out);
+    return anvil_vm::VM_RUN_REFUSED;
+}
+
 // Compile and execute a JavaScript snippet inside the caller-owned `AnvilVmContext`.
-// Returns 1 when the numeric result is valid, 2 when the compiler accepted the
-// script and execution aborted, and 0 when the compiler rejected it.
+// A plain script returns 1 (ran), 2 (accepted then stopped) or 0 (refused). A
+// source that starts with the request magic is read as a request instead and
+// can also return 3 or 4 (see run_request).
 // This is not a general compiler.
 u32 anvil_cpp_vm_run_script(
     void* context_memory,
@@ -820,29 +919,14 @@ u32 anvil_cpp_vm_run_script(
     }
     auto& ctx = *static_cast<anvil_vm::AnvilVmContext*>(context_memory);
     ctx.init();
-    // The telemetry also carries the reason when the script is refused.
-    if (!compiler_memory || !source_ptr || source_len == 0u) {
-        ctx.fail(anvil_vm::VM_REFUSE_SYNTAX, "empty script");
-        ctx.fill_telemetry(telemetry_out);
-        return 0u;
+    if (anvil_vm::has_request_magic(source_ptr, source_len)) {
+        return run_request(
+            ctx, compiler_memory, source_ptr, source_len, telemetry_out, numeric_result_out
+        );
     }
-    ctx.host_set_text = g_text_host_fn;
-    ctx.host = g_text_host;
-    if (!anvil_vm::compile_js_to_bytecode(ctx, compiler_memory, source_ptr, source_len)) {
-        ctx.fill_telemetry(telemetry_out);
-        return 0u;
-    }
-    const anvil_vm::AnvilValue res = ctx.execute(0u);
-    if (telemetry_out) {
-        ctx.fill_telemetry(telemetry_out);
-    }
-    if (numeric_result_out) {
-        *numeric_result_out = res.as_number();
-    }
-    if (ctx.aborted) {
-        return 2u;
-    }
-    return 1u;
+    return run_script_text(
+        ctx, compiler_memory, source_ptr, source_len, telemetry_out, numeric_result_out
+    );
 }
 
 // Copy one numeric global out of a context left by anvil_cpp_vm_run_script.
