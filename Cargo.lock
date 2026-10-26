@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "anvil-compress"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "anvil-dom"
@@ -12,18 +12,18 @@ version = "0.23.2"
 
 [[package]]
 name = "anvil-gpu"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "anvil-image"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anvil-compress",
 ]
 
 [[package]]
 name = "anvil-json"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "anvil-layout"
@@ -72,4 +72,4 @@ dependencies = [
 
 [[package]]
 name = "anvil-ttf"
-version = "0.8.0"
+version = "0.8.1"
