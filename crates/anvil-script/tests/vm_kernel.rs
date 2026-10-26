@@ -184,3 +184,76 @@ fn a_generous_heap_budget_runs_normally() {
     .expect("runs on a large budget");
     assert_eq!(value, 3.0);
 }
+
+/// A 100,000-element array, built by index. The old storage capped arrays at
+/// 256 elements and 2,048 elements of storage in all; now they grow in the
+/// arena. The step budget is raised so the loop itself is not what stops.
+#[test]
+fn a_100k_element_array_grows_in_the_arena() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "const a = []; let i = 0; while (i < 100000) { a[i] = i; i = i + 1; } \
+                  let r = a[99999] + a[0] + a.length; r;";
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, source).expect("runs");
+    assert_eq!(value, 199_999.0);
+}
+
+/// Far more live arrays than the old 256-array table held.
+#[test]
+fn many_live_arrays_past_the_old_table() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "let holder = []; let i = 0; \
+                  while (i < 2000) { holder.push([i, i + 1]); i = i + 1; } \
+                  let r = holder.length + holder[1999][1]; r;";
+    let (value, _) = eval_cpp_vm_script(source).expect("runs");
+    assert_eq!(value, 4000.0);
+}
+
+/// Pushing past the old per-array length cap of 256.
+#[test]
+fn an_array_grows_past_the_old_length_cap() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "const a = []; let i = 0; \
+                  while (i < 5000) { a.push(i * 2); i = i + 1; } \
+                  let r = a[4999] + a.length; r;";
+    let (value, _) = eval_cpp_vm_script(source).expect("runs");
+    assert_eq!(value, 14998.0);
+}
+
+/// GC keeps the arrays a global still points at, and reclaims the rest, while
+/// the surviving array's contents stay intact across many collections.
+#[test]
+fn gc_keeps_reachable_arrays_through_churn() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // `keep` survives; the array made each iteration becomes garbage. A small
+    // byte budget forces the heap to collect and compact mid-run, which must
+    // not disturb `keep`.
+    let source = "const keep = [11, 22, 33]; let i = 0; \
+                  while (i < 4000) { const junk = [i, i, i, i, i, i, i, i]; junk[0] = i; i = i + 1; } \
+                  let r = keep[0] + keep[1] + keep[2] + keep.length; r;";
+    let (value, telemetry) =
+        anvil_script::eval_cpp_vm_request_tuned(5_000_000, 64 * 1024, source).expect("runs");
+    assert_eq!(value, 69.0);
+    // The churn forced at least one collection.
+    assert!(telemetry.gc_collections >= 1);
+}
+
+/// A tiny heap budget stops a growing array with the heap limit, naming the
+/// budget, instead of any fixed array cap.
+#[test]
+fn a_small_budget_stops_a_growing_array() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // 32 KiB holds far fewer than 100,000 eight-byte values.
+    let source = "const a = []; let i = 0; while (i < 100000) { a[i] = i; i = i + 1; } 1;";
+    let error = anvil_script::eval_cpp_vm_request_heap_budget(32 * 1024, source).unwrap_err();
+    assert_eq!(error.message, "heap limit reached: 32768 bytes");
+}

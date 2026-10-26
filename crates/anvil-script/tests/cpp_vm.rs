@@ -130,7 +130,7 @@ fn run_limits_stop_with_a_reason() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let cases: [(&str, u32, &str); 8] = [
+    let cases: [(&str, u32, &str); 5] = [
         (
             // Numeric, so the native loop counts the steps.
             "let i = 0; while (i < 1000000) { i = i + 1; } i;",
@@ -151,22 +151,6 @@ fn run_limits_stop_with_a_reason() {
             "let head = null; let i = 0; while (i < 600) { head = {next: head}; i = i + 1; } 1;",
             3,
             "object limit reached: 512 live objects",
-        ),
-        (
-            "let head = null; let i = 0; while (i < 300) { head = [head]; i = i + 1; } 1;",
-            4,
-            "array limit reached: 256 live arrays",
-        ),
-        (
-            "let k = [[], [], [], [], [], [], [], [], [], [], []]; let i = 0; \
-             while (i < 200) { let j = 0; while (j < 11) { k[j][i] = i; j = j + 1; } i = i + 1; } 1;",
-            5,
-            "array storage limit reached: 2048 elements",
-        ),
-        (
-            "let a = []; let i = 0; while (i < 300) { a[i] = i; i = i + 1; } 1;",
-            6,
-            "array length limit reached: 256 elements per array",
         ),
         (
             "let i = 0; while (i < 512) { let o = {}; \

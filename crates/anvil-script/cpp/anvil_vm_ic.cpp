@@ -57,14 +57,14 @@ AnvilValue AnvilIcTable::load_property_ic(
     // Array `.length` fast-path check.
     if (receiver.is_array()) {
         const u32 arr_id = receiver.payload();
-        if (arr_id < MAX_HEAP_ARRAYS && heap.arrays[arr_id].active) {
+        if (arr_id < heap.array_count && heap.arrays()[arr_id].active) {
             u32 str_len = 0u;
             const char* name = heap.get_string_ptr(prop_sym, &str_len);
             if (str_len == 6u &&
                 name[0] == 'l' && name[1] == 'e' && name[2] == 'n' &&
                 name[3] == 'g' && name[4] == 't' && name[5] == 'h') {
                 ++ic_hits;
-                return AnvilValue::make_smi(static_cast<i32>(heap.arrays[arr_id].length));
+                return AnvilValue::make_smi(static_cast<i32>(heap.arrays()[arr_id].length));
             }
         }
         return AnvilValue::make_undefined();

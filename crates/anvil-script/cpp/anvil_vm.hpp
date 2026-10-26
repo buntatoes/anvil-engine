@@ -48,9 +48,6 @@ constexpr u32 MAX_SHAPES                = 256u;
 constexpr u32 MAX_SHAPE_PROPS           = 32u;
 constexpr u32 MAX_SHAPE_TRANSITIONS     = 512u;
 constexpr u32 MAX_HEAP_OBJECTS          = 512u;
-constexpr u32 MAX_HEAP_ARRAYS           = 256u;
-constexpr u32 MAX_ARRAY_ELEMENTS        = 2048u;
-constexpr u32 MAX_ARRAY_LENGTH          = 256u;
 // Calls nest until the frame stack or the register file runs out.
 constexpr u32 MAX_CALL_DEPTH =
     (MAX_CALL_FRAMES - 1u) < (MAX_TOTAL_REGISTERS / MAX_REGISTERS_PER_FRAME - 1u)
@@ -158,6 +155,8 @@ enum class StoreResult : u32 {
     ShapesFull = 3u,
     ArrayTooLong = 4u,
     ArrayStorageFull = 5u,
+    // The arena ran out within the byte budget while growing storage.
+    HeapFull = 6u,
 };
 
 // ============================================================================
@@ -654,13 +653,36 @@ struct AnvilHeap {
     AnvilShapeTransition transitions[MAX_SHAPE_TRANSITIONS];
     u32 transition_count;
 
-    // GC-managed objects, arrays, and functions
+    // GC-managed objects and functions (still fixed for now).
     AnvilHeapObject objects[MAX_HEAP_OBJECTS];
-    AnvilHeapArray arrays[MAX_HEAP_ARRAYS];
-    AnvilValue array_storage[MAX_ARRAY_ELEMENTS];
-    u32 array_storage_used;
     AnvilHeapFunction functions[MAX_FUNCTIONS];
     u32 function_count;
+
+    // Arrays and their element storage live in the arena and grow as needed,
+    // so neither the number of arrays nor their length is capped any more.
+    // Element slices are offsets into array_storage; array_storage itself moves
+    // as a whole when it grows, so the slice offsets stay valid.
+    u32 arrays_off;
+    u32 arrays_cap;
+    u32 array_count;
+    u32 array_storage_off;
+    u32 array_storage_cap;
+    u32 array_storage_used;
+
+    AnvilHeapArray* arrays() noexcept {
+        return reinterpret_cast<AnvilHeapArray*>(arena.at(arrays_off));
+    }
+    const AnvilHeapArray* arrays() const noexcept {
+        return reinterpret_cast<const AnvilHeapArray*>(arena.at(arrays_off));
+    }
+    AnvilValue* array_storage() noexcept {
+        return reinterpret_cast<AnvilValue*>(arena.at(array_storage_off));
+    }
+    const AnvilValue* array_storage() const noexcept {
+        return reinterpret_cast<const AnvilValue*>(arena.at(array_storage_off));
+    }
+    bool ensure_arrays(u32 need) noexcept;
+    bool ensure_array_storage(u32 need) noexcept;
 
     // Heap & GC telemetry
     u32 live_objects;

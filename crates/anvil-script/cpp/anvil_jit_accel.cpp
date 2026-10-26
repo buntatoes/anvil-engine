@@ -194,10 +194,11 @@ bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
             fail_limit(VM_STOP_SHAPES, "shape", MAX_SHAPES, "shapes");
             return false;
         case StoreResult::ArrayTooLong:
-            fail_limit(VM_STOP_ARRAY_LENGTH, "array length", MAX_ARRAY_LENGTH, "elements per array");
-            return false;
         case StoreResult::ArrayStorageFull:
-            fail_limit(VM_STOP_ARRAY_STORAGE, "array storage", MAX_ARRAY_ELEMENTS, "elements");
+        case StoreResult::HeapFull:
+            // Arrays grow in the arena now, so these only arise when the arena
+            // hits the byte budget.
+            fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
             return false;
         case StoreResult::NotStored:
             fail(VM_STOP_UNSUPPORTED, "property write on a value that is not an object");
@@ -471,20 +472,14 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
             }
 
             case AnvilOpcode::NewArray: {
-                if (heap.live_arrays + 4u >= MAX_HEAP_ARRAYS) {
-                    collect_garbage(reg_base + MAX_REGISTERS_PER_FRAME);
-                }
                 u32 arr_id = heap.alloc_array(inst.b);
                 if (arr_id == NO_SLOT) {
+                    // Reclaim dead arrays and old slices, then try once more.
                     reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
                     arr_id = heap.alloc_array(inst.b);
                 }
                 if (arr_id == NO_SLOT) {
-                    if (heap.live_arrays >= MAX_HEAP_ARRAYS) {
-                        fail_limit(VM_STOP_ARRAYS, "array", MAX_HEAP_ARRAYS, "live arrays");
-                    } else {
-                        fail_limit(VM_STOP_ARRAY_STORAGE, "array storage", MAX_ARRAY_ELEMENTS, "elements");
-                    }
+                    fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
                     return AnvilValue::make_undefined();
                 }
                 R[inst.a] = AnvilValue::make_array(arr_id);
@@ -532,7 +527,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 }
                 {
                     StoreResult stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
-                    if (stored == StoreResult::ArrayStorageFull) {
+                    if (stored == StoreResult::HeapFull) {
                         reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
                         stored = heap.set_array_elem(recv.payload(), idx, R[inst.c]);
                     }
@@ -551,7 +546,7 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
                 }
                 {
                     StoreResult stored = heap.push_array_elem(recv.payload(), R[inst.b]);
-                    if (stored == StoreResult::ArrayStorageFull) {
+                    if (stored == StoreResult::HeapFull) {
                         reclaim_array_storage(reg_base + MAX_REGISTERS_PER_FRAME);
                         stored = heap.push_array_elem(recv.payload(), R[inst.b]);
                     }
