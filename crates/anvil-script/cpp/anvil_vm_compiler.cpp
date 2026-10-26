@@ -670,12 +670,12 @@ struct AnvilCompiler {
         const u16 break_pc = static_cast<u16>(ctx->program.code_len);
         for (u32 i = 0u; i < jumps.break_count && i < MAX_LOOP_JUMPS; ++i) {
             if (jumps.breaks[i] < ctx->program.code_len) {
-                ctx->program.code[jumps.breaks[i]] = AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, break_pc);
+                ctx->program.code()[jumps.breaks[i]] = AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, break_pc);
             }
         }
         for (u32 i = 0u; i < jumps.continue_count && i < MAX_LOOP_JUMPS; ++i) {
             if (jumps.continues[i] < ctx->program.code_len) {
-                ctx->program.code[jumps.continues[i]] =
+                ctx->program.code()[jumps.continues[i]] =
                     AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(continue_pc));
             }
         }
@@ -1317,7 +1317,7 @@ struct AnvilCompiler {
             ));
             const u8 rhs = compile_bitwise();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, rhs, 0u));
-            ctx->program.code[patch_pc] = AnvilInstruction::make_abx(
+            ctx->program.code()[patch_pc] = AnvilInstruction::make_abx(
                 is_and ? AnvilOpcode::JumpIfFalse : AnvilOpcode::JumpIfTrue,
                 dst,
                 static_cast<u16>(ctx->program.code_len)
@@ -1338,14 +1338,14 @@ struct AnvilCompiler {
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, then_reg, 0u));
             const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
             expect(TokenKind::Colon);
-            ctx->program.code[jfalse_pc] = AnvilInstruction::make_abx(
+            ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::JumpIfFalse,
                 cond_or_val,
                 static_cast<u16>(ctx->program.code_len)
             );
             const u8 else_reg = compile_expr();
             ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, else_reg, 0u));
-            ctx->program.code[jend_pc] = AnvilInstruction::make_abx(
+            ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
                 static_cast<u16>(ctx->program.code_len)
@@ -1470,19 +1470,19 @@ struct AnvilCompiler {
             u8 last_reg = compile_statement();
             if (match(TokenKind::KwElse)) {
                 const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
-                ctx->program.code[jfalse_pc] = AnvilInstruction::make_abx(
+                ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::JumpIfFalse,
                     cond_reg,
                     static_cast<u16>(ctx->program.code_len)
                 );
                 last_reg = compile_statement();
-                ctx->program.code[jend_pc] = AnvilInstruction::make_abx(
+                ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::Jump,
                     0u,
                     static_cast<u16>(ctx->program.code_len)
                 );
             } else {
-                ctx->program.code[jfalse_pc] = AnvilInstruction::make_abx(
+                ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::JumpIfFalse,
                     cond_reg,
                     static_cast<u16>(ctx->program.code_len)
@@ -1553,7 +1553,7 @@ struct AnvilCompiler {
                 0u,
                 static_cast<u16>(loop_head_pc)
             ));
-            ctx->program.code[jexit_pc] = AnvilInstruction::make_abx(
+            ctx->program.code()[jexit_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::JumpIfFalse,
                 cond_reg,
                 static_cast<u16>(ctx->program.code_len)
@@ -1596,7 +1596,7 @@ struct AnvilCompiler {
             expect(TokenKind::RParen);
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(cond_pc)));
 
-            ctx->program.code[jbody_pc] = AnvilInstruction::make_abx(
+            ctx->program.code()[jbody_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
                 static_cast<u16>(ctx->program.code_len)
@@ -1608,7 +1608,7 @@ struct AnvilCompiler {
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, static_cast<u16>(step_pc)));
 
             if (has_cond) {
-                ctx->program.code[jexit_pc] = AnvilInstruction::make_abx(
+                ctx->program.code()[jexit_pc] = AnvilInstruction::make_abx(
                     AnvilOpcode::JumpIfFalse,
                     cond_reg,
                     static_cast<u16>(ctx->program.code_len)
@@ -1678,7 +1678,7 @@ struct AnvilCompiler {
                 ctx->heap.functions()[fn_id].local_count = high_reg;
                 ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
             }
-            ctx->program.code[jskip_pc] = AnvilInstruction::make_abx(
+            ctx->program.code()[jskip_pc] = AnvilInstruction::make_abx(
                 AnvilOpcode::Jump,
                 0u,
                 static_cast<u16>(ctx->program.code_len)
@@ -1839,7 +1839,7 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
         if (ctx.program.overflow == VM_REFUSE_CONSTANTS) {
             ctx.fail_limit(VM_REFUSE_HEAP, "heap", ctx.heap.arena.budget, "bytes");
         } else {
-            ctx.fail_limit(VM_REFUSE_CODE_SIZE, "code size", MAX_BYTECODE_INSTRUCTIONS, "instructions");
+            ctx.fail_limit(VM_REFUSE_CODE_SIZE, "code size", ANVIL_MAX_PROGRAM_INSTRUCTIONS, "instructions");
         }
     }
     // A global no top-level declaration gave a value belongs to another

@@ -51,7 +51,15 @@ constexpr u32 ANVIL_DEFAULT_CALL_DEPTH  = 10000u;
 // may hold. Shapes, the transition table and the object table all grow in the
 // arena, so their counts are bounded only by the byte budget.
 constexpr u32 DICT_THRESHOLD            = 64u;
+// The numeric JIT's fixed assembler buffers are sized to this, and it declines
+// a program longer than this (the interpreter runs it instead).
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
+// The interpreter's bytecode grows in the arena, so a program is no longer
+// capped at a small fixed array. The ceiling is the 16-bit jump field: a jump
+// target must fit in it until the wider encoding lands.
+constexpr u32 ANVIL_MAX_PROGRAM_INSTRUCTIONS = 65535u;
+// Instructions the code block holds to start with; it doubles from here.
+constexpr u32 INIT_CODE_BUFFER = 256u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
 
@@ -979,7 +987,10 @@ struct AnvilCallFrame {
 };
 
 struct AnvilBytecodeProgram {
-    AnvilInstruction code[MAX_BYTECODE_INSTRUCTIONS];
+    // The bytecode is a block in the shared arena (like the constant pool),
+    // grown as the compiler emits. `code_off` is its offset; `code()` reaches it.
+    u32 code_off;
+    u32 code_cap;
     u32 code_len;
     // The constant pool grows in the shared arena; `arena` points at it, set by
     // init() each run (like the heap's own base pointer).
@@ -1000,8 +1011,47 @@ struct AnvilBytecodeProgram {
     }
     bool ensure_constants(u32 need) noexcept;
 
+    AnvilInstruction* code() noexcept {
+        return reinterpret_cast<AnvilInstruction*>(arena->at(code_off));
+    }
+    const AnvilInstruction* code() const noexcept {
+        return reinterpret_cast<const AnvilInstruction*>(arena->at(code_off));
+    }
+    // Grow the code block to hold at least `need` instructions, copying what is
+    // there and returning the old block to the free list. False when the arena
+    // cannot grow any further.
+    bool ensure_code(u32 need) noexcept {
+        if (need <= code_cap) {
+            return true;
+        }
+        u32 new_cap = code_cap == 0u ? INIT_CODE_BUFFER : code_cap;
+        while (new_cap < need) {
+            new_cap *= 2u;
+        }
+        bool over = false;
+        const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(AnvilInstruction)), &over);
+        if (new_off == NO_SLOT) {
+            return false;
+        }
+        AnvilInstruction* dst = reinterpret_cast<AnvilInstruction*>(arena->at(new_off));
+        const AnvilInstruction* old = code();
+        for (u32 i = 0u; i < code_len; ++i) {
+            dst[i] = old[i];
+        }
+        const u32 old_off = code_off;
+        const u32 old_cap = code_cap;
+        code_off = new_off;
+        code_cap = new_cap;
+        if (old_cap != 0u) {
+            arena->free(old_off, old_cap * static_cast<u32>(sizeof(AnvilInstruction)));
+        }
+        return true;
+    }
+
     void init(AnvilArena* a) noexcept {
         arena = a;
+        code_off = 0u;
+        code_cap = 0u;
         code_len = 0u;
         constants_off = 0u;
         constants_cap = 0u;
@@ -1014,7 +1064,7 @@ struct AnvilBytecodeProgram {
     }
 
     u32 emit(AnvilInstruction inst) noexcept {
-        if (code_len >= MAX_BYTECODE_INSTRUCTIONS) {
+        if (code_len >= ANVIL_MAX_PROGRAM_INSTRUCTIONS || !ensure_code(code_len + 1u)) {
             if (compile_ok) {
                 overflow = VM_REFUSE_CODE_SIZE;
             }
@@ -1022,7 +1072,7 @@ struct AnvilBytecodeProgram {
             return 0u;
         }
         const u32 idx = code_len++;
-        code[idx] = inst;
+        code()[idx] = inst;
         return idx;
     }
 

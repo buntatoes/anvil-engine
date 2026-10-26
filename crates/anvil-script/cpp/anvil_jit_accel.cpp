@@ -387,7 +387,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base) noexcept {
             return AnvilValue::make_undefined();
         }
 
-        const AnvilInstruction inst = program.code[pc++];
+        const AnvilInstruction inst = program.code()[pc++];
         AnvilValue* R = &registers()[reg_base];
 
         // Strings and objects in arithmetic or ordering need conversions

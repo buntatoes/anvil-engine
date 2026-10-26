@@ -585,3 +585,24 @@ fn a_script_past_the_old_token_cap_compiles() {
         .expect("compiles and runs past the old token cap");
     assert_eq!(value, 500.0);
 }
+
+// ---- The bytecode grows in the arena -------------------------------------
+
+/// A 2,000-statement script compiles and runs. Each statement emits several
+/// instructions, so this is well past the old 4,096-instruction array; the
+/// bytecode now grows in the arena. It is also too long for the numeric JIT, so
+/// it runs on the interpreter.
+#[test]
+fn a_2000_statement_script_compiles() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let mut source = String::from("let s = 0; ");
+    for _ in 0..2000 {
+        source.push_str("s = s + 1; ");
+    }
+    source.push_str("s;");
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
+        .expect("compiles past the old instruction cap");
+    assert_eq!(value, 2000.0);
+}

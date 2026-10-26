@@ -340,8 +340,13 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
     if (program.code_len == 0u || !program.compile_ok) {
         return false;
     }
+    // The JIT's assembler buffers are fixed; a longer program runs on the
+    // interpreter, which grows its bytecode in the arena.
+    if (program.code_len > MAX_BYTECODE_INSTRUCTIONS) {
+        return false;
+    }
     for (u32 i = 0u; i < program.code_len; ++i) {
-        const AnvilInstruction inst = program.code[i];
+        const AnvilInstruction inst = program.code()[i];
         if (!opcode_supported(inst.op)) {
             return false;
         }
@@ -375,7 +380,7 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
             if (i + 1u >= program.code_len) {
                 return false;
             }
-            const AnvilInstruction next = program.code[i + 1u];
+            const AnvilInstruction next = program.code()[i + 1u];
             const bool jump = next.op == AnvilOpcode::JumpIfFalse || next.op == AnvilOpcode::JumpIfTrue;
             if (!jump || next.a != inst.a) {
                 return false;
@@ -574,7 +579,7 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
 
     for (u32 pc = 0u; ok && pc < ctx->program.code_len; ++pc) {
         as.pc_at[pc] = page.length;
-        const AnvilInstruction inst = ctx->program.code[pc];
+        const AnvilInstruction inst = ctx->program.code()[pc];
         ok = ok && as.step_or_abort(step_fn);
         switch (inst.op) {
             case AnvilOpcode::Nop:
