@@ -83,6 +83,29 @@ fn objects_held_only_by_top_level_variables_survive_collection() {
 fn console_log_is_not_dropped() {
     let rt = page("let x = 1; console.log(x);");
     assert_eq!(rt.console_logs(), ["1"]);
+    // console.log of a number now runs on the C++ VM when it is linked.
+    assert_eq!(rt.last_script_used_vm(), is_cpp_jit_kernel_active());
+}
+
+#[test]
+fn a_page_runs_a_console_log_script_on_the_vm() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let rt = page("for (let i = 0; i < 3; i++) { console.log(i * i); }");
+    assert_eq!(rt.console_logs(), ["0", "1", "4"]);
+    assert!(rt.last_script_used_vm());
+}
+
+#[test]
+fn a_page_console_log_of_a_string_falls_back_to_the_interpreter() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Strings are not supported on the VM yet, so the script runs on the Rust
+    // interpreter instead -- and its one line is printed just once.
+    let rt = page("console.log(\"hi\"); console.log(7);");
+    assert_eq!(rt.console_logs(), ["hi", "7"]);
     assert!(!rt.last_script_used_vm());
 }
 

@@ -3462,13 +3462,18 @@ impl ScriptRuntime {
         if !self.in_rust_eval && !script_stays_on_rust(&cleaned) {
             // A VM run has no effect on the page, so a script the VM refuses
             // or stops at a limit runs again from the start on the Rust
-            // interpreter. The reason is kept for last_vm_error.
-            let request = vm_request::run(cleaned.trim().as_bytes());
-            match self.try_owned_vm(&request) {
-                VmRun::Value(number, telemetry) => match telemetry.exported_globals() {
+            // interpreter. The reason is kept for last_vm_error. The run also
+            // services console.log host calls and collects their output; that
+            // output is only committed once the whole script ran on the VM, so
+            // a fallback to the interpreter never double-prints a line.
+            match self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0) {
+                Ok(run) => match run.telemetry.exported_globals() {
                     Ok(globals) => {
                         self.last_script_used_vm = true;
-                        self.last_vm_number = Some(number);
+                        self.last_vm_number = Some(run.result);
+                        for line in run.output {
+                            self.push_console(line);
+                        }
                         // Later scripts see the top-level variables and the
                         // functions this one declared.
                         for (name, value) in globals {
@@ -3488,10 +3493,10 @@ impl ScriptRuntime {
                         self.last_vm_error = Some(VmError { code: 33, message });
                     }
                 },
-                VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => {
+                Err(error) if error.code == 33 && error.message.contains("not available") => {}
+                Err(error) => {
                     self.last_vm_error = Some(error);
                 }
-                VmRun::Rejected(None) => {}
             }
         }
         let outer = self.in_rust_eval;
