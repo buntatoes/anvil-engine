@@ -399,6 +399,54 @@ fn closures_capture_the_enclosing_scope() {
 }
 
 #[test]
+fn each_loop_iteration_gives_a_closure_its_own_let() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Top-level loop: three arrows each capture their own `i`.
+    assert_eq!(
+        cpp(
+            "const fs = []; for (let i = 0; i < 3; i++) { fs.push(() => i); }              fs[0]() + fs[1]() + fs[2]();"
+        ),
+        Some(3.0)
+    );
+    // The same inside a function, captured by a nested function declaration.
+    assert_eq!(
+        cpp(
+            "function f() { let fs = []; for (let i = 0; i < 4; i = i + 1) {              fs.push(function () { return i; }); } let s = 0;              for (let j = 0; j < 4; j = j + 1) { let c = fs[j]; s = s + c(); } return s; } f();"
+        ),
+        Some(6.0)
+    );
+    // A plain counting loop is unaffected.
+    assert_eq!(
+        cpp("let s = 0; for (let i = 0; i < 100; i = i + 1) { s = s + i; } s;"),
+        Some(4950.0)
+    );
+}
+
+#[test]
+fn a_closure_calls_through_an_array_element() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(
+        cpp("let fs = []; fs.push(function () { return 7; }); fs[0]();"),
+        Some(7.0)
+    );
+}
+
+#[test]
+fn a_top_level_block_scoped_let_is_captured() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(
+        cpp("let g; if (1) { let x = 7; g = () => x; } g();"),
+        Some(7.0)
+    );
+}
+
+#[test]
 fn a_non_capturing_function_is_the_same_value_each_time() {
     if !is_cpp_jit_kernel_active() {
         return;

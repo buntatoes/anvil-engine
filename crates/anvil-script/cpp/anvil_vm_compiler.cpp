@@ -1735,10 +1735,6 @@ struct AnvilCompiler {
                     cur = rhs;
                     continue;
                 }
-                if (peek().kind == TokenKind::LParen) {
-                    reject_here(VM_REFUSE_UNSUPPORTED, "unsupported call through an element");
-                    break;
-                }
                 const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, dst, cur, idx_reg));
                 cur = dst;
@@ -2028,6 +2024,25 @@ struct AnvilCompiler {
                 return 0u;
             }
             if (!in_function) {
+                // A block-scoped top-level `let`/`const` in a script that has
+                // closures lives in a heap cell local, so a closure can capture
+                // it (and a per-iteration loop `let` gives each closure its own
+                // binding). Top-level (block_depth 0) names stay in global slots
+                // so later scripts and `var`s still see them.
+                if (fn_uses_cells && block_depth > 0u && !is_var) {
+                    const u16 dst = declare_local(sym);
+                    if (match(TokenKind::Assign)) {
+                        const u16 v = compile_expr();
+                        reject_if_expression_continues();
+                        init_local(dst, true, v);
+                    } else {
+                        const u16 u = alloc_reg();
+                        emit_load_undefined(u);
+                        init_local(dst, true, u);
+                    }
+                    match(TokenKind::Semicolon);
+                    return dst;
+                }
                 // A top-level name lives only in its global slot, so a
                 // function that reads or writes it sees the same value as
                 // the top-level code does.
@@ -2206,9 +2221,11 @@ struct AnvilCompiler {
             // A `let` in the header belongs to the loop.
             const BlockScope scope(block_depth);
             expect(TokenKind::LParen);
+            const u32 loop_locals_start = local_count;
             if (!match(TokenKind::Semicolon)) {
                 compile_statement();
             }
+            const u32 loop_locals_end = local_count;
             const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
             const u32 cond_pc = ctx->program.code_len;
             ctx->program.emit(AnvilInstruction::make_abc(
@@ -2230,6 +2247,18 @@ struct AnvilCompiler {
             const u32 jbody_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
 
             const u32 step_pc = ctx->program.code_len;
+            // Per-iteration `let`: before the increment (which the first
+            // iteration skips), rebind each captured loop variable to a fresh
+            // cell holding its current value, so a closure made in the body
+            // keeps that iteration's value rather than sharing one cell.
+            for (u32 i = loop_locals_start; i < loop_locals_end; ++i) {
+                if (locals()[i].is_cell) {
+                    const u16 reg = locals()[i].reg;
+                    const u16 tmp = alloc_reg();
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CellGet, tmp, reg, 0u));
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, reg, tmp, 0u));
+                }
+            }
             if (peek().kind != TokenKind::RParen) {
                 compile_statement_or_assign_no_semi();
             }
@@ -2514,6 +2543,17 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
         return false;
     }
     g_compiler.hoist_functions();
+
+    // Top-level block-scoped `let`s that a closure captures must live in heap
+    // cells, not global slots, so each is reachable as an upvalue. Only when the
+    // script contains a function or arrow does the top level use cells.
+    for (u32 ti = 0u; ti < g_compiler.lexer.count; ++ti) {
+        const TokenKind tk = g_compiler.lexer.tokens()[ti].kind;
+        if (tk == TokenKind::KwFunction || tk == TokenKind::FatArrow) {
+            g_compiler.fn_uses_cells = true;
+            break;
+        }
+    }
 
     u16 last_reg = 0u;
     while (g_compiler.peek().kind != TokenKind::Eof && !g_compiler.had_error) {
