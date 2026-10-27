@@ -22,6 +22,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-js"
+version = "0.1.0"
+
+[[package]]
 name = "anvil-json"
 version = "0.3.2"
 
@@ -60,6 +64,7 @@ name = "anvil-script"
 version = "0.23.2"
 dependencies = [
  "anvil-dom",
+ "anvil-js",
  "anvil-json",
 ]
 

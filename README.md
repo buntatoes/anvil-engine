@@ -26,7 +26,7 @@ There are no crates.io dependencies.
 | `anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
 | `anvil-paint` | Display list and zoom |
 | `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients), bounded LRU glyph coverage cache (sizes in `RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
-| `anvil-script` | Budgeted JavaScript runtime, WebAssembly 1.0 (`WASM`) decoder/validator/stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), and the numeric x86-64 compiler |
+| `anvil-script` | Budgeted JavaScript runtime (`anvil-js` self-hosted ES2022+ compiler and Web/DOM runtime on `AnvilVM`), WebAssembly 1.0 (`WASM`) decoder/validator/stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), and the numeric x86-64 compiler |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
 
@@ -124,6 +124,8 @@ Clone this repository and the libraries below as sibling directories. You don't 
 ../anvil-ttf
 ../anvil-gpu
 ../anvil-compress
+../anvil-css
+../anvil-js
 ```
 
 `anvil-image` links `anvil-compress`.
@@ -149,7 +151,7 @@ The full terms are in [LICENSE](./LICENSE). If this summary and `LICENSE` ever d
 | --- | --- |
 | This one (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Audit and use only. Not redistributable on its own |
 | `anvil-browser` | Apache-2.0. Not this file |
-| `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories. The engine links these |
+| `anvil-css`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories. The engine links these |
 | `anvil-cipher`, `anvil-hpack`, `anvil-pqc`, `anvil-video` | MPL-2.0, in those repositories. The engine does not link these |
 
 Revisions of these crates that were already published in `anvil-browser` under the Apache License 2.0 stay under that license for those revisions only.

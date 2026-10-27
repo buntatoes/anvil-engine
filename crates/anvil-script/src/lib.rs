@@ -44,6 +44,10 @@ pub use wasm::{
 };
 
 use anvil_dom::{Document, NodeId};
+pub use anvil_js::{
+    RUNTIME_BUILTINS_JS, RUNTIME_JSON_CODEC_JS, RUNTIME_WEB_APIS_JS, self_hosted_bundle,
+    self_hosted_bundle_hash, self_hosted_runtime_bundle,
+};
 use anvil_json::{JsonValue, parse_json, to_json_string};
 
 /// Maximum bytes of a `fetch()` body kept by the interpreter.
@@ -941,18 +945,8 @@ fn format_console_line(call: &PendingHostCall) -> Result<String, VmError> {
             HostArg::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             HostArg::Null => "null".to_string(),
             HostArg::Undefined => "undefined".to_string(),
-            HostArg::Str(_) => {
-                return Err(VmError {
-                    code: 33,
-                    message: "console.log of a string is not supported yet".to_string(),
-                });
-            }
-            HostArg::Other => {
-                return Err(VmError {
-                    code: 33,
-                    message: "console.log of an object is not supported yet".to_string(),
-                });
-            }
+            HostArg::Str(s) => s.clone(),
+            HostArg::Other => "[object Object]".to_string(),
         };
         parts.push(part);
     }
@@ -992,6 +986,117 @@ pub struct ConsoleError {
 pub fn eval_cpp_vm_with_console(source: &str) -> Result<ConsoleRun, ConsoleError> {
     eval_cpp_vm_with_console_configured(source, 0, 0, 0)
 }
+
+/// Escape an arbitrary source string as a valid JavaScript double-quoted string literal.
+fn quote_js_string_literal(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 32 => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Compile ES2022+ JavaScript source (`source`) into Core JS by running the
+/// self-hosted `anvil-js` compiler bundle (`anvil_js::self_hosted_bundle()`)
+/// directly on the C++20 `AnvilVM`.
+pub fn compile_es2022_with_anvil_js(source: &str, is_module: bool) -> Result<String, String> {
+    let bundle = self_hosted_bundle();
+    let quoted = quote_js_string_literal(source);
+    let mod_flag = if is_module { "true" } else { "false" };
+    let driver = format!(
+        "{bundle}\nconst __anvil_res = index$compileSource({quoted}, {mod_flag}, true);\nif (__anvil_res.ok) {{\n  console.log(\"OK\");\n  console.log(__anvil_res.code);\n}} else {{\n  console.log(\"ERR\");\n  console.log(__anvil_res.error);\n}}\n"
+    );
+    let run = eval_cpp_vm_with_console_configured(&driver, 80_000_000, 64 * 1024 * 1024, 10_000)
+        .map_err(|e| e.error.message)?;
+    match run.output.first().map(String::as_str) {
+        Some("OK") => Ok(run.output[1..].join("\n")),
+        Some("ERR") => Err(run.output[1..].join("\n")),
+        _ => Err("anvil-js compiler returned no status line".to_string()),
+    }
+}
+
+/// Compile and execute an ES2022+ script (`source`) using the self-hosted
+/// `anvil-js` compiler and the C++20 `AnvilVM`.
+pub fn eval_es2022_with_anvil_js(source: &str) -> Result<ConsoleRun, ConsoleError> {
+    let core_js = compile_es2022_with_anvil_js(source, false).map_err(|msg| ConsoleError {
+        output: Vec::new(),
+        error: VmError {
+            code: 33,
+            message: msg,
+        },
+    })?;
+    eval_cpp_vm_with_console_configured(&core_js, 50_000_000, 64 * 1024 * 1024, 10_000)
+}
+
+/// Compile an ES2022+ web application script (`app_script`) via the self-hosted
+/// `anvil-js` compiler, link it with the self-hosted Core JS Web/DOM runtime
+/// (`anvil_js::self_hosted_runtime_bundle()`), and execute the complete browser
+/// environment on `AnvilVM`.
+pub fn eval_webapp_with_anvil_js(
+    initial_url: &str,
+    app_script: &str,
+) -> Result<ConsoleRun, ConsoleError> {
+    let lowered_app =
+        compile_es2022_with_anvil_js(app_script, false).map_err(|msg| ConsoleError {
+            output: Vec::new(),
+            error: VmError {
+                code: 33,
+                message: msg,
+            },
+        })?;
+    let rt_bundle = self_hosted_runtime_bundle();
+    let quoted_url = quote_js_string_literal(initial_url);
+    let full_program = format!(
+        "{rt_bundle}\n\
+const env = createBrowserEnv({quoted_url});\n\
+const window = env.window;\n\
+const globalThis = window;\n\
+const self = window;\n\
+const document = env.document;\n\
+const navigator = env.navigator;\n\
+const location = env.location;\n\
+const history = env.history;\n\
+const localStorage = env.localStorage;\n\
+const sessionStorage = env.sessionStorage;\n\
+const customElements = env.customElements;\n\
+const performance = env.performance;\n\
+const JSON = {{ parse: anvilJsonParse, stringify: anvilJsonStringify }};\n\
+const btoa = anvilBtoa;\n\
+const atob = anvilAtob;\n\
+const encodeURIComponent = anvilEncodeURIComponent;\n\
+const decodeURIComponent = anvilDecodeURIComponent;\n\
+{lowered_app}\n"
+    );
+    eval_cpp_vm_with_console_configured(&full_program, 80_000_000, 64 * 1024 * 1024, 10_000)
+}
+
+#[allow(dead_code)]
+fn needs_anvil_js_lowering(source: &str) -> bool {
+    source.contains('#')
+        || source.contains("static {")
+        || source.contains("static{")
+        || source.contains("??=")
+        || source.contains("||=")
+        || source.contains("&&=")
+        || source.contains("...")
+}
+
+#[allow(dead_code)]
+fn eval_cpp_vm_with_console_noop_anchor() {}
 
 /// Like [`eval_cpp_vm_with_console`] with explicit budgets. A budget of 0
 /// leaves the built-in default; the source size is capped only by the heap
@@ -3489,7 +3594,17 @@ impl ScriptRuntime {
             // services console.log host calls and collects their output; that
             // output is only committed once the whole script ran on the VM, so
             // a fallback to the interpreter never double-prints a line.
-            let (output, outcome) = self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0);
+            let (mut output, mut outcome) = self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0);
+            if matches!(&outcome, Err(err) if err.refused() && !err.is_limit())
+                && needs_anvil_js_lowering(&cleaned)
+                && let Ok(lowered) = compile_es2022_with_anvil_js(cleaned.trim(), false)
+            {
+                let (low_out, low_res) = self.run_cpp_vm_console(&lowered, 0, 0, 0);
+                if low_res.is_ok() {
+                    output = low_out;
+                    outcome = low_res;
+                }
+            }
             match outcome {
                 Ok((result, telemetry)) => match telemetry.exported_globals() {
                     Ok(globals) => {
@@ -4966,6 +5081,60 @@ impl ScriptRuntime {
         if expr == "Number.MIN_SAFE_INTEGER" {
             return Value::Number(-9_007_199_254_740_991.0);
         }
+        if expr == "window.location.search" || expr == "location.search" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let search = match href.find('?') {
+                Some(q) => {
+                    let after = &href[q..];
+                    match after.find('#') {
+                        Some(h) => after[..h].to_string(),
+                        None => after.to_string(),
+                    }
+                }
+                None => String::new(),
+            };
+            return Value::Str(search);
+        }
+        if expr == "window.location.pathname" || expr == "location.pathname" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let after_scheme = href.find("://").map(|i| &href[i + 3..]).unwrap_or(href);
+            let path = match after_scheme.find('/') {
+                Some(slash) => {
+                    let rest = &after_scheme[slash..];
+                    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+                    rest[..end].to_string()
+                }
+                None => "/".to_string(),
+            };
+            return Value::Str(path);
+        }
+        if expr == "window.location.hostname" || expr == "location.hostname" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let after_scheme = href.find("://").map(|i| &href[i + 3..]).unwrap_or(href);
+            let end = after_scheme
+                .find(['/', ':', '?', '#'])
+                .unwrap_or(after_scheme.len());
+            return Value::Str(after_scheme[..end].to_string());
+        }
+        if expr == "window.location.hash" || expr == "location.hash" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let hash = href
+                .find('#')
+                .map(|h| href[h..].to_string())
+                .unwrap_or_default();
+            return Value::Str(hash);
+        }
+        if expr == "navigator.userAgent" || expr == "window.navigator.userAgent" {
+            return Value::Str(
+                "AnvilBrowser/23.2 (Win64; x64) AnvilEngine/23.2 AnvilJS/2.0".to_string(),
+            );
+        }
+        if expr == "navigator.language" || expr == "window.navigator.language" {
+            return Value::Str("en-US".to_string());
+        }
+        if expr == "navigator.onLine" || expr == "window.navigator.onLine" {
+            return Value::Bool(true);
+        }
         if expr == "window.location.href" || expr == "location.href" {
             return Value::Str(self.page_origin.clone().unwrap_or_default());
         }
@@ -5128,6 +5297,7 @@ impl ScriptRuntime {
         match prop {
             "textContent" | "innerText" | "nodeValue" => Value::Str(doc.text_content(id)),
             "innerHTML" => Value::Str(doc.inner_html(id)),
+            "shadowRoot" => Value::Element(id),
             "outerHTML" => Value::Str(doc.outer_html(id)),
             "tagName" | "nodeName" => Value::Str(
                 doc.get(id)
@@ -5459,7 +5629,11 @@ impl ScriptRuntime {
                 obj.insert("signal", sig);
                 Value::Json(obj)
             }
-            "MutationObserver" | "IntersectionObserver" | "ResizeObserver" => {
+            "MutationObserver"
+            | "IntersectionObserver"
+            | "ResizeObserver"
+            | "MediaSource"
+            | "XMLHttpRequest" => {
                 let mut obj = JsonValue::empty_object();
                 obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
                 Value::Json(obj)
@@ -6379,6 +6553,54 @@ impl ScriptRuntime {
                 };
             }
 
+            if obj_expr == "customElements" || obj_expr == "window.customElements" {
+                let args = split_args(args_src);
+                return match method {
+                    "define" => {
+                        if args.len() >= 2 {
+                            let tag = self.eval_expr(doc, &args[0]).as_string(doc);
+                            let ctor = self.eval_expr(doc, &args[1]);
+                            self.set_var(&format!("__ce_{tag}"), ctor);
+                        }
+                        Value::Null
+                    }
+                    "get" => {
+                        let tag = args
+                            .first()
+                            .map(|a| self.eval_expr(doc, a).as_string(doc))
+                            .unwrap_or_default();
+                        self.get_var(&format!("__ce_{tag}"))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    }
+                    "whenDefined" => {
+                        let pid = self.new_resolved(Value::Bool(true));
+                        self.make_promise_value(pid)
+                    }
+                    _ => Value::Null,
+                };
+            }
+
+            if obj_expr == "history" || obj_expr == "window.history" {
+                let args = split_args(args_src);
+                if matches!(method, "pushState" | "replaceState") && args.len() >= 3 {
+                    let url = self.eval_expr(doc, &args[2]).as_string(doc);
+                    if !url.is_empty() {
+                        let current = self.page_origin.clone().unwrap_or_default();
+                        let resolved = resolve_script_fetch_url(&current, &url);
+                        self.page_origin = Some(resolved);
+                    }
+                }
+                return Value::Null;
+            }
+
+            if obj_expr == "MediaSource" || obj_expr == "window.MediaSource" {
+                if method == "isTypeSupported" {
+                    return Value::Bool(true);
+                }
+                return Value::Null;
+            }
+
             if obj_expr == "WebAssembly" || obj_expr == "window.WebAssembly" {
                 let args = split_args(args_src);
                 return self.eval_webassembly_static(doc, method, &args);
@@ -6992,7 +7214,19 @@ impl ScriptRuntime {
                                 }
                                 return Value::Null;
                             }
-                            (_, "observe" | "unobserve" | "disconnect") => {
+                            ("MediaSource", "addSourceBuffer") => {
+                                let mut sb = JsonValue::empty_object();
+                                sb.insert(
+                                    "__anvil_kind",
+                                    JsonValue::String("SourceBuffer".to_string()),
+                                );
+                                return Value::Json(sb);
+                            }
+                            (
+                                _,
+                                "observe" | "unobserve" | "disconnect" | "appendBuffer"
+                                | "endOfStream" | "open" | "send" | "setRequestHeader",
+                            ) => {
                                 return Value::Null;
                             }
                             _ => {}
@@ -7053,6 +7287,9 @@ impl ScriptRuntime {
                 Value::Element(id) => {
                     let args = split_args(args_src);
                     match method {
+                        "attachShadow" => {
+                            return Value::Element(id);
+                        }
                         "getAttribute" => {
                             let name = args
                                 .first()

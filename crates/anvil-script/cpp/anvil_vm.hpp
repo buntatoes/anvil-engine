@@ -10,7 +10,7 @@
 //   - anvil_jit_accel.cpp   (Register VM dispatch loop, hot-loop OSR kernels, extern "C" ABI)
 //
 // Designed to compile cleanly with zero external runtime dependencies under both:
-//   - Windows MSVC: cl.exe /c /O2 /fp:fast /std:c++20 /Zl
+//   - Windows MSVC: cl.exe /c /O2 /fp:precise /std:c++20 /Zl
 //   - Linux GCC/Clang: g++ -c -O3 -std=c++20 -fno-exceptions -fno-rtti
 
 #ifndef ANVIL_VM_HPP
@@ -26,65 +26,73 @@ using f64 = double;
 
 namespace anvil_vm {
 
+using ::u8;
+using ::u16;
+using ::u32;
+using ::u64;
+using ::i32;
+using ::i64;
+using ::f64;
+
 // ============================================================================
 // 1. Deterministic Engine Limits & Budgets
 // ============================================================================
 
 constexpr u32 ANVIL_VM_KERNEL_VERSION    = 18u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
-// The most registers one function may use. Operands are 16-bit, so this is the
-// encoding limit; a function that needs more is refused. The register stack and
-// the frame stack grow in the arena, and each frame advances by the function's
-// own register count (not a fixed window), so the memory a run uses is bounded
-// by its byte budget, not by this number.
 constexpr u32 MAX_REGISTERS_PER_FRAME   = 65535u;
-// Registers the runtime register stack reserves per frame to start with; it
-// grows from there as functions use more. Only the initial size, not a cap.
 constexpr u32 INIT_REGISTERS_PER_FRAME  = 64u;
-// The most arguments one call may pass. They are staged in a small array while
-// compiling the call, so this bounds that array rather than the register file.
 constexpr u32 MAX_CALL_ARGS             = 256u;
-// The managed heap lives in an arena that Rust allocates after the context
-// header (see anvil_cpp_vm_context_bytes). The arena is reserved up front but
-// only touched as it is used; one byte budget, set by Configure, caps how
-// much of it a run may hand out. The string pool, interned-string table and
-// growable heap tables all draw from it, so these counts are no longer fixed.
 constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
 constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
-// Default nesting depth for calls; a Configure request may raise or lower it.
 constexpr u32 ANVIL_DEFAULT_CALL_DEPTH  = 10000u;
-// The recursive-descent front end spends native stack per level of nesting
-// (more for a nested expression than for a nested statement). So a
-// pathologically deep script refuses cleanly instead of overflowing the
-// native stack, the compiler measures how far the stack has grown from where
-// the compile began and refuses past this many bytes. The default stays well
-// within a small (2 MiB) thread stack; a Configure request may raise it for a
-// caller on a larger stack, or lower it.
 constexpr u32 ANVIL_DEFAULT_PARSE_STACK_BUDGET = 1024u * 1024u;
-// An object keeps a shared hidden class (AnvilShape) until it has this many
-// named properties; past it the object switches to its own property map
-// (dictionary mode), so there is no fixed cap on how many properties an object
-// may hold. Shapes, the transition table and the object table all grow in the
-// arena, so their counts are bounded only by the byte budget.
 constexpr u32 DICT_THRESHOLD            = 64u;
-// The numeric JIT's fixed assembler buffers are sized to this, and it declines
-// a program longer than this (the interpreter runs it instead).
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
-// The interpreter's bytecode grows in the arena, so a program is no longer
-// capped at a small fixed array, and jump targets are 32-bit. This ceiling is a
-// backstop against a runaway program; the compiler arena's byte budget is the
-// real limit, stopping an over-large source with the heap-limit reason first.
 constexpr u32 ANVIL_MAX_PROGRAM_INSTRUCTIONS = 16777215u;
-// Instructions the code block holds to start with; it doubles from here.
 constexpr u32 INIT_CODE_BUFFER = 256u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
+constexpr u32 MAX_TRY_DEPTH             = 64u;
 
 // Returned by the allocators and tables when they are full.
 constexpr u32 NO_SLOT = 0xFFFFFFFFu;
 // A dictionary-mode object carries this in place of a shape id.
 constexpr u32 DICT_SHAPE = 0xFFFFFFFEu;
 constexpr u16 NO_GLOBAL = 0xFFFFu;
+
+// Built-in object kinds stored in AnvilHeapObject::builtin_kind.
+enum class BuiltinObjectKind : u8 {
+    Plain       = 0u,
+    Map         = 1u,
+    Set         = 2u,
+    ArrayBuffer = 3u,
+    Uint8Array  = 4u,
+    Uint16Array = 5u,
+    Int32Array  = 6u,
+    Uint32Array = 7u,
+    Float64Array = 8u,
+    Error       = 9u,
+};
+
+// Error subtype IDs used by NewBuiltin.
+enum class BuiltinCtorKind : u8 {
+    Error        = 1u,
+    TypeError    = 2u,
+    RangeError   = 3u,
+    SyntaxError  = 4u,
+    ReferenceError = 5u,
+    Map          = 6u,
+    Set          = 7u,
+    ArrayBuffer  = 8u,
+    Uint8Array   = 9u,
+    Uint16Array  = 10u,
+    Int32Array   = 11u,
+    Uint32Array  = 12u,
+    Float64Array = 13u,
+    Array        = 14u,
+    Object       = 15u,
+};
 
 // Why a run stopped or the compiler refused a script. Codes below 32 stop
 // a run that has started; codes from 32 up refuse the script before it
@@ -103,6 +111,7 @@ enum VmErrorCode : u32 {
     VM_STOP_UNSUPPORTED     = 10u,
     VM_STOP_HEAP            = 11u,
     VM_STOP_NOT_FUNCTION    = 12u,
+    VM_STOP_UNCAUGHT        = 13u,
     VM_REFUSE_SYNTAX        = 32u,
     VM_REFUSE_UNSUPPORTED   = 33u,
     VM_REFUSE_UNKNOWN_NAME  = 34u,
@@ -122,9 +131,6 @@ enum VmErrorCode : u32 {
 
 constexpr u32 MAX_ERROR_TEXT = 160u;
 constexpr u32 MAX_EXPORT_BYTES = 4096u;
-// Arguments of a single host call the out buffer carries when a run pauses
-// with the host-call status. More than this and `pending_host_overflow` is
-// set; console.log with that many arguments is beyond anything real.
 constexpr u32 MAX_HOST_ARGS = 32u;
 
 // The first reason a run stopped or a script was refused, as plain text.
@@ -189,12 +195,6 @@ enum class StoreResult : u32 {
 // ============================================================================
 // 2. 64-Bit NaN-Boxed Value Representation (AnvilValue)
 // ============================================================================
-//
-// IEEE-754 double values that are not quiet tagged NaNs are stored raw via bit-cast.
-// Tagged non-double values use the upper 16 bits:
-//   0x7FF8 | (tag << 48) | 32-bit payload
-// Because standard hardware NaNs generated by arithmetic have tag bits 0, any
-// tag in [1..9] uniquely identifies a non-double boxed value.
 
 enum class ValueTag : u32 {
     Number    = 0u,
@@ -231,17 +231,9 @@ inline f64 bits_to_f64(u64 b) noexcept {
     return conv.d;
 }
 
-// Number helpers shared by the interpreter and the native loops. Casting a
-// double that is NaN or out of range to an integer is undefined in C++, so
-// every conversion goes through these.
-
 constexpr f64 TWO_POW_52 = 4503599627370496.0;
 constexpr f64 TWO_POW_32 = 4294967296.0;
 
-// NaN and finiteness are read from the bits, not from `v != v` or
-// `v - v == 0.0`. A compiler allowed to assume no NaN or infinity folds those
-// to constants, which would let 0 / 0 escape the NaN check in make_number and
-// read back as a tagged value.
 constexpr u64 F64_EXPONENT_MASK = 0x7FF0000000000000ULL;
 constexpr u64 F64_FRACTION_MASK = 0x000FFFFFFFFFFFFFULL;
 
@@ -282,6 +274,12 @@ inline f64 js_round(f64 v) noexcept {
     if (!(js_abs(v) < TWO_POW_52)) {
         return v;
     }
+    if (v >= 0.0 && v < 0.5) {
+        return 0.0;
+    }
+    if (v >= -0.5 && v <= 0.0) {
+        return -0.0;
+    }
     f64 r = js_floor(v);
     if (v - r >= 0.5) {
         r += 1.0;
@@ -299,22 +297,48 @@ inline f64 js_sqrt(f64 v) noexcept {
 #if defined(__GNUC__) || defined(__clang__)
     return __builtin_sqrt(v);
 #else
-    // Scale into [0.5, 2) by powers of four, run Newton, scale back.
-    f64 x = v;
-    f64 scale = 1.0;
-    while (x > 2.0) {
-        x *= 0.25;
-        scale *= 2.0;
+    const u64 b = f64_to_bits(v);
+    i32 exp = static_cast<i32>((b >> 52) & 0x7FFu) - 1023;
+    u64 mant = b & F64_FRACTION_MASK;
+    if (exp == -1023) {
+        exp = -1022;
+        while ((mant & (1ULL << 52)) == 0ULL) {
+            mant <<= 1;
+            --exp;
+        }
+    } else {
+        mant |= (1ULL << 52);
     }
-    while (x < 0.5) {
-        x *= 4.0;
-        scale *= 0.5;
+    if ((exp & 1) != 0) {
+        mant <<= 1;
+        --exp;
     }
-    f64 g = 1.0;
-    for (int i = 0; i < 8; ++i) {
-        g = 0.5 * (g + x / g);
+    i32 half_exp = exp >> 1;
+    u64 q = 0ULL;
+    u64 rem = 0ULL;
+    for (i32 i = 0; i < 54; ++i) {
+        const i32 shift = 52 - (i * 2);
+        const u64 pair = (shift >= 0) ? ((mant >> shift) & 3ULL) : 0ULL;
+        rem = (rem << 2) | pair;
+        const u64 cand = (q << 2) | 1ULL;
+        if (rem >= cand) {
+            rem -= cand;
+            q = (q << 1) | 1ULL;
+        } else {
+            q <<= 1;
+        }
     }
-    return g * scale;
+    const u64 round_bit = q & 1ULL;
+    u64 sig = q >> 1;
+    if (round_bit != 0ULL && (rem != 0ULL || (sig & 1ULL) != 0ULL)) {
+        ++sig;
+        if (sig == (1ULL << 53)) {
+            sig >>= 1;
+            ++half_exp;
+        }
+    }
+    const u64 out_exp = static_cast<u64>(half_exp + 1023);
+    return bits_to_f64((out_exp << 52) | (sig & F64_FRACTION_MASK));
 #endif
 }
 
@@ -326,7 +350,6 @@ inline i32 js_to_int32(f64 v) noexcept {
     }
     const f64 t = v < 0.0 ? -js_floor(-v) : js_floor(v);
     const f64 q = t / TWO_POW_32;
-    // q is whole from 2^52 up, so t is then a multiple of 2^32.
     if (!(js_abs(q) < TWO_POW_52)) {
         return 0;
     }
@@ -364,9 +387,7 @@ inline f64 js_sign(f64 v) noexcept {
     return v;
 }
 
-// Math.pow with the ECMAScript edge cases that differ from C's pow: a zero
-// exponent is 1 for any base (even NaN), a NaN exponent gives NaN, and a base
-// of 1 or -1 raised to an infinite power gives NaN.
+// Math.pow with the ECMAScript edge cases that differ from C's pow.
 inline f64 js_pow(f64 base, f64 exp) noexcept {
     if (exp == 0.0) {
         return 1.0;
@@ -409,8 +430,7 @@ inline f64 js_max2(f64 a, f64 b) noexcept {
     return a > b ? a : b;
 }
 
-// The % operator: the sign follows the dividend, as in JavaScript. Each
-// subtraction of a power-of-two multiple of the divisor is exact.
+// The % operator: the sign follows the dividend, as in JavaScript.
 inline f64 js_remainder(f64 x, f64 y) noexcept {
     if (js_is_nan(x) || js_is_nan(y) || !js_is_finite(x) || y == 0.0) {
         return bits_to_f64(0x7FF8000000000000ULL);
@@ -434,7 +454,6 @@ inline f64 js_remainder(f64 x, f64 y) noexcept {
     return negative ? -r : r;
 }
 
-// Saturating casts with the results Rust's `as` gives, NaN to 0.
 inline i64 sat_i64(f64 v) noexcept {
     if (js_is_nan(v)) {
         return 0;
@@ -489,16 +508,12 @@ struct AnvilValue {
     }
 
     static AnvilValue make_number(f64 n) noexcept {
-        // The range check comes first so the cast is defined, and -0 stays
-        // a double so its sign is kept.
         if (n >= -1073741824.0 && n <= 1073741823.0 && (n != 0.0 || (f64_to_bits(n) >> 63) == 0u)) {
             const i32 as_int = static_cast<i32>(n);
             if (static_cast<f64>(as_int) == n) {
                 return make_smi(as_int);
             }
         }
-        // Every NaN becomes the one plain NaN, so no NaN the hardware makes
-        // (0 / 0 sets the sign bit) can read back as a tagged value.
         if (js_is_nan(n)) {
             return AnvilValue(NANBOX_BASE_MASK);
         }
@@ -623,16 +638,9 @@ struct AnvilValue {
 // 3. Hidden Classes (AnvilShape) & Managed Mark-Sweep Heap (AnvilHeap)
 // ============================================================================
 
-// Blocks are sized to a power of two (at least 8 bytes, so a freed block can
-// hold the u32 link below). One free list per size class lets freed blocks be
-// handed out again instead of being abandoned, so growth and churn reuse the
-// arena. `used` is the bump frontier and never retreats; the byte budget caps
-// how far it may reach, and reuse keeps it from reaching as far.
 constexpr u32 ARENA_SIZE_CLASSES = 32u;
 
 struct AnvilArena {
-    // Recomputed from the context pointer at every init(), so nothing inside
-    // the arena is a raw pointer and the whole region stays relocatable.
     u8* base;
     u32 used;      // bump frontier
     u32 reserve;   // total bytes the arena may ever use
@@ -640,7 +648,6 @@ struct AnvilArena {
     u32 high_water;
     u32 free_list[ARENA_SIZE_CLASSES]; // head block offset per class, or NO_SLOT
 
-    // Smallest class whose block is at least `bytes` (and at least 8).
     static u32 size_class(u32 bytes) noexcept {
         u32 need = bytes < 8u ? 8u : bytes;
         u32 c = 3u;
@@ -665,9 +672,6 @@ struct AnvilArena {
         }
     }
 
-    // Hand out a block big enough for `bytes`: a freed one of the right class
-    // if there is one, otherwise a fresh bump. NO_SLOT (and `*over` set) when a
-    // fresh block would pass the budget.
     u32 alloc(u32 bytes, bool* over) noexcept {
         const u32 c = size_class(bytes);
         if (free_list[c] != NO_SLOT) {
@@ -694,8 +698,6 @@ struct AnvilArena {
         return off;
     }
 
-    // Return a block to its class free list. `bytes` must be what it was
-    // allocated for, so it lands in the same class it came from.
     void free(u32 off, u32 bytes) noexcept {
         if (off == NO_SLOT) {
             return;
@@ -748,12 +750,16 @@ struct AnvilHeapObject {
     bool active;
     bool marked;
     bool dict;            // dictionary mode: own key map, no shared shape
+    u8 builtin_kind;
     u32 shape_id;         // a shape id, or DICT_SHAPE when dict
     u32 proto_obj_id;
     u32 prop_count;       // live properties, kept in both modes
     u32 slots_off;        // arena block: AnvilValue[slots_cap]
     u32 slots_cap;
     u32 dict_keys_off;    // arena block: u32[slots_cap] of keys (dict only), else NO_SLOT
+    u32 aux_id;           // Map/Set backing array id, ArrayBuffer arena offset, or TypedArray buffer obj_id
+    u32 byte_offset;      // TypedArray byte offset into buffer
+    u32 byte_length;      // ArrayBuffer or TypedArray byte length
 };
 
 struct AnvilHeapArray {
@@ -772,16 +778,10 @@ struct AnvilHeapFunction {
     u32 local_count;
     u32 code_start;
     u32 code_len;
-    // The one canonical closure for this function, created on first use, so a
-    // non-capturing function is the same value every time (`f === f`). NO_SLOT
-    // until first referenced as a value.
     u32 canonical_closure;
+    u32 home_proto_id;    // prototype object where this method lives (for super.m), or NO_SLOT
 };
 
-// A closure is a function value: a function id plus the cells it captured. A
-// non-capturing function has a single pinned canonical closure; a capturing
-// function makes a fresh closure, holding its own cells, each time it is
-// evaluated, so two such closures are distinct under ===.
 struct AnvilHeapClosure {
     bool active;
     bool marked;
@@ -789,15 +789,14 @@ struct AnvilHeapClosure {
     u32 fn_id;
     u32 upvals_off;     // arena block: u32[upval_count] of cell array ids, or NO_SLOT
     u32 upval_count;
+    u32 proto_obj_id;   // constructor .prototype object, or NO_SLOT
+    u32 static_obj_id;  // constructor static properties object, or NO_SLOT
+    u32 super_closure_id; // superclass constructor closure id, or NO_SLOT
 };
 
 struct AnvilHeap {
-    // The arena every growable region is carved from.
     AnvilArena arena;
 
-    // Interned string pool: a byte region and a table, both in the arena and
-    // grown as needed. Offsets are relative to the arena base; byte offsets in
-    // the table entries are relative to str_pool_off.
     u32 str_pool_off;
     u32 str_pool_cap;
     u32 string_bytes_used;
@@ -805,7 +804,6 @@ struct AnvilHeap {
     u32 strings_cap;
     u32 string_count;
 
-    // Typed views on the two string regions.
     char* string_bytes() noexcept { return reinterpret_cast<char*>(arena.at(str_pool_off)); }
     const char* string_bytes() const noexcept {
         return reinterpret_cast<const char*>(arena.at(str_pool_off));
@@ -816,11 +814,9 @@ struct AnvilHeap {
     const AnvilInternedString* strings() const noexcept {
         return reinterpret_cast<const AnvilInternedString*>(arena.at(strings_off));
     }
-    // Grow a region to at least `need` bytes/entries; false on heap limit.
     bool ensure_string_bytes(u32 need) noexcept;
     bool ensure_string_table(u32 need) noexcept;
 
-    // Hidden classes (Shapes) & transition table, both growable in the arena.
     u32 shapes_off;
     u32 shapes_cap;
     u32 shape_count;
@@ -841,8 +837,6 @@ struct AnvilHeap {
     bool ensure_shapes(u32 need) noexcept;
     bool ensure_transitions(u32 need) noexcept;
 
-    // GC-managed objects: a growable table in the arena, each object's slots and
-    // (in dictionary mode) key map in their own arena blocks.
     u32 objects_off;
     u32 objects_cap;
     u32 object_count;
@@ -877,9 +871,6 @@ struct AnvilHeap {
     }
     bool ensure_functions(u32 need) noexcept;
 
-    // Closures: a growable table in the arena. A closure is created when a
-    // function is used as a value (LoadFunc / MakeClosure) and, unless pinned
-    // as a function's canonical closure, is collected like any other heap value.
     u32 closures_off;
     u32 closures_cap;
     u32 closure_count;
@@ -897,10 +888,6 @@ struct AnvilHeap {
     bool ensure_closures(u32 need) noexcept;
     u32 alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pinned) noexcept;
 
-    // Arrays and their element storage live in the arena and grow as needed, so
-    // neither the number of arrays nor their length is capped any more. Each
-    // array owns its element block; growth allocates a larger block and frees
-    // the old one, and a swept array frees its block to the arena free list.
     u32 arrays_off;
     u32 arrays_cap;
     u32 array_count;
@@ -911,7 +898,6 @@ struct AnvilHeap {
     const AnvilHeapArray* arrays() const noexcept {
         return reinterpret_cast<const AnvilHeapArray*>(arena.at(arrays_off));
     }
-    // Elements of one array, its own arena block.
     AnvilValue* array_elems(u32 off) noexcept {
         return reinterpret_cast<AnvilValue*>(arena.at(off));
     }
@@ -919,6 +905,13 @@ struct AnvilHeap {
         return reinterpret_cast<const AnvilValue*>(arena.at(off));
     }
     bool ensure_arrays(u32 need) noexcept;
+
+    // Built-in Error prototype hierarchy (pinned objects)
+    u32 err_proto_id;
+    u32 type_err_proto_id;
+    u32 range_err_proto_id;
+    u32 syntax_err_proto_id;
+    u32 ref_err_proto_id;
 
     // Heap & GC telemetry
     u32 live_objects;
@@ -935,21 +928,22 @@ struct AnvilHeap {
     u32 transition_shape(u32 current_shape, u32 prop_sym) noexcept;
     i32 lookup_shape_slot(u32 shape_id, u32 prop_sym) const noexcept;
 
-    // These return NO_SLOT when the table or storage is full.
     u32 alloc_object(u32 initial_shape = 0u) noexcept;
     u32 alloc_array(u32 initial_capacity = 8u) noexcept;
-    u32 alloc_cell(AnvilValue v) noexcept;  // a one-slot array used as a closure cell
+    u32 alloc_cell(AnvilValue v) noexcept;
     u32 alloc_function(u32 name_sym, u32 arity, u32 local_count, u32 code_start, u32 code_len) noexcept;
+    u32 alloc_error_object(BuiltinCtorKind kind, u32 msg_sym) noexcept;
 
-    AnvilValue get_object_prop(u32 obj_id, u32 prop_sym, u32* out_shape, i32* out_slot) const noexcept;
-    StoreResult set_object_prop(u32 obj_id, u32 prop_sym, AnvilValue val, u32* out_shape, i32* out_slot) noexcept;
+    AnvilValue get_object_prop(u32 obj_id, u32 prop_sym, u32* out_shape = nullptr, i32* out_slot = nullptr) const noexcept;
+    StoreResult set_object_prop(u32 obj_id, u32 prop_sym, AnvilValue val, u32* out_shape = nullptr, i32* out_slot = nullptr) noexcept;
+    bool has_object_prop(u32 obj_id, u32 prop_sym) const noexcept;
+    bool delete_object_prop(u32 obj_id, u32 prop_sym) noexcept;
 
     AnvilValue get_array_elem(u32 arr_id, i32 index) const noexcept;
     StoreResult set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept;
     StoreResult push_array_elem(u32 arr_id, AnvilValue val) noexcept;
-    // Intern the concatenation of two pooled strings, built in place at the
-    // end of the pool. NO_SLOT when the pool has no room for it.
     u32 intern_concat(u32 sym_a, u32 sym_b) noexcept;
+    u32 value_to_string_sym(AnvilValue v) noexcept;
 
     void mark_value(AnvilValue v) noexcept;
     void mark_object(u32 obj_id) noexcept;
@@ -1010,7 +1004,6 @@ struct AnvilIcTable {
     u32 dom_ic_misses;
 
     void init(AnvilArena* a) noexcept;
-    // NO_SLOT when all sites are taken.
     u32 allocate_site(u32 prop_sym) noexcept;
     AnvilValue load_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym) noexcept;
     StoreResult store_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym, AnvilValue val) noexcept;
@@ -1026,7 +1019,7 @@ struct AnvilIcTable {
 
 enum class AnvilOpcode : u8 {
     Nop          = 0u,
-    LoadConst    = 1u,   // R[a] = Const[imm16]
+    LoadConst    = 1u,   // R[a] = Const[imm32]
     LoadSmi      = 2u,   // R[a] = Smi(imm16 as i16)
     LoadNull     = 3u,   // R[a] = null
     LoadTrue     = 4u,   // R[a] = true
@@ -1051,11 +1044,11 @@ enum class AnvilOpcode : u8 {
     CmpLe        = 23u,  // R[a] = (R[b] <= R[c])
     CmpGt        = 24u,  // R[a] = (R[b] > R[c])
     CmpGe        = 25u,  // R[a] = (R[b] >= R[c])
-    Jump         = 26u,  // pc = imm16
-    JumpIfFalse  = 27u,  // if (!R[a]) pc = imm16
-    JumpIfTrue   = 28u,  // if (R[a]) pc = imm16
-    GetGlobal    = 29u,  // R[a] = Globals[imm16]
-    SetGlobal    = 30u,  // Globals[imm16] = R[a]
+    Jump         = 26u,  // pc = imm32
+    JumpIfFalse  = 27u,  // if (!R[a]) pc = imm32
+    JumpIfTrue   = 28u,  // if (R[a]) pc = imm32
+    GetGlobal    = 29u,  // R[a] = Globals[imm32]
+    SetGlobal    = 30u,  // Globals[imm32] = R[a]
     NewObject    = 31u,  // R[a] = alloc_object()
     NewArray     = 32u,  // R[a] = alloc_array(b)
     GetPropIC    = 33u,  // R[a] = IC[c](R[b], prop_sym_from_ic)
@@ -1063,13 +1056,11 @@ enum class AnvilOpcode : u8 {
     GetElem      = 35u,  // R[a] = R[b][R[c]]
     SetElem      = 36u,  // R[a][R[b]] = R[c]
     ArrayPush    = 37u,  // push(R[a], R[b])
-    Call         = 38u,  // R[a] = call(fn_id = b, arg_base = c, argc = imm8)
+    Call         = 38u,  // R[a] = call(fn_id = b, arg_base = c)
     CallMath     = 39u,  // R[a] = math_op(op = b, arg = R[c])
     LoopHeader   = 40u,  // hot-loop profiling counter at loop head
     Return       = 41u,  // return R[a]
     Halt         = 42u,  // stop chunk execution, result in R[a]
-    // R[a] is a number. imm16 is a slot in AnvilVmContext::host_ids.
-    // The native compiler calls the page host. The interpreter ignores it.
     HostSetText  = 43u,
     CmpLooseEq   = 44u,  // R[a] = (R[b] == R[c])
     CmpLooseNe   = 45u,  // R[a] = (R[b] != R[c])
@@ -1083,25 +1074,34 @@ enum class AnvilOpcode : u8 {
     GetUpval     = 53u,  // R[a] = contents of the running closure's upvalue b
     SetUpval     = 54u,  // the running closure's upvalue a <- R[b]
     MakeClosure  = 55u,  // R[a] = closure(fn_id = imm32, upvalue cells R[b..b+c])
-    // R[a] = host_call(fn_id = imm32, arg_base = b, argc = c). The run pauses
-    // with the host-call status so a safe-Rust caller can read the arguments
-    // from the out buffer, act on them (console.log prints them) and Resume;
-    // the result left in R[a] is undefined. The JIT does not compile it.
-    HostCall     = 56u,
-    // R[a] = the cell (not its contents) held in the running closure's upvalue
-    // b, boxed as a cell reference. It lets an enclosing function re-stage one
-    // of its own captured cells into a MakeClosure for a function nested inside
-    // it, which is how a variable is captured through more than one function.
-    // The JIT does not compile it.
-    GetUpvalCell = 57u,
+    HostCall     = 56u,  // R[a] = host_call(fn_id = imm32, arg_base = b, argc = c)
+    GetUpvalCell = 57u,  // R[a] = cell held in running closure's upvalue b
+    BitNot       = 58u,  // R[a] = ~ToInt32(R[b])
+    TypeOf       = 59u,  // R[a] = typeof R[b]
+    InOp         = 60u,  // R[a] = (R[b] in R[c])
+    InstanceOf   = 61u,  // R[a] = (R[b] instanceof R[c])
+    DeleteProp   = 62u,  // R[a] = delete R[b].prop(imm32)
+    DeleteElem   = 63u,  // R[a] = delete R[b][R[c]]
+    LoadThis     = 64u,  // R[a] = cur_this
+    CallMethod   = 65u,  // R[a] = R[b].method(args = R[b+1..b+1+c], prop_sym = imm32)
+    NewInstance  = 66u,  // R[a] = new R[b](arg_base = c, argc = imm32)
+    NewBuiltin   = 67u,  // R[a] = new_builtin(kind = b, arg_base = c, argc = imm32)
+    StringFromCharCode = 68u, // R[a] = String.fromCharCode(R[b..b+c])
+    EnterTry     = 69u,  // push try handler (catch_reg = a, catch_pc = imm32)
+    SetTryFinally = 70u, // set top try handler's finally_pc = imm32
+    LeaveTry     = 71u,  // normal exit from try/catch -> target_pc = imm32
+    EndFinally   = 72u,  // finish finally block
+    Throw        = 73u,  // throw R[a]
+    IterLen      = 74u,  // R[a] = iterable_len(R[b])
+    IterGet      = 75u,  // R[a] = iterable_get(R[b], idx = R[c])
+    SetupClass   = 76u,  // configure class closure R[a], super = R[b], proto_out = R[c]
+    DefineMethod = 77u,  // define method on class R[a], closure = R[b], is_static = c, name_sym = imm32
+    CallSuperCtor = 78u, // R[a] = super(arg_base = b, argc = c)
+    CallSuperMethod = 79u, // R[a] = super.method(arg_base = b, argc = c, name_sym = imm32)
+    ToNum        = 80u,  // R[a] = +R[b]
 };
 
 struct AnvilInstruction {
-    // Each instruction is a fixed cell. The three register operands are 16 bits
-    // wide, so a function can address far more than 256 registers; the extended
-    // immediate is 32 bits, so jump targets, constant indices and global slots
-    // are not bounded by a program of 65,535 instructions. `pad` keeps `imm`
-    // naturally aligned and is always zero.
     AnvilOpcode op;
     u8 pad;
     u16 a;
@@ -1125,9 +1125,6 @@ struct AnvilInstruction {
         return static_cast<i32>(imm);
     }
 
-    // Narrow views of the extended immediate, kept so code that only needs the
-    // low 16 bits (the numeric JIT, whose programs never exceed the old limits)
-    // reads the same value as before.
     constexpr u16 imm16() const noexcept {
         return static_cast<u16>(imm);
     }
@@ -1141,45 +1138,54 @@ struct AnvilGlobalBinding {
     u32 name_sym;
     AnvilValue value;
     bool occupied;
-    // Declared at the top level or with `var`, so later scripts see it.
     bool exported;
-    // Compile-time scope state for this global, carried with the binding so it
-    // grows with the table: whether a top-level declaration gave it a value,
-    // and the block depth of that declaration (0xFFFFFFFF before it has one).
     bool declared;
     u32 decl_depth;
 };
 
 struct AnvilCallFrame {
     u32 fn_id;
-    u32 closure_id;    // the caller's running closure, restored on return
+    u32 closure_id;
     u32 return_pc;
     u32 reg_base;
-    // The caller's register-window size, so Return restores the stride the
-    // caller ran with. Frames are no longer a fixed stride apart: each function
-    // advances the register base by its own register count.
     u32 caller_frame_regs;
-    u8 dst_reg;
+    u16 dst_reg;
+    u32 new_instance_obj; // NO_SLOT for normal calls; object id for `new Ctor(...)`
+    AnvilValue caller_this;
+};
+
+// Completion state for an active try/catch/finally handler.
+enum class TryCompletionKind : u8 {
+    Normal = 0u,
+    Throw  = 1u,
+    Return = 2u,
+};
+
+struct AnvilTryHandler {
+    u32 frame_depth;
+    u32 reg_base;
+    u32 cur_frame_regs;
+    u32 cur_closure;
+    AnvilValue cur_this;
+    u32 catch_pc;
+    u32 finally_pc;
+    u16 catch_reg;
+    TryCompletionKind completion_kind;
+    AnvilValue completion_val;
+    u32 completion_pc;
 };
 
 struct AnvilBytecodeProgram {
-    // The bytecode is a block in the shared arena (like the constant pool),
-    // grown as the compiler emits. `code_off` is its offset; `code()` reaches it.
     u32 code_off;
     u32 code_cap;
     u32 code_len;
-    // Registers the top-level code uses, so execution knows the first frame's
-    // size (each function's own size is kept with the function).
     u32 top_frame_regs;
-    // The constant pool grows in the shared arena; `arena` points at it, set by
-    // init() each run (like the heap's own base pointer).
     AnvilArena* arena;
     u32 constants_off;
     u32 constants_cap;
     u32 const_len;
     u32 loop_trip_counts[64];
     bool compile_ok;
-    // VM_REFUSE_CODE_SIZE or VM_REFUSE_CONSTANTS once compile_ok is false.
     u32 overflow;
 
     AnvilValue* constants() noexcept {
@@ -1196,9 +1202,6 @@ struct AnvilBytecodeProgram {
     const AnvilInstruction* code() const noexcept {
         return reinterpret_cast<const AnvilInstruction*>(arena->at(code_off));
     }
-    // Grow the code block to hold at least `need` instructions, copying what is
-    // there and returning the old block to the free list. False when the arena
-    // cannot grow any further.
     bool ensure_code(u32 need) noexcept {
         if (need <= code_cap) {
             return true;
@@ -1256,10 +1259,10 @@ struct AnvilBytecodeProgram {
         return idx;
     }
 
-    u16 add_constant(AnvilValue val) noexcept {
+    u32 add_constant(AnvilValue val) noexcept {
         for (u32 i = 0; i < const_len; ++i) {
             if (constants()[i].bits == val.bits) {
-                return static_cast<u16>(i);
+                return i;
             }
         }
         if (!ensure_constants(const_len + 1u)) {
@@ -1269,7 +1272,7 @@ struct AnvilBytecodeProgram {
             compile_ok = false;
             return 0u;
         }
-        const u16 idx = static_cast<u16>(const_len++);
+        const u32 idx = const_len++;
         constants()[idx] = val;
         return idx;
     }
@@ -1291,19 +1294,14 @@ struct AnvilVmTelemetryC {
     u32 polymorphic_ic_sites;
     u32 hot_loops_accelerated;
     u32 native_compilations;
-    // Why the run stopped or the script was refused: a VmErrorCode (0 when
-    // it ran to the end) and the reason, `stop_len` bytes with no NUL.
     u32 stop_code;
     u32 stop_len;
     char stop_text[MAX_ERROR_TEXT];
-    // Top-level variables later scripts can see, written by fill_exports.
-    // `exports_len` bytes are used; `exports_full` is 1 when they did not fit.
     u32 exports_len;
     u32 exports_full;
     u8 exports[MAX_EXPORT_BYTES];
 };
 
-// The Rust side (`AnvilVmTelemetry` in src/lib.rs) has the same layout.
 static_assert(sizeof(AnvilVmTelemetryC) == 11u * 4u + 8u + MAX_ERROR_TEXT + 8u + MAX_EXPORT_BYTES,
               "telemetry layout");
 
@@ -1311,10 +1309,6 @@ struct AnvilVmContext {
     AnvilHeap heap;
     AnvilIcTable ic;
     AnvilBytecodeProgram program;
-    // The register stack and the frame stack live in the arena and grow with
-    // the call depth, so neither the depth nor the register count is capped by
-    // a fixed array any more. Each frame advances by the function's own register
-    // count, not a fixed window.
     u32 registers_off;
     u32 registers_cap;
     AnvilValue* registers() noexcept {
@@ -1344,6 +1338,10 @@ struct AnvilVmContext {
         return reinterpret_cast<const AnvilCallFrame*>(heap.arena.at(frames_off));
     }
     bool ensure_frames(u32 need) noexcept;
+
+    AnvilTryHandler try_stack[MAX_TRY_DEPTH];
+    u32 try_depth;
+
     u32 steps_executed;
     u32 hot_loops_accelerated;
     u32 native_compilations;
@@ -1354,36 +1352,18 @@ struct AnvilVmContext {
     u32 host_id_count;
     void (*host_set_text)(void* host, const char* id, u32 len, double value);
     void* host;
-    // Limits a Configure request set for this context. 0 means "use the
-    // built-in default". They are kept across runs (init() does not clear
-    // them), so a Configure call applies to the Run calls that follow on the
-    // same context. step_limit and script_size_limit take effect now; the
-    // heap and call-depth budgets are stored here for the heap and the frame
-    // stack to use as they grow.
     u32 step_limit;
     u32 script_size_limit;
     u32 heap_byte_budget;
     u32 call_depth_limit;
 
-    // Cooperative yield for stop and resume. When yield_interval is not zero a
-    // run pauses every that-many instructions and hands control back with the
-    // host-call status, so a caller can stop a run and resume it later with no
-    // native stack in use. 0 means the run never pauses. paused says the last
-    // run stopped at a yield rather than finishing; resume_pc and
-    // resume_reg_base are where resume() continues. yield_interval is a
-    // Configure setting and is kept across runs; init() clears the rest.
     u32 yield_interval;
     bool paused;
     u32 resume_pc;
     u32 resume_reg_base;
     u32 resume_frame_regs;
     u32 resume_closure;
-    // A host call the running guest reached (console.log and friends). When a
-    // HostCall opcode runs, the arguments are copied here, the run pauses with
-    // the host-call status, and fill_telemetry writes the call into the out
-    // buffer for a safe-Rust caller. resume() puts undefined in resume_host_dst
-    // and continues. pending_host_overflow is 1 when there were more arguments
-    // than MAX_HOST_ARGS. These are cleared by init() and reset on resume().
+    AnvilValue resume_this;
     bool pending_host_call;
     u32 pending_host_fn;
     u32 pending_arg_count;
@@ -1391,36 +1371,23 @@ struct AnvilVmContext {
     u16 resume_host_dst;
     AnvilValue pending_args[MAX_HOST_ARGS];
 
-    // Compiler native-stack budget in bytes (measured from the compile
-    // entry) before a deeply nested script is refused rather than overflowing
-    // the stack. A Configure setting kept across runs; 0 means the default.
     u32 parse_stack_budget;
 
-    // Steps this run may take before it stops: the configured budget, or the
-    // built-in default when none was set.
     u32 effective_step_limit() const noexcept {
         return step_limit != 0u ? step_limit : MAX_VM_STEPS;
     }
 
-    // Nesting depth this run may reach before it stops: the configured budget,
-    // or the built-in default when none was set.
     u32 effective_call_depth() const noexcept {
         return call_depth_limit != 0u ? call_depth_limit : ANVIL_DEFAULT_CALL_DEPTH;
     }
 
-    // Native-stack budget the compiler's recursive descent may grow before a
-    // too-deeply nested script is refused: the configured budget, or the
-    // built-in default when none was set.
     u32 effective_parse_stack_budget() const noexcept {
         return parse_stack_budget != 0u ? parse_stack_budget : ANVIL_DEFAULT_PARSE_STACK_BUDGET;
     }
 
     void init() noexcept;
-    // NO_GLOBAL when all global slots are taken.
     u16 resolve_global_slot(u32 name_sym) noexcept;
 
-    // Record why the run stopped or the script was refused. Only the first
-    // reason is kept. A stop code also ends the run.
     bool fail(u32 code, const char* text) noexcept {
         if (code < VM_REFUSE_SYNTAX) {
             aborted = true;
@@ -1434,7 +1401,6 @@ struct AnvilVmContext {
         return true;
     }
 
-    // "<what> limit reached: <limit> <unit>"
     void fail_limit(u32 code, const char* what, u32 limit, const char* unit) noexcept {
         if (fail(code, what)) {
             error.add(" limit reached: ");
@@ -1444,7 +1410,6 @@ struct AnvilVmContext {
         }
     }
 
-    // "<text> '<name>'"
     void fail_name(u32 code, const char* text, const char* name, u32 name_len) noexcept {
         if (fail(code, text)) {
             error.add(" '");
@@ -1452,38 +1417,23 @@ struct AnvilVmContext {
             error.add("'");
         }
     }
-    // Collect with the registers below `reg_top` and the globals as roots.
     void collect_garbage(u32 reg_top) noexcept;
-    // Collect, then compact array storage.
     void reclaim_array_storage(u32 reg_top) noexcept;
-    // Record a stop for a store that hit a limit. False when the run stops.
     bool store_ok(StoreResult stored) noexcept;
     AnvilValue execute(u32 entry_pc = 0u) noexcept;
-    // Continue a run that paused at a yield, from the saved pc and register
-    // base, with the frame stack left as it was. The caller must not call
-    // init() first, so the arena, program, registers and frames all survive.
     AnvilValue resume() noexcept;
-    // The shared instruction loop, entered fresh by execute() and continued by
-    // resume(). Returns the result, or undefined when it pauses at a yield.
-    AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in) noexcept;
+    AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in, AnvilValue cur_this_in = AnvilValue::make_undefined(), u32 stop_frame_depth = 0u) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
     void fill_exports(AnvilVmTelemetryC* out) const noexcept;
-    // Write the pending host call (fn id, argument count, overflow flag, then
-    // the tagged arguments) into the out buffer's export area when a run is
-    // paused on a HostCall. Reuses the export record encoding.
     void fill_host_call(AnvilVmTelemetryC* out) const noexcept;
 };
 
-// Compile a numeric program to x86-64 and run it. Returns false when the
-// program is not numeric or the code page cannot be executed. On success,
-// `out_number` is the Halt/Return value.
 bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexcept;
-
-// Compile source text into `ctx.program`. `compiler_memory` is caller-owned
-// storage of `anvil_cpp_vm_compiler_bytes` bytes. This is not a general compiler.
 bool compile_js_to_bytecode(AnvilVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept;
 
-// Hash helper used across string pool and DOM selector IC.
+// Exact IEEE-754 decimal/radix number literal parser used by the compiler and number formatter.
+f64 parse_f64_slice(const char* s, u32 len) noexcept;
+
 inline u64 fnv1a_hash_bytes(const char* data, u32 len) noexcept {
     u64 h = 14695981039346656037ULL;
     for (u32 i = 0; i < len; ++i) {

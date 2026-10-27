@@ -9,6 +9,44 @@ namespace anvil_vm {
 
 namespace {
 constexpr u32 INIT_IC_SITE_TABLE = 16u;
+
+inline bool prop_is(const char* name, u32 len, const char* lit, u32 lit_len) noexcept {
+    if (len != lit_len) {
+        return false;
+    }
+    for (u32 i = 0u; i < len; ++i) {
+        if (name[i] != lit[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline u32 utf16_unit_length(const char* s, u32 byte_len) noexcept {
+    u32 units = 0u;
+    u32 i = 0u;
+    while (i < byte_len) {
+        const u8 b = static_cast<u8>(s[i]);
+        if ((b & 0x80u) == 0u) {
+            i += 1u;
+            units += 1u;
+        } else if ((b & 0xE0u) == 0xC0u) {
+            i += 2u;
+            units += 1u;
+        } else if ((b & 0xF0u) == 0xE0u) {
+            i += 3u;
+            units += 1u;
+        } else if ((b & 0xF8u) == 0xF0u) {
+            i += 4u;
+            units += 2u;
+        } else {
+            i += 1u;
+            units += 1u;
+        }
+    }
+    return units;
+}
+
 } // namespace
 
 bool AnvilIcTable::ensure_sites(u32 need) noexcept {
@@ -88,11 +126,57 @@ AnvilValue AnvilIcTable::load_property_ic(
         if (arr_id < heap.array_count && heap.arrays()[arr_id].active) {
             u32 str_len = 0u;
             const char* name = heap.get_string_ptr(prop_sym, &str_len);
-            if (str_len == 6u &&
-                name[0] == 'l' && name[1] == 'e' && name[2] == 'n' &&
-                name[3] == 'g' && name[4] == 't' && name[5] == 'h') {
+            if (prop_is(name, str_len, "length", 6u)) {
                 ++ic_hits;
                 return AnvilValue::make_smi(static_cast<i32>(heap.arrays()[arr_id].length));
+            }
+        }
+        return AnvilValue::make_undefined();
+    }
+
+    // String `.length` (in UTF-16 code units).
+    if (receiver.is_string()) {
+        u32 str_len = 0u;
+        const char* name = heap.get_string_ptr(prop_sym, &str_len);
+        if (prop_is(name, str_len, "length", 6u)) {
+            u32 s_bytes = 0u;
+            const char* s_ptr = heap.get_string_ptr(receiver.payload(), &s_bytes);
+            ++ic_hits;
+            return AnvilValue::make_smi(static_cast<i32>(utf16_unit_length(s_ptr, s_bytes)));
+        }
+        return AnvilValue::make_undefined();
+    }
+
+    // Function / Class static properties and `.prototype` / `.name` / `.length`.
+    if (receiver.is_function()) {
+        const u32 cid = receiver.payload();
+        if (cid < heap.closure_count && heap.closures()[cid].active) {
+            u32 str_len = 0u;
+            const char* name = heap.get_string_ptr(prop_sym, &str_len);
+            if (prop_is(name, str_len, "prototype", 9u) &&
+                heap.closures()[cid].proto_obj_id != NO_SLOT) {
+                return AnvilValue::make_object(heap.closures()[cid].proto_obj_id);
+            }
+            u32 cur_cid = cid;
+            u32 hops = 0u;
+            while (cur_cid != NO_SLOT && cur_cid < heap.closure_count &&
+                   heap.closures()[cur_cid].active && hops < 16u) {
+                const u32 st_id = heap.closures()[cur_cid].static_obj_id;
+                if (st_id != NO_SLOT && st_id < heap.object_count &&
+                    heap.objects()[st_id].active && heap.has_object_prop(st_id, prop_sym)) {
+                    return heap.get_object_prop(st_id, prop_sym);
+                }
+                cur_cid = heap.closures()[cur_cid].super_closure_id;
+                ++hops;
+            }
+            const u32 fn_id = heap.closures()[cid].fn_id;
+            if (fn_id < heap.function_count && heap.functions()[fn_id].active) {
+                if (prop_is(name, str_len, "length", 6u)) {
+                    return AnvilValue::make_smi(static_cast<i32>(heap.functions()[fn_id].arity));
+                }
+                if (prop_is(name, str_len, "name", 4u)) {
+                    return AnvilValue::make_string(heap.functions()[fn_id].name_sym);
+                }
             }
         }
         return AnvilValue::make_undefined();
@@ -107,6 +191,46 @@ AnvilValue AnvilIcTable::load_property_ic(
     }
 
     const AnvilHeapObject& obj = heap.objects()[obj_id];
+
+    // Builtin object virtual properties (`size`, `byteLength`, `byteOffset`, `buffer`, `length`).
+    if (obj.builtin_kind != static_cast<u8>(BuiltinObjectKind::Plain) &&
+        obj.builtin_kind != static_cast<u8>(BuiltinObjectKind::Error)) {
+        u32 str_len = 0u;
+        const char* name = heap.get_string_ptr(prop_sym, &str_len);
+        const auto bkind = static_cast<BuiltinObjectKind>(obj.builtin_kind);
+        if ((bkind == BuiltinObjectKind::Map || bkind == BuiltinObjectKind::Set) &&
+            prop_is(name, str_len, "size", 4u)) {
+            return AnvilValue::make_smi(static_cast<i32>(obj.byte_length));
+        }
+        if (bkind == BuiltinObjectKind::ArrayBuffer &&
+            prop_is(name, str_len, "byteLength", 10u)) {
+            return AnvilValue::make_number(static_cast<f64>(obj.byte_length));
+        }
+        if (bkind >= BuiltinObjectKind::Uint8Array && bkind <= BuiltinObjectKind::Float64Array) {
+            if (prop_is(name, str_len, "byteLength", 10u)) {
+                return AnvilValue::make_number(static_cast<f64>(obj.byte_length));
+            }
+            if (prop_is(name, str_len, "byteOffset", 10u)) {
+                return AnvilValue::make_number(static_cast<f64>(obj.byte_offset));
+            }
+            if (prop_is(name, str_len, "buffer", 6u)) {
+                return AnvilValue::make_object(obj.aux_id);
+            }
+            if (prop_is(name, str_len, "length", 6u)) {
+                u32 shift = 0u;
+                if (bkind == BuiltinObjectKind::Uint16Array) {
+                    shift = 1u;
+                } else if (bkind == BuiltinObjectKind::Int32Array ||
+                           bkind == BuiltinObjectKind::Uint32Array) {
+                    shift = 2u;
+                } else if (bkind == BuiltinObjectKind::Float64Array) {
+                    shift = 3u;
+                }
+                return AnvilValue::make_number(static_cast<f64>(obj.byte_length >> shift));
+            }
+        }
+    }
+
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
@@ -168,6 +292,22 @@ StoreResult AnvilIcTable::store_property_ic(
     u32 prop_sym,
     AnvilValue val
 ) noexcept {
+    if (receiver.is_function()) {
+        const u32 cid = receiver.payload();
+        if (cid >= heap.closure_count || !heap.closures()[cid].active) {
+            return StoreResult::NotStored;
+        }
+        u32 st_id = heap.closures()[cid].static_obj_id;
+        if (st_id == NO_SLOT) {
+            st_id = heap.alloc_object(0u);
+            if (st_id == NO_SLOT) {
+                return StoreResult::HeapFull;
+            }
+            heap.closures()[cid].static_obj_id = st_id;
+        }
+        return heap.set_object_prop(st_id, prop_sym, val);
+    }
+
     if (!receiver.is_object()) {
         return StoreResult::NotStored;
     }
@@ -198,7 +338,6 @@ StoreResult AnvilIcTable::store_property_ic(
         }
     }
 
-    // Store IC miss: transition shape if property is new and record resulting `(shape_id, slot)`.
     ++ic_misses;
     u32 new_shape = 0u;
     i32 slot = -1;

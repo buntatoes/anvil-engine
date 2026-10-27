@@ -15,7 +15,7 @@
 # The libraries under [workspace.dependencies] are separate MPL-2.0 repositories.
 #
 # LicenseRef-Proprietary: this repository.
-# MPL-2.0: anvil-image, anvil-json, anvil-ttf, anvil-gpu, and anvil-compress (linked through anvil-image).
+# MPL-2.0: anvil-css, anvil-image, anvil-js, anvil-json, anvil-ttf, anvil-gpu, and anvil-compress (linked through anvil-image).
 
 [workspace]
 resolver = "3"
@@ -40,6 +40,7 @@ publish = false
 
 [workspace.dependencies]
 anvil-image = { path = "../anvil-image" }
+anvil-js = { path = "../anvil-js" }
 anvil-json = { path = "../anvil-json" }
 anvil-ttf = { path = "../anvil-ttf" }
 anvil-gpu = { path = "../anvil-gpu" }

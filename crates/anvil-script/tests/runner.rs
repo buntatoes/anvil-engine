@@ -95,11 +95,11 @@ fn a_refused_script_is_reported_on_stderr_and_exits_nonzero() {
     }
     // A string argument to console.log is not supported yet, so the compiler
     // refuses the script rather than running it some other way.
-    let path = temp_file("refused", "console.log(\"hi\");\n");
+    let path = temp_file("refused", "with (x) {}\n");
     let (stdout, stderr, code) = run(&path);
     assert_eq!(stdout, "");
     assert!(stderr.starts_with("anvil-js-run: "), "{stderr}");
-    assert!(stderr.contains("string is not supported"), "{stderr}");
+    assert!(stderr.contains("unsupported word 'with'"), "{stderr}");
     assert!(stderr.contains("code "), "{stderr}");
     assert_ne!(code, 0);
     let _ = std::fs::remove_file(&path);

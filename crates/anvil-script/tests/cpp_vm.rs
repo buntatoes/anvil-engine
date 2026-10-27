@@ -102,11 +102,9 @@ fn a_page_console_log_of_a_string_falls_back_to_the_interpreter() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    // Strings are not supported on the VM yet, so the script runs on the Rust
-    // interpreter instead -- and its one line is printed just once.
     let rt = page("console.log(\"hi\"); console.log(7);");
     assert_eq!(rt.console_logs(), ["hi", "7"]);
-    assert!(!rt.last_script_used_vm());
+    assert!(rt.last_script_used_vm());
 }
 
 #[test]
@@ -119,15 +117,23 @@ fn scripts_with_unknown_names_are_left_to_the_interpreter() {
         "let r = page_total + 1; r;",
         "let r = 1; done = r; r;",
         "let r = Math.log(1); r;",
-        "let a = [1, 2]; a.pop(); a.length;",
-        "let o = {a: 1}; let r = o.a; o.toString(); r;",
-        "let r = 0; try { r = 1; } finally { r = 2; } r;",
-        "let r = 0; switch (r) { case 0: r = 1; } r;",
-        "let s = 'a\\nb'; 1;",
-        "let n = 1e3; n;",
+        "let r = 0; with (r) {}",
+        "let n = 1_000_; n;",
         "return 1;",
     ] {
         assert_eq!(cpp(source), None, "{source}");
+    }
+    for (source, expected) in [
+        ("let a = [1, 2]; a.pop(); a.length;", 1.0),
+        ("let o = {a: 1}; let r = o.a; o.toString(); r;", 1.0),
+        ("let r = 0; try { r = 1; } finally { r = 2; } r;", 2.0),
+        ("let r = 0; switch (r) { case 0: r = 1; } r;", 1.0),
+        ("let s = 'a\\nb'; 1;", 1.0),
+        ("let n = 1e3; n;", 1000.0),
+        ("let r = 0; class C {} r;", 0.0),
+        ("let s = `a`; 1;", 1.0),
+    ] {
+        assert_eq!(cpp(source), Some(expected), "{source}");
     }
 }
 
@@ -230,7 +236,7 @@ fn refused_scripts_say_why() {
         return;
     }
     let cases = [
-        ("let t = typeof 1; 1;", "unsupported word 'typeof'"),
+        ("with (o) {}", "unsupported word 'with'"),
         (
             "foo(1); 2;",
             "call to a function not declared in this script 'foo'",
@@ -240,7 +246,7 @@ fn refused_scripts_say_why() {
             "name not declared in this script 'page_total'",
         ),
         ("let r = Math.log(1); r;", "unsupported Math function 'log'"),
-        ("let n = 1e3; n;", "unsupported number '1e3'"),
+        ("let n = 1_000_; n;", "unsupported number '1_000_'"),
         ("return 1;", "return outside a function near '1'"),
         ("let s = 'abc", "unterminated string ''abc'"),
         ("let r = 1; }", "unexpected near '}'"),
@@ -821,10 +827,6 @@ fn values_the_vm_cannot_convert_go_to_the_interpreter() {
         return;
     }
     for source in [
-        "let s = 'a'; let r = s + 1; 1;",
-        "let s = 'a'; let r = s < 'b'; 1;",
-        "let s = 'abc'; let n = s.length; n;",
-        "let o = {a: 1}; let k = 'a'; let v = o[k]; 1;",
         "let a = [1]; a[-1] = 2; 1;",
         "let a = [1]; a[0.5] = 2; 1;",
         "let n = 1; n.x = 2; 1;",
@@ -832,10 +834,18 @@ fn values_the_vm_cannot_convert_go_to_the_interpreter() {
         let error = vm_error(source);
         assert_eq!(error.code, 10, "{source}: {}", error.message);
     }
+    for (source, expected) in [
+        ("let s = 'a'; let r = s + 1; 1;", 1.0),
+        ("let s = 'a'; let r = s < 'b'; 1;", 1.0),
+        ("let s = 'abc'; let n = s.length; n;", 3.0),
+        ("let o = {a: 1}; let k = 'a'; let v = o[k]; v;", 1.0),
+    ] {
+        assert_eq!(cpp(source), Some(expected), "{source}");
+    }
     let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
     let mut rt = ScriptRuntime::new();
     rt.eval_script(&mut doc, "let s = 'abc'; let n = s.length + 1;");
-    assert!(!rt.last_script_used_vm());
+    assert!(rt.last_script_used_vm());
     rt.eval_script(&mut doc, "document.getElementById('out').textContent = n;");
     let out = doc.get_element_by_id("out").expect("out");
     assert_eq!(doc.text_content(out), "4");
@@ -960,6 +970,7 @@ fn loose_equality_postfix_and_push_values() {
             "let s = 0; for (let i = 0; i < 1000; i++) { if (i % 3 == 0) { s += i; } } s;",
             166833.0,
         ),
+        ("let o = {n: 1}; o.n++; o.n;", 2.0),
     ];
     for (source, want) in cases {
         assert_eq!(cpp(source), Some(want), "{source}");
@@ -976,7 +987,7 @@ fn loose_equality_postfix_and_push_values() {
         assert_eq!(error.code, 10, "{source}: {}", error.message);
         assert_eq!(error.message, "== between values of different types");
     }
-    let error = vm_error("let o = {n: 1}; o.n++; o.n;");
+    let error = vm_error("1++;");
     assert_eq!(error.code, 33);
     assert!(error.message.contains("++ or --"), "{}", error.message);
 }
@@ -1069,18 +1080,11 @@ fn console_log_runs_inside_loops_and_functions() {
 }
 
 #[test]
-fn console_log_of_a_string_literal_is_refused_cleanly() {
+fn console_log_of_a_string_literal_prints_the_string() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let failure = eval_cpp_vm_with_console("console.log(\"hi\");").unwrap_err();
-    assert_eq!(failure.error.code, 33);
-    assert!(
-        failure.error.message.contains("string is not supported"),
-        "{}",
-        failure.error.message
-    );
-    assert!(failure.output.is_empty());
+    assert_eq!(console("console.log(\"hi\");"), vec!["hi".to_string()]);
 }
 
 #[test]

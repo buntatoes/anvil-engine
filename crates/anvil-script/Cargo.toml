@@ -18,4 +18,5 @@ publish.workspace = true
 
 [dependencies]
 anvil-dom = { path = "../anvil-dom" }
+anvil-js.workspace = true
 anvil-json.workspace = true
