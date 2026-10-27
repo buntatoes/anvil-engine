@@ -517,16 +517,23 @@ fn a_closure_captures_from_one_and_from_two_levels_out() {
 }
 
 #[test]
-fn capture_from_more_than_two_functions_out_is_refused() {
+fn capture_from_three_functions_out_works() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    // d reads x, a local three functions out, which is not supported yet.
-    let source = "function a() { let x = 1; function b() { function c() { function d() { return x; } return d(); } return c(); } return b(); } a();";
-    assert_eq!(
-        vm_error(source).message,
-        "variable captured from more than two functions out near ';'"
-    );
+    // d reads x, a local three functions out, threaded through c and b.
+    let source = "function a() { let x = 7; function b() { function c() { function d() { return x; } return d(); } return c(); } return b(); } a();";
+    assert_eq!(cpp(source), Some(7.0));
+}
+
+#[test]
+fn capture_from_four_functions_out_works() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // e reads x, a local four functions out, threaded through d, c and b.
+    let source = "function a() { let x = 9; function b() { function c() { function d() { function e() { return x; } return e(); } return d(); } return c(); } return b(); } a();";
+    assert_eq!(cpp(source), Some(9.0));
 }
 
 #[test]

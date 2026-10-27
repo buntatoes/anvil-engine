@@ -563,8 +563,6 @@ struct AnvilCompiler {
     // functions.
     bool fn_uses_cells;
     static constexpr u32 MAX_UPVALUES = ANVIL_MAX_UPVALUES;
-    // How many functions out a capture may reach.
-    static constexpr u32 MAX_CAPTURE_LEVELS = 2u;
     FnScope root_fn;
     FnScope* cur_fn;
     u16 next_reg;
@@ -989,10 +987,9 @@ struct AnvilCompiler {
 
     // Resolve `sym` as an upvalue of function scope fs: a local of some
     // enclosing function, threaded as an upvalue through every function in
-    // between. Returns fs's upvalue index, or -1 when sym belongs to no
-    // enclosing function (a global). *out_levels gets how many functions out it
-    // was found (1 = the immediately enclosing function).
-    i32 resolve_upvalue(FnScope* fs, u32 sym, u32 depth, u32* out_levels) noexcept {
+    // between, to any depth. Returns fs's upvalue index, or -1 when sym belongs
+    // to no enclosing function (a global).
+    i32 resolve_upvalue(FnScope* fs, u32 sym) noexcept {
         FnScope* parent = fs->parent;
         if (parent == nullptr) {
             return -1;
@@ -1001,14 +998,11 @@ struct AnvilCompiler {
              i >= static_cast<i32>(parent->local_floor); --i) {
             if (locals()[i].name_sym == sym) {
                 locals()[i].is_cell = true;
-                *out_levels = depth;
                 return add_upvalue(fs, true, locals()[i].reg, sym);
             }
         }
-        u32 deeper = 0u;
-        const i32 pu = resolve_upvalue(parent, sym, depth + 1u, &deeper);
+        const i32 pu = resolve_upvalue(parent, sym);
         if (pu >= 0) {
-            *out_levels = deeper;
             return add_upvalue(fs, false, static_cast<u16>(pu), sym);
         }
         return -1;
@@ -1026,14 +1020,8 @@ struct AnvilCompiler {
             }
         }
         if (cur_fn != nullptr && cur_fn->parent != nullptr) {
-            u32 levels = 0u;
-            const i32 u = resolve_upvalue(cur_fn, sym, 1u, &levels);
+            const i32 u = resolve_upvalue(cur_fn, sym);
             if (u >= 0) {
-                if (levels > MAX_CAPTURE_LEVELS) {
-                    reject_here(VM_REFUSE_UNSUPPORTED,
-                                "variable captured from more than two functions out");
-                    return VarRef{VarKind::Global, 0u, 0u, sym};
-                }
                 return VarRef{VarKind::Upval, 0u, static_cast<u32>(u), sym};
             }
         }
