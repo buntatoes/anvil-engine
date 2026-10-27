@@ -13,7 +13,7 @@
 
 Version 0.23.2. Author: Buntato.
 
-The source is public, so anyone can read it, audit it, and use it as part of Anvil Browser. It's still proprietary, though, not open source: you can't redistribute it on its own or use it to build a different product. [Anvil Browser](https://github.com/buntatoes/anvil-browser) and the nine companion libraries can be redistributed without it, under their own licenses. See [License](#license).
+The source is public, so anyone can read it, audit it, and use it as part of Anvil Browser. It's still proprietary, though, not open source: you can't redistribute it on its own or use it to build a different product. [Anvil Browser](https://github.com/buntatoes/anvil-browser) and the eleven companion libraries can be redistributed without it, under their own licenses. See [License](#license).
 
 There are no crates.io dependencies.
 
@@ -143,7 +143,7 @@ The engine is public so you can see exactly what it does. It is proprietary, not
 - You can read it, audit it, build it, and use it, unchanged, as part of Anvil Browser.
 - You can share Anvil Browser, including builds that have the engine compiled in, as long as `LICENSE` and the copyright notice go with it.
 - You can't redistribute the engine on its own, change it, sell it, or use it in a different product without my permission.
-- Anvil Browser and the nine libraries can also be redistributed without the engine, under their own licenses.
+- Anvil Browser and the eleven libraries can also be redistributed without the engine, under their own licenses.
 
 The full terms are in [LICENSE](./LICENSE). If this summary and `LICENSE` ever disagree, `LICENSE` wins.
 
