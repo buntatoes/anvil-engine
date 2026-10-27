@@ -215,6 +215,11 @@ void AnvilVmContext::init() noexcept {
     paused = false;
     resume_pc = 0u;
     resume_reg_base = 0u;
+    pending_host_call = false;
+    pending_host_fn = 0u;
+    pending_arg_count = 0u;
+    pending_host_overflow = 0u;
+    resume_host_dst = 0u;
     resume_frame_regs = 0u;
     steps_executed = 0u;
     hot_loops_accelerated = 0u;
@@ -367,6 +372,15 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
 AnvilValue AnvilVmContext::resume() noexcept {
     paused = false;
+    // A host call returns undefined to the guest; a plain yield resumes with
+    // the register file untouched.
+    if (pending_host_call) {
+        pending_host_call = false;
+        const u32 dst = resume_reg_base + resume_host_dst;
+        if (dst < registers_cap) {
+            registers()[dst] = AnvilValue::make_undefined();
+        }
+    }
     return run_loop(resume_pc, resume_reg_base, resume_frame_regs, resume_closure);
 }
 
@@ -775,6 +789,30 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cu
                 break;
             }
 
+            case AnvilOpcode::HostCall: {
+                // Copy the arguments off the register file, record the call,
+                // and pause with the host-call status. The caller reads the
+                // arguments from the out buffer and sends a Resume.
+                const u32 fn_id = inst.imm32();
+                const u32 base = inst.b;
+                const u32 argc = inst.c;
+                const u32 kept = argc < MAX_HOST_ARGS ? argc : MAX_HOST_ARGS;
+                for (u32 i = 0u; i < kept; ++i) {
+                    pending_args[i] = R[base + i];
+                }
+                pending_host_fn = fn_id;
+                pending_arg_count = kept;
+                pending_host_overflow = argc > MAX_HOST_ARGS ? 1u : 0u;
+                pending_host_call = true;
+                paused = true;
+                resume_pc = pc;
+                resume_reg_base = reg_base;
+                resume_frame_regs = cur_frame_regs;
+                resume_closure = cur_closure;
+                resume_host_dst = inst.a;
+                return AnvilValue::make_undefined();
+            }
+
             case AnvilOpcode::CallValue: {
                 const AnvilValue callee = R[inst.b];
                 if (!callee.is_function()) {
@@ -1017,7 +1055,13 @@ void AnvilVmContext::fill_telemetry(AnvilVmTelemetryC* out) const noexcept {
     for (u32 i = 0u; i < MAX_ERROR_TEXT; ++i) {
         out->stop_text[i] = i < n ? error.text[i] : '\0';
     }
-    fill_exports(out);
+    // When the run paused on a host call, the out buffer carries that call's
+    // arguments instead of the top-level variables.
+    if (paused && pending_host_call) {
+        fill_host_call(out);
+    } else {
+        fill_exports(out);
+    }
 }
 
 namespace {
@@ -1112,6 +1156,43 @@ void AnvilVmContext::fill_exports(AnvilVmTelemetryC* out) const noexcept {
     }
     out->exports_full = w.full ? 1u : 0u;
     out->exports_len = w.full ? 0u : w.len;
+}
+
+// The pending host call the out buffer carries while a run is paused on a
+// HostCall: fn id (u32), argument count (u32), overflow flag (u32), then one
+// tagged record per argument -- kind (u8) and, for a number or bool, an f64,
+// or for a string its length (u32) and bytes. Kinds match the export records.
+void AnvilVmContext::fill_host_call(AnvilVmTelemetryC* out) const noexcept {
+    ExportWriter w{out->exports, MAX_EXPORT_BYTES, 0u, false};
+    w.put_u32(pending_host_fn);
+    w.put_u32(pending_arg_count);
+    w.put_u32(pending_host_overflow);
+    for (u32 i = 0u; i < pending_arg_count && !w.full; ++i) {
+        const AnvilValue v = pending_args[i];
+        u8 kind = 6u;
+        if (v.is_bool()) {
+            kind = 2u;
+        } else if (v.is_number()) {
+            kind = 1u;
+        } else if (v.is_null()) {
+            kind = 3u;
+        } else if (v.is_undefined()) {
+            kind = 4u;
+        } else if (v.is_string()) {
+            kind = 5u;
+        }
+        w.put_u8(kind);
+        if (kind == 1u || kind == 2u) {
+            w.put_f64(v.as_number());
+        } else if (kind == 5u) {
+            u32 text_len = 0u;
+            const char* text = heap.get_string_ptr(v.payload(), &text_len);
+            w.put_u32(text ? text_len : 0u);
+            w.put_text(text, text_len);
+        }
+    }
+    out->exports_full = w.full ? 1u : 0u;
+    out->exports_len = w.len;
 }
 
 } // namespace anvil_vm

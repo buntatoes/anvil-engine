@@ -190,6 +190,75 @@ impl AnvilVmTelemetry {
     }
 }
 
+/// One argument of a host call the C++ VM passed back (for example to
+/// `console.log`). Strings only appear once the VM has string values.
+#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+enum HostArg {
+    Number(f64),
+    Bool(bool),
+    Null,
+    Undefined,
+    Str(String),
+    Other,
+}
+
+/// A host call the VM reached and paused on: which host function and its
+/// arguments, read from the out buffer's export area.
+#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+struct PendingHostCall {
+    fn_id: u32,
+    overflow: bool,
+    args: Vec<HostArg>,
+}
+
+impl AnvilVmTelemetry {
+    /// Read the pending host call the C++ VM wrote while paused on a HostCall.
+    /// `None` when the bytes are not a well-formed host-call record.
+    #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+    fn pending_host_call(&self) -> Option<PendingHostCall> {
+        let len = (self.exports.len as usize).min(VM_EXPORT_BYTES);
+        let mut reader = ExportReader {
+            bytes: &self.exports.bytes[..len],
+        };
+        let read_u32 = |r: &mut ExportReader| -> Option<u32> {
+            let b = r.take(4)?;
+            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let fn_id = read_u32(&mut reader)?;
+        let arg_count = read_u32(&mut reader)?;
+        let overflow = read_u32(&mut reader)? != 0;
+        let mut args = Vec::new();
+        for _ in 0..arg_count {
+            let kind = reader.take(1)?[0];
+            let arg = match kind {
+                1 | 2 => {
+                    let b = reader.take(8)?;
+                    let mut bits = [0u8; 8];
+                    bits.copy_from_slice(b);
+                    let number = f64::from_le_bytes(bits);
+                    if kind == 1 {
+                        HostArg::Number(number)
+                    } else {
+                        HostArg::Bool(number != 0.0)
+                    }
+                }
+                3 => HostArg::Null,
+                4 => HostArg::Undefined,
+                5 => HostArg::Str(reader.text()?),
+                _ => HostArg::Other,
+            };
+            args.push(arg);
+        }
+        Some(PendingHostCall {
+            fn_id,
+            overflow,
+            args,
+        })
+    }
+}
+
 /// Reads the records in [`VmExports`].
 #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
 struct ExportReader<'a> {
@@ -840,6 +909,99 @@ pub fn eval_cpp_vm_request_resumed(
     }
 }
 
+/// A number formatted as JavaScript's `Number.prototype.toString` would,
+/// which is how `console.log` prints a bare number.
+#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+fn js_number_to_string(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if n == 0.0 {
+        // Covers both 0 and -0, which stringify to "0".
+        return "0".to_string();
+    }
+    if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
+        return format!("{}", n as i64);
+    }
+    format!("{n}")
+}
+
+/// Format one host-call line the way `console.log` prints its arguments:
+/// each value as JavaScript would, joined by a single space. Strings and
+/// other reference values are not supported yet and are refused cleanly.
+#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+fn format_console_line(call: &PendingHostCall) -> Result<String, VmError> {
+    let mut parts: Vec<String> = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        let part = match arg {
+            HostArg::Number(n) => js_number_to_string(*n),
+            HostArg::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            HostArg::Null => "null".to_string(),
+            HostArg::Undefined => "undefined".to_string(),
+            HostArg::Str(_) => {
+                return Err(VmError {
+                    code: 33,
+                    message: "console.log of a string is not supported yet".to_string(),
+                });
+            }
+            HostArg::Other => {
+                return Err(VmError {
+                    code: 33,
+                    message: "console.log of an object is not supported yet".to_string(),
+                });
+            }
+        };
+        parts.push(part);
+    }
+    Ok(parts.join(" "))
+}
+
+/// The result of running a script on the C++ VM and collecting its
+/// `console.log` output: one string per `console.log` call, the script's
+/// final value, and the telemetry from the last step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConsoleRun {
+    /// One line per `console.log`, already formatted the way JavaScript
+    /// prints the arguments.
+    pub output: Vec<String>,
+    /// The script's final value (the Halt result).
+    pub result: f64,
+    /// Telemetry from the final step.
+    pub telemetry: AnvilVmTelemetry,
+}
+
+/// Run `source` on the C++ VM with the default budgets, driving every
+/// `console.log` host call to completion and collecting its output. The
+/// script runs entirely on the VM: there is no fallback to the interpreter,
+/// so a refusal or a stop comes back as the error, with no partial output
+/// left behind.
+pub fn eval_cpp_vm_with_console(source: &str) -> Result<ConsoleRun, VmError> {
+    eval_cpp_vm_with_console_configured(source, 0, 0, 0)
+}
+
+/// Like [`eval_cpp_vm_with_console`] with explicit budgets. A budget of 0
+/// leaves the built-in default; the source size is capped only by the heap
+/// byte budget.
+pub fn eval_cpp_vm_with_console_configured(
+    source: &str,
+    step_budget: u32,
+    heap_byte_budget: u32,
+    call_depth_limit: u32,
+) -> Result<ConsoleRun, VmError> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(VmError {
+            code: 32,
+            message: "empty script".to_string(),
+        });
+    }
+    let mut runtime = ScriptRuntime::new();
+    runtime.run_cpp_vm_console(trimmed, step_budget, heap_byte_budget, call_depth_limit)
+}
+
 pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
@@ -1424,6 +1586,9 @@ pub struct ScriptRuntime {
     last_script_used_vm: bool,
     last_vm_number: Option<f64>,
     last_vm_error: Option<VmError>,
+    // Telemetry from the last paused VM step (status 3), so the console
+    // driver can read the pending host call without a second FFI entry.
+    last_vm_telemetry: Option<Box<AnvilVmTelemetry>>,
     in_rust_eval: bool,
     vm_owner: VmOwner,
     wasm_modules: Vec<WasmModule>,
@@ -1471,6 +1636,7 @@ impl Default for ScriptRuntime {
             last_script_used_vm: false,
             last_vm_number: None,
             last_vm_error: None,
+            last_vm_telemetry: None,
             in_rust_eval: false,
             vm_owner: VmOwner::empty(),
             wasm_modules: Vec::new(),
@@ -3381,6 +3547,58 @@ impl ScriptRuntime {
         }
     }
 
+    /// Run `source` on the owned context, servicing every `console.log` host
+    /// call (a pause, status 3) by formatting and collecting its line, then
+    /// sending a Resume. Returns the collected output and the final value, or
+    /// the stop or refusal reason. No fallback to the interpreter.
+    pub(crate) fn run_cpp_vm_console(
+        &mut self,
+        source: &str,
+        step_budget: u32,
+        heap_byte_budget: u32,
+        call_depth_limit: u32,
+    ) -> Result<ConsoleRun, VmError> {
+        // Budgets apply to the Run and every Resume on this context; the source
+        // size is capped only by the heap budget (script size 0).
+        let configure = vm_request::configure(step_budget, 0, heap_byte_budget, call_depth_limit);
+        let _ = self.try_owned_vm(&configure);
+        let resume = vm_request::resume();
+        let mut outcome = self.try_owned_vm(&vm_request::run(source.as_bytes()));
+        let mut output: Vec<String> = Vec::new();
+        // A pause comes back as a stop with code 3; the telemetry for it is on
+        // the runtime. Read the host call, collect its line, then Resume.
+        loop {
+            match outcome {
+                VmRun::Value(result, telemetry) => {
+                    return Ok(ConsoleRun {
+                        output,
+                        result,
+                        telemetry: *telemetry,
+                    });
+                }
+                VmRun::Stopped(ref error) if error.code == 3 => {
+                    let telemetry = self.last_vm_telemetry.take().ok_or_else(|| VmError {
+                        code: 33,
+                        message: "the VM paused without leaving the host call".to_string(),
+                    })?;
+                    let call = telemetry.pending_host_call().ok_or_else(|| VmError {
+                        code: 33,
+                        message: "the VM wrote a broken host-call record".to_string(),
+                    })?;
+                    output.push(format_console_line(&call)?);
+                    outcome = self.try_owned_vm(&resume);
+                }
+                VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => return Err(error),
+                VmRun::Rejected(None) => {
+                    return Err(VmError {
+                        code: 33,
+                        message: "the C++ VM is not available".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     fn try_owned_vm(&mut self, request: &[u8]) -> VmRun {
         let trimmed = request;
         if trimmed.is_empty() || trimmed.len() > u32::MAX as usize {
@@ -3402,6 +3620,13 @@ impl ScriptRuntime {
                     &mut telemetry,
                     &mut result,
                 )
+            };
+            // Keep the telemetry from a pause so the console driver can read
+            // the pending host call without a second FFI entry point.
+            self.last_vm_telemetry = if code == 3 {
+                Some(Box::new(telemetry))
+            } else {
+                None
             };
             let reason = || {
                 telemetry.stop_reason().unwrap_or(VmError {

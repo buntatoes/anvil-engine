@@ -9,7 +9,7 @@
 use anvil_dom::parse_html;
 use anvil_script::{
     ScriptRuntime, VmError, eval_cpp_vm_script, eval_cpp_vm_script_bindings,
-    eval_cpp_vm_script_checked, is_cpp_jit_kernel_active,
+    eval_cpp_vm_script_checked, eval_cpp_vm_with_console, is_cpp_jit_kernel_active,
 };
 
 /// Halt value of `source` on the C++ VM, or `None` when it did not run there.
@@ -208,10 +208,6 @@ fn refused_scripts_say_why() {
     }
     let cases = [
         ("let t = typeof 1; 1;", "unsupported word 'typeof'"),
-        (
-            "let x = 1; console.log(x);",
-            "unsupported method call 'log'",
-        ),
         (
             "foo(1); 2;",
             "call to a function not declared in this script 'foo'",
@@ -920,4 +916,114 @@ fn loose_equality_postfix_and_push_values() {
     let error = vm_error("let o = {n: 1}; o.n++; o.n;");
     assert_eq!(error.code, 33);
     assert!(error.message.contains("++ or --"), "{}", error.message);
+}
+
+/// The console output of `source` on the C++ VM, or a panic with the reason
+/// when the VM refused or stopped it.
+fn console(source: &str) -> Vec<String> {
+    match eval_cpp_vm_with_console(source) {
+        Ok(run) => run.output,
+        Err(error) => panic!("{}: {} ({source})", error.code, error.message),
+    }
+}
+
+#[test]
+fn console_log_prints_a_number_through_a_host_call() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(console("console.log(42);"), vec!["42".to_string()]);
+    assert_eq!(console("console.log(1 + 2 * 3);"), vec!["7".to_string()]);
+    assert_eq!(
+        console("console.log(0.1 + 0.2);"),
+        vec!["0.30000000000000004".to_string()]
+    );
+    assert_eq!(console("console.log(-0);"), vec!["0".to_string()]);
+}
+
+#[test]
+fn console_log_prints_booleans_null_and_undefined_as_javascript_would() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(console("console.log(true);"), vec!["true".to_string()]);
+    assert_eq!(console("console.log(1 < 2);"), vec!["true".to_string()]);
+    assert_eq!(console("console.log(2 < 1);"), vec!["false".to_string()]);
+    assert_eq!(console("console.log(null);"), vec!["null".to_string()]);
+    assert_eq!(
+        console("let u; console.log(u);"),
+        vec!["undefined".to_string()]
+    );
+}
+
+#[test]
+fn console_log_joins_several_arguments_with_a_single_space() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(console("console.log(1, 2, 3);"), vec!["1 2 3".to_string()]);
+    assert_eq!(
+        console("console.log(1, true, null);"),
+        vec!["1 true null".to_string()]
+    );
+}
+
+#[test]
+fn console_log_zero_arguments_prints_an_empty_line() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(console("console.log();"), vec![String::new()]);
+}
+
+#[test]
+fn several_console_log_calls_each_make_a_line() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(
+        console("console.log(1); console.log(2); console.log(3);"),
+        vec!["1".to_string(), "2".to_string(), "3".to_string()]
+    );
+}
+
+#[test]
+fn console_log_runs_inside_loops_and_functions() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    assert_eq!(
+        console("for (let i = 0; i < 3; i++) { console.log(i); }"),
+        vec!["0".to_string(), "1".to_string(), "2".to_string()]
+    );
+    assert_eq!(
+        console("function f(x){ console.log(x * 2); } f(5); f(6);"),
+        vec!["10".to_string(), "12".to_string()]
+    );
+}
+
+#[test]
+fn console_log_of_a_string_literal_is_refused_cleanly() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let error = eval_cpp_vm_with_console("console.log(\"hi\");").unwrap_err();
+    assert_eq!(error.code, 33);
+    assert!(
+        error.message.contains("string is not supported"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn console_is_not_intercepted_when_shadowed_by_a_local() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Inside a function a local `console` is a plain value, so `console.log(...)`
+    // is member access, not a host call, and the VM refuses it rather than
+    // printing.
+    let outcome = eval_cpp_vm_with_console("function f(){ let console = 1; console.log(2); } f();");
+    assert!(outcome.is_err(), "{outcome:?}");
 }

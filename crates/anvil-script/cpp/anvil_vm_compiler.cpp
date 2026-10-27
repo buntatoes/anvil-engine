@@ -1419,6 +1419,56 @@ struct AnvilCompiler {
                 return compile_function_literal(true, false, sym);
             }
 
+            // Built-in `console.log(args...)`: a host call. The run pauses so a
+            // safe-Rust caller can read the arguments, print them and resume;
+            // the value left behind is undefined. Only when `console` is not
+            // shadowed by a local or a function declared in this script.
+            if (match_kw(&src[id_tok.offset], id_tok.length, "console", 7) &&
+                find_local(sym) < 0 && find_function(sym) == NO_SLOT &&
+                peek(0u).kind == TokenKind::Dot && peek(1u).kind == TokenKind::Ident &&
+                match_kw(&src[peek(1u).offset], peek(1u).length, "log", 3) &&
+                peek(2u).kind == TokenKind::LParen) {
+                advance();  // the dot
+                advance();  // log
+                expect(TokenKind::LParen);
+                u16 arg_regs[MAX_CALL_ARGS];
+                u32 argc = 0u;
+                while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
+                    // Strings are not supported yet; refuse a string argument
+                    // cleanly rather than print a placeholder for it.
+                    if (peek().kind == TokenKind::String) {
+                        const Token st = peek();
+                        reject_name(VM_REFUSE_UNSUPPORTED,
+                                    "console.log of a string is not supported yet", st);
+                        break;
+                    }
+                    const u16 arg_r = compile_expr();
+                    if (argc < MAX_CALL_ARGS) {
+                        arg_regs[argc] = arg_r;
+                    } else {
+                        reject_limit(VM_REFUSE_REGISTERS, "call argument", MAX_CALL_ARGS, "arguments per call");
+                    }
+                    ++argc;
+                    if (!match(TokenKind::Comma)) {
+                        break;
+                    }
+                }
+                expect(TokenKind::RParen);
+                // Stage the arguments into a contiguous run so an argument's
+                // temporaries cannot overwrite an earlier one.
+                const u16 call_base = next_reg;
+                for (u32 i = 0u; i < argc && !had_error; ++i) {
+                    const u16 slot_r = alloc_reg();
+                    if (i < argc && arg_regs[i] != slot_r) {
+                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                    }
+                }
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction{AnvilOpcode::HostCall, 0u, dst, call_base,
+                                                   static_cast<u16>(argc), 0u});
+                return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym});
+            }
+
             // Global isNaN / isFinite: coerce the one argument to a number and
             // test it. Only built-in when the name is not shadowed by a local
             // or a function declared in this script.

@@ -122,6 +122,10 @@ enum VmErrorCode : u32 {
 
 constexpr u32 MAX_ERROR_TEXT = 160u;
 constexpr u32 MAX_EXPORT_BYTES = 4096u;
+// Arguments of a single host call the out buffer carries when a run pauses
+// with the host-call status. More than this and `pending_host_overflow` is
+// set; console.log with that many arguments is beyond anything real.
+constexpr u32 MAX_HOST_ARGS = 32u;
 
 // The first reason a run stopped or a script was refused, as plain text.
 struct AnvilVmError {
@@ -1079,6 +1083,11 @@ enum class AnvilOpcode : u8 {
     GetUpval     = 53u,  // R[a] = contents of the running closure's upvalue b
     SetUpval     = 54u,  // the running closure's upvalue a <- R[b]
     MakeClosure  = 55u,  // R[a] = closure(fn_id = imm32, upvalue cells R[b..b+c])
+    // R[a] = host_call(fn_id = imm32, arg_base = b, argc = c). The run pauses
+    // with the host-call status so a safe-Rust caller can read the arguments
+    // from the out buffer, act on them (console.log prints them) and Resume;
+    // the result left in R[a] is undefined. The JIT does not compile it.
+    HostCall     = 56u,
 };
 
 struct AnvilInstruction {
@@ -1363,6 +1372,18 @@ struct AnvilVmContext {
     u32 resume_reg_base;
     u32 resume_frame_regs;
     u32 resume_closure;
+    // A host call the running guest reached (console.log and friends). When a
+    // HostCall opcode runs, the arguments are copied here, the run pauses with
+    // the host-call status, and fill_telemetry writes the call into the out
+    // buffer for a safe-Rust caller. resume() puts undefined in resume_host_dst
+    // and continues. pending_host_overflow is 1 when there were more arguments
+    // than MAX_HOST_ARGS. These are cleared by init() and reset on resume().
+    bool pending_host_call;
+    u32 pending_host_fn;
+    u32 pending_arg_count;
+    u32 pending_host_overflow;
+    u16 resume_host_dst;
+    AnvilValue pending_args[MAX_HOST_ARGS];
 
     // Compiler native-stack budget in bytes (measured from the compile
     // entry) before a deeply nested script is refused rather than overflowing
@@ -1441,6 +1462,10 @@ struct AnvilVmContext {
     AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
     void fill_exports(AnvilVmTelemetryC* out) const noexcept;
+    // Write the pending host call (fn id, argument count, overflow flag, then
+    // the tagged arguments) into the out buffer's export area when a run is
+    // paused on a HostCall. Reuses the export record encoding.
+    void fill_host_call(AnvilVmTelemetryC* out) const noexcept;
 };
 
 // Compile a numeric program to x86-64 and run it. Returns false when the
