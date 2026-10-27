@@ -973,12 +973,23 @@ pub struct ConsoleRun {
     pub telemetry: AnvilVmTelemetry,
 }
 
+/// A refused or stopped console run: the lines printed before it stopped and
+/// the reason it stopped. The output is kept so a caller can print what ran
+/// before reporting the error, as a JavaScript host would.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConsoleError {
+    /// Lines the run printed before it stopped.
+    pub output: Vec<String>,
+    /// Why the run was refused or stopped.
+    pub error: VmError,
+}
+
 /// Run `source` on the C++ VM with the default budgets, driving every
 /// `console.log` host call to completion and collecting its output. The
 /// script runs entirely on the VM: there is no fallback to the interpreter,
-/// so a refusal or a stop comes back as the error, with no partial output
-/// left behind.
-pub fn eval_cpp_vm_with_console(source: &str) -> Result<ConsoleRun, VmError> {
+/// so a refusal or a stop comes back as [`ConsoleError`], carrying any lines
+/// the run printed before it stopped.
+pub fn eval_cpp_vm_with_console(source: &str) -> Result<ConsoleRun, ConsoleError> {
     eval_cpp_vm_with_console_configured(source, 0, 0, 0)
 }
 
@@ -990,16 +1001,28 @@ pub fn eval_cpp_vm_with_console_configured(
     step_budget: u32,
     heap_byte_budget: u32,
     call_depth_limit: u32,
-) -> Result<ConsoleRun, VmError> {
+) -> Result<ConsoleRun, ConsoleError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
-        return Err(VmError {
-            code: 32,
-            message: "empty script".to_string(),
+        return Err(ConsoleError {
+            output: Vec::new(),
+            error: VmError {
+                code: 32,
+                message: "empty script".to_string(),
+            },
         });
     }
     let mut runtime = ScriptRuntime::new();
-    runtime.run_cpp_vm_console(trimmed, step_budget, heap_byte_budget, call_depth_limit)
+    let (output, outcome) =
+        runtime.run_cpp_vm_console(trimmed, step_budget, heap_byte_budget, call_depth_limit);
+    match outcome {
+        Ok((result, telemetry)) => Ok(ConsoleRun {
+            output,
+            result,
+            telemetry: *telemetry,
+        }),
+        Err(error) => Err(ConsoleError { output, error }),
+    }
 }
 
 pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
@@ -3466,12 +3489,13 @@ impl ScriptRuntime {
             // services console.log host calls and collects their output; that
             // output is only committed once the whole script ran on the VM, so
             // a fallback to the interpreter never double-prints a line.
-            match self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0) {
-                Ok(run) => match run.telemetry.exported_globals() {
+            let (output, outcome) = self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0);
+            match outcome {
+                Ok((result, telemetry)) => match telemetry.exported_globals() {
                     Ok(globals) => {
                         self.last_script_used_vm = true;
-                        self.last_vm_number = Some(run.result);
-                        for line in run.output {
+                        self.last_vm_number = Some(result);
+                        for line in output {
                             self.push_console(line);
                         }
                         // Later scripts see the top-level variables and the
@@ -3487,8 +3511,9 @@ impl ScriptRuntime {
                         }
                         return;
                     }
-                    // Later scripts could not see what this one declared,
-                    // so it runs on the Rust interpreter.
+                    // Later scripts could not see what this one declared, so it
+                    // runs on the Rust interpreter. Any lines the VM collected
+                    // are dropped so the interpreter does not reprint them.
                     Err(message) => {
                         self.last_vm_error = Some(VmError { code: 33, message });
                     }
@@ -3554,15 +3579,18 @@ impl ScriptRuntime {
 
     /// Run `source` on the owned context, servicing every `console.log` host
     /// call (a pause, status 3) by formatting and collecting its line, then
-    /// sending a Resume. Returns the collected output and the final value, or
-    /// the stop or refusal reason. No fallback to the interpreter.
+    /// sending a Resume. Returns the lines collected so far together with the
+    /// final value and telemetry, or the stop or refusal reason. The lines are
+    /// returned on both paths, so a caller that prints as it goes keeps the
+    /// output a run made before it stopped. No fallback to the interpreter.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn run_cpp_vm_console(
         &mut self,
         source: &str,
         step_budget: u32,
         heap_byte_budget: u32,
         call_depth_limit: u32,
-    ) -> Result<ConsoleRun, VmError> {
+    ) -> (Vec<String>, Result<(f64, Box<AnvilVmTelemetry>), VmError>) {
         // Budgets apply to the Run and every Resume on this context; the source
         // size is capped only by the heap budget (script size 0).
         let configure = vm_request::configure(step_budget, 0, heap_byte_budget, call_depth_limit);
@@ -3575,30 +3603,46 @@ impl ScriptRuntime {
         loop {
             match outcome {
                 VmRun::Value(result, telemetry) => {
-                    return Ok(ConsoleRun {
-                        output,
-                        result,
-                        telemetry: *telemetry,
-                    });
+                    return (output, Ok((result, telemetry)));
                 }
                 VmRun::Stopped(ref error) if error.code == 3 => {
-                    let telemetry = self.last_vm_telemetry.take().ok_or_else(|| VmError {
-                        code: 33,
-                        message: "the VM paused without leaving the host call".to_string(),
-                    })?;
-                    let call = telemetry.pending_host_call().ok_or_else(|| VmError {
-                        code: 33,
-                        message: "the VM wrote a broken host-call record".to_string(),
-                    })?;
-                    output.push(format_console_line(&call)?);
+                    let telemetry = match self.last_vm_telemetry.take() {
+                        Some(telemetry) => telemetry,
+                        None => {
+                            return (
+                                output,
+                                Err(VmError {
+                                    code: 33,
+                                    message: "the VM paused without leaving the host call"
+                                        .to_string(),
+                                }),
+                            );
+                        }
+                    };
+                    match telemetry
+                        .pending_host_call()
+                        .ok_or_else(|| VmError {
+                            code: 33,
+                            message: "the VM wrote a broken host-call record".to_string(),
+                        })
+                        .and_then(|call| format_console_line(&call))
+                    {
+                        Ok(line) => output.push(line),
+                        Err(error) => return (output, Err(error)),
+                    }
                     outcome = self.try_owned_vm(&resume);
                 }
-                VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => return Err(error),
+                VmRun::Stopped(error) | VmRun::Rejected(Some(error)) => {
+                    return (output, Err(error));
+                }
                 VmRun::Rejected(None) => {
-                    return Err(VmError {
-                        code: 33,
-                        message: "the C++ VM is not available".to_string(),
-                    });
+                    return (
+                        output,
+                        Err(VmError {
+                            code: 33,
+                            message: "the C++ VM is not available".to_string(),
+                        }),
+                    );
                 }
             }
         }

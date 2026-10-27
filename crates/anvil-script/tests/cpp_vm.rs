@@ -946,7 +946,10 @@ fn loose_equality_postfix_and_push_values() {
 fn console(source: &str) -> Vec<String> {
     match eval_cpp_vm_with_console(source) {
         Ok(run) => run.output,
-        Err(error) => panic!("{}: {} ({source})", error.code, error.message),
+        Err(failure) => panic!(
+            "{}: {} ({source})",
+            failure.error.code, failure.error.message
+        ),
     }
 }
 
@@ -1030,13 +1033,14 @@ fn console_log_of_a_string_literal_is_refused_cleanly() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let error = eval_cpp_vm_with_console("console.log(\"hi\");").unwrap_err();
-    assert_eq!(error.code, 33);
+    let failure = eval_cpp_vm_with_console("console.log(\"hi\");").unwrap_err();
+    assert_eq!(failure.error.code, 33);
     assert!(
-        error.message.contains("string is not supported"),
+        failure.error.message.contains("string is not supported"),
         "{}",
-        error.message
+        failure.error.message
     );
+    assert!(failure.output.is_empty());
 }
 
 #[test]
