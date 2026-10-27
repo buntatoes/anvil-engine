@@ -511,6 +511,16 @@ u32 AnvilHeap::alloc_array(u32 initial_capacity) noexcept {
     bytes_allocated += static_cast<u32>(sizeof(AnvilHeapArray)) + cap * static_cast<u32>(sizeof(AnvilValue));
     return id;
 }
+
+u32 AnvilHeap::alloc_cell(AnvilValue v) noexcept {
+    const u32 id = alloc_array(1u);
+    if (id == NO_SLOT) {
+        return NO_SLOT;
+    }
+    arrays()[id].length = 1u;
+    array_elems(arrays()[id].storage_off)[0] = v;
+    return id;
+}
 u32 AnvilHeap::alloc_function(
     u32 name_sym,
     u32 arity,

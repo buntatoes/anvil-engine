@@ -1113,21 +1113,17 @@ fn extra_arguments_are_ignored() {
     assert_eq!(v, 7.0);
 }
 
-/// A closure that reads an enclosing local is still refused (captured variables
-/// aren't supported yet); it is a clean refusal, and the Rust interpreter runs
-/// the script.
+/// A closure that reads an enclosing local runs on the VM: the inner function
+/// captures the outer `let` by reference.
 #[test]
-fn a_closure_over_an_outer_local_is_refused_for_now() {
+fn a_closure_reads_an_enclosing_local() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let error = anvil_script::eval_cpp_vm_request_configured(
+    let (v, _) = anvil_script::eval_cpp_vm_request_configured(
         1_000_000,
         "function mk() { let k = 5; return function () { return k; }; } mk()();",
     )
-    .unwrap_err();
-    assert!(
-        error.code >= 32,
-        "expected a compile-time refusal, got: {error:?}"
-    );
+    .expect("a closure over an outer local runs");
+    assert_eq!(v, 5.0);
 }

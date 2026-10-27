@@ -504,6 +504,17 @@ struct BlockScope {
 struct LocalBinding {
     u32 name_sym;
     u16 reg;
+    bool is_cell;   // the binding lives in a heap cell (captured by a closure)
+};
+
+// How a referenced name is reached: a plain register, a cell in a register, an
+// upvalue of the running closure, or a global slot.
+enum class VarKind { Local, Cell, Upval, Global };
+struct VarRef {
+    VarKind kind;
+    u16 reg;   // Local: value register; Cell: cell register
+    u32 idx;   // Upval: upvalue index
+    u32 sym;   // Global: name symbol
 };
 
 struct AnvilCompiler {
@@ -524,6 +535,17 @@ struct AnvilCompiler {
     u32 locals_cap;
     u32 local_count;
     u32 local_floor;
+    // Closures. A function that contains a nested function holds its locals in
+    // heap cells, so an inner function can capture them. enclosing_floor is the
+    // first local index of the immediately enclosing function (for single-level
+    // capture); the upvalue arrays record, for the function being compiled, the
+    // enclosing cell register behind each captured name.
+    bool fn_uses_cells;
+    u32 enclosing_floor;
+    static constexpr u32 MAX_UPVALUES = 64u;
+    u16 upval_cell_reg[MAX_UPVALUES];
+    u32 upval_sym[MAX_UPVALUES];
+    u32 upval_count;
     u16 next_reg;
     // Registers below this hold the current function's parameters and
     // locals. Registers from here up are temporaries, free again after
@@ -780,12 +802,11 @@ struct AnvilCompiler {
             if (!stmt_pos) {
                 continue;
             }
-            // A declaration inside a block or another function captures its
-            // enclosing scope; that needs closures and is not compiled yet.
+            // A declaration inside another function is compiled in place as a
+            // local closure, not hoisted to the function table. (A declaration
+            // in a plain top-level block is refused where it is compiled.)
             if (depth != 0u) {
-                const Token& shown = (i + 1u < lexer.count) ? lexer.tokens()[i + 1u] : t;
-                reject_name(VM_REFUSE_UNSUPPORTED, "function declared inside a block or function", shown);
-                return;
+                continue;
             }
             if (i + 2u >= lexer.count || lexer.tokens()[i + 1u].kind != TokenKind::Ident ||
                 lexer.tokens()[i + 2u].kind != TokenKind::LParen) {
@@ -915,7 +936,7 @@ struct AnvilCompiler {
         }
         const u16 r = alloc_reg();
         if (ensure_locals(local_count + 1u)) {
-            locals()[local_count++] = LocalBinding{sym, r};
+            locals()[local_count++] = LocalBinding{sym, r, fn_uses_cells};
         } else {
             reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
         }
@@ -923,6 +944,157 @@ struct AnvilCompiler {
             reg_floor = static_cast<u16>(r + 1u);
         }
         return r;
+    }
+
+    u32 add_upvalue(u16 enclosing_cell_reg, u32 sym) noexcept {
+        for (u32 i = 0u; i < upval_count; ++i) {
+            if (upval_sym[i] == sym) {
+                return i;
+            }
+        }
+        if (upval_count >= MAX_UPVALUES) {
+            reject_limit(VM_REFUSE_REGISTERS, "captured variable", MAX_UPVALUES,
+                         "captured variables per function");
+            return 0u;
+        }
+        upval_cell_reg[upval_count] = enclosing_cell_reg;
+        upval_sym[upval_count] = sym;
+        return upval_count++;
+    }
+
+    // Resolve a name to how it is reached: this function's own local (plain or
+    // cell), an upvalue captured from the immediately enclosing function, or a
+    // global. Single-level capture: only the enclosing function's locals are
+    // searched for a capture.
+    VarRef resolve_var(u32 sym) noexcept {
+        for (i32 i = static_cast<i32>(local_count) - 1; i >= static_cast<i32>(local_floor); --i) {
+            if (locals()[i].name_sym == sym) {
+                return VarRef{locals()[i].is_cell ? VarKind::Cell : VarKind::Local,
+                              locals()[i].reg, 0u, sym};
+            }
+        }
+        if (in_function) {
+            for (i32 i = static_cast<i32>(local_floor) - 1; i >= static_cast<i32>(enclosing_floor); --i) {
+                if (locals()[i].name_sym == sym) {
+                    const u32 idx = add_upvalue(locals()[i].reg, sym);
+                    return VarRef{VarKind::Upval, 0u, idx, sym};
+                }
+            }
+            // A name belonging to a function more than one level out would need
+            // upvalues threaded through every function in between; that rewrite
+            // is not done, so refuse rather than silently read a global.
+            for (i32 i = static_cast<i32>(enclosing_floor) - 1; i >= 0; --i) {
+                if (locals()[i].name_sym == sym) {
+                    reject_here(VM_REFUSE_UNSUPPORTED,
+                                "variable captured from more than one function out");
+                    return VarRef{VarKind::Global, 0u, 0u, sym};
+                }
+            }
+        }
+        return VarRef{VarKind::Global, 0u, 0u, sym};
+    }
+
+    // Load a variable's value into a register (a fresh one for cell/upvalue/global).
+    u16 load_var(const VarRef& vr) noexcept {
+        switch (vr.kind) {
+            case VarKind::Local:
+                return vr.reg;
+            case VarKind::Cell: {
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CellGet, dst, vr.reg, 0u));
+                return dst;
+            }
+            case VarKind::Upval: {
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(
+                    AnvilOpcode::GetUpval, dst, static_cast<u16>(vr.idx), 0u));
+                return dst;
+            }
+            case VarKind::Global:
+            default: {
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abx(
+                    AnvilOpcode::GetGlobal, dst, global_slot(vr.sym)));
+                return dst;
+            }
+        }
+    }
+
+    // Store a value into a variable (rebinding it, not mutating what it points to).
+    void store_var(const VarRef& vr, u16 src) noexcept {
+        switch (vr.kind) {
+            case VarKind::Local:
+                if (vr.reg != src) {
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, vr.reg, src, 0u));
+                }
+                break;
+            case VarKind::Cell:
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CellSet, vr.reg, src, 0u));
+                break;
+            case VarKind::Upval:
+                ctx->program.emit(AnvilInstruction::make_abc(
+                    AnvilOpcode::SetUpval, static_cast<u16>(vr.idx), src, 0u));
+                break;
+            case VarKind::Global:
+            default:
+                ctx->program.emit(AnvilInstruction::make_abx(
+                    AnvilOpcode::SetGlobal, src, global_slot(vr.sym)));
+                break;
+        }
+    }
+
+    // Initialise a freshly declared local register from a value, boxing it in a
+    // cell when the local is captured.
+    void init_local(u16 reg, bool is_cell, u16 value_reg) noexcept {
+        if (is_cell) {
+            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, reg, value_reg, 0u));
+        } else if (reg != value_reg) {
+            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, reg, value_reg, 0u));
+        }
+    }
+
+    // True when the function whose body begins at the cursor contains a nested
+    // function or arrow, so its locals must be held in cells. The cursor is at
+    // the parameter list '(' or the arrow parameter; scanning skips that list.
+    bool body_has_nested_function() const noexcept {
+        // The cursor is at the function body: '{' for a block body, or the first
+        // token of a bare arrow-expression body. True when the body contains a
+        // nested function or arrow, so this function's locals must be cells.
+        if (cursor >= lexer.count) {
+            return false;
+        }
+        if (lexer.tokens()[cursor].kind == TokenKind::LBrace) {
+            u32 d = 0u;
+            for (u32 k = 0u; cursor + k < lexer.count; ++k) {
+                const TokenKind kk = lexer.tokens()[cursor + k].kind;
+                if (kk == TokenKind::LBrace) {
+                    ++d;
+                } else if (kk == TokenKind::RBrace) {
+                    --d;
+                    if (d == 0u) { return false; }
+                } else if (kk == TokenKind::KwFunction || kk == TokenKind::FatArrow) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Bare arrow-expression body: scan to the end of the expression.
+        i32 d = 0;
+        for (u32 k = 0u; cursor + k < lexer.count; ++k) {
+            const TokenKind kk = lexer.tokens()[cursor + k].kind;
+            if (kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace) {
+                ++d;
+            } else if (kk == TokenKind::RParen || kk == TokenKind::RBracket ||
+                       kk == TokenKind::RBrace) {
+                if (d == 0) { return false; }
+                --d;
+            } else if (d == 0 && (kk == TokenKind::Comma || kk == TokenKind::Semicolon)) {
+                return false;
+            } else if (kk == TokenKind::KwFunction || kk == TokenKind::FatArrow) {
+                return true;
+            }
+        }
+        return false;
     }
 
     u32 intern_name(const char* name, u32 len) noexcept {
@@ -1008,12 +1180,24 @@ struct AnvilCompiler {
         const u16 saved_reg_floor = reg_floor;
         const u16 saved_high_reg = high_reg;
         const bool saved_in_fn = in_function;
+        const bool saved_uses_cells = fn_uses_cells;
+        const u32 saved_enclosing_floor = enclosing_floor;
+        u16 saved_upval_cell_reg[MAX_UPVALUES];
+        u32 saved_upval_sym[MAX_UPVALUES];
+        const u32 saved_upval_count = upval_count;
+        for (u32 i = 0u; i < upval_count; ++i) {
+            saved_upval_cell_reg[i] = upval_cell_reg[i];
+            saved_upval_sym[i] = upval_sym[i];
+        }
 
+        enclosing_floor = saved_local_floor;
         local_floor = local_count;
         next_reg = 0u;
         reg_floor = 0u;
         high_reg = 0u;
         in_function = true;
+        fn_uses_cells = false;
+        upval_count = 0u;
 
         u32 arity = 0u;
         if (single_param_sym != NO_SLOT) {
@@ -1039,11 +1223,25 @@ struct AnvilCompiler {
             expect(TokenKind::FatArrow);
         }
 
+        // Now at the body: decide whether this function holds its locals in
+        // cells so that a nested function can capture them.
+        fn_uses_cells = body_has_nested_function();
+
         const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
         const u32 fn_start_pc = ctx->program.code_len;
         if (fn_id < ctx->heap.function_count) {
             ctx->heap.functions()[fn_id].code_start = fn_start_pc;
             ctx->heap.functions()[fn_id].arity = arity;
+        }
+
+        // Box the parameters that arrived in registers, as the first thing the
+        // function body does, so each call gets fresh cells.
+        if (fn_uses_cells) {
+            for (u32 i = local_floor; i < local_count; ++i) {
+                locals()[i].is_cell = true;
+                const u16 preg = locals()[i].reg;
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, preg, preg, 0u));
+            }
         }
 
         if (is_arrow && peek().kind != TokenKind::LBrace) {
@@ -1063,15 +1261,42 @@ struct AnvilCompiler {
         ctx->program.code()[jskip_pc] =
             AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
 
+        // Capture list for this function, read while its upvalues are still live.
+        const u32 n_up = upval_count;
+        u16 captured_cell_reg[MAX_UPVALUES];
+        for (u32 i = 0u; i < n_up; ++i) {
+            captured_cell_reg[i] = upval_cell_reg[i];
+        }
+
         local_count = saved_local_count;
         local_floor = saved_local_floor;
         next_reg = saved_next_reg;
         reg_floor = saved_reg_floor;
         high_reg = saved_high_reg;
         in_function = saved_in_fn;
+        fn_uses_cells = saved_uses_cells;
+        enclosing_floor = saved_enclosing_floor;
+        upval_count = saved_upval_count;
+        for (u32 i = 0u; i < saved_upval_count; ++i) {
+            upval_cell_reg[i] = saved_upval_cell_reg[i];
+            upval_sym[i] = saved_upval_sym[i];
+        }
 
         const u16 dst = alloc_reg();
-        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_id));
+        if (n_up == 0u) {
+            // No captures: the function's canonical closure, so f === f holds.
+            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_id));
+        } else {
+            // Stage the captured cells (from the enclosing frame) contiguously,
+            // then build a fresh closure over them.
+            const u16 base = next_reg;
+            for (u32 i = 0u; i < n_up; ++i) {
+                const u16 slot = alloc_reg();
+                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot, captured_cell_reg[i], 0u));
+            }
+            ctx->program.emit(AnvilInstruction{AnvilOpcode::MakeClosure, 0u, dst, base,
+                                               static_cast<u16>(n_up), fn_id});
+        }
         return dst;
     }
 
@@ -1332,9 +1557,9 @@ struct AnvilCompiler {
             // A local or a declared global that holds a function value is
             // called through the value with CallValue.
             if (match(TokenKind::LParen)) {
-                const i32 callee_local = find_local(sym);
+                const VarRef callee_var = resolve_var(sym);
                 const u32 target_fn = find_function(sym);
-                const bool direct = (target_fn != NO_SLOT && callee_local < 0);
+                const bool direct = (target_fn != NO_SLOT && callee_var.kind == VarKind::Global);
 
                 // Every argument is compiled first, into scattered temporaries;
                 // they are copied into a contiguous run below so an argument's
@@ -1373,14 +1598,16 @@ struct AnvilCompiler {
                     const u16 dst = alloc_reg();
                     ctx->program.emit(AnvilInstruction::make_abc(
                         AnvilOpcode::Call, dst, static_cast<u16>(target_fn), call_base));
-                    return dst;
+                    return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym});
                 }
 
-                // Locate the callee value: a local, or a declared global.
+                // Locate the callee value: a local or upvalue holding a
+                // function, or a declared global.
                 u16 callee_reg = 0u;
                 bool have_callee = false;
-                if (callee_local >= 0) {
-                    callee_reg = static_cast<u16>(callee_local);
+                if (callee_var.kind == VarKind::Local || callee_var.kind == VarKind::Cell ||
+                    callee_var.kind == VarKind::Upval) {
+                    callee_reg = load_var(callee_var);
                     have_callee = true;
                 } else {
                     for (u32 gi = 0u; gi < ctx->global_count; ++gi) {
@@ -1412,35 +1639,29 @@ struct AnvilCompiler {
                 const u16 dst = alloc_reg();
                 ctx->program.emit(AnvilInstruction{
                     AnvilOpcode::CallValue, 0u, dst, callee_reg, call_base, argc});
-                return dst;
+                return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym});
             }
 
-            // Variable read (local register or global binding)
-            const i32 local_r = find_local(sym);
-            if (local_r < 0 && match_kw(&src[id_tok.offset], id_tok.length, "undefined", 9)) {
-                const u16 dst = alloc_reg();
-                emit_load_undefined(dst);
-                return compile_postfix(dst, sym, -1);
-            }
-            // A function declared in this script, used as a value (passed,
-            // returned or stored), loads as a function value.
-            if (local_r < 0) {
+            // Variable read: this function's local or cell, an upvalue, or a
+            // global binding.
+            const VarRef vr = resolve_var(sym);
+            if (vr.kind == VarKind::Global) {
+                if (match_kw(&src[id_tok.offset], id_tok.length, "undefined", 9)) {
+                    const u16 dst = alloc_reg();
+                    emit_load_undefined(dst);
+                    return compile_postfix(dst, vr);
+                }
+                // A function declared in this script, used as a value (passed,
+                // returned or stored), loads as a function value.
                 const u32 fn_as_value = find_function(sym);
                 if (fn_as_value != NO_SLOT) {
                     const u16 dst = alloc_reg();
                     ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_as_value));
-                    return compile_postfix(dst, sym, -1);
+                    return compile_postfix(dst, vr);
                 }
             }
-            u16 base_reg = 0u;
-            if (local_r >= 0) {
-                base_reg = static_cast<u16>(local_r);
-            } else {
-                base_reg = alloc_reg();
-                const u16 g_slot = global_slot(sym);
-                ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::GetGlobal, base_reg, g_slot));
-            }
-            return compile_postfix(base_reg, sym, local_r);
+            const u16 base_reg = load_var(vr);
+            return compile_postfix(base_reg, vr);
         }
 
         reject_syntax();
@@ -1449,7 +1670,7 @@ struct AnvilCompiler {
         return fallback;
     }
 
-    u16 compile_postfix(u16 base_reg, u32 ident_sym, i32 local_r) noexcept {
+    u16 compile_postfix(u16 base_reg, VarRef vr) noexcept {
         u16 cur = base_reg;
         while (!had_error) {
             if (match(TokenKind::Dot)) {
@@ -1523,6 +1744,37 @@ struct AnvilCompiler {
                 cur = dst;
                 continue;
             }
+            if (match(TokenKind::LParen)) {
+                // A call applied to a value expression (for example the result
+                // of an earlier call, `mk()()`), dispatched through the value.
+                u16 arg_regs[MAX_CALL_ARGS];
+                u32 argc = 0u;
+                while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
+                    const u16 arg_r = compile_expr();
+                    if (argc < MAX_CALL_ARGS) {
+                        arg_regs[argc] = arg_r;
+                    } else {
+                        reject_limit(VM_REFUSE_REGISTERS, "call argument", MAX_CALL_ARGS, "arguments per call");
+                    }
+                    ++argc;
+                    if (!match(TokenKind::Comma)) {
+                        break;
+                    }
+                }
+                expect(TokenKind::RParen);
+                const u16 call_base = next_reg;
+                for (u32 i = 0u; i < argc && !had_error; ++i) {
+                    const u16 slot_r = alloc_reg();
+                    if (arg_regs[i] != slot_r) {
+                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                    }
+                }
+                const u16 dst = alloc_reg();
+                ctx->program.emit(AnvilInstruction{
+                    AnvilOpcode::CallValue, 0u, dst, cur, call_base, argc});
+                cur = dst;
+                continue;
+            }
             if (peek().kind == TokenKind::PlusPlus || peek().kind == TokenKind::MinusMinus) {
                 // Only a plain variable is compiled. `o.n++` or `a[i]++`
                 // would need the store to go back to the property.
@@ -1545,29 +1797,13 @@ struct AnvilCompiler {
                     old_reg,
                     one_reg
                 ));
-                store_back_ident(ident_sym, local_r, dst);
+                store_var(vr, dst);
                 cur = old_reg;
                 break;
             }
             break;
         }
         return cur;
-    }
-
-    void store_back_ident(u32 sym, i32 local_r, u16 src_reg) noexcept {
-        if (local_r >= 0) {
-            if (static_cast<u16>(local_r) != src_reg) {
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::Move,
-                    static_cast<u16>(local_r),
-                    src_reg,
-                    0u
-                ));
-            }
-        } else {
-            const u16 g_slot = global_slot(sym);
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, src_reg, g_slot));
-        }
     }
 
     u16 compile_unary() noexcept {
@@ -1823,14 +2059,15 @@ struct AnvilCompiler {
                 return val_reg;
             }
             const u16 dst = declare_local(sym);
+            const bool is_cell = fn_uses_cells;
             if (match(TokenKind::Assign)) {
                 const u16 val_reg = compile_expr();
                 reject_if_expression_continues();
-                if (val_reg != dst) {
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, val_reg, 0u));
-                }
+                init_local(dst, is_cell, val_reg);
             } else {
-                emit_load_undefined(dst);
+                const u16 u = alloc_reg();
+                emit_load_undefined(u);
+                init_local(dst, is_cell, u);
             }
             match(TokenKind::Semicolon);
             return dst;
@@ -2028,6 +2265,32 @@ struct AnvilCompiler {
                 return 0u;
             }
             const u32 fn_sym = token_sym(fn_tok);
+
+            if (in_function) {
+                // A nested declaration: a local binding that holds a closure.
+                // The binding is created first (in a cell when this function
+                // keeps its locals in cells, which it does whenever it contains
+                // a nested function) so the inner function can capture its own
+                // name for recursion before its value is stored.
+                const u16 dst = declare_local(fn_sym);
+                const VarRef self = resolve_var(fn_sym);
+                const u16 u = alloc_reg();
+                emit_load_undefined(u);
+                init_local(dst, self.kind == VarKind::Cell, u);
+                const u16 val = compile_function_literal(false, true, NO_SLOT);
+                store_var(self, val);
+                return 0u;
+            }
+
+            // A top-level declaration was hoisted into the function table in the
+            // first pass; a declaration sitting in a plain top-level block was
+            // not, and is refused here.
+            const u32 fn_id = find_function(fn_sym);
+            if (fn_id == NO_SLOT) {
+                reject_name(VM_REFUSE_UNSUPPORTED,
+                            "function declared inside a block", fn_tok);
+                return 0u;
+            }
             expect(TokenKind::LParen);
 
             // Save enclosing compiler state. The enclosing locals stay in the
@@ -2040,12 +2303,24 @@ struct AnvilCompiler {
             const u16 saved_reg_floor = reg_floor;
             const u16 saved_high_reg = high_reg;
             const bool saved_in_fn = in_function;
+            const bool saved_uses_cells = fn_uses_cells;
+            const u32 saved_enclosing_floor = enclosing_floor;
+            u16 saved_upval_cell_reg[MAX_UPVALUES];
+            u32 saved_upval_sym[MAX_UPVALUES];
+            const u32 saved_upval_count = upval_count;
+            for (u32 i = 0u; i < upval_count; ++i) {
+                saved_upval_cell_reg[i] = upval_cell_reg[i];
+                saved_upval_sym[i] = upval_sym[i];
+            }
 
+            enclosing_floor = saved_local_floor;
             local_floor = local_count;
             next_reg = 0u;
             reg_floor = 0u;
             high_reg = 0u;
             in_function = true;
+            fn_uses_cells = false;
+            upval_count = 0u;
 
             u32 arity = 0u;
             while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
@@ -2062,14 +2337,24 @@ struct AnvilCompiler {
             }
             expect(TokenKind::RParen);
 
+            // Hold this function's locals in cells when it contains a nested
+            // function.
+            fn_uses_cells = body_has_nested_function();
+
             const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
             const u32 fn_start_pc = ctx->program.code_len;
-            // hoist_functions made the function already; its code starts here.
-            const u32 fn_id = find_function(fn_sym);
-            if (fn_id == NO_SLOT) {
-                reject_name(VM_REFUSE_SYNTAX, "function not found by the first pass", fn_tok);
-            } else {
+            if (fn_id < ctx->heap.function_count) {
                 ctx->heap.functions()[fn_id].code_start = fn_start_pc;
+            }
+
+            // Box the parameters that arrived in registers, as the first thing
+            // the function body does, so each call gets fresh cells.
+            if (fn_uses_cells) {
+                for (u32 i = local_floor; i < local_count; ++i) {
+                    locals()[i].is_cell = true;
+                    const u16 preg = locals()[i].reg;
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, preg, preg, 0u));
+                }
             }
 
             compile_statement();
@@ -2095,6 +2380,13 @@ struct AnvilCompiler {
             reg_floor = saved_reg_floor;
             high_reg = saved_high_reg;
             in_function = saved_in_fn;
+            fn_uses_cells = saved_uses_cells;
+            enclosing_floor = saved_enclosing_floor;
+            upval_count = saved_upval_count;
+            for (u32 i = 0u; i < saved_upval_count; ++i) {
+                upval_cell_reg[i] = saved_upval_cell_reg[i];
+                upval_sym[i] = saved_upval_sym[i];
+            }
             return 0u;
         }
 
@@ -2119,15 +2411,8 @@ struct AnvilCompiler {
                 const Token id_tok = advance();
                 const bool is_inc = advance().kind == TokenKind::PlusPlus;
                 const u32 sym = token_sym(id_tok);
-                const i32 local_r = find_local(sym);
-                u16 cur_reg = 0u;
-                if (local_r >= 0) {
-                    cur_reg = static_cast<u16>(local_r);
-                } else {
-                    cur_reg = alloc_reg();
-                    const u16 g_slot = global_slot(sym);
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::GetGlobal, cur_reg, g_slot));
-                }
+                const VarRef vr = resolve_var(sym);
+                const u16 cur_reg = load_var(vr);
                 const u16 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
                 const u16 dst = alloc_reg();
@@ -2137,10 +2422,10 @@ struct AnvilCompiler {
                     cur_reg,
                     one_reg
                 ));
-                store_back_ident(sym, local_r, dst);
+                store_var(vr, dst);
                 // At the top level the old value is still in its temporary,
                 // and the VM reads a script's value as a number.
-                return local_r >= 0 ? dst : cur_reg;
+                return vr.kind == VarKind::Global ? cur_reg : dst;
             }
             if (second == TokenKind::Assign ||
                 second == TokenKind::PlusEq ||
@@ -2149,28 +2434,21 @@ struct AnvilCompiler {
                 const Token id_tok = advance();
                 const TokenKind assign_kind = advance().kind;
                 const u32 sym = token_sym(id_tok);
-                const i32 local_r = find_local(sym);
+                const VarRef vr = resolve_var(sym);
                 const u16 rhs = compile_expr();
 
                 if (assign_kind == TokenKind::Assign) {
-                    store_back_ident(sym, local_r, rhs);
+                    store_var(vr, rhs);
                     return rhs;
                 }
 
-                u16 cur_reg = 0u;
-                if (local_r >= 0) {
-                    cur_reg = static_cast<u16>(local_r);
-                } else {
-                    cur_reg = alloc_reg();
-                    const u16 g_slot = global_slot(sym);
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::GetGlobal, cur_reg, g_slot));
-                }
+                const u16 cur_reg = load_var(vr);
                 const u16 dst = alloc_reg();
                 const AnvilOpcode opc = (assign_kind == TokenKind::PlusEq)
                     ? AnvilOpcode::Add
                     : (assign_kind == TokenKind::MinusEq ? AnvilOpcode::Sub : AnvilOpcode::Mul);
                 ctx->program.emit(AnvilInstruction::make_abc(opc, dst, cur_reg, rhs));
-                store_back_ident(sym, local_r, dst);
+                store_var(vr, dst);
                 return dst;
             }
         }
@@ -2212,6 +2490,9 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.next_loop_id = 0u;
     g_compiler.loop_depth = 0u;
     g_compiler.in_function = false;
+    g_compiler.fn_uses_cells = false;
+    g_compiler.enclosing_floor = 0u;
+    g_compiler.upval_count = 0u;
     g_compiler.had_error = false;
     g_compiler.block_depth = 0u;
     // Anchor the native-stack guard at the compile entry: the recursive

@@ -362,19 +362,20 @@ AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
 
     frame_count = 0u;
     const u32 top_regs = program.top_frame_regs != 0u ? program.top_frame_regs : 1u;
-    return run_loop(entry_pc, 0u, top_regs);
+    return run_loop(entry_pc, 0u, top_regs, NO_SLOT);
 }
 
 AnvilValue AnvilVmContext::resume() noexcept {
     paused = false;
-    return run_loop(resume_pc, resume_reg_base, resume_frame_regs);
+    return run_loop(resume_pc, resume_reg_base, resume_frame_regs, resume_closure);
 }
 
-AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexcept {
+AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in) noexcept {
     const u32 step_limit_now = effective_step_limit();
     // Registers the running function owns: the base advances by this on a call
     // and back on a return, so frames take only the space each function needs.
     u32 cur_frame_regs = frame_regs;
+    u32 cur_closure = cur_closure_in;
     u32 slice = 0u;
     while (pc < program.code_len) {
         // Pause at a yield boundary: save where to continue and hand control
@@ -385,6 +386,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
             resume_pc = pc;
             resume_reg_base = reg_base;
             resume_frame_regs = cur_frame_regs;
+            resume_closure = cur_closure;
             return AnvilValue::make_undefined();
         }
         ++slice;
@@ -747,9 +749,10 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                     regs[next_base + a_idx] = regs[reg_base + inst.c + a_idx];
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, pc, reg_base, cur_frame_regs, static_cast<u8>(inst.a)};
+                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, static_cast<u8>(inst.a)};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
+                cur_closure = NO_SLOT;
                 pc = fn.code_start;
                 break;
             }
@@ -820,9 +823,10 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                         : AnvilValue::make_undefined();
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, pc, reg_base, cur_frame_regs, static_cast<u8>(inst.a)};
+                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, static_cast<u8>(inst.a)};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
+                cur_closure = cid;
                 pc = fn.code_start;
                 break;
             }
@@ -878,6 +882,87 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                 break;
             }
 
+            case AnvilOpcode::NewCell: {
+                u32 cell = heap.alloc_cell(R[inst.b]);
+                if (cell == NO_SLOT) {
+                    reclaim_array_storage(reg_base + cur_frame_regs);
+                    cell = heap.alloc_cell(R[inst.b]);
+                }
+                if (cell == NO_SLOT) {
+                    fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
+                    return AnvilValue::make_undefined();
+                }
+                R[inst.a] = AnvilValue::make_array(cell);
+                break;
+            }
+
+            case AnvilOpcode::CellGet: {
+                R[inst.a] = R[inst.b].is_array()
+                    ? heap.get_array_elem(R[inst.b].payload(), 0)
+                    : AnvilValue::make_undefined();
+                break;
+            }
+
+            case AnvilOpcode::CellSet: {
+                if (R[inst.a].is_array()) {
+                    heap.set_array_elem(R[inst.a].payload(), 0, R[inst.b]);
+                }
+                break;
+            }
+
+            case AnvilOpcode::GetUpval: {
+                const u32 idx = inst.b;
+                if (cur_closure < heap.closure_count &&
+                    idx < heap.closures()[cur_closure].upval_count) {
+                    const u32 cell =
+                        heap.closure_upvals(heap.closures()[cur_closure].upvals_off)[idx];
+                    R[inst.a] = heap.get_array_elem(cell, 0);
+                } else {
+                    R[inst.a] = AnvilValue::make_undefined();
+                }
+                break;
+            }
+
+            case AnvilOpcode::SetUpval: {
+                const u32 idx = inst.a;
+                if (cur_closure < heap.closure_count &&
+                    idx < heap.closures()[cur_closure].upval_count) {
+                    const u32 cell =
+                        heap.closure_upvals(heap.closures()[cur_closure].upvals_off)[idx];
+                    heap.set_array_elem(cell, 0, R[inst.b]);
+                }
+                break;
+            }
+
+            case AnvilOpcode::MakeClosure: {
+                const u32 fn_id = inst.imm32();
+                const u32 base = inst.b;
+                const u32 n = inst.c;
+                u32 upvals_off = NO_SLOT;
+                if (n > 0u) {
+                    bool over = false;
+                    upvals_off = heap.arena.alloc(n * static_cast<u32>(sizeof(u32)), &over);
+                    if (upvals_off == NO_SLOT) {
+                        fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
+                        return AnvilValue::make_undefined();
+                    }
+                    u32* up = heap.closure_upvals(upvals_off);
+                    for (u32 i = 0u; i < n; ++i) {
+                        up[i] = R[base + i].payload();
+                    }
+                }
+                const u32 cid = heap.alloc_closure(fn_id, upvals_off, n, false);
+                if (cid == NO_SLOT) {
+                    if (upvals_off != NO_SLOT) {
+                        heap.arena.free(upvals_off, n * static_cast<u32>(sizeof(u32)));
+                    }
+                    fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
+                    return AnvilValue::make_undefined();
+                }
+                R[inst.a] = AnvilValue::make_function(cid);
+                break;
+            }
+
             case AnvilOpcode::LoopHeader: {
                 const u32 lid = inst.a & 63u;
                 ++program.loop_trip_counts[lid];
@@ -895,6 +980,7 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexce
                 const AnvilCallFrame caller = frames()[--frame_count];
                 reg_base = caller.reg_base;
                 cur_frame_regs = caller.caller_frame_regs;
+                cur_closure = caller.closure_id;
                 pc = caller.return_pc;
                 registers()[reg_base + caller.dst_reg] = ret_val;
                 break;

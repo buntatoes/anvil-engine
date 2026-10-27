@@ -926,6 +926,7 @@ struct AnvilHeap {
     // These return NO_SLOT when the table or storage is full.
     u32 alloc_object(u32 initial_shape = 0u) noexcept;
     u32 alloc_array(u32 initial_capacity = 8u) noexcept;
+    u32 alloc_cell(AnvilValue v) noexcept;  // a one-slot array used as a closure cell
     u32 alloc_function(u32 name_sym, u32 arity, u32 local_count, u32 code_start, u32 code_len) noexcept;
 
     AnvilValue get_object_prop(u32 obj_id, u32 prop_sym, u32* out_shape, i32* out_slot) const noexcept;
@@ -1064,6 +1065,12 @@ enum class AnvilOpcode : u8 {
     CallValue    = 47u,  // R[a] = call(R[b], arg_base = c, argc = imm32)
     CallMath2    = 48u,  // R[a] = math2(op = imm32, R[b], R[c])
     CallPred     = 49u,  // R[a] = predicate(op = b, R[c]) -> bool
+    NewCell      = 50u,  // R[a] = new cell holding R[b]
+    CellGet      = 51u,  // R[a] = contents of cell R[b]
+    CellSet      = 52u,  // cell R[a] <- R[b]
+    GetUpval     = 53u,  // R[a] = contents of the running closure's upvalue b
+    SetUpval     = 54u,  // the running closure's upvalue a <- R[b]
+    MakeClosure  = 55u,  // R[a] = closure(fn_id = imm32, upvalue cells R[b..b+c])
 };
 
 struct AnvilInstruction {
@@ -1122,6 +1129,7 @@ struct AnvilGlobalBinding {
 
 struct AnvilCallFrame {
     u32 fn_id;
+    u32 closure_id;    // the caller's running closure, restored on return
     u32 return_pc;
     u32 reg_base;
     // The caller's register-window size, so Return restores the stride the
@@ -1346,6 +1354,7 @@ struct AnvilVmContext {
     u32 resume_pc;
     u32 resume_reg_base;
     u32 resume_frame_regs;
+    u32 resume_closure;
 
     // Compiler native-stack budget in bytes (measured from the compile
     // entry) before a deeply nested script is refused rather than overflowing
@@ -1421,7 +1430,7 @@ struct AnvilVmContext {
     AnvilValue resume() noexcept;
     // The shared instruction loop, entered fresh by execute() and continued by
     // resume(). Returns the result, or undefined when it pauses at a yield.
-    AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs) noexcept;
+    AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
     void fill_exports(AnvilVmTelemetryC* out) const noexcept;
 };

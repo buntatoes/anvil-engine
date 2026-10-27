@@ -334,12 +334,8 @@ fn function_declarations_the_vm_cannot_scope_are_refused() {
     }
     let cases = [
         (
-            "function f() { function g() { return 1; } return g(); } f();",
-            "function declared inside a block or function 'g'",
-        ),
-        (
             "let r = 0; if (r === 0) { function g() { return 1; } } r;",
-            "function declared inside a block or function 'g'",
+            "function declared inside a block 'g'",
         ),
         (
             "function f() { return 1; } function f() { return 2; } f();",
@@ -353,6 +349,84 @@ fn function_declarations_the_vm_cannot_scope_are_refused() {
     for (source, message) in cases {
         assert_eq!(vm_error(source).message, message, "{source}");
     }
+}
+
+#[test]
+fn closures_capture_the_enclosing_scope() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // Read a captured variable.
+    assert_eq!(
+        cpp(
+            "function mk() { let x = 5; function get() { return x; } return get; } let g = mk(); g();"
+        ),
+        Some(5.0)
+    );
+    // A nested declaration called directly, and reached as a call-of-a-call.
+    assert_eq!(
+        cpp("function mk() { let x = 5; return function () { return x; }; } mk()();"),
+        Some(5.0)
+    );
+    // A counter that mutates its captured binding across calls.
+    assert_eq!(
+        cpp(
+            "function mk() { let c = 0; function inc() { c = c + 1; return c; } return inc; }              let f = mk(); f(); f(); f();"
+        ),
+        Some(3.0)
+    );
+    // A captured parameter, through a returned closure.
+    assert_eq!(
+        cpp(
+            "function adder(x) { return function (y) { return x + y; }; }              let add5 = adder(5); add5(3) + adder(10)(1);"
+        ),
+        Some(19.0)
+    );
+    // Recursion through a captured name.
+    assert_eq!(
+        cpp(
+            "function outer() { function fac(n) { if (n <= 1) { return 1; } return n * fac(n - 1); }              return fac(5); } outer();"
+        ),
+        Some(120.0)
+    );
+    // Two closures sharing one binding.
+    assert_eq!(
+        cpp(
+            "function make() { let n = 0; function up() { n = n + 1; return n; }              function down() { n = n - 1; return n; } let o = 0; o = up(); o = up(); o = down(); return o; }              make();"
+        ),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn a_non_capturing_function_is_the_same_value_each_time() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // f === f stays true for a declared function used as a value.
+    assert_eq!(
+        cpp("function f() { return 1; } let a = f; let b = f; (a === b) ? 1 : 0;"),
+        Some(1.0)
+    );
+    // Distinct capturing closures are distinct under ===.
+    assert_eq!(
+        cpp(
+            "function mk(v) { return function () { return v; }; }              let a = mk(1); let b = mk(2); (a === a && !(a === b)) ? 1 : 0;"
+        ),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn capture_from_more_than_one_function_out_is_refused() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let source = "function a() { let x = 1; function b() { function c() { return x; } return c(); }                   return b(); } a();";
+    assert_eq!(
+        vm_error(source).message,
+        "variable captured from more than one function out near ';'"
+    );
 }
 
 #[test]
