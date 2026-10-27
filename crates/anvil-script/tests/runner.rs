@@ -53,6 +53,29 @@ fn prints_console_output_to_stdout_and_exits_zero() {
 }
 
 #[test]
+fn a_multi_level_capture_program_prints_through_the_runner() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // A counter whose cell is two functions out, logged each step, confirms
+    // multi-level capture runs end to end through the file runner.
+    let path = temp_file(
+        "multilevel",
+        "function outer() { let n = 0; function mid() { return function () { n = n + 1; return n; }; } return mid(); }
+         let s = outer();
+         console.log(s());
+         console.log(s());
+         console.log(s());
+",
+    );
+    let (stdout, stderr, code) = run(&path);
+    assert_eq!(stdout, "1\n2\n3\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_script_with_no_output_prints_nothing_and_exits_zero() {
     if !is_cpp_jit_kernel_active() {
         return;
