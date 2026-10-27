@@ -90,7 +90,10 @@ fn main() {
                         "/nologo",
                         "/c",
                         "/O2",
-                        "/fp:fast",
+                        // Strict IEEE doubles: under /fp:fast cl.exe may treat
+                        // NaN as equal to itself and fold `x - x` to 0, which
+                        // breaks NaN, Infinity and === on numbers.
+                        "/fp:precise",
                         "/std:c++20",
                         "/Gs1048576",
                         "/Zl",

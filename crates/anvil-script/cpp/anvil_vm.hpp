@@ -234,12 +234,20 @@ inline f64 bits_to_f64(u64 b) noexcept {
 constexpr f64 TWO_POW_52 = 4503599627370496.0;
 constexpr f64 TWO_POW_32 = 4294967296.0;
 
+// NaN and finiteness are read from the bits, not from `v != v` or
+// `v - v == 0.0`. A compiler allowed to assume no NaN or infinity folds those
+// to constants, which would let 0 / 0 escape the NaN check in make_number and
+// read back as a tagged value.
+constexpr u64 F64_EXPONENT_MASK = 0x7FF0000000000000ULL;
+constexpr u64 F64_FRACTION_MASK = 0x000FFFFFFFFFFFFFULL;
+
 inline bool js_is_nan(f64 v) noexcept {
-    return v != v;
+    const u64 b = f64_to_bits(v);
+    return (b & F64_EXPONENT_MASK) == F64_EXPONENT_MASK && (b & F64_FRACTION_MASK) != 0u;
 }
 
 inline bool js_is_finite(f64 v) noexcept {
-    return v == v && v - v == 0.0;
+    return (f64_to_bits(v) & F64_EXPONENT_MASK) != F64_EXPONENT_MASK;
 }
 
 inline f64 js_abs(f64 v) noexcept {
@@ -599,7 +607,7 @@ struct AnvilValue {
                 return as_smi() != 0;
             case ValueTag::Number: {
                 const f64 d = bits_to_f64(bits);
-                return d != 0.0 && d == d;
+                return d != 0.0 && !js_is_nan(d);
             }
             default:
                 return true;

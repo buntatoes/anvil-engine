@@ -620,6 +620,47 @@ fn numbers_follow_javascript() {
 }
 
 #[test]
+fn nan_and_infinity_from_arithmetic_stay_numbers() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // 0 / 0 made at run time has the sign bit set. It has to come back as
+    // NaN, both from a register and after a trip through an object.
+    for expr in [
+        "0 / 0",
+        "-(0 / 0)",
+        "(1 / 0) - (1 / 0)",
+        "(1 / 0) * 0",
+        "Math.sqrt(0 - 1)",
+    ] {
+        let plain = format!("let r = {expr}; r;");
+        assert!(cpp(&plain).expect("ran").is_nan(), "{plain}");
+        let boxed = format!("let o = {{v: 0}}; o.v = {expr}; o.v;");
+        assert!(cpp(&boxed).expect("ran").is_nan(), "{boxed}");
+    }
+    // NaN is falsy and not equal to itself.
+    assert_eq!(
+        cpp("let n = 0 / 0; let r = 0; if (n) { r = 1; } r;"),
+        Some(0.0)
+    );
+    assert_eq!(
+        cpp("let n = 0 / 0; let r = 0; if (!n) { r = 1; } r;"),
+        Some(1.0)
+    );
+    assert_eq!(
+        cpp("let n = 0 / 0; let r = 0; if (n !== n) { r = 1; } r;"),
+        Some(1.0)
+    );
+    // Infinities are numbers but not finite.
+    let f = Some(0.0);
+    assert_eq!(cpp("let r = Number.isFinite(-1 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isInteger(-1 / 0); r;"), f);
+    assert_eq!(cpp("let r = isFinite(0 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isNaN(1 / 0); r;"), f);
+    assert_eq!(cpp("let r = Number.isNaN(-(0 / 0)); r;"), Some(1.0));
+}
+
+#[test]
 fn more_math_functions_run_on_the_vm() {
     if !is_cpp_jit_kernel_active() {
         return;

@@ -442,7 +442,7 @@ double num_mod(double lhs, double rhs) noexcept {
 double num_neg(double v) noexcept { return -v; }
 
 double num_not(double v) noexcept {
-    const bool truthy = (v != 0.0) && (v == v);
+    const bool truthy = (v != 0.0) && !js_is_nan(v);
     return truthy ? 0.0 : 1.0;
 }
 
