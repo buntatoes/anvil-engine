@@ -517,6 +517,25 @@ struct VarRef {
     u32 sym;   // Global: name symbol
 };
 
+// Max variables one function may capture.
+constexpr u32 ANVIL_MAX_UPVALUES = 64u;
+
+// One entry in the chain of functions being compiled, innermost last. It
+// records where the function's locals begin and the variables it captures from
+// functions around it. A captured variable is reached either from a cell held
+// in a register of the immediately enclosing function (is_local), or from one
+// of that enclosing function's own captured cells (an upvalue of the enclosing
+// function) -- which is how a variable is captured through more than one
+// function.
+struct FnScope {
+    FnScope* parent;
+    u32 local_floor;
+    u32 upval_count;
+    bool upval_is_local[ANVIL_MAX_UPVALUES];
+    u16 upval_index[ANVIL_MAX_UPVALUES];
+    u32 upval_sym[ANVIL_MAX_UPVALUES];
+};
+
 struct AnvilCompiler {
     AnvilVmContext* ctx;
     const char* src;
@@ -536,16 +555,18 @@ struct AnvilCompiler {
     u32 local_count;
     u32 local_floor;
     // Closures. A function that contains a nested function holds its locals in
-    // heap cells, so an inner function can capture them. enclosing_floor is the
-    // first local index of the immediately enclosing function (for single-level
-    // capture); the upvalue arrays record, for the function being compiled, the
-    // enclosing cell register behind each captured name.
+    // heap cells, so an inner function can capture them. The functions being
+    // compiled form a chain: cur_fn is the innermost and root_fn is the
+    // top-level script. Each scope records the variables it captures and whether
+    // each is reached from an enclosing local cell or from an enclosing
+    // function's own captured cell, so a capture can reach through several
+    // functions.
     bool fn_uses_cells;
-    u32 enclosing_floor;
-    static constexpr u32 MAX_UPVALUES = 64u;
-    u16 upval_cell_reg[MAX_UPVALUES];
-    u32 upval_sym[MAX_UPVALUES];
-    u32 upval_count;
+    static constexpr u32 MAX_UPVALUES = ANVIL_MAX_UPVALUES;
+    // How many functions out a capture may reach.
+    static constexpr u32 MAX_CAPTURE_LEVELS = 2u;
+    FnScope root_fn;
+    FnScope* cur_fn;
     u16 next_reg;
     // Registers below this hold the current function's parameters and
     // locals. Registers from here up are temporaries, free again after
@@ -946,20 +967,51 @@ struct AnvilCompiler {
         return r;
     }
 
-    u32 add_upvalue(u16 enclosing_cell_reg, u32 sym) noexcept {
-        for (u32 i = 0u; i < upval_count; ++i) {
-            if (upval_sym[i] == sym) {
-                return i;
+    // Record that function scope fs captures `sym`, reached either from an
+    // enclosing local cell register (is_local) or from an enclosing function's
+    // own captured cell at upvalue `index` (not is_local). Deduplicates by name.
+    i32 add_upvalue(FnScope* fs, bool is_local, u16 index, u32 sym) noexcept {
+        for (u32 i = 0u; i < fs->upval_count; ++i) {
+            if (fs->upval_sym[i] == sym) {
+                return static_cast<i32>(i);
             }
         }
-        if (upval_count >= MAX_UPVALUES) {
+        if (fs->upval_count >= MAX_UPVALUES) {
             reject_limit(VM_REFUSE_REGISTERS, "captured variable", MAX_UPVALUES,
                          "captured variables per function");
-            return 0u;
+            return 0;
         }
-        upval_cell_reg[upval_count] = enclosing_cell_reg;
-        upval_sym[upval_count] = sym;
-        return upval_count++;
+        fs->upval_is_local[fs->upval_count] = is_local;
+        fs->upval_index[fs->upval_count] = index;
+        fs->upval_sym[fs->upval_count] = sym;
+        return static_cast<i32>(fs->upval_count++);
+    }
+
+    // Resolve `sym` as an upvalue of function scope fs: a local of some
+    // enclosing function, threaded as an upvalue through every function in
+    // between. Returns fs's upvalue index, or -1 when sym belongs to no
+    // enclosing function (a global). *out_levels gets how many functions out it
+    // was found (1 = the immediately enclosing function).
+    i32 resolve_upvalue(FnScope* fs, u32 sym, u32 depth, u32* out_levels) noexcept {
+        FnScope* parent = fs->parent;
+        if (parent == nullptr) {
+            return -1;
+        }
+        for (i32 i = static_cast<i32>(fs->local_floor) - 1;
+             i >= static_cast<i32>(parent->local_floor); --i) {
+            if (locals()[i].name_sym == sym) {
+                locals()[i].is_cell = true;
+                *out_levels = depth;
+                return add_upvalue(fs, true, locals()[i].reg, sym);
+            }
+        }
+        u32 deeper = 0u;
+        const i32 pu = resolve_upvalue(parent, sym, depth + 1u, &deeper);
+        if (pu >= 0) {
+            *out_levels = deeper;
+            return add_upvalue(fs, false, static_cast<u16>(pu), sym);
+        }
+        return -1;
     }
 
     // Resolve a name to how it is reached: this function's own local (plain or
@@ -973,22 +1025,16 @@ struct AnvilCompiler {
                               locals()[i].reg, 0u, sym};
             }
         }
-        if (in_function) {
-            for (i32 i = static_cast<i32>(local_floor) - 1; i >= static_cast<i32>(enclosing_floor); --i) {
-                if (locals()[i].name_sym == sym) {
-                    const u32 idx = add_upvalue(locals()[i].reg, sym);
-                    return VarRef{VarKind::Upval, 0u, idx, sym};
-                }
-            }
-            // A name belonging to a function more than one level out would need
-            // upvalues threaded through every function in between; that rewrite
-            // is not done, so refuse rather than silently read a global.
-            for (i32 i = static_cast<i32>(enclosing_floor) - 1; i >= 0; --i) {
-                if (locals()[i].name_sym == sym) {
+        if (cur_fn != nullptr && cur_fn->parent != nullptr) {
+            u32 levels = 0u;
+            const i32 u = resolve_upvalue(cur_fn, sym, 1u, &levels);
+            if (u >= 0) {
+                if (levels > MAX_CAPTURE_LEVELS) {
                     reject_here(VM_REFUSE_UNSUPPORTED,
-                                "variable captured from more than one function out");
+                                "variable captured from more than two functions out");
                     return VarRef{VarKind::Global, 0u, 0u, sym};
                 }
+                return VarRef{VarKind::Upval, 0u, static_cast<u32>(u), sym};
             }
         }
         return VarRef{VarKind::Global, 0u, 0u, sym};
@@ -1181,23 +1227,19 @@ struct AnvilCompiler {
         const u16 saved_high_reg = high_reg;
         const bool saved_in_fn = in_function;
         const bool saved_uses_cells = fn_uses_cells;
-        const u32 saved_enclosing_floor = enclosing_floor;
-        u16 saved_upval_cell_reg[MAX_UPVALUES];
-        u32 saved_upval_sym[MAX_UPVALUES];
-        const u32 saved_upval_count = upval_count;
-        for (u32 i = 0u; i < upval_count; ++i) {
-            saved_upval_cell_reg[i] = upval_cell_reg[i];
-            saved_upval_sym[i] = upval_sym[i];
-        }
+        FnScope fs;
+        fs.parent = cur_fn;
+        fs.local_floor = local_count;
+        fs.upval_count = 0u;
+        FnScope* saved_cur_fn = cur_fn;
+        cur_fn = &fs;
 
-        enclosing_floor = saved_local_floor;
         local_floor = local_count;
         next_reg = 0u;
         reg_floor = 0u;
         high_reg = 0u;
         in_function = true;
         fn_uses_cells = false;
-        upval_count = 0u;
 
         u32 arity = 0u;
         if (single_param_sym != NO_SLOT) {
@@ -1261,11 +1303,13 @@ struct AnvilCompiler {
         ctx->program.code()[jskip_pc] =
             AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
 
-        // Capture list for this function, read while its upvalues are still live.
-        const u32 n_up = upval_count;
-        u16 captured_cell_reg[MAX_UPVALUES];
+        // Capture list for this function, read while its scope is still live.
+        const u32 n_up = fs.upval_count;
+        bool captured_is_local[MAX_UPVALUES];
+        u16 captured_index[MAX_UPVALUES];
         for (u32 i = 0u; i < n_up; ++i) {
-            captured_cell_reg[i] = upval_cell_reg[i];
+            captured_is_local[i] = fs.upval_is_local[i];
+            captured_index[i] = fs.upval_index[i];
         }
 
         local_count = saved_local_count;
@@ -1275,24 +1319,25 @@ struct AnvilCompiler {
         high_reg = saved_high_reg;
         in_function = saved_in_fn;
         fn_uses_cells = saved_uses_cells;
-        enclosing_floor = saved_enclosing_floor;
-        upval_count = saved_upval_count;
-        for (u32 i = 0u; i < saved_upval_count; ++i) {
-            upval_cell_reg[i] = saved_upval_cell_reg[i];
-            upval_sym[i] = saved_upval_sym[i];
-        }
+        cur_fn = saved_cur_fn;
 
         const u16 dst = alloc_reg();
         if (n_up == 0u) {
             // No captures: the function's canonical closure, so f === f holds.
             ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_id));
         } else {
-            // Stage the captured cells (from the enclosing frame) contiguously,
-            // then build a fresh closure over them.
+            // Stage the captured cells contiguously, then build a fresh closure
+            // over them. A cell held in an enclosing local register is moved in;
+            // a cell the enclosing function itself captured is loaded from its
+            // own upvalue, so a capture can reach through more than one function.
             const u16 base = next_reg;
             for (u32 i = 0u; i < n_up; ++i) {
                 const u16 slot = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot, captured_cell_reg[i], 0u));
+                if (captured_is_local[i]) {
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot, captured_index[i], 0u));
+                } else {
+                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetUpvalCell, slot, captured_index[i], 0u));
+                }
             }
             ctx->program.emit(AnvilInstruction{AnvilOpcode::MakeClosure, 0u, dst, base,
                                                static_cast<u16>(n_up), fn_id});
@@ -2383,23 +2428,19 @@ struct AnvilCompiler {
             const u16 saved_high_reg = high_reg;
             const bool saved_in_fn = in_function;
             const bool saved_uses_cells = fn_uses_cells;
-            const u32 saved_enclosing_floor = enclosing_floor;
-            u16 saved_upval_cell_reg[MAX_UPVALUES];
-            u32 saved_upval_sym[MAX_UPVALUES];
-            const u32 saved_upval_count = upval_count;
-            for (u32 i = 0u; i < upval_count; ++i) {
-                saved_upval_cell_reg[i] = upval_cell_reg[i];
-                saved_upval_sym[i] = upval_sym[i];
-            }
+            FnScope fs;
+            fs.parent = cur_fn;
+            fs.local_floor = local_count;
+            fs.upval_count = 0u;
+            FnScope* saved_cur_fn = cur_fn;
+            cur_fn = &fs;
 
-            enclosing_floor = saved_local_floor;
             local_floor = local_count;
             next_reg = 0u;
             reg_floor = 0u;
             high_reg = 0u;
             in_function = true;
             fn_uses_cells = false;
-            upval_count = 0u;
 
             u32 arity = 0u;
             while (peek().kind != TokenKind::RParen && peek().kind != TokenKind::Eof && !had_error) {
@@ -2460,12 +2501,7 @@ struct AnvilCompiler {
             high_reg = saved_high_reg;
             in_function = saved_in_fn;
             fn_uses_cells = saved_uses_cells;
-            enclosing_floor = saved_enclosing_floor;
-            upval_count = saved_upval_count;
-            for (u32 i = 0u; i < saved_upval_count; ++i) {
-                upval_cell_reg[i] = saved_upval_cell_reg[i];
-                upval_sym[i] = saved_upval_sym[i];
-            }
+            cur_fn = saved_cur_fn;
             return 0u;
         }
 
@@ -2570,8 +2606,10 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.loop_depth = 0u;
     g_compiler.in_function = false;
     g_compiler.fn_uses_cells = false;
-    g_compiler.enclosing_floor = 0u;
-    g_compiler.upval_count = 0u;
+    g_compiler.root_fn.parent = nullptr;
+    g_compiler.root_fn.local_floor = 0u;
+    g_compiler.root_fn.upval_count = 0u;
+    g_compiler.cur_fn = &g_compiler.root_fn;
     g_compiler.had_error = false;
     g_compiler.block_depth = 0u;
     // Anchor the native-stack guard at the compile entry: the recursive

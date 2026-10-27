@@ -1088,6 +1088,12 @@ enum class AnvilOpcode : u8 {
     // from the out buffer, act on them (console.log prints them) and Resume;
     // the result left in R[a] is undefined. The JIT does not compile it.
     HostCall     = 56u,
+    // R[a] = the cell (not its contents) held in the running closure's upvalue
+    // b, boxed as a cell reference. It lets an enclosing function re-stage one
+    // of its own captured cells into a MakeClosure for a function nested inside
+    // it, which is how a variable is captured through more than one function.
+    // The JIT does not compile it.
+    GetUpvalCell = 57u,
 };
 
 struct AnvilInstruction {

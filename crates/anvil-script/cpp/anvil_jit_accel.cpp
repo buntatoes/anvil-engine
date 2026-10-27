@@ -961,6 +961,19 @@ AnvilValue AnvilVmContext::run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cu
                 break;
             }
 
+            case AnvilOpcode::GetUpvalCell: {
+                const u32 idx = inst.b;
+                if (cur_closure < heap.closure_count &&
+                    idx < heap.closures()[cur_closure].upval_count) {
+                    const u32 cell =
+                        heap.closure_upvals(heap.closures()[cur_closure].upvals_off)[idx];
+                    R[inst.a] = AnvilValue::make_array(cell);
+                } else {
+                    R[inst.a] = AnvilValue::make_undefined();
+                }
+                break;
+            }
+
             case AnvilOpcode::SetUpval: {
                 const u32 idx = inst.a;
                 if (cur_closure < heap.closure_count &&

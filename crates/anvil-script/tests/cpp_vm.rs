@@ -485,14 +485,47 @@ fn a_non_capturing_function_is_the_same_value_each_time() {
 }
 
 #[test]
-fn capture_from_more_than_one_function_out_is_refused() {
+fn capture_from_two_functions_out_works() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let source = "function a() { let x = 1; function b() { function c() { return x; } return c(); }                   return b(); } a();";
+    // c reads x, a local two functions out (c inside b inside a). b threads it
+    // through as an upvalue so c can reach it.
+    let source = "function a() { let x = 1; function b() { function c() { return x; } return c(); } return b(); } a();";
+    assert_eq!(cpp(source), Some(1.0));
+}
+
+#[test]
+fn two_level_counter_keeps_its_state() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // The counter cell lives in `outer`; the returned function reaches it two
+    // functions out, through `mid`.
+    let source = "function outer() { let n = 0; function mid() { return function () { n = n + 1; return n; }; } return mid(); }                   let step = outer(); step(); step(); step();";
+    assert_eq!(cpp(source), Some(3.0));
+}
+
+#[test]
+fn a_closure_captures_from_one_and_from_two_levels_out() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // The innermost function reads `a` (two out) and `b` (one out) and adds them.
+    let source = "function f() { let a = 10; function g() { let b = 5; return function () { return a + b; }; } return g(); } f()();";
+    assert_eq!(cpp(source), Some(15.0));
+}
+
+#[test]
+fn capture_from_more_than_two_functions_out_is_refused() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    // d reads x, a local three functions out, which is not supported yet.
+    let source = "function a() { let x = 1; function b() { function c() { function d() { return x; } return d(); } return c(); } return b(); } a();";
     assert_eq!(
         vm_error(source).message,
-        "variable captured from more than one function out near ';'"
+        "variable captured from more than two functions out near ';'"
     );
 }
 
