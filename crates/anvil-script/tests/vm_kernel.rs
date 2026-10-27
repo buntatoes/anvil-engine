@@ -1127,3 +1127,162 @@ fn a_closure_reads_an_enclosing_local() {
     .expect("a closure over an outer local runs");
     assert_eq!(v, 5.0);
 }
+
+/// A seeded differential for closures. The old front end had no first-class
+/// function values, so it cannot be the oracle here. Instead each generated
+/// program is built so its integer result is known, and the C++ VM must
+/// return it. The
+/// programs cover captured locals and parameters, per-iteration loop `let`,
+/// counters, two closures sharing one binding and recursion through a captured
+/// name, all with single-level capture.
+#[test]
+fn seeded_closures_match_a_reference_model() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    const M: i64 = 1_000_000;
+    let mut seed: u64 = 0x5eed_c105_u64;
+    let mut next = |lo: i64, hi: i64| -> i64 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        lo + ((seed >> 33) as i64) % (hi - lo + 1)
+    };
+    let mut checked = 0usize;
+    for _ in 0..30 {
+        // A: counter.
+        {
+            let s = next(0, 5);
+            let t = next(1, 4);
+            let k = next(1, 6);
+            let mut prog = format!(
+                "function mk() {{ let n = {s}; return function () {{ n = n + {t}; return n; }}; }} let c = mk();"
+            );
+            for _ in 0..(k - 1) {
+                prog.push_str(" c();");
+            }
+            prog.push_str(" let r = c(); (((r) % 1000000) + 1000000) % 1000000;");
+            let want = ((s + t * k) % M + M) % M;
+            run_eq(&prog, want as f64);
+            checked += 1;
+        }
+        // B: captured-parameter adder, a closure returned from a closure.
+        {
+            let x = next(0, 20);
+            let y = next(0, 20);
+            let prog = format!(
+                "function adder(a) {{ return function (b) {{ return a + b; }}; }} let r = adder({x})({y}); (((r) % 1000000) + 1000000) % 1000000;"
+            );
+            run_eq(&prog, ((((x + y) % M) + M) % M) as f64);
+            checked += 1;
+        }
+        // C: per-iteration loop let, closures held in an array.
+        {
+            let n = next(2, 6);
+            let c = next(1, 5);
+            let prog = format!(
+                "let fs = []; for (let i = 0; i < {n}; i = i + 1) {{ fs.push(function () {{ return i * {c}; }}); }} \
+                 let r = 0; for (let j = 0; j < {n}; j = j + 1) {{ let f = fs[j]; r = r + f(); }} \
+                 (((r) % 1000000) + 1000000) % 1000000;"
+            );
+            let want = ((c * (n * (n - 1) / 2)) % M + M) % M;
+            run_eq(&prog, want as f64);
+            checked += 1;
+        }
+        // D: two closures sharing one binding.
+        {
+            let s = next(0, 5);
+            let m = next(2, 6);
+            let mut ops = String::new();
+            let mut net = 0i64;
+            for _ in 0..m {
+                if next(0, 1) == 0 {
+                    ops.push_str(" o = up();");
+                    net += 1;
+                } else {
+                    ops.push_str(" o = down();");
+                    net -= 1;
+                }
+            }
+            let prog = format!(
+                "function make() {{ let n = {s}; function up() {{ n = n + 1; return n; }} \
+                 function down() {{ n = n - 1; return n; }} let o = 0;{ops} return o; }} \
+                 let r = make(); (((r) % 1000000) + 1000000) % 1000000;"
+            );
+            run_eq(&prog, (((s + net) % M + M) % M) as f64);
+            checked += 1;
+        }
+        // E: recursion through a captured name.
+        {
+            let k = next(1, 8);
+            let prog = format!(
+                "function outer() {{ function sumto(n) {{ if (n <= 0) {{ return 0; }} return n + sumto(n - 1); }} \
+                 return sumto({k}); }} let r = outer(); (((r) % 1000000) + 1000000) % 1000000;"
+            );
+            run_eq(&prog, (((k * (k + 1) / 2) % M + M) % M) as f64);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 150, "expected 150 seeded closure cases");
+}
+
+fn run_eq(script: &str, want: f64) {
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(20_000_000, script)
+        .unwrap_or_else(|e| {
+            panic!(
+                "C++ VM refused a closure program: {} :: {script}",
+                e.message
+            )
+        });
+    assert_eq!(value, want, "wrong answer for: {script}");
+}
+
+/// A thousand distinct closures held in an array, each capturing its own loop
+/// index, all called back by index.
+#[test]
+fn a_thousand_closures_live_in_an_array() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let script = "const fs = []; for (let i = 0; i < 1000; i++) { fs.push(() => i); } \
+                  let r = 0; for (let j = 0; j < 1000; j++) { r = r + fs[j](); } r;";
+    let (value, _) = anvil_script::eval_cpp_vm_request_configured(50_000_000, script)
+        .expect("a thousand closures run");
+    assert_eq!(value, 499_500.0);
+}
+
+/// Live closures and the cells they captured survive garbage collection under a
+/// tight heap budget while transient objects churn around them.
+#[test]
+fn closures_survive_collection_under_a_tight_budget() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let script = "function mk() { let k = 42; return function () { return k; }; } \
+                  let keep = mk(); let s = 0; \
+                  for (let i = 0; i < 1200; i = i + 1) { let o = { a: i, b: i + 1 }; let z = [i, i, i]; s = s + 1; } \
+                  keep() + (s - s);";
+    let (value, tel) = anvil_script::eval_cpp_vm_request_heap_budget(200_000, script)
+        .expect("a kept closure survives GC under a tight budget");
+    assert_eq!(value, 42.0);
+    assert!(
+        tel.gc_collections > 0,
+        "the tight budget should force at least one collection"
+    );
+}
+
+/// Distinct capturing closures are distinct under ===, while a non-capturing
+/// function is the same value each time.
+#[test]
+fn closure_identity_is_per_closure() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+    let distinct = "function mk(v) { return function () { return v; }; } \
+                    let a = mk(1); let b = mk(2); (a === b) ? 1 : 0;";
+    let (v, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, distinct).expect("runs");
+    assert_eq!(v, 0.0);
+    let same = "function f() { return 1; } let a = f; let b = f; (a === b) ? 1 : 0;";
+    let (v2, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, same).expect("runs");
+    assert_eq!(v2, 1.0);
+}
