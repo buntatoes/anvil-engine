@@ -1,8 +1,0 @@
-Anvil Engine
-Copyright (c) 2026 Buntato
-
-`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are public to read, but they are source-available for auditing and use only, not open source. They may not be redistributed on their own. Anvil Browser may be redistributed without them. See LICENSE.
-
-`anvil-cipher`, `anvil-compress`, `anvil-css`, `anvil-gpu`, `anvil-hpack`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, and `anvil-video` are separate Mozilla Public License 2.0 repositories. This engine links `anvil-css`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and `anvil-compress`.
-
-`anvil-browser` is a separate repository under the Apache License 2.0. Its license is not this file.

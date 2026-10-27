@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // Optional C++20 AnvilVM (NaN-boxed heap, hidden classes, Inline Caches, and register VM) build script.
 // Author: Buntato

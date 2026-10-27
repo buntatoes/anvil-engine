@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! HTML parser for [`crate::Document`].
 //!
@@ -107,6 +107,13 @@ pub fn parse_html(input: &str) -> Document {
             let parent = placement_parent(&doc, &stack, &name);
             let id = doc.create_element(&name, attrs);
             doc.append(parent, id).expect("new node has no children");
+
+            if name == "noscript" {
+                if let Some((_, next)) = read_raw_text(input, index, "noscript") {
+                    index = next;
+                }
+                continue;
+            }
 
             if name == "script" || name == "style" {
                 // Newlines become spaces before the script interpreter sees
@@ -553,6 +560,13 @@ fn strip_js_comments_before_collapse(source: &str) -> String {
         if ch == '"' || ch == '\'' || ch == '`' {
             quote = Some(ch);
             out.push(ch);
+            continue;
+        }
+        if ch == '\\' {
+            out.push(ch);
+            if let Some(esc) = chars.next() {
+                out.push(esc);
+            }
             continue;
         }
         if ch == '/' && chars.peek() == Some(&'/') {

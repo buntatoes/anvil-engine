@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // C++20 Register Virtual Machine Execution Engine, Hot-Loop Accelerator, and Rust FFI Entry Points.
 // Author: Buntato

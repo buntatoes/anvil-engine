@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Hybrid Rust + WebAssembly 1.0 (`WASM`) + C++20 (`AnvilVM`) script runtime, bytecode compiler, and DOM binding layer.
 //!
@@ -1082,6 +1082,658 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
 {lowered_app}\n"
     );
     eval_cpp_vm_with_console_configured(&full_program, 80_000_000, 64 * 1024 * 1024, 10_000)
+}
+
+/// Compile an ES2022+ web application script (`app_script`) via `anvil-js`, execute it
+/// on `AnvilVM` with the self-hosted Web/DOM runtime, and synchronize all recorded
+/// `AnvilDOMDocument` mutations (`createElement`, `appendChild`, `setAttribute`, `classList`,
+/// `style`, `attachShadow`, `customElements.define`, and 2D `<canvas>` operations) back onto
+/// the live [`anvil_dom::Document`].
+pub fn eval_webapp_with_live_dom_bridge(
+    doc: &mut Document,
+    initial_url: &str,
+    app_script: &str,
+) -> Result<ConsoleRun, ConsoleError> {
+    let lowered_app =
+        compile_es2022_with_anvil_js(app_script, false).map_err(|msg| ConsoleError {
+            output: Vec::new(),
+            error: VmError {
+                code: 33,
+                message: msg,
+            },
+        })?;
+    let mut seed_js = String::new();
+    let mut bind_js = String::new();
+    for idx in 0..doc.node_count() {
+        let nid = NodeId::from_raw(idx as u32);
+        if let Some(tag) = doc.get(nid).data().tag() {
+            if matches!(tag, "html" | "head" | "body" | "#document" | "#shadow-root") {
+                continue;
+            }
+            if let Some(el_id) = doc.get(nid).data().id() {
+                let q_tag = quote_js_string_literal(tag);
+                let q_id = quote_js_string_literal(el_id);
+                seed_js.push_str(&format!(
+                    "{{ const __el = document.createElement({q_tag}); __el.setAttribute(\"id\", {q_id}); document.body.appendChild(__el); }}\n"
+                ));
+                bind_js.push_str(&format!(
+                    "{{ const __b = document.getElementById({q_id}); if (__b) {{ document._recordDomOp({{ op: \"bindSeedId\", nodeId: __b._hostNodeId, htmlId: {q_id} }}); }} }}\n"
+                ));
+            }
+        }
+    }
+    seed_js.push_str("document.takeDomMutations();\n");
+    seed_js.push_str(&bind_js);
+    let sync_footer = r#"
+if (document.title) {
+    document._recordDomOp({ op: "setTitle", title: document.title });
+}
+function __anvilSyncDomTree(node) {
+    if (!node) return;
+    if (typeof node.textContent === "string" && node.textContent.length > 0) {
+        document._recordDomOp({ op: "setTextContent", nodeId: node._hostNodeId, text: node.textContent });
+    }
+    if (typeof node._className === "string" && node._className.length > 0) {
+        document._recordDomOp({ op: "setClassName", nodeId: node._hostNodeId, className: node._className });
+    }
+    if (node.style) {
+        const sKeys = ["backgroundColor", "color", "display", "width", "height", "opacity", "border", "margin", "padding", "position", "top", "left", "fontSize", "fontWeight"];
+        for (let sIdx = 0; sIdx < sKeys.length; sIdx = sIdx + 1) {
+            const prop = sKeys[sIdx];
+            const val = node.style[prop];
+            if (typeof val === "string" && val.length > 0) {
+                document._recordDomOp({ op: "setStyle", nodeId: node._hostNodeId, name: prop, value: val });
+            }
+        }
+    }
+    if (node.shadowRoot) {
+        __anvilSyncDomTree(node.shadowRoot);
+    }
+    if (node.children && node.children.length) {
+        for (let cIdx = 0; cIdx < node.children.length; cIdx = cIdx + 1) {
+            __anvilSyncDomTree(node.children[cIdx]);
+        }
+    }
+}
+__anvilSyncDomTree(document.body);
+const __rawMuts = document.takeDomMutations();
+for (let mIdx = 0; mIdx < __rawMuts.length; mIdx = mIdx + 1) {
+    const m = __rawMuts[mIdx];
+    const c = m.cmd;
+    if (c) {
+        const row = [
+            "canvasDraw",
+            m.nodeId || 0,
+            c.kind || "",
+            c.x || c.dx || 0,
+            c.y || c.dy || 0,
+            c.w || c.width || 0,
+            c.h || c.height || 0,
+            c.style || c.text || "",
+            c.lineWidth || 1
+        ];
+        console.log("__ANVIL_DOM_MUT__:" + anvilJsonStringify(row));
+    } else {
+        const row = [
+            m.op || "",
+            m.nodeId || m.hostId || m.parentId || 0,
+            m.childId || m.shadowRootId || 0,
+            m.tagName || m.name || m.htmlId || m.title || m.className || m.mode || "",
+            m.value || m.text || ""
+        ];
+        console.log("__ANVIL_DOM_MUT__:" + anvilJsonStringify(row));
+    }
+}
+"#;
+    let rt_bundle = self_hosted_runtime_bundle();
+    let quoted_url = quote_js_string_literal(initial_url);
+    let full_program = format!(
+        "{rt_bundle}\n\
+const env = createBrowserEnv({quoted_url});\n\
+const window = env.window;\n\
+const globalThis = window;\n\
+const self = window;\n\
+const document = env.document;\n\
+const navigator = env.navigator;\n\
+const location = env.location;\n\
+const history = env.history;\n\
+const localStorage = env.localStorage;\n\
+const sessionStorage = env.sessionStorage;\n\
+const customElements = env.customElements;\n\
+const performance = env.performance;\n\
+const JSON = {{ parse: anvilJsonParse, stringify: anvilJsonStringify }};\n\
+const btoa = anvilBtoa;\n\
+const atob = anvilAtob;\n\
+const encodeURIComponent = anvilEncodeURIComponent;\n\
+const decodeURIComponent = anvilDecodeURIComponent;\n\
+{seed_js}\n\
+{lowered_app}\n\
+{sync_footer}\n"
+    );
+    let mut run =
+        eval_cpp_vm_with_console_configured(&full_program, 80_000_000, 64 * 1024 * 1024, 10_000)?;
+    let mut parsed_records: Vec<JsonValue> = Vec::new();
+    run.output.retain(|line| {
+        if let Some(rest) = line.strip_prefix("__ANVIL_DOM_MUT__:") {
+            if let Ok(parsed) = parse_json(rest) {
+                parsed_records.push(parsed);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if !parsed_records.is_empty() {
+        apply_vm_dom_mutations(doc, &JsonValue::Array(parsed_records));
+    }
+    Ok(run)
+}
+
+/// Apply a JSON array of DOM mutation records emitted by `AnvilDOMDocument.takeDomMutations()`
+/// inside `AnvilVM` directly onto a live [`anvil_dom::Document`].
+pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
+    let JsonValue::Array(records) = mutations else {
+        return;
+    };
+    let mut vm_nodes: std::collections::HashMap<u32, NodeId> = std::collections::HashMap::new();
+    vm_nodes.insert(1, doc.html());
+    vm_nodes.insert(2, doc.head());
+    vm_nodes.insert(3, doc.body());
+
+    let extract_u32 = |obj: &JsonValue, key: &str| -> Option<u32> {
+        obj.get(key).and_then(|v| match v {
+            JsonValue::Number(n) => Some(*n as u32),
+            _ => None,
+        })
+    };
+
+    for rec in records {
+        if let JsonValue::Array(row) = rec {
+            let op = row.first().and_then(|v| v.as_str()).unwrap_or("");
+            let id_u32 = row
+                .get(1)
+                .and_then(|v| match v {
+                    JsonValue::Number(n) => Some(*n as u32),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let child_u32 = row
+                .get(2)
+                .and_then(|v| match v {
+                    JsonValue::Number(n) => Some(*n as u32),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let s1 = row.get(3).and_then(|v| v.as_str()).unwrap_or("");
+            let s2 = row.get(4).and_then(|v| v.as_str()).unwrap_or("");
+            match op {
+                "bindSeedId" => {
+                    if let Some(existing) = doc.get_element_by_id(s1) {
+                        vm_nodes.insert(id_u32, existing);
+                    }
+                }
+                "createElement" => {
+                    let tag = if s1.is_empty() { "div" } else { s1 };
+                    let nid = doc.create_element(tag, Vec::new());
+                    vm_nodes.insert(id_u32, nid);
+                }
+                "createTextNode" => {
+                    let nid = doc.create_text(s2);
+                    vm_nodes.insert(id_u32, nid);
+                }
+                "appendChild" => {
+                    if let (Some(&parent_id), Some(&child_id)) =
+                        (vm_nodes.get(&id_u32), vm_nodes.get(&child_u32))
+                    {
+                        let _ = doc.append(parent_id, child_id);
+                    }
+                }
+                "removeChild" => {
+                    if let (Some(&parent_id), Some(&child_id)) =
+                        (vm_nodes.get(&id_u32), vm_nodes.get(&child_u32))
+                    {
+                        let _ = doc.remove_child(parent_id, child_id);
+                    }
+                }
+                "setAttribute" => {
+                    if s1 == "id"
+                        && let Some(existing) = doc.get_element_by_id(s2)
+                    {
+                        vm_nodes.insert(id_u32, existing);
+                    }
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        doc.set_attribute(nid, s1, s2);
+                    }
+                }
+                "removeAttribute" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        doc.remove_attribute(nid, s1);
+                    }
+                }
+                "setTextContent" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        doc.set_text_content(nid, s2);
+                    }
+                }
+                "setClassName" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        for cls in s1.split_whitespace() {
+                            doc.add_class(nid, cls);
+                        }
+                    }
+                }
+                "setStyle" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        let css_prop = camel_to_kebab(s1);
+                        update_inline_style(doc, nid, &css_prop, s2);
+                    }
+                }
+                "attachShadow" => {
+                    if let Some(&host_id) = vm_nodes.get(&id_u32) {
+                        let s_id = doc.attach_shadow(host_id, s1 != "closed");
+                        if child_u32 != 0 {
+                            vm_nodes.insert(child_u32, s_id);
+                        }
+                    }
+                }
+                "customElementDefine" | "defineCustomElement" => {
+                    if !s1.is_empty() {
+                        doc.define_custom_element(s1);
+                    }
+                }
+                "setTitle" => {
+                    doc.set_title(s1);
+                }
+                "canvasDraw" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        let kind = row.get(2).and_then(|v| v.as_str()).unwrap_or("");
+                        let row_i32 = |idx: usize| -> i32 {
+                            row.get(idx)
+                                .and_then(|v| match v {
+                                    JsonValue::Number(n) => Some(*n as i32),
+                                    _ => None,
+                                })
+                                .unwrap_or(0)
+                        };
+                        let x = row_i32(3);
+                        let y = row_i32(4);
+                        let w = row_i32(5).max(0) as u32;
+                        let h = row_i32(6).max(0) as u32;
+                        let style = row.get(7).and_then(|v| v.as_str()).unwrap_or("#000000");
+                        let lw = row_i32(8).max(1) as u32;
+                        match kind {
+                            "fillRect" => {
+                                doc.canvas_fill_rect(nid, x, y, w, h, parse_canvas_color(style));
+                            }
+                            "strokeRect" => {
+                                doc.canvas_stroke_rect(
+                                    nid,
+                                    x,
+                                    y,
+                                    w,
+                                    h,
+                                    lw,
+                                    parse_canvas_color(style),
+                                );
+                            }
+                            "clearRect" => {
+                                doc.canvas_clear_rect(nid, x, y, w, h);
+                            }
+                            "fillText" => {
+                                doc.canvas_draw_text_bitmap(
+                                    nid,
+                                    style,
+                                    x,
+                                    y,
+                                    parse_canvas_color("#000000"),
+                                );
+                            }
+                            "putImageData" => {
+                                let pw = w.max(1);
+                                let ph = h.max(1);
+                                let rgba = vec![255u8; (pw as usize) * (ph as usize) * 4];
+                                doc.canvas_put_image_data(nid, x, y, pw, ph, &rgba);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(op) = rec.get("op").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let id_u32 = extract_u32(rec, "nodeId")
+            .or_else(|| extract_u32(rec, "id"))
+            .or_else(|| extract_u32(rec, "hostId"))
+            .or_else(|| extract_u32(rec, "parentId"))
+            .unwrap_or(0);
+        match op {
+            "bindSeedId" => {
+                if let Some(html_id) = rec.get("htmlId").and_then(|v| v.as_str())
+                    && let Some(existing) = doc.get_element_by_id(html_id)
+                {
+                    vm_nodes.insert(id_u32, existing);
+                }
+            }
+            "createElement" => {
+                let tag = rec
+                    .get("tagName")
+                    .or_else(|| rec.get("tag"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("div");
+                let nid = doc.create_element(tag, Vec::new());
+                vm_nodes.insert(id_u32, nid);
+            }
+            "createTextNode" => {
+                let text = rec.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let nid = doc.create_text(text);
+                vm_nodes.insert(id_u32, nid);
+            }
+            "appendChild" => {
+                let parent_u32 = extract_u32(rec, "parentId").unwrap_or(id_u32);
+                let child_u32 = extract_u32(rec, "childId").unwrap_or(0);
+                if let (Some(&parent_id), Some(&child_id)) =
+                    (vm_nodes.get(&parent_u32), vm_nodes.get(&child_u32))
+                {
+                    let _ = doc.append(parent_id, child_id);
+                }
+            }
+            "removeChild" => {
+                let parent_u32 = extract_u32(rec, "parentId").unwrap_or(id_u32);
+                let child_u32 = extract_u32(rec, "childId").unwrap_or(0);
+                if let (Some(&parent_id), Some(&child_id)) =
+                    (vm_nodes.get(&parent_u32), vm_nodes.get(&child_u32))
+                {
+                    let _ = doc.remove_child(parent_id, child_id);
+                }
+            }
+            "setAttribute" => {
+                let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let val = rec.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if name == "id"
+                    && let Some(existing) = doc.get_element_by_id(val)
+                {
+                    vm_nodes.insert(id_u32, existing);
+                }
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.set_attribute(nid, name, val);
+                }
+            }
+            "removeAttribute" => {
+                let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.remove_attribute(nid, name);
+                }
+            }
+            "setTextContent" => {
+                let text = rec.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.set_text_content(nid, text);
+                }
+            }
+            "setInnerHTML" => {
+                let html = rec.get("html").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.set_inner_html(nid, html);
+                }
+            }
+            "setClassName" => {
+                let cls_str = rec.get("className").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    for cls in cls_str.split_whitespace() {
+                        doc.add_class(nid, cls);
+                    }
+                }
+            }
+            "classListAdd" => {
+                let cls = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.add_class(nid, cls);
+                }
+            }
+            "classListRemove" => {
+                let cls = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.remove_class(nid, cls);
+                }
+            }
+            "setStyle" => {
+                let name = rec.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let val = rec.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    let css_prop = camel_to_kebab(name);
+                    update_inline_style(doc, nid, &css_prop, val);
+                }
+            }
+            "attachShadow" => {
+                let mode = rec.get("mode").and_then(|v| v.as_str()).unwrap_or("open");
+                let host_u32 = extract_u32(rec, "hostId").unwrap_or(id_u32);
+                let shadow_u32 = extract_u32(rec, "shadowRootId")
+                    .or_else(|| extract_u32(rec, "shadowId"))
+                    .unwrap_or(0);
+                if let Some(&host_id) = vm_nodes.get(&host_u32) {
+                    let s_id = doc.attach_shadow(host_id, mode != "closed");
+                    if shadow_u32 != 0 {
+                        vm_nodes.insert(shadow_u32, s_id);
+                    }
+                }
+            }
+            "customElementDefine" | "defineCustomElement" => {
+                if let Some(name) = rec.get("name").and_then(|v| v.as_str()) {
+                    doc.define_custom_element(name);
+                }
+            }
+            "setTitle" => {
+                if let Some(title) = rec.get("title").and_then(|v| v.as_str()) {
+                    doc.set_title(title);
+                }
+            }
+            "canvasDraw" => {
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    let cmd = rec.get("cmd").unwrap_or(rec);
+                    let kind = cmd
+                        .get("cmdKind")
+                        .or_else(|| cmd.get("kind"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let style = cmd
+                        .get("style")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("#000000");
+                    match kind {
+                        "fillRect" => {
+                            let x = json_i32(cmd, "x");
+                            let y = json_i32(cmd, "y");
+                            let w = json_i32(cmd, "w").max(0) as u32;
+                            let h = json_i32(cmd, "h").max(0) as u32;
+                            doc.canvas_fill_rect(nid, x, y, w, h, parse_canvas_color(style));
+                        }
+                        "strokeRect" => {
+                            let x = json_i32(cmd, "x");
+                            let y = json_i32(cmd, "y");
+                            let w = json_i32(cmd, "w").max(0) as u32;
+                            let h = json_i32(cmd, "h").max(0) as u32;
+                            let lw = json_i32(cmd, "lineWidth").max(1) as u32;
+                            doc.canvas_stroke_rect(nid, x, y, w, h, lw, parse_canvas_color(style));
+                        }
+                        "clearRect" => {
+                            doc.canvas_clear_rect(
+                                nid,
+                                json_i32(cmd, "x"),
+                                json_i32(cmd, "y"),
+                                json_i32(cmd, "w").max(0) as u32,
+                                json_i32(cmd, "h").max(0) as u32,
+                            );
+                        }
+                        "fillText" => {
+                            let text = cmd
+                                .get("cmdText")
+                                .or_else(|| cmd.get("text"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            doc.canvas_draw_text_bitmap(
+                                nid,
+                                text,
+                                json_i32(cmd, "x"),
+                                json_i32(cmd, "y"),
+                                parse_canvas_color(style),
+                            );
+                        }
+                        "putImageData" => {
+                            let dx = json_i32(cmd, "dx");
+                            let dy = json_i32(cmd, "dy");
+                            let w = json_i32(cmd, "width").max(1) as u32;
+                            let h = json_i32(cmd, "height").max(1) as u32;
+                            let pixel_len = (w as usize) * (h as usize) * 4;
+                            let rgba = vec![255u8; pixel_len];
+                            doc.canvas_put_image_data(nid, dx, dy, w, h, &rgba);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "canvasFillRect" => {
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    let x = json_i32(rec, "x");
+                    let y = json_i32(rec, "y");
+                    let w = json_i32(rec, "w").max(0) as u32;
+                    let h = json_i32(rec, "h").max(0) as u32;
+                    let style = rec
+                        .get("style")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("#000000");
+                    doc.canvas_fill_rect(nid, x, y, w, h, parse_canvas_color(style));
+                }
+            }
+            "canvasStrokeRect" => {
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    let x = json_i32(rec, "x");
+                    let y = json_i32(rec, "y");
+                    let w = json_i32(rec, "w").max(0) as u32;
+                    let h = json_i32(rec, "h").max(0) as u32;
+                    let lw = json_i32(rec, "lineWidth").max(1) as u32;
+                    let style = rec
+                        .get("style")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("#000000");
+                    doc.canvas_stroke_rect(nid, x, y, w, h, lw, parse_canvas_color(style));
+                }
+            }
+            "canvasClearRect" => {
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.canvas_clear_rect(
+                        nid,
+                        json_i32(rec, "x"),
+                        json_i32(rec, "y"),
+                        json_i32(rec, "w").max(0) as u32,
+                        json_i32(rec, "h").max(0) as u32,
+                    );
+                }
+            }
+            "canvasFillText" => {
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    let text = rec.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let style = rec
+                        .get("style")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("#000000");
+                    doc.canvas_draw_text_bitmap(
+                        nid,
+                        text,
+                        json_i32(rec, "x"),
+                        json_i32(rec, "y"),
+                        parse_canvas_color(style),
+                    );
+                }
+            }
+            "canvasPutImageData" => {
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    let dx = json_i32(rec, "x");
+                    let dy = json_i32(rec, "y");
+                    let w = json_i32(rec, "w").max(1) as u32;
+                    let h = json_i32(rec, "h").max(1) as u32;
+                    let pixel_len = (w as usize) * (h as usize) * 4;
+                    let rgba = vec![255u8; pixel_len];
+                    doc.canvas_put_image_data(nid, dx, dy, w, h, &rgba);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn json_i32(obj: &JsonValue, key: &str) -> i32 {
+    obj.get(key)
+        .and_then(|v| match v {
+            JsonValue::Number(n) => Some(*n as i32),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn parse_canvas_color(raw: &str) -> [u8; 4] {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            )
+        {
+            return [r, g, b, 255];
+        }
+        if hex.len() == 3 {
+            let bytes = hex.as_bytes();
+            let nib = |b: u8| match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(r), Some(g), Some(b)) = (nib(bytes[0]), nib(bytes[1]), nib(bytes[2])) {
+                return [r * 17, g * 17, b * 17, 255];
+            }
+        }
+    }
+    if let Some(inner) = s
+        .strip_prefix("rgba(")
+        .or_else(|| s.strip_prefix("rgb("))
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() >= 3 {
+            let r = parts[0].parse::<f32>().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
+            let g = parts[1].parse::<f32>().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
+            let b = parts[2].parse::<f32>().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
+            let a = parts
+                .get(3)
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| {
+                    if v <= 1.0 {
+                        (v * 255.0).round() as u8
+                    } else {
+                        v.clamp(0.0, 255.0) as u8
+                    }
+                })
+                .unwrap_or(255);
+            return [r, g, b, a];
+        }
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "red" => [255, 0, 0, 255],
+        "green" => [0, 128, 0, 255],
+        "blue" => [0, 0, 255, 255],
+        "white" => [255, 255, 255, 255],
+        "yellow" => [255, 255, 0, 255],
+        "cyan" => [0, 255, 255, 255],
+        "magenta" => [255, 0, 255, 255],
+        "transparent" => [0, 0, 0, 0],
+        _ => [0, 0, 0, 255],
+    }
 }
 
 #[allow(dead_code)]
@@ -4697,28 +5349,92 @@ impl ScriptRuntime {
         }
     }
 
+    fn set_pending_navigation(&mut self, dest: &str) {
+        let trimmed = dest.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("/httpservice/retry/enablejs")
+            || lower.contains("gbv=1")
+            || lower.contains("noscript")
+        {
+            return;
+        }
+        self.pending_navigation = Some(trimmed.to_string());
+    }
+
     fn assign_target(&mut self, doc: &mut Document, lhs: &str, value: Value) {
         let lhs = lhs.trim();
-        if lhs == "document.title" || lhs == "window.document.title" {
+        if matches!(
+            lhs,
+            "document.title"
+                | "window.document.title"
+                | "self.document.title"
+                | "globalThis.document.title"
+        ) {
             let text = value.as_string(doc);
             doc.set_title(&text);
             return;
         }
-        if lhs == "window.location.href" || lhs == "location.href" || lhs == "window.location" {
-            let dest = value.as_string(doc);
-            if !dest.trim().is_empty() {
-                self.pending_navigation = Some(dest.trim().to_string());
-            }
+        if matches!(
+            lhs,
+            "document.cookie"
+                | "window.document.cookie"
+                | "self.document.cookie"
+                | "globalThis.document.cookie"
+        ) {
+            let text = value.as_string(doc);
+            self.set_var("__document_cookie", Value::Str(text));
             return;
+        }
+        if matches!(
+            lhs,
+            "window.location.href"
+                | "location.href"
+                | "window.location"
+                | "location"
+                | "document.location"
+                | "document.location.href"
+                | "window.document.location"
+                | "window.document.location.href"
+        ) {
+            let dest = value.as_string(doc);
+            self.set_pending_navigation(&dest);
+            return;
+        }
+        if let Some(win_prop) = lhs
+            .strip_prefix("window.")
+            .or_else(|| lhs.strip_prefix("self."))
+            .or_else(|| lhs.strip_prefix("globalThis."))
+        {
+            let win_prop = win_prop.trim();
+            if is_identifier(win_prop) {
+                self.set_var(win_prop, value);
+                return;
+            }
         }
 
         if lhs.ends_with(']')
             && let Some(open) = lhs.rfind('[')
             && open > 0
         {
-            let target_ident = lhs[..open].trim();
+            let target_ident = lhs[..open]
+                .trim()
+                .strip_prefix("window.")
+                .or_else(|| lhs[..open].trim().strip_prefix("self."))
+                .or_else(|| lhs[..open].trim().strip_prefix("globalThis."))
+                .unwrap_or(lhs[..open].trim())
+                .trim();
             let idx_expr = &lhs[open + 1..lhs.len() - 1];
             let idx_val = self.eval_expr(doc, idx_expr);
+            if target_ident == "window" || target_ident == "self" || target_ident == "globalThis" {
+                let key = idx_val.as_string(doc);
+                if is_identifier(&key) {
+                    self.set_var(&key, value);
+                }
+                return;
+            }
             if is_identifier(target_ident)
                 && let Some(existing) = self.get_var(target_ident).cloned()
             {
@@ -4742,6 +5458,13 @@ impl ScriptRuntime {
                         let key = idx_val.as_string(doc);
                         jobj.insert(&key, value.to_json_value(doc));
                         self.set_var(target_ident, Value::Json(jobj));
+                        return;
+                    }
+                    Value::Str(ref s) if s == "__anvil_window" => {
+                        let key = idx_val.as_string(doc);
+                        if is_identifier(&key) {
+                            self.set_var(&key, value);
+                        }
                         return;
                     }
                     _ => {}
@@ -4774,13 +5497,43 @@ impl ScriptRuntime {
                     return;
                 }
             }
-            if let Value::Element(id) = self.eval_expr(doc, obj_expr.trim()) {
+            let obj_val = self.eval_expr(doc, obj_expr.trim());
+            if let Value::Str(ref s) = obj_val
+                && s == "__anvil_window"
+            {
+                let prop_trimmed = prop.trim();
+                if is_identifier(prop_trimmed) {
+                    self.set_var(prop_trimmed, value);
+                }
+                return;
+            }
+            if let Value::Element(id) = obj_val {
+                if id == doc.root() {
+                    match prop.trim() {
+                        "title" => {
+                            let text = value.as_string(doc);
+                            doc.set_title(&text);
+                            return;
+                        }
+                        "cookie" => {
+                            let text = value.as_string(doc);
+                            self.set_var("__document_cookie", Value::Str(text));
+                            return;
+                        }
+                        "location" => {
+                            let dest = value.as_string(doc);
+                            self.set_pending_navigation(&dest);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 match prop.trim() {
                     "textContent" | "innerText" | "nodeValue" => {
                         let text = value.as_string(doc);
                         doc.set_text_content(id, &text);
                     }
-                    "innerHTML" => {
+                    "innerHTML" | "outerHTML" => {
                         let html = value.as_string(doc);
                         doc.set_inner_html(id, &html);
                         self.dom_cache.clear();
@@ -4825,12 +5578,10 @@ impl ScriptRuntime {
                 }
                 return;
             }
-            if is_identifier(obj_expr.trim())
-                && let Some(Value::Json(mut jobj)) = self.get_var(obj_expr.trim()).cloned()
-            {
+            if let Value::Json(mut jobj) = obj_val {
                 let jval = value.to_json_value(doc);
                 jobj.insert(prop.trim(), jval);
-                self.set_var(obj_expr.trim(), Value::Json(jobj));
+                self.assign_target(doc, obj_expr.trim(), Value::Json(jobj));
                 return;
             }
         }
@@ -4923,12 +5674,84 @@ impl ScriptRuntime {
             return self.eval_new_expr(doc, new_rest.trim());
         }
 
+        if let Some(void_rest) = expr
+            .strip_prefix("void ")
+            .or_else(|| expr.strip_prefix("void("))
+        {
+            let inner = if expr.starts_with("void(") {
+                &expr[4..]
+            } else {
+                void_rest.trim()
+            };
+            let _ = self.eval_expr(doc, inner);
+            return Value::Null;
+        }
+
+        if let Some(del_rest) = expr.strip_prefix("delete ") {
+            let _ = del_rest;
+            return Value::Bool(true);
+        }
+
         if let Some(rest) = expr.strip_prefix("typeof ") {
-            let v = self.eval_expr(doc, rest.trim());
+            let target = rest
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim();
+            if matches!(
+                target,
+                "window"
+                    | "self"
+                    | "globalThis"
+                    | "document"
+                    | "window.document"
+                    | "navigator"
+                    | "window.navigator"
+                    | "location"
+                    | "window.location"
+                    | "history"
+                    | "window.history"
+                    | "localStorage"
+                    | "window.localStorage"
+                    | "sessionStorage"
+                    | "window.sessionStorage"
+                    | "console"
+                    | "Math"
+                    | "JSON"
+                    | "Promise"
+                    | "performance"
+                    | "customElements"
+            ) {
+                return Value::Str("object".to_string());
+            }
+            if self.functions.iter().any(|(n, _, _)| n == target)
+                || matches!(
+                    target,
+                    "fetch"
+                        | "setTimeout"
+                        | "setInterval"
+                        | "clearTimeout"
+                        | "clearInterval"
+                        | "requestAnimationFrame"
+                        | "cancelAnimationFrame"
+                        | "encodeURIComponent"
+                        | "decodeURIComponent"
+                        | "encodeURI"
+                        | "decodeURI"
+                        | "atob"
+                        | "btoa"
+                        | "parseInt"
+                        | "parseFloat"
+                )
+            {
+                return Value::Str("function".to_string());
+            }
+            let v = self.eval_expr(doc, target);
             let ty = match v {
                 Value::Null => "undefined",
                 Value::Bool(_) => "boolean",
                 Value::Number(_) => "number",
+                Value::Str(ref s) if s == "__anvil_window" => "object",
                 Value::Str(_) => "string",
                 Value::Element(_) | Value::Array(_) | Value::Json(_) => "object",
             };
@@ -4940,6 +5763,18 @@ impl ScriptRuntime {
         {
             let v = self.eval_expr(doc, rest.trim());
             return Value::Bool(!v.is_truthy());
+        }
+
+        if let Some((lhs, rhs)) = split_assignment(expr) {
+            let lhs_t = lhs.trim();
+            if is_identifier(lhs_t)
+                || lhs_t.contains('.')
+                || (lhs_t.ends_with(']') && lhs_t.contains('['))
+            {
+                let val = self.eval_expr(doc, rhs.trim());
+                self.assign_target(doc, lhs_t, val.clone());
+                return val;
+            }
         }
 
         if let Some((cond_s, branches_s)) = split_top_level_op(expr, "?")
@@ -5048,6 +5883,15 @@ impl ScriptRuntime {
         if let Some(num) = parse_js_number_literal(expr) {
             return Value::Number(num);
         }
+        if matches!(
+            expr,
+            "document" | "window.document" | "self.document" | "globalThis.document"
+        ) {
+            return Value::Element(doc.root());
+        }
+        if matches!(expr, "window" | "self" | "globalThis") {
+            return Value::Str("__anvil_window".to_string());
+        }
         if expr == "document.title" || expr == "window.document.title" {
             return Value::Str(doc.title());
         }
@@ -5059,6 +5903,39 @@ impl ScriptRuntime {
         }
         if expr == "document.documentElement" || expr == "window.document.documentElement" {
             return Value::Element(doc.html());
+        }
+        if expr == "document.readyState" || expr == "window.document.readyState" {
+            return Value::Str("complete".to_string());
+        }
+        if expr == "document.visibilityState" || expr == "window.document.visibilityState" {
+            return Value::Str("visible".to_string());
+        }
+        if expr == "document.hidden" || expr == "window.document.hidden" {
+            return Value::Bool(false);
+        }
+        if expr == "document.cookie" || expr == "window.document.cookie" {
+            return Value::Str(
+                self.get_var("__document_cookie")
+                    .map(|v| v.as_string(doc))
+                    .unwrap_or_default(),
+            );
+        }
+        if matches!(
+            expr,
+            "document.URL"
+                | "window.document.URL"
+                | "document.documentURI"
+                | "window.document.documentURI"
+        ) {
+            return Value::Str(self.page_origin.clone().unwrap_or_default());
+        }
+        if expr == "document.domain" || expr == "window.document.domain" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let after_scheme = href.find("://").map(|i| &href[i + 3..]).unwrap_or(href);
+            let end = after_scheme
+                .find(['/', ':', '?', '#'])
+                .unwrap_or(after_scheme.len());
+            return Value::Str(after_scheme[..end].to_string());
         }
         if expr == "window.innerWidth" || expr == "innerWidth" {
             return Value::Number(1280.0);
@@ -5116,6 +5993,34 @@ impl ScriptRuntime {
                 .unwrap_or(after_scheme.len());
             return Value::Str(after_scheme[..end].to_string());
         }
+        if expr == "window.location.host" || expr == "location.host" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let after_scheme = href.find("://").map(|i| &href[i + 3..]).unwrap_or(href);
+            let end = after_scheme
+                .find(['/', '?', '#'])
+                .unwrap_or(after_scheme.len());
+            return Value::Str(after_scheme[..end].to_string());
+        }
+        if expr == "window.location.protocol" || expr == "location.protocol" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            let proto = href
+                .find("://")
+                .map(|i| format!("{}:", &href[..i]))
+                .unwrap_or_else(|| "https:".to_string());
+            return Value::Str(proto);
+        }
+        if expr == "window.location.origin" || expr == "location.origin" {
+            let href = self.page_origin.as_deref().unwrap_or_default();
+            if let Some(scheme_idx) = href.find("://") {
+                let after = &href[scheme_idx + 3..];
+                let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+                return Value::Str(format!("{}{}", &href[..scheme_idx + 3], &after[..end]));
+            }
+            return Value::Str(String::new());
+        }
+        if expr == "window.location.port" || expr == "location.port" {
+            return Value::Str(String::new());
+        }
         if expr == "window.location.hash" || expr == "location.hash" {
             let href = self.page_origin.as_deref().unwrap_or_default();
             let hash = href
@@ -5126,13 +6031,16 @@ impl ScriptRuntime {
         }
         if expr == "navigator.userAgent" || expr == "window.navigator.userAgent" {
             return Value::Str(
-                "AnvilBrowser/23.2 (Win64; x64) AnvilEngine/23.2 AnvilJS/2.0".to_string(),
+                "AnvilBrowser/23.3 (Win64; x64) AnvilEngine/23.3 AnvilJS/4.0".to_string(),
             );
         }
         if expr == "navigator.language" || expr == "window.navigator.language" {
             return Value::Str("en-US".to_string());
         }
         if expr == "navigator.onLine" || expr == "window.navigator.onLine" {
+            return Value::Bool(true);
+        }
+        if expr == "navigator.cookieEnabled" || expr == "window.navigator.cookieEnabled" {
             return Value::Bool(true);
         }
         if expr == "window.location.href" || expr == "location.href" {
@@ -5204,6 +6112,10 @@ impl ScriptRuntime {
                         .map(Value::from_json_value)
                         .unwrap_or(Value::Null);
                 }
+                Value::Str(ref s) if s == "__anvil_window" => {
+                    let key = idx_val.as_string(doc);
+                    return self.get_var(&key).cloned().unwrap_or(Value::Null);
+                }
                 _ => {}
             }
         }
@@ -5272,6 +6184,15 @@ impl ScriptRuntime {
                         .map(Value::from_json_value)
                         .unwrap_or(Value::Null);
                 }
+                Value::Str(ref s) if s == "__anvil_window" => {
+                    return match prop_trimmed {
+                        "document" => Value::Element(doc.root()),
+                        "innerWidth" => Value::Number(1280.0),
+                        "innerHeight" => Value::Number(800.0),
+                        "devicePixelRatio" => Value::Number(1.0),
+                        _ => self.get_var(prop_trimmed).cloned().unwrap_or(Value::Null),
+                    };
+                }
                 Value::Str(s) if prop_trimmed == "length" => {
                     return Value::Number(s.chars().count() as f64);
                 }
@@ -5284,6 +6205,7 @@ impl ScriptRuntime {
         }
         if let Some(stripped_win) = expr
             .strip_prefix("window.")
+            .or_else(|| expr.strip_prefix("self."))
             .or_else(|| expr.strip_prefix("globalThis."))
             && let Some(val) = self.get_var(stripped_win.trim())
         {
@@ -5294,10 +6216,55 @@ impl ScriptRuntime {
     }
 
     fn read_element_prop(&self, doc: &Document, id: NodeId, prop: &str) -> Value {
+        if id == doc.root() {
+            match prop {
+                "body" => return Value::Element(doc.body()),
+                "head" => return Value::Element(doc.head()),
+                "documentElement" => return Value::Element(doc.html()),
+                "title" => return Value::Str(doc.title()),
+                "readyState" => return Value::Str("complete".to_string()),
+                "visibilityState" => return Value::Str("visible".to_string()),
+                "hidden" => return Value::Bool(false),
+                "cookie" => {
+                    return Value::Str(
+                        self.get_var("__document_cookie")
+                            .map(|v| v.as_string(doc))
+                            .unwrap_or_default(),
+                    );
+                }
+                "URL" | "documentURI" => {
+                    return Value::Str(self.page_origin.clone().unwrap_or_default());
+                }
+                "domain" => {
+                    let href = self.page_origin.as_deref().unwrap_or_default();
+                    let after_scheme = href.find("://").map(|i| &href[i + 3..]).unwrap_or(href);
+                    let end = after_scheme
+                        .find(['/', ':', '?', '#'])
+                        .unwrap_or(after_scheme.len());
+                    return Value::Str(after_scheme[..end].to_string());
+                }
+                _ => {}
+            }
+        }
         match prop {
             "textContent" | "innerText" | "nodeValue" => Value::Str(doc.text_content(id)),
             "innerHTML" => Value::Str(doc.inner_html(id)),
-            "shadowRoot" => Value::Element(id),
+            "shadowRoot" => doc
+                .shadow_root(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Element(id)),
+            "host" => doc
+                .shadow_host(id)
+                .map(Value::Element)
+                .unwrap_or(Value::Null),
+            "width" => {
+                let (w, _) = doc.canvas_dimensions(id);
+                Value::Number(w as f64)
+            }
+            "height" => {
+                let (_, h) = doc.canvas_dimensions(id);
+                Value::Number(h as f64)
+            }
             "outerHTML" => Value::Str(doc.outer_html(id)),
             "tagName" | "nodeName" => Value::Str(
                 doc.get(id)
@@ -5636,6 +6603,119 @@ impl ScriptRuntime {
             | "XMLHttpRequest" => {
                 let mut obj = JsonValue::empty_object();
                 obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
+                if callee == "MediaSource" {
+                    obj.insert("readyState", JsonValue::String("open".to_string()));
+                    obj.insert("duration", JsonValue::Number(0.0));
+                }
+                Value::Json(obj)
+            }
+            "ImageData" => {
+                let w = args
+                    .first()
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                    .unwrap_or(1.0)
+                    .clamp(1.0, 2048.0) as u32;
+                let h = args
+                    .get(1)
+                    .and_then(|a| self.eval_expr(doc, a).as_number())
+                    .unwrap_or(1.0)
+                    .clamp(1.0, 2048.0) as u32;
+                let len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String("ImageData".to_string()));
+                obj.insert("width", JsonValue::Number(w as f64));
+                obj.insert("height", JsonValue::Number(h as f64));
+                if self.array_fits(len) {
+                    obj.insert("data", JsonValue::Array(vec![JsonValue::Number(0.0); len]));
+                }
+                Value::Json(obj)
+            }
+            "VideoFrame" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String("VideoFrame".to_string()));
+                let mut w = 64.0;
+                let mut h = 64.0;
+                let mut ts = 0.0;
+                let mut fmt = "RGBA".to_string();
+                if let Some(opts_arg) = args.get(1).or_else(|| args.first())
+                    && let Value::Json(jopts) = self.eval_expr(doc, opts_arg)
+                {
+                    if let Some(JsonValue::Number(cw)) =
+                        jopts.get("codedWidth").or_else(|| jopts.get("width"))
+                    {
+                        w = *cw;
+                    }
+                    if let Some(JsonValue::Number(ch)) =
+                        jopts.get("codedHeight").or_else(|| jopts.get("height"))
+                    {
+                        h = *ch;
+                    }
+                    if let Some(JsonValue::Number(t)) = jopts.get("timestamp") {
+                        ts = *t;
+                    }
+                    if let Some(JsonValue::String(f)) = jopts.get("format") {
+                        fmt = f.clone();
+                    }
+                }
+                obj.insert("codedWidth", JsonValue::Number(w));
+                obj.insert("codedHeight", JsonValue::Number(h));
+                obj.insert("displayWidth", JsonValue::Number(w));
+                obj.insert("displayHeight", JsonValue::Number(h));
+                obj.insert("timestamp", JsonValue::Number(ts));
+                obj.insert("format", JsonValue::String(fmt));
+                Value::Json(obj)
+            }
+            "EncodedVideoChunk" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert(
+                    "__anvil_kind",
+                    JsonValue::String("EncodedVideoChunk".to_string()),
+                );
+                let mut chunk_type = "key".to_string();
+                let mut ts = 0.0;
+                let mut byte_len = 0.0;
+                if let Some(first) = args.first()
+                    && let Value::Json(jinit) = self.eval_expr(doc, first)
+                {
+                    if let Some(JsonValue::String(t)) = jinit.get("type") {
+                        chunk_type = t.clone();
+                    }
+                    if let Some(JsonValue::Number(t)) = jinit.get("timestamp") {
+                        ts = *t;
+                    }
+                    if let Some(JsonValue::Array(arr)) = jinit.get("data") {
+                        byte_len = arr.len() as f64;
+                    }
+                }
+                obj.insert("type", JsonValue::String(chunk_type));
+                obj.insert("timestamp", JsonValue::Number(ts));
+                obj.insert("byteLength", JsonValue::Number(byte_len));
+                Value::Json(obj)
+            }
+            "VideoEncoder" | "VideoDecoder" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
+                obj.insert("state", JsonValue::String("unconfigured".to_string()));
+                obj.insert("encodeQueueSize", JsonValue::Number(0.0));
+                obj.insert("decodeQueueSize", JsonValue::Number(0.0));
+                obj.insert("encodedChunks", JsonValue::Number(0.0));
+                obj.insert("decodedFrames", JsonValue::Number(0.0));
+                Value::Json(obj)
+            }
+            "AudioContext" | "MediaRecorder" => {
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
+                if callee == "AudioContext" {
+                    obj.insert("state", JsonValue::String("running".to_string()));
+                    obj.insert("sampleRate", JsonValue::Number(48000.0));
+                    obj.insert("currentTime", JsonValue::Number(0.0));
+                } else {
+                    obj.insert("state", JsonValue::String("inactive".to_string()));
+                    obj.insert(
+                        "mimeType",
+                        JsonValue::String("video/webm;codecs=vp9,opus".to_string()),
+                    );
+                }
                 Value::Json(obj)
             }
             "Event" | "CustomEvent" => {
@@ -5815,6 +6895,7 @@ impl ScriptRuntime {
         let callee = callee_raw
             .trim()
             .strip_prefix("window.")
+            .or_else(|| callee_raw.trim().strip_prefix("self."))
             .or_else(|| callee_raw.trim().strip_prefix("globalThis."))
             .unwrap_or(callee_raw.trim())
             .trim();
@@ -5828,6 +6909,19 @@ impl ScriptRuntime {
                 return self.invoke_method_body(doc, &params, &body, &args, next_super.as_deref());
             }
             return Value::Null;
+        }
+
+        if callee.starts_with("function") || callee.starts_with("async function") {
+            let args = split_args(args_src);
+            let (is_async, rest) = split_async_prefix(callee);
+            if is_async {
+                let (params, body) = async_callback_parts(rest);
+                let values: Vec<Value> = args.iter().map(|a| self.eval_expr(doc, a)).collect();
+                let env = self.capture_env(&body);
+                return self.start_async(doc, &params, values, &body, &env);
+            }
+            let (params, body) = extract_multi_param_callback(callee);
+            return self.invoke_method_body(doc, &params, &body, &args, None);
         }
 
         if callee.starts_with('(')
@@ -6144,13 +7238,32 @@ impl ScriptRuntime {
                 }
                 return Value::Str(encoded);
             }
-            "decodeURIComponent" => {
+            "decodeURI" | "decodeURIComponent" => {
                 let args = split_args(args_src);
                 let raw = args
                     .first()
                     .map(|a| self.eval_expr(doc, a).as_string(doc))
                     .unwrap_or_default();
-                return Value::Str(raw.replace("%20", " ").replace('+', " "));
+                let mut out_bytes = Vec::with_capacity(raw.len());
+                let bytes = raw.as_bytes();
+                let mut idx = 0;
+                while idx < bytes.len() {
+                    if bytes[idx] == b'%'
+                        && idx + 2 < bytes.len()
+                        && let Ok(hex_str) = std::str::from_utf8(&bytes[idx + 1..idx + 3])
+                        && let Ok(decoded_b) = u8::from_str_radix(hex_str, 16)
+                    {
+                        out_bytes.push(decoded_b);
+                        idx += 3;
+                    } else if bytes[idx] == b'+' && callee == "decodeURIComponent" {
+                        out_bytes.push(b' ');
+                        idx += 1;
+                    } else {
+                        out_bytes.push(bytes[idx]);
+                        idx += 1;
+                    }
+                }
+                return Value::Str(String::from_utf8_lossy(&out_bytes).into_owned());
             }
             "queueMicrotask" => {
                 let args = split_args(args_src);
@@ -6560,6 +7673,7 @@ impl ScriptRuntime {
                         if args.len() >= 2 {
                             let tag = self.eval_expr(doc, &args[0]).as_string(doc);
                             let ctor = self.eval_expr(doc, &args[1]);
+                            doc.define_custom_element(&tag);
                             self.set_var(&format!("__ce_{tag}"), ctor);
                         }
                         Value::Null
@@ -6579,6 +7693,68 @@ impl ScriptRuntime {
                     }
                     _ => Value::Null,
                 };
+            }
+
+            if obj_expr == "VideoEncoder"
+                || obj_expr == "window.VideoEncoder"
+                || obj_expr == "VideoDecoder"
+                || obj_expr == "window.VideoDecoder"
+            {
+                if method == "isConfigSupported" {
+                    let args = split_args(args_src);
+                    let cfg_val = args
+                        .first()
+                        .map(|a| self.eval_expr(doc, a))
+                        .unwrap_or(Value::Null);
+                    let codec_str = match &cfg_val {
+                        Value::Json(j) => j
+                            .get("codec")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("avc1.42E01E"),
+                        _ => "avc1.42E01E",
+                    };
+                    let caps = anvil_video::MediaCapabilitiesInfo::query(codec_str, 1280, 720, 60);
+                    let mut res = JsonValue::empty_object();
+                    res.insert("supported", JsonValue::Bool(caps.supported));
+                    res.insert("config", cfg_val.to_json_value(doc));
+                    let pid = self.new_resolved(Value::Json(res));
+                    return self.make_promise_value(pid);
+                }
+            }
+
+            if obj_expr == "navigator.mediaCapabilities"
+                || obj_expr == "window.navigator.mediaCapabilities"
+            {
+                if method == "decodingInfo" || method == "encodingInfo" {
+                    let caps =
+                        anvil_video::MediaCapabilitiesInfo::query("av01.0.04M.08", 1920, 1080, 60);
+                    let mut res = JsonValue::empty_object();
+                    res.insert("supported", JsonValue::Bool(caps.supported));
+                    res.insert("smooth", JsonValue::Bool(caps.smooth));
+                    res.insert("powerEfficient", JsonValue::Bool(caps.power_efficient));
+                    res.insert("hardwareAccelerated", JsonValue::Bool(caps.power_efficient));
+                    let pid = self.new_resolved(Value::Json(res));
+                    return self.make_promise_value(pid);
+                }
+            }
+
+            if matches!(
+                obj_expr,
+                "location"
+                    | "window.location"
+                    | "self.location"
+                    | "globalThis.location"
+                    | "document.location"
+                    | "window.document.location"
+            ) {
+                let args = split_args(args_src);
+                if matches!(method, "assign" | "replace")
+                    && let Some(first) = args.first()
+                {
+                    let url = self.eval_expr(doc, first).as_string(doc);
+                    self.set_pending_navigation(&url);
+                }
+                return Value::Null;
             }
 
             if obj_expr == "history" || obj_expr == "window.history" {
@@ -6606,7 +7782,7 @@ impl ScriptRuntime {
                 return self.eval_webassembly_static(doc, method, &args);
             }
 
-            if obj_expr == "navigator" {
+            if obj_expr == "navigator" || obj_expr == "window.navigator" {
                 let args = split_args(args_src);
                 let first = args
                     .first()
@@ -6627,11 +7803,15 @@ impl ScriptRuntime {
                         obj.insert("cenc", JsonValue::String("cenc".to_string()));
                         Value::Json(obj)
                     }
+                    "sendBeacon" => Value::Bool(true),
                     _ => Value::Null,
                 };
             }
 
-            if obj_expr == "document" || obj_expr == "window.document" {
+            if matches!(
+                obj_expr,
+                "document" | "window.document" | "self.document" | "globalThis.document"
+            ) {
                 let args = split_args(args_src);
                 let first = args
                     .first()
@@ -6666,19 +7846,26 @@ impl ScriptRuntime {
                         Value::Array(ids.into_iter().map(Value::Element).collect())
                     }
                     "getElementsByClassName" => {
-                        let sel = format!(".{}", first.trim());
-                        let ids = doc.query_selector_all(&sel);
+                        let ids = doc.get_elements_by_class_name(doc.root(), first.trim());
                         Value::Array(ids.into_iter().map(Value::Element).collect())
                     }
                     "getElementsByTagName" => {
-                        let ids = doc.query_selector_all(first.trim());
+                        let ids = doc.get_elements_by_tag_name(doc.root(), first.trim());
+                        Value::Array(ids.into_iter().map(Value::Element).collect())
+                    }
+                    "getElementsByName" => {
+                        let ids = doc.get_elements_by_name(first.trim());
                         Value::Array(ids.into_iter().map(Value::Element).collect())
                     }
                     "createElement" => {
                         let id = doc.create_element(&first, Vec::new());
                         Value::Element(id)
                     }
-                    "createTextNode" => {
+                    "createDocumentFragment" => {
+                        let id = doc.create_element("anvil-fragment", Vec::new());
+                        Value::Element(id)
+                    }
+                    "createTextNode" | "createComment" => {
                         let id = doc.create_text(&first);
                         Value::Element(id)
                     }
@@ -6756,6 +7943,9 @@ impl ScriptRuntime {
             }
 
             match self.eval_expr(doc, obj_expr) {
+                Value::Str(ref s) if s == "__anvil_window" => {
+                    return self.eval_call(doc, method, args_src);
+                }
                 Value::Str(s) => {
                     let args = split_args(args_src);
                     let arg0 = args
@@ -7215,17 +8405,362 @@ impl ScriptRuntime {
                                 return Value::Null;
                             }
                             ("MediaSource", "addSourceBuffer") => {
+                                let mime = args
+                                    .first()
+                                    .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                    .unwrap_or_default();
                                 let mut sb = JsonValue::empty_object();
                                 sb.insert(
                                     "__anvil_kind",
                                     JsonValue::String("SourceBuffer".to_string()),
                                 );
+                                sb.insert("mimeType", JsonValue::String(mime));
+                                sb.insert("updating", JsonValue::Bool(false));
+                                sb.insert("appendedSegments", JsonValue::Number(0.0));
                                 return Value::Json(sb);
+                            }
+                            ("SourceBuffer", "appendBuffer") => {
+                                let prev = jval
+                                    .get("appendedSegments")
+                                    .and_then(|v| match v {
+                                        JsonValue::Number(n) => Some(*n),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0.0);
+                                jval.insert("appendedSegments", JsonValue::Number(prev + 1.0));
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval));
+                                }
+                                return Value::Null;
+                            }
+                            ("VideoEncoder", "configure") | ("VideoDecoder", "configure") => {
+                                jval.insert("state", JsonValue::String("configured".to_string()));
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval));
+                                }
+                                return Value::Null;
+                            }
+                            ("VideoEncoder", "encode") => {
+                                let mut enc = anvil_video::WebCodecsVideoEncoder::new();
+                                let _ = enc.configure("avc1.42E01E", 16, 16, 30, 16);
+                                let frame = anvil_video::VideoFrame {
+                                    width: 16,
+                                    height: 16,
+                                    pts_ms: 0,
+                                    keyframe: true,
+                                    rgba: vec![128u8; 16 * 16 * 4],
+                                };
+                                let _ = enc.encode(&frame, true);
+                                let prev = jval
+                                    .get("encodedChunks")
+                                    .and_then(|v| match v {
+                                        JsonValue::Number(n) => Some(*n),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0.0);
+                                jval.insert("encodedChunks", JsonValue::Number(prev + 1.0));
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval));
+                                }
+                                return Value::Null;
+                            }
+                            ("VideoDecoder", "decode") => {
+                                let prev = jval
+                                    .get("decodedFrames")
+                                    .and_then(|v| match v {
+                                        JsonValue::Number(n) => Some(*n),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0.0);
+                                jval.insert("decodedFrames", JsonValue::Number(prev + 1.0));
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval));
+                                }
+                                return Value::Null;
+                            }
+                            ("VideoEncoder", "flush") | ("VideoDecoder", "flush") => {
+                                let pid = self.new_resolved(Value::Null);
+                                return self.make_promise_value(pid);
+                            }
+                            ("VideoEncoder", "close")
+                            | ("VideoDecoder", "close")
+                            | ("VideoFrame", "close") => {
+                                jval.insert("state", JsonValue::String("closed".to_string()));
+                                if is_identifier(obj_expr) {
+                                    self.set_var(obj_expr, Value::Json(jval));
+                                }
+                                return Value::Null;
+                            }
+                            ("CanvasRenderingContext2D", m) => {
+                                let canvas_idx = jval
+                                    .get("__canvas_id")
+                                    .and_then(|v| match v {
+                                        JsonValue::Number(n) => Some(*n as u32),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0);
+                                let cid = NodeId::from_raw(canvas_idx);
+                                let eval_i32 =
+                                    |rt: &mut Self, d: &mut Document, idx: usize| -> i32 {
+                                        args.get(idx)
+                                            .and_then(|a| rt.eval_expr(d, a).as_number())
+                                            .unwrap_or(0.0)
+                                            .round() as i32
+                                    };
+                                match m {
+                                    "fillRect" => {
+                                        let x = eval_i32(self, doc, 0);
+                                        let y = eval_i32(self, doc, 1);
+                                        let w = eval_i32(self, doc, 2).max(0) as u32;
+                                        let h = eval_i32(self, doc, 3).max(0) as u32;
+                                        let fill = jval
+                                            .get("fillStyle")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("#000000");
+                                        doc.canvas_fill_rect(
+                                            cid,
+                                            x,
+                                            y,
+                                            w,
+                                            h,
+                                            parse_canvas_color(fill),
+                                        );
+                                        return Value::Null;
+                                    }
+                                    "strokeRect" => {
+                                        let x = eval_i32(self, doc, 0);
+                                        let y = eval_i32(self, doc, 1);
+                                        let w = eval_i32(self, doc, 2).max(0) as u32;
+                                        let h = eval_i32(self, doc, 3).max(0) as u32;
+                                        let lw = jval
+                                            .get("lineWidth")
+                                            .and_then(|v| match v {
+                                                JsonValue::Number(n) => Some(*n as i32),
+                                                _ => None,
+                                            })
+                                            .unwrap_or(1)
+                                            .max(1)
+                                            as u32;
+                                        let stroke = jval
+                                            .get("strokeStyle")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("#000000");
+                                        doc.canvas_stroke_rect(
+                                            cid,
+                                            x,
+                                            y,
+                                            w,
+                                            h,
+                                            lw,
+                                            parse_canvas_color(stroke),
+                                        );
+                                        return Value::Null;
+                                    }
+                                    "clearRect" => {
+                                        let x = eval_i32(self, doc, 0);
+                                        let y = eval_i32(self, doc, 1);
+                                        let w = eval_i32(self, doc, 2).max(0) as u32;
+                                        let h = eval_i32(self, doc, 3).max(0) as u32;
+                                        doc.canvas_clear_rect(cid, x, y, w, h);
+                                        return Value::Null;
+                                    }
+                                    "fillText" | "strokeText" => {
+                                        let text = args
+                                            .first()
+                                            .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                            .unwrap_or_default();
+                                        let x = eval_i32(self, doc, 1);
+                                        let y = eval_i32(self, doc, 2);
+                                        let fill = jval
+                                            .get("fillStyle")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("#000000");
+                                        doc.canvas_draw_text_bitmap(
+                                            cid,
+                                            &text,
+                                            x,
+                                            y,
+                                            parse_canvas_color(fill),
+                                        );
+                                        return Value::Null;
+                                    }
+                                    "beginPath" | "closePath" | "save" | "restore" | "scale"
+                                    | "translate" => {
+                                        return Value::Null;
+                                    }
+                                    "moveTo" => {
+                                        let x = eval_i32(self, doc, 0);
+                                        let y = eval_i32(self, doc, 1);
+                                        jval.insert("__pen_x", JsonValue::Number(x as f64));
+                                        jval.insert("__pen_y", JsonValue::Number(y as f64));
+                                        if is_identifier(obj_expr) {
+                                            self.set_var(obj_expr, Value::Json(jval));
+                                        }
+                                        return Value::Null;
+                                    }
+                                    "lineTo" => {
+                                        let x0 = json_i32(&jval, "__pen_x");
+                                        let y0 = json_i32(&jval, "__pen_y");
+                                        let x1 = eval_i32(self, doc, 0);
+                                        let y1 = eval_i32(self, doc, 1);
+                                        let stroke = jval
+                                            .get("strokeStyle")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("#000000");
+                                        doc.canvas_draw_line(
+                                            cid,
+                                            x0,
+                                            y0,
+                                            x1,
+                                            y1,
+                                            parse_canvas_color(stroke),
+                                        );
+                                        jval.insert("__pen_x", JsonValue::Number(x1 as f64));
+                                        jval.insert("__pen_y", JsonValue::Number(y1 as f64));
+                                        if is_identifier(obj_expr) {
+                                            self.set_var(obj_expr, Value::Json(jval));
+                                        }
+                                        return Value::Null;
+                                    }
+                                    "arc" => {
+                                        let cx = eval_i32(self, doc, 0);
+                                        let cy = eval_i32(self, doc, 1);
+                                        let r = eval_i32(self, doc, 2).max(1);
+                                        let fill = jval
+                                            .get("fillStyle")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("#000000");
+                                        doc.canvas_fill_rect(
+                                            cid,
+                                            cx - r,
+                                            cy - r,
+                                            (r * 2) as u32,
+                                            (r * 2) as u32,
+                                            parse_canvas_color(fill),
+                                        );
+                                        return Value::Null;
+                                    }
+                                    "fill" | "stroke" => {
+                                        return Value::Null;
+                                    }
+                                    "createImageData" => {
+                                        let w = eval_i32(self, doc, 0).clamp(1, 2048) as u32;
+                                        let h = eval_i32(self, doc, 1).clamp(1, 2048) as u32;
+                                        let len = (w as usize) * (h as usize) * 4;
+                                        let mut img = JsonValue::empty_object();
+                                        img.insert(
+                                            "__anvil_kind",
+                                            JsonValue::String("ImageData".to_string()),
+                                        );
+                                        img.insert("width", JsonValue::Number(w as f64));
+                                        img.insert("height", JsonValue::Number(h as f64));
+                                        if self.array_fits(len) {
+                                            img.insert(
+                                                "data",
+                                                JsonValue::Array(vec![JsonValue::Number(0.0); len]),
+                                            );
+                                        }
+                                        return Value::Json(img);
+                                    }
+                                    "getImageData" => {
+                                        let sx = eval_i32(self, doc, 0).max(0) as u32;
+                                        let sy = eval_i32(self, doc, 1).max(0) as u32;
+                                        let sw = eval_i32(self, doc, 2).clamp(1, 2048) as u32;
+                                        let sh = eval_i32(self, doc, 3).clamp(1, 2048) as u32;
+                                        let surf = doc.ensure_canvas_surface(cid);
+                                        let mut data =
+                                            Vec::with_capacity((sw as usize) * (sh as usize) * 4);
+                                        for row in 0..sh {
+                                            for col in 0..sw {
+                                                let px = sx + col;
+                                                let py = sy + row;
+                                                if px < surf.width && py < surf.height {
+                                                    let idx = ((py * surf.width + px) as usize) * 4;
+                                                    data.push(JsonValue::Number(
+                                                        surf.rgba[idx] as f64,
+                                                    ));
+                                                    data.push(JsonValue::Number(
+                                                        surf.rgba[idx + 1] as f64,
+                                                    ));
+                                                    data.push(JsonValue::Number(
+                                                        surf.rgba[idx + 2] as f64,
+                                                    ));
+                                                    data.push(JsonValue::Number(
+                                                        surf.rgba[idx + 3] as f64,
+                                                    ));
+                                                } else {
+                                                    data.extend_from_slice(&[
+                                                        JsonValue::Number(0.0),
+                                                        JsonValue::Number(0.0),
+                                                        JsonValue::Number(0.0),
+                                                        JsonValue::Number(0.0),
+                                                    ]);
+                                                }
+                                            }
+                                        }
+                                        let mut img = JsonValue::empty_object();
+                                        img.insert(
+                                            "__anvil_kind",
+                                            JsonValue::String("ImageData".to_string()),
+                                        );
+                                        img.insert("width", JsonValue::Number(sw as f64));
+                                        img.insert("height", JsonValue::Number(sh as f64));
+                                        img.insert("data", JsonValue::Array(data));
+                                        return Value::Json(img);
+                                    }
+                                    "putImageData" => {
+                                        let Some(first_arg) = args.first() else {
+                                            return Value::Null;
+                                        };
+                                        let img_val = self.eval_expr(doc, first_arg);
+                                        let dx = eval_i32(self, doc, 1);
+                                        let dy = eval_i32(self, doc, 2);
+                                        if let Value::Json(jimg) = img_val {
+                                            let w = jimg
+                                                .get("width")
+                                                .and_then(|v| match v {
+                                                    JsonValue::Number(n) => Some(*n as u32),
+                                                    _ => None,
+                                                })
+                                                .unwrap_or(1)
+                                                .max(1);
+                                            let h = jimg
+                                                .get("height")
+                                                .and_then(|v| match v {
+                                                    JsonValue::Number(n) => Some(*n as u32),
+                                                    _ => None,
+                                                })
+                                                .unwrap_or(1)
+                                                .max(1);
+                                            let mut bytes = Vec::new();
+                                            if let Some(JsonValue::Array(arr)) = jimg.get("data") {
+                                                bytes.extend(arr.iter().map(|v| match v {
+                                                    JsonValue::Number(n) => {
+                                                        n.clamp(0.0, 255.0) as u8
+                                                    }
+                                                    _ => 0,
+                                                }));
+                                            } else if let Some(dval) = jimg.get("data") {
+                                                bytes = self.extract_wasm_bytes(
+                                                    &Value::from_json_value(dval.clone()),
+                                                );
+                                            }
+                                            let expected = (w as usize) * (h as usize) * 4;
+                                            if bytes.len() < expected {
+                                                bytes.resize(expected, 255);
+                                            }
+                                            doc.canvas_put_image_data(cid, dx, dy, w, h, &bytes);
+                                        }
+                                        return Value::Null;
+                                    }
+                                    _ => return Value::Null,
+                                }
                             }
                             (
                                 _,
-                                "observe" | "unobserve" | "disconnect" | "appendBuffer"
-                                | "endOfStream" | "open" | "send" | "setRequestHeader",
+                                "observe" | "unobserve" | "disconnect" | "endOfStream" | "open"
+                                | "send" | "setRequestHeader" | "start" | "stop" | "resume"
+                                | "suspend",
                             ) => {
                                 return Value::Null;
                             }
@@ -7288,7 +8823,57 @@ impl ScriptRuntime {
                     let args = split_args(args_src);
                     match method {
                         "attachShadow" => {
-                            return Value::Element(id);
+                            let mut open = true;
+                            if let Some(first) = args.first()
+                                && let Value::Json(jopts) = self.eval_expr(doc, first)
+                                && let Some(JsonValue::String(mode)) = jopts.get("mode")
+                            {
+                                open = mode != "closed";
+                            }
+                            let shadow_id = doc.attach_shadow(id, open);
+                            return Value::Element(shadow_id);
+                        }
+                        "getContext" => {
+                            let ctx_type = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_else(|| "2d".to_string());
+                            if ctx_type.eq_ignore_ascii_case("2d") {
+                                let _ = doc.ensure_canvas_surface(id);
+                                let mut ctx = JsonValue::empty_object();
+                                ctx.insert(
+                                    "__anvil_kind",
+                                    JsonValue::String("CanvasRenderingContext2D".to_string()),
+                                );
+                                ctx.insert("__canvas_id", JsonValue::Number(id.index() as f64));
+                                ctx.insert("fillStyle", JsonValue::String("#000000".to_string()));
+                                ctx.insert("strokeStyle", JsonValue::String("#000000".to_string()));
+                                ctx.insert("lineWidth", JsonValue::Number(1.0));
+                                return Value::Json(ctx);
+                            }
+                            return Value::Null;
+                        }
+                        "play" => {
+                            let pid = self.new_resolved(Value::Null);
+                            return self.make_promise_value(pid);
+                        }
+                        "pause" | "load" => {
+                            return Value::Null;
+                        }
+                        "canPlayType" => {
+                            let mime = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc).to_ascii_lowercase())
+                                .unwrap_or_default();
+                            let ok = mime.contains("mp4")
+                                || mime.contains("webm")
+                                || mime.contains("ogg")
+                                || mime.contains("avc1")
+                                || mime.contains("av01")
+                                || mime.contains("vp09")
+                                || mime.contains("opus")
+                                || mime.contains("flac");
+                            return Value::Str(if ok { "probably" } else { "" }.to_string());
                         }
                         "getAttribute" => {
                             let name = args
@@ -7446,22 +9031,104 @@ impl ScriptRuntime {
                         "focus" | "blur" | "scrollIntoView" => {
                             return Value::Null;
                         }
-                        "querySelector" => {
+                        "getElementById" => {
                             let sel = args
                                 .first()
                                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                                 .unwrap_or_default();
                             return doc
-                                .query_selector_within(id, &sel)
+                                .get_element_by_id(&sel)
                                 .map(Value::Element)
                                 .unwrap_or(Value::Null);
+                        }
+                        "getElementsByTagName" => {
+                            let tag = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            let ids = doc.get_elements_by_tag_name(id, tag.trim());
+                            return Value::Array(ids.into_iter().map(Value::Element).collect());
+                        }
+                        "getElementsByClassName" => {
+                            let cls = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            let ids = doc.get_elements_by_class_name(id, cls.trim());
+                            return Value::Array(ids.into_iter().map(Value::Element).collect());
+                        }
+                        "getElementsByName" => {
+                            let name = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            let ids = doc.get_elements_by_name(name.trim());
+                            return Value::Array(ids.into_iter().map(Value::Element).collect());
+                        }
+                        "createElement" => {
+                            let tag = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            return Value::Element(doc.create_element(&tag, Vec::new()));
+                        }
+                        "createDocumentFragment" => {
+                            return Value::Element(
+                                doc.create_element("anvil-fragment", Vec::new()),
+                            );
+                        }
+                        "createTextNode" | "createComment" => {
+                            let text = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            return Value::Element(doc.create_text(&text));
+                        }
+                        "insertAdjacentHTML" if args.len() >= 2 => {
+                            let pos = self.eval_expr(doc, &args[0]).as_string(doc);
+                            let html = self.eval_expr(doc, &args[1]).as_string(doc);
+                            doc.insert_adjacent_html(id, &pos, &html);
+                            self.dom_cache.clear();
+                            return Value::Null;
+                        }
+                        "insertAdjacentText" if args.len() >= 2 => {
+                            let pos = self.eval_expr(doc, &args[0]).as_string(doc);
+                            let text = self.eval_expr(doc, &args[1]).as_string(doc);
+                            doc.insert_adjacent_text(id, &pos, &text);
+                            self.dom_cache.clear();
+                            return Value::Null;
+                        }
+                        "insertAdjacentElement" if args.len() >= 2 => {
+                            let pos = self.eval_expr(doc, &args[0]).as_string(doc);
+                            if let Value::Element(new_el) = self.eval_expr(doc, &args[1]) {
+                                let res = doc.insert_adjacent_element(id, &pos, new_el);
+                                self.dom_cache.clear();
+                                return res.map(Value::Element).unwrap_or(Value::Null);
+                            }
+                            return Value::Null;
+                        }
+                        "querySelector" => {
+                            let sel = args
+                                .first()
+                                .map(|a| self.eval_expr(doc, a).as_string(doc))
+                                .unwrap_or_default();
+                            let found = if id == doc.root() {
+                                doc.query_selector(&sel)
+                            } else {
+                                doc.query_selector_within(id, &sel)
+                            };
+                            return found.map(Value::Element).unwrap_or(Value::Null);
                         }
                         "querySelectorAll" => {
                             let sel = args
                                 .first()
                                 .map(|a| self.eval_expr(doc, a).as_string(doc))
                                 .unwrap_or_default();
-                            let ids = doc.query_selector_all_within(id, &sel);
+                            let ids = if id == doc.root() {
+                                doc.query_selector_all(&sel)
+                            } else {
+                                doc.query_selector_all_within(id, &sel)
+                            };
                             return Value::Array(ids.into_iter().map(Value::Element).collect());
                         }
                         "addEventListener" if args.len() >= 2 => {
@@ -7469,7 +9136,20 @@ impl ScriptRuntime {
                             if event.eq_ignore_ascii_case("click") {
                                 let handler_raw = args[1].trim();
                                 let body = extract_callback_body(handler_raw);
-                                self.click_listeners.push((id, body));
+                                let target_id = if id == doc.root() { doc.body() } else { id };
+                                self.click_listeners.push((target_id, body));
+                            } else if id == doc.root()
+                                && matches!(
+                                    event.to_ascii_lowercase().as_str(),
+                                    "domcontentloaded" | "load" | "readystatechange"
+                                )
+                            {
+                                let (code, env, is_async) = self.deferred_callback(&args[1]);
+                                self.schedule_job(Job::Script {
+                                    code,
+                                    env,
+                                    is_async,
+                                });
                             }
                             return Value::Null;
                         }
@@ -9062,6 +10742,13 @@ fn strip_comments(input: &str) -> String {
             }
             continue;
         }
+        if ch == '\\' {
+            out.push(ch);
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+            continue;
+        }
         if ch == '"' || ch == '\'' || ch == '`' {
             in_quote = Some(ch);
             out.push(ch);
@@ -9255,12 +10942,43 @@ fn split_statements(input: &str) -> Vec<String> {
                     }
                 }
             }
-            ';' | '\n' if paren == 0 && brace == 0 && bracket == 0 => {
+            ';' if paren == 0 && brace == 0 && bracket == 0 => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     out.push(trimmed);
                 }
                 current.clear();
+            }
+            '\n' if paren == 0 && brace == 0 && bracket == 0 => {
+                let trimmed = current.trim();
+                let ends_with_continuation = trimmed.ends_with('.')
+                    || (trimmed.ends_with('+') && !trimmed.ends_with("++"))
+                    || (trimmed.ends_with('-') && !trimmed.ends_with("--"))
+                    || trimmed.ends_with('*')
+                    || trimmed.ends_with('=')
+                    || trimmed.ends_with('?')
+                    || trimmed.ends_with(':')
+                    || trimmed.ends_with('|')
+                    || trimmed.ends_with('&')
+                    || trimmed.ends_with(',');
+                let mut look = chars.clone();
+                while let Some(&c) = look.peek() {
+                    if c == ' ' || c == '\t' || c == '\r' {
+                        look.next();
+                    } else {
+                        break;
+                    }
+                }
+                let next_continues =
+                    matches!(look.peek().copied(), Some('.') | Some('?') | Some(':'));
+                if ends_with_continuation || next_continues {
+                    current.push(' ');
+                } else {
+                    if !trimmed.is_empty() {
+                        out.push(trimmed.to_string());
+                    }
+                    current.clear();
+                }
             }
             _ => current.push(ch),
         }
@@ -9388,7 +11106,13 @@ fn split_assignment(input: &str) -> Option<(&str, &str)> {
             b'=' if paren == 0 && brace == 0 && bracket == 0 => {
                 let prev = if idx > 0 { bytes[idx - 1] } else { 0 };
                 let next = bytes.get(idx + 1).copied().unwrap_or(0);
-                if next != b'=' && next != b'>' && !matches!(prev, b'=' | b'!' | b'<' | b'>') {
+                if next != b'='
+                    && next != b'>'
+                    && !matches!(
+                        prev,
+                        b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%'
+                    )
+                {
                     return Some((&input[..idx], &input[idx + 1..]));
                 }
             }
@@ -10902,5 +12626,136 @@ mod tests {
         ] {
             assert!(eval_cpp_vm_script_bindings(src).is_none(), "{src}");
         }
+    }
+
+    #[test]
+    fn executes_canvas_2d_context_shadow_dom_custom_elements_and_webcodecs() {
+        let mut doc = parse_html(
+            "<div id=\"host\"></div>
+             <my-widget id=\"widget\"></my-widget>
+             <canvas id=\"cv\" width=\"32\" height=\"16\"></canvas>
+             <video id=\"vid\"></video>
+             <p id=\"out\"></p>
+             <script>
+               customElements.define('my-widget', class MyWidget {});
+               let w = document.getElementById('widget');
+               let isDefined = w.matches(':defined');
+
+               let host = document.getElementById('host');
+               let sr = host.attachShadow({ mode: 'open' });
+               let badge = document.createElement('span');
+               badge.id = 'shadow-badge';
+               badge.textContent = 'ShadowOK';
+               sr.appendChild(badge);
+
+               let cv = document.getElementById('cv');
+               let ctx = cv.getContext('2d');
+               ctx.fillStyle = '#ff0000';
+               ctx.fillRect(0, 0, 16, 16);
+               let img = ctx.createImageData(2, 2);
+               ctx.putImageData(img, 16, 0);
+               let sampled = ctx.getImageData(0, 0, 1, 1);
+
+               let vid = document.getElementById('vid');
+               let canPlay = vid.canPlayType('video/mp4; codecs=\"avc1.42E01E\"');
+               let enc = new VideoEncoder({});
+               enc.configure({ codec: 'avc1.42E01E', width: 16, height: 16 });
+               let vf = new VideoFrame(null, { codedWidth: 16, codedHeight: 16, timestamp: 0 });
+               enc.encode(vf);
+               vf.close();
+
+               document.getElementById('out').textContent =
+                 isDefined + ':' + sr.firstElementChild.textContent + ':' + sampled.data[0] + ':' + canPlay + ':' + enc.encodedChunks;
+             </script>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "true:ShadowOK:255:probably:1");
+
+        let cv = doc.get_element_by_id("cv").unwrap();
+        let surf = doc.canvas_surface(cv).expect("canvas surface created");
+        assert_eq!(surf.width, 32);
+        assert_eq!(surf.height, 16);
+        assert_eq!(&surf.rgba[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[cfg(anvil_cpp_jit)]
+    #[test]
+    fn live_dom_bridge_synchronizes_anvil_vm_mutations_and_canvas_to_document() {
+        if !is_cpp_jit_kernel_active() {
+            return;
+        }
+        let mut doc = parse_html(
+            "<div id=\"app\"></div>
+             <canvas id=\"stage\" width=\"24\" height=\"12\"></canvas>",
+        );
+        let script = "
+            document.title = 'LiveBridgeTitle';
+            customElements.define('x-card', function() {});
+            const app = document.getElementById('app');
+            app.classList.add('hydrated');
+            app.style.backgroundColor = 'rgb(10, 20, 30)';
+            const child = document.createElement('p');
+            child.setAttribute('id', 'created-p');
+            child.textContent = 'FromAnvilVM';
+            app.appendChild(child);
+            const sr = app.attachShadow({ mode: 'open' });
+            const sh = document.createElement('span');
+            sh.textContent = 'ShadowChild';
+            sr.appendChild(sh);
+            const stage = document.getElementById('stage');
+            const ctx = stage.getContext('2d');
+            ctx.fillStyle = '#00ff00';
+            ctx.fillRect(0, 0, 12, 12);
+        ";
+        let run = eval_webapp_with_live_dom_bridge(&mut doc, "https://example.com/", script)
+            .expect("live dom bridge executed");
+        assert!(run.telemetry.bytecode_ops_executed > 0);
+        assert_eq!(doc.title(), "LiveBridgeTitle");
+        assert!(doc.is_custom_element_defined("x-card"));
+
+        let app = doc.get_element_by_id("app").unwrap();
+        assert!(doc.get(app).data().has_class("hydrated"));
+        let created = doc
+            .get_element_by_id("created-p")
+            .expect("created-p synced");
+        assert_eq!(doc.text_content(created), "FromAnvilVM");
+        let sr = doc.shadow_root(app).expect("shadow root synced");
+        assert_eq!(doc.text_content(sr), "ShadowChild");
+
+        let stage = doc.get_element_by_id("stage").unwrap();
+        let surf = doc
+            .canvas_surface(stage)
+            .expect("stage canvas surface synced");
+        assert_eq!(&surf.rgba[0..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn executes_parameterized_iife_window_document_ready_state_and_blocks_nojs_redirects() {
+        let mut doc = parse_html(
+            "<html><head><title>Init</title></head>
+             <body>
+               <noscript><style>div{display:none}</style></noscript>
+               <div id=\"box\" class=\"card\"><input name=\"q\" value=\"rust\"></div>
+               <script>
+                 (function(w, d) {
+                   w.google = w.google || {};
+                   w.google.kEI = 'ok';
+                   let q = d.getElementsByName('q');
+                   let cards = d.getElementsByClassName('card');
+                   let box = d.getElementById('box');
+                   box.insertAdjacentHTML('beforeend', '<span id=\"added\">' + d.readyState + ':' + q.length + ':' + cards.length + ':' + w.google.kEI + '</span>');
+                   w.location.replace('/httpservice/retry/enablejs?sei=123');
+                 })(window, document);
+               </script>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        assert!(rt.take_pending_navigation().is_none());
+        let added = doc.get_element_by_id("added").expect("added span");
+        assert_eq!(doc.text_content(added), "complete:1:1:ok");
     }
 }

@@ -13,10 +13,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license = "LicenseRef-Proprietary"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
 publish.workspace = true
 
 [dependencies]
 anvil-dom = { path = "../anvil-dom" }
 anvil-js.workspace = true
 anvil-json.workspace = true
+anvil-video.workspace = true

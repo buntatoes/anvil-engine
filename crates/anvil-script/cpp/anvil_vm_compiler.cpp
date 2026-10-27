@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // C++20 Lexer, Recursive-Descent / Pratt Expression Parser, and Register Bytecode Compiler.
 // Author: Buntato

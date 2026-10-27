@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Checks of the `anvil-js-run` file runner: its stdout, its stderr, and the
 //! exit codes it returns. The success checks need the C++ VM, so they return

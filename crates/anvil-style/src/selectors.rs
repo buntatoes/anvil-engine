@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Selector parsing and matching.
 //!
@@ -281,6 +281,8 @@ enum Simple {
     Where(Vec<Selector>),
     Not(Vec<Selector>),
     Has(Vec<Selector>),
+    Host(Vec<Selector>),
+    HostContext(Vec<Selector>),
     /// Language ranges from `:lang()`, as written.
     Lang(Vec<String>),
     /// `:dir()`. `None` for a direction other than `ltr` or `rtl`.
@@ -300,7 +302,12 @@ impl Simple {
             | Simple::Class(_)
             | Simple::PseudoElement => 0,
             Simple::Attr(_) | Simple::State(_) | Simple::Nth(_) | Simple::Dir(_) => 1,
-            Simple::Lang(_) | Simple::Is(_) | Simple::Where(_) | Simple::Not(_) => 2,
+            Simple::Lang(_)
+            | Simple::Is(_)
+            | Simple::Where(_)
+            | Simple::Not(_)
+            | Simple::Host(_)
+            | Simple::HostContext(_) => 2,
             Simple::Has(_) => 3,
         }
     }
@@ -330,20 +337,64 @@ enum State {
     ReadWrite,
     PlaceholderShown,
     Defined,
+    Host,
     Open,
     Closed,
     /// A `progress` without `value`. Radio groups are not tracked.
     Indeterminate,
-    /// Valid, and never true for a static page: `:active`, `:autofill`,
-    /// `:blank`, `:buffering`, `:current`, `:first`, `:focus`,
-    /// `:focus-visible`, `:focus-within`, `:fullscreen`, `:future`, `:host`,
-    /// `:hover`, `:in-range`, `:invalid`, `:left`, `:local-link`, `:modal`,
-    /// `:muted`, `:out-of-range`, `:past`, `:paused`, `:picture-in-picture`,
-    /// `:playing`, `:popover-open`, `:right`, `:seeking`, `:stalled`,
-    /// `:target`, `:target-within`, `:user-invalid`, `:user-valid`, `:valid`,
-    /// `:visited`, `:volume-locked`, and the functions `:current()`,
-    /// `:host()`, `:host-context()`, and `:state()`.
+    /// Valid, and never true for a static page.
     Never,
+}
+
+fn is_known_vendor_pseudo(lower: &str) -> bool {
+    let Some(rest) = lower.strip_prefix('-') else {
+        return false;
+    };
+    let Some((prefix, suffix)) = rest.split_once('-') else {
+        return false;
+    };
+    if prefix.len() < 2 {
+        return false;
+    }
+    matches!(
+        suffix,
+        "input-placeholder"
+            | "placeholder"
+            | "search-cancel-button"
+            | "search-decoration"
+            | "search-results-button"
+            | "search-results-decoration"
+            | "scrollbar"
+            | "scrollbar-thumb"
+            | "scrollbar-track"
+            | "scrollbar-button"
+            | "scrollbar-corner"
+            | "autofill"
+            | "focus-inner"
+            | "focusring"
+            | "clear"
+            | "reveal"
+            | "file-upload-button"
+            | "slider-thumb"
+            | "slider-runnable-track"
+            | "progress-bar"
+            | "progress-value"
+            | "progress-inner-element"
+            | "meter-bar"
+            | "details-marker"
+            | "calendar-picker-indicator"
+            | "inner-spin-button"
+            | "outer-spin-button"
+            | "color-swatch"
+            | "color-swatch-wrapper"
+            | "any"
+            | "any-link"
+            | "full-screen"
+            | "read-only"
+            | "read-write"
+            | "placeholder-shown"
+            | "user-invalid"
+    )
 }
 
 fn state_for(name: &str) -> Option<State> {
@@ -367,10 +418,11 @@ fn state_for(name: &str) -> Option<State> {
         "read-write" => State::ReadWrite,
         "placeholder-shown" => State::PlaceholderShown,
         "defined" => State::Defined,
+        "host" => State::Host,
         "open" => State::Open,
         "closed" => State::Closed,
         "indeterminate" => State::Indeterminate,
-        _ if PSEUDO_CLASSES.contains(&name) => State::Never,
+        _ if PSEUDO_CLASSES.contains(&name) || is_known_vendor_pseudo(name) => State::Never,
         _ => return None,
     };
     Some(state)
@@ -838,13 +890,14 @@ fn parse_compound(cur: &mut Cursor, cx: Ctx) -> Parsed<Compound> {
                 let legacy =
                     !element && arg.is_none() && LEGACY_PSEUDO_ELEMENTS.contains(&name.as_str());
                 if element || legacy {
-                    let known = match arg {
-                        Some(arg) => {
-                            PSEUDO_ELEMENT_FUNCTIONS.contains(&name.as_str())
-                                && arg.iter().any(|c| !is_ws(*c))
-                        }
-                        None => PSEUDO_ELEMENTS.contains(&name.as_str()),
-                    };
+                    let known = is_known_vendor_pseudo(&name)
+                        || match arg {
+                            Some(arg) => {
+                                PSEUDO_ELEMENT_FUNCTIONS.contains(&name.as_str())
+                                    && arg.iter().any(|c| !is_ws(*c))
+                            }
+                            None => PSEUDO_ELEMENTS.contains(&name.as_str()),
+                        };
                     // Pseudo-elements are not allowed inside `:is()`,
                     // `:not()`, `:has()`, and the other selector arguments.
                     if !known || cx.nested {
@@ -940,6 +993,9 @@ fn parse_attribute(cur: &mut Cursor) -> Parsed<AttrSelector> {
 }
 
 fn parse_pseudo_function(name: &str, arg: &[char], cx: Ctx) -> Parsed<Simple> {
+    if is_known_vendor_pseudo(name) {
+        return Ok(Simple::State(State::Never));
+    }
     if !PSEUDO_CLASS_FUNCTIONS.contains(&name) {
         return Err(Fail::Invalid);
     }
@@ -975,6 +1031,16 @@ fn parse_pseudo_function(name: &str, arg: &[char], cx: Ctx) -> Parsed<Simple> {
                 _ => None,
             }))
         }
+        "host" if !blank => match parse_list(arg, cx.inner()?, false) {
+            Ok(list) => Ok(Simple::Host(list)),
+            Err(Fail::TooBig) => Err(Fail::TooBig),
+            Err(Fail::Invalid) => Ok(Simple::State(State::Never)),
+        },
+        "host-context" if !blank => match parse_list(arg, cx.inner()?, false) {
+            Ok(list) => Ok(Simple::HostContext(list)),
+            Err(Fail::TooBig) => Err(Fail::TooBig),
+            Err(Fail::Invalid) => Ok(Simple::State(State::Never)),
+        },
         _ if blank => Err(Fail::Invalid),
         _ => Ok(Simple::State(State::Never)),
     }
@@ -1162,6 +1228,7 @@ fn simple_specificity(part: &Simple) -> Spec {
             (0, 1, 0),
             nth.of.as_deref().map(max_specificity).unwrap_or((0, 0, 0)),
         ),
+        Simple::Host(list) | Simple::HostContext(list) => add((0, 1, 0), max_specificity(list)),
         Simple::Is(list) | Simple::Not(list) | Simple::Has(list) => max_specificity(list),
         Simple::Where(_) => (0, 0, 0),
     }
@@ -1727,6 +1794,29 @@ impl<'d> Matcher<'d> {
             Simple::Is(list) | Simple::Where(list) => self.any_matches(list, n),
             Simple::Not(list) => !self.any_matches(list, n),
             Simple::Has(list) => list.iter().any(|rel| self.has(rel, n)),
+            Simple::Host(list) => {
+                let nid = Self::node_id(n);
+                if !self.doc.is_shadow_host(nid) {
+                    return false;
+                }
+                let host = self.doc.shadow_host(nid).unwrap_or(nid);
+                self.any_matches(list, host.index() as u32)
+            }
+            Simple::HostContext(list) => {
+                let nid = Self::node_id(n);
+                if !self.doc.is_shadow_host(nid) {
+                    return false;
+                }
+                let host = self.doc.shadow_host(nid).unwrap_or(nid);
+                let mut cur = host.index() as u32;
+                while cur != NONE {
+                    if self.any_matches(list, cur) {
+                        return true;
+                    }
+                    cur = self.parent_el(cur);
+                }
+                false
+            }
             Simple::Lang(ranges) => self.lang(ranges, n),
             Simple::Dir(dir) => dir.is_some_and(|rtl| self.is_rtl(n) == rtl),
         }
@@ -1955,7 +2045,8 @@ impl<'d> Matcher<'d> {
                     && data.attr("placeholder").is_some()
                     && self.doc.input_value(Self::node_id(n)).is_empty()
             }
-            State::Defined => !tag.contains('-'),
+            State::Defined => !tag.contains('-') || self.doc.is_custom_element_defined(tag),
+            State::Host => self.doc.is_shadow_host(Self::node_id(n)),
             State::Open => matches!(tag, "details" | "dialog") && data.attr("open").is_some(),
             State::Closed => matches!(tag, "details" | "dialog") && data.attr("open").is_none(),
             State::Indeterminate => tag == "progress" && data.attr("value").is_none(),

@@ -1,71 +1,174 @@
-Anvil Engine
-Copyright (c) 2026 Buntato
+Anvil Ecosystem Dual License: PolyForm Noncommercial 1.0.0 OR Paid Commercial License (with Non-Compete Clause)
+SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+Copyright (c) 2026 Buntato <324143321+buntatoes@users.noreply.github.com>
 
-1. COVERED FILES
-----------------
-This license covers this repository:
+================================================================================
+PART I: DUAL LICENSING & NON-COMPETE TERMS
+================================================================================
 
-- `crates/anvil-dom/`
-- `crates/anvil-style/`
-- `crates/anvil-layout/`
-- `crates/anvil-paint/`
-- `crates/anvil-raster/`
-- `crates/anvil-script/`
-- the build files and documentation in this repository
+This software and all associated source code, shaders, scripts, build tooling,
+and documentation in the Anvil Browser ecosystem (`anvil-browser`,
+`anvil-engine`, `anvil-cipher`, `anvil-compress`, `anvil-css`, `anvil-gpu`,
+`anvil-hpack`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-pqc`,
+`anvil-ttf`, and `anvil-video`) are copyright (c) 2026 Buntato and are made
+available under a Dual License model:
 
-2. WHAT YOU MAY DO
-------------------
-You may, free of charge:
+1. NONCOMMERCIAL USE (PolyForm Noncommercial License 1.0.0):
+   You may read, audit, build, modify, and use this software free of charge
+   strictly for noncommercial purposes (such as personal use, academic research,
+   educational study, security auditing, or qualifying nonprofit activity) under
+   the terms of the PolyForm Noncommercial License 1.0.0 set forth in Part II
+   below, subject at all times to the Non-Compete Clause in Section 3 of this
+   Part I.
 
-(a) read and audit the source code of the covered files;
+2. PAID COMMERCIAL LICENSE:
+   Any use of this software, in whole or in part, for commercial, for-profit,
+   corporate, internal business, revenue-generating, or paid-service purposes
+   requires a separate, active Paid Commercial License agreement executed in
+   writing with the sole author and copyright holder:
 
-(b) build the covered files and use them, unmodified, as part of Anvil
-    Browser and the other Anvil repositories; and
+   Licensor: Buntato <324143321+buntatoes@users.noreply.github.com>
+   Repository: https://github.com/buntatoes
 
-(c) redistribute Anvil Browser, and any build of it, in source or binary
-    form, including builds that contain the compiled covered files,
-    as long as you keep this license and the copyright notice with them.
+   Without a signed Paid Commercial License from Buntato, all commercial uses
+   are strictly prohibited.
 
-3. WHAT YOU MAY NOT DO
-----------------------
-Without prior written permission from Buntato, you may not:
+3. MANDATORY NON-COMPETE CLAUSE:
+   Notwithstanding any provision in Part II or any other notice, and unless
+   expressly waived in a separate written commercial agreement signed by
+   Buntato, you may NOT use, copy, modify, adapt, translate, link, embed,
+   benchmark for commercial replication, train automated code-generation models
+   on, or distribute this software (or any portion or derivative work thereof)
+   to design, build, power, ship, or commercialize any competing product or
+   service, including but not limited to:
+   (a) a standalone or embedded web browser or webview runtime;
+   (b) an HTML/DOM parser, CSS selector/cascade/layout engine, or display-list
+       and GPU/CPU page rasterizer;
+   (c) a JavaScript compiler, bytecode virtual machine, or WebAssembly runtime;
+   (d) a media codec, container muxer/demuxer, or GPU compositor library sold
+       or distributed as a competing engine component.
 
-(a) copy, modify, merge, publish, or distribute the covered source files
-    on their own, or as part of any product other than Anvil Browser;
+4. TRADEMARKS & AUTHORSHIP:
+   The names "Anvil", "Anvil Browser", "Anvil Engine", "AnvilVM", and associated
+   logos/marks are the exclusive property of Buntato and are not licensed for
+   use on any third-party or derivative product. All copies and permitted
+   distributions must retain the copyright notice "Copyright (c) 2026 Buntato"
+   and a complete copy of this LICENSE file.
 
-(b) sublicense or sell the covered files; or
+================================================================================
+PART II: POLYFORM NONCOMMERCIAL LICENSE 1.0.0
+================================================================================
 
-(c) use the covered files to build a different product.
+https://polyformproject.org/licenses/noncommercial/1.0.0
 
-You may redistribute Anvil Browser without the engine source. The engine
-source is shared for auditing and use only.
+Acceptance
+----------
+In order to get any license under these terms, you must agree to them as both
+strict obligations and conditions to all your licenses.
 
-The names "Anvil" and "Anvil Browser" are not licensed for use on any
-other product.
+Copyright License
+-----------------
+The licensor grants you a copyright license for the software to do everything
+you might do with the software that would otherwise infringe the licensor's
+copyright in it for any permitted purpose. However, you may only distribute the
+software according to Distribution License and make changes or new works based
+on the software according to Changes and New Works License.
 
-4. NOT COVERED
---------------
-This file does not license:
-
-- `anvil-browser` (the window, network stack, sandbox, built-in pages,
-  and brand mark), which is Apache License 2.0
-- `anvil-cipher`, `anvil-compress`, `anvil-css`, `anvil-gpu`, `anvil-hpack`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-pqc`, `anvil-ttf`, and `anvil-video`, and
-  `anvil-compress`, which are separate Mozilla Public License 2.0
-  repositories
-
-5. EARLIER REVISIONS
+Distribution License
 --------------------
-These crates used to live in `anvil-browser`. Revisions that were already
-published there under the Apache License, Version 2.0, stay under that
-license for anyone who already received those revisions. This repository,
-and every later revision, is covered by this license.
+The licensor grants you an additional copyright license to distribute copies of
+the software. Your license to distribute covers distributing the software with
+changes and new works permitted by Changes and New Works License.
 
-6. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
----------------------------------------------------
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-THE AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
+Notices
+-------
+You must ensure that anyone who gets a copy of any part of the software from
+you also gets a copy of these terms or the URL for them above, as well as
+copies of any plain-text lines beginning with `Required Notice:` that the
+licensor provided with the software. For example:
+
+  Required Notice: Copyright (c) 2026 Buntato <324143321+buntatoes@users.noreply.github.com>
+
+Changes and New Works License
+-----------------------------
+The licensor grants you an additional copyright license to make changes and new
+works based on the software for any permitted purpose.
+
+Patent License
+--------------
+The licensor grants you a patent license for the software that covers patent
+claims the licensor can license, or becomes able to license, that you would
+infringe by using the software.
+
+Noncommercial Purposes Only
+---------------------------
+Any noncommercial purpose is a permitted purpose under this PolyForm
+Noncommercial License 1.0.0, subject to the Non-Compete Clause in Part I.
+
+Personal Uses
+-------------
+Personal use for research, experiment, and testing for the benefit of public
+knowledge, personal study, private entertainment, hobby projects, amateur
+pursuits, or religious observance, without any anticipated commercial
+application, is use for a permitted purpose.
+
+Noncommercial Organizations
+---------------------------
+Use by any charitable organization, educational institution, public research
+organization, public safety or health organization, environmental protection
+organization, or government institution is use for a permitted purpose
+regardless of the source of funding or obligations resulting from the funding,
+provided such use complies with the Non-Compete Clause in Part I and does not
+involve commercial sale or for-profit licensing of the software.
+
+Fair Use
+--------
+You may have "fair use" rights for the software under the law. These terms do
+not limit them.
+
+No Other Rights
+---------------
+These terms do not allow you to sublicense or transfer any of your licenses to
+anyone else, or prevent the licensor from granting licenses to anyone else.
+These terms do not imply any other licenses.
+
+Patent Defense
+--------------
+If you make any written claim that the software infringes or contributes to
+infringement of any patent, your patent license for the software granted under
+these terms ends immediately. If your company makes such a claim, your patent
+license ends immediately for work on behalf of your company.
+
+Violations
+----------
+The first time you are notified in writing that you have violated any of these
+terms, or done anything with the software not covered by your licenses, your
+licenses can nonetheless continue if you come into full compliance with these
+terms, and take practical steps to correct past violations, within 32 days of
+receiving notice. Otherwise, all your licenses end immediately.
+
+No Liability
+------------
+***As far as the law allows, the software comes as is, without any warranty or
+condition, and the licensor will not be liable to you for any damages arising
+out of these terms or the use or nature of the software, under any kind of
+legal claim.***
+
+Definitions
+-----------
+The **licensor** is the individual or entity offering these terms, and the
+**software** is the software the licensor makes available under these terms.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of
+organization that you work for, plus all organizations that have control over,
+are under the control of, or are under common control with that organization.
+**Control** means ownership of substantially all the assets of an entity, or
+the power to direct its management and policies by vote, contract, or
+otherwise. Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the software under
+these terms.
+
+**Use** means anything you do with the software requiring one of your licenses.

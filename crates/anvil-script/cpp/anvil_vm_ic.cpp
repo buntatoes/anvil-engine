@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // C++20 4-Way Polymorphic Inline Cache (IC) Engine & DOM Selector IC Table.
 // Author: Buntato

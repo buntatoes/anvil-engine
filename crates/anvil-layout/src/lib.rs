@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Block, inline, flex, grid, table, and positioned layout, plus hit testing.
 //!
@@ -65,12 +65,12 @@ pub use anvil_dom::NodeId;
 use anvil_dom::{Document, NodeData};
 pub use anvil_image::Image;
 pub use anvil_style::{
-    AlignItems, BoxShadow, Color, Edge, FlexDirection, FlexWrap, JustifyContent, LinearGradient,
-    Overflow, Position,
+    AlignItems, BoxShadow, BoxSizing, Color, Edge, FlexDirection, FlexWrap, JustifyContent,
+    LinearGradient, Overflow, Position, TextAlign, Visibility, WhiteSpace,
 };
 use anvil_style::{
-    ComputedStyle, Display, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE, Size, StyleMap,
-    TrackBreadth, TransformFn,
+    ComputedStyle, Display, GridAutoRepeat, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE,
+    Size, StyleMap, TrackBreadth, TransformFn,
 };
 use anvil_ttf::TtfFont;
 
@@ -335,6 +335,19 @@ fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
     }
     if is_element {
         tree.opacity = style.opacity;
+        if style.visibility != Visibility::Visible {
+            tree.background = None;
+            tree.background_gradient = None;
+            tree.box_shadow = None;
+            tree.border_color = Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            };
+            tree.image = None;
+            tree.text.clear();
+        }
     }
     for child in &mut tree.children {
         resolve_effects(child, doc, styles);
@@ -799,24 +812,200 @@ fn used_gaps(
     )
 }
 
-/// Border-box width from `width` and `max-width`.
+/// Border-box width from `width`, `min-width`, `max-width`, and `box-sizing`.
 ///
-/// A definite `width` is the content width; padding and border are added.
-/// `auto`, and a percentage with no basis, fills the containing block minus
-/// horizontal margins. A definite `max-width` caps the border box. The result
-/// is never negative.
+/// A definite `width` is the content width when `content-box` (padding and border
+/// are added) or the border-box width when `border-box`. `auto`, and a percentage
+/// with no basis, fills the containing block minus horizontal margins.
 fn resolve_border_width(style: &ComputedStyle, containing_width: f32, styles: &StyleMap) -> f32 {
     let padding_h = style.padding.left + style.padding.right;
     let border_h = style.border.left + style.border.right;
+    let chrome_h = padding_h + border_h;
+    let to_border = |len: f32| match style.box_sizing {
+        BoxSizing::ContentBox => (len + chrome_h).max(0.0),
+        BoxSizing::BorderBox => len.max(chrome_h),
+    };
     let mut border_width = match used_length(style.width, Some(containing_width), style, styles) {
-        Some(width) => (width + padding_h + border_h).max(0.0),
+        Some(width) => to_border(width),
         None => (containing_width - style.margin.left - style.margin.right).max(0.0),
     };
     if let Some(max_w) = used_length(style.max_width, Some(containing_width), style, styles) {
-        let max_border_w = (max_w + padding_h + border_h).max(0.0);
-        border_width = border_width.min(max_border_w);
+        border_width = border_width.min(to_border(max_w));
+    }
+    if let Some(min_w) = used_length(style.min_width, Some(containing_width), style, styles) {
+        border_width = border_width.max(to_border(min_w));
     }
     border_width
+}
+
+fn resolve_border_x(
+    style: &ComputedStyle,
+    x: f32,
+    containing_width: f32,
+    border_width: f32,
+) -> f32 {
+    let free = (containing_width - border_width - style.margin.left - style.margin.right).max(0.0);
+    if style.margin_left_auto && style.margin_right_auto {
+        x + style.margin.left + free * 0.5
+    } else if style.margin_left_auto {
+        x + style.margin.left + free
+    } else {
+        x + style.margin.left
+    }
+}
+
+fn clamp_border_width(
+    style: &ComputedStyle,
+    containing_width: f32,
+    styles: &StyleMap,
+    mut border_width: f32,
+) -> f32 {
+    let chrome_h =
+        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    let to_border = |len: f32| match style.box_sizing {
+        BoxSizing::ContentBox => (len + chrome_h).max(0.0),
+        BoxSizing::BorderBox => len.max(chrome_h),
+    };
+    if let Some(max_w) = used_length(style.max_width, Some(containing_width), style, styles) {
+        border_width = border_width.min(to_border(max_w));
+    }
+    if let Some(min_w) = used_length(style.min_width, Some(containing_width), style, styles) {
+        border_width = border_width.max(to_border(min_w));
+    }
+    border_width.max(0.0)
+}
+
+fn intrinsic_box_width(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    id: NodeId,
+    containing_width: f32,
+) -> f32 {
+    let style = styles.get(id);
+    let chrome_h =
+        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    if let Some(w) = used_length(style.width, Some(containing_width), style, styles) {
+        let bw = match style.box_sizing {
+            BoxSizing::ContentBox => w + chrome_h,
+            BoxSizing::BorderBox => w.max(chrome_h),
+        };
+        return clamp_border_width(style, containing_width, styles, bw);
+    }
+    let data = doc.get(id).data();
+    let tag = data.tag().unwrap_or("");
+    let raw_content_w = if tag == "img" || tag == "video" {
+        data.attr("width")
+            .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .or_else(|| images.get(&id).map(|img| img.width as f32))
+            .unwrap_or(120.0)
+    } else if tag == "canvas" {
+        data.attr("width")
+            .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .unwrap_or(300.0)
+    } else if doc.is_checkbox_input(id) {
+        20.0 - chrome_h
+    } else if tag == "input" && doc.is_submit_control(id) {
+        let lbl = data.attr("value").unwrap_or("Submit");
+        measure(lbl, style.font_size) + 8.0
+    } else if doc.is_text_input(id) {
+        360.0_f32.min(containing_width.max(60.0)) - chrome_h
+    } else if doc.is_select_control(id) {
+        let lbl = doc.select_display_label(id);
+        (measure(&lbl, style.font_size) + 32.0).max(140.0 - chrome_h)
+    } else if tag == "button" {
+        measure(&doc.text_content(id), style.font_size) + 8.0
+    } else {
+        let text_w = measure(doc.text_content(id).trim(), style.font_size);
+        let mut child_row_w = 0.0_f32;
+        let mut child_max_w = 0.0_f32;
+        for &cid in doc.children(id) {
+            if is_skipped(doc, styles, cid) {
+                continue;
+            }
+            if matches!(doc.get(cid).data(), NodeData::Element { .. }) {
+                let cstyle = styles.get(cid);
+                let cw = intrinsic_box_width(doc, styles, images, cid, containing_width)
+                    + cstyle.margin.left
+                    + cstyle.margin.right;
+                if style.display == Display::Flex && style.flex_direction == FlexDirection::Row {
+                    child_row_w += cw;
+                } else if cstyle.inline_level {
+                    child_row_w += cw;
+                } else {
+                    child_max_w = child_max_w.max(cw);
+                }
+            }
+        }
+        text_w.max(child_row_w).max(child_max_w)
+    };
+    let bw = (raw_content_w.max(0.0) + chrome_h).min(containing_width.max(chrome_h));
+    clamp_border_width(style, containing_width, styles, bw)
+}
+
+fn flush_inline_blocks(
+    pending: &mut Vec<LayoutBox>,
+    styles: &StyleMap,
+    content_x: f32,
+    cursor_y: &mut f32,
+    content_width: f32,
+    text_align: TextAlign,
+    out: &mut Vec<LayoutBox>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let items = std::mem::take(pending);
+    let mut rows: Vec<Vec<LayoutBox>> = Vec::new();
+    let mut current: Vec<LayoutBox> = Vec::new();
+    let mut row_w = 0.0_f32;
+    for item in items {
+        let cstyle = styles.get(item.node);
+        let outer_w = cstyle.margin.left + item.rect.width + cstyle.margin.right;
+        if !current.is_empty() && row_w + outer_w > content_width {
+            rows.push(std::mem::take(&mut current));
+            row_w = 0.0;
+        }
+        row_w += outer_w;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    for row in rows {
+        let total_w: f32 = row
+            .iter()
+            .map(|b| {
+                let cs = styles.get(b.node);
+                cs.margin.left + b.rect.width + cs.margin.right
+            })
+            .sum();
+        let row_h: f32 = row
+            .iter()
+            .map(|b| {
+                let cs = styles.get(b.node);
+                cs.margin.top + b.rect.height + cs.margin.bottom
+            })
+            .fold(0.0_f32, f32::max);
+        let mut cur_x = match text_align {
+            TextAlign::Center => content_x + ((content_width - total_w) * 0.5).max(0.0),
+            TextAlign::Right => content_x + (content_width - total_w).max(0.0),
+            TextAlign::Left | TextAlign::Justify => content_x,
+        };
+        for mut b in row {
+            let cs = styles.get(b.node);
+            let outer_h = cs.margin.top + b.rect.height + cs.margin.bottom;
+            let y_off = ((row_h - outer_h) * 0.5).max(0.0);
+            let target_x = cur_x + cs.margin.left;
+            let target_y = *cursor_y + y_off + cs.margin.top;
+            let dx = target_x - b.rect.x;
+            let dy = target_y - b.rect.y;
+            offset_box(&mut b, dx, dy);
+            cur_x += cs.margin.left + b.rect.width + cs.margin.right;
+            out.push(b);
+        }
+        *cursor_y += row_h;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -848,6 +1037,7 @@ fn layout_block(
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
     let is_img = tag == "img" || tag == "video";
+    let is_canvas = tag == "canvas";
     let is_checkbox = doc.is_checkbox_input(id);
     let is_text_ctrl = doc.is_text_input(id);
     let is_textarea = tag == "textarea";
@@ -855,6 +1045,10 @@ fn layout_block(
     let is_submit_input = tag == "input" && doc.is_submit_control(id);
     let decoded_image = if is_img {
         images.get(&id).cloned()
+    } else if is_canvas {
+        doc.canvas_surface(id)
+            .and_then(|s| Image::from_rgba(s.width, s.height, s.rgba.clone()).ok())
+            .or_else(|| images.get(&id).cloned())
     } else {
         None
     };
@@ -866,6 +1060,13 @@ fn layout_block(
                 .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
                 .or_else(|| decoded_image.as_ref().map(|img| img.width as f32))
                 .unwrap_or(120.0);
+            border_width = attr_w + padding.left + padding.right + border.left + border.right;
+        } else if is_canvas {
+            let attr_w = data
+                .attr("width")
+                .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+                .or_else(|| decoded_image.as_ref().map(|img| img.width as f32))
+                .unwrap_or(300.0);
             border_width = attr_w + padding.left + padding.right + border.left + border.right;
         } else if is_checkbox {
             border_width = 20.0;
@@ -906,18 +1107,22 @@ fn layout_block(
                 + border.right
                 + 8.0)
                 .min(containing_width.max(48.0));
+        } else if style.inline_level && style.display != Display::Inline {
+            border_width = intrinsic_box_width(doc, styles, images, id, containing_width);
         }
+        border_width = clamp_border_width(&style, containing_width, styles, border_width);
     }
 
     let content_width =
         (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
-    let border_x = x + margin.left;
+    let border_x = resolve_border_x(&style, x, containing_width, border_width);
     let border_y = y + margin.top;
     let content_x = border_x + border.left + padding.left;
     let mut cursor_y = border_y + border.top + padding.top;
     let mut children = Vec::new();
     let mut text = Vec::new();
     let mut inline_ids = Vec::new();
+    let mut pending_inline_blocks: Vec<LayoutBox> = Vec::new();
     let mut pending_marker = list_marker;
 
     if is_img && decoded_image.is_none() {
@@ -1061,7 +1266,37 @@ fn layout_block(
                     content_width,
                     &mut text,
                 );
-                let child_marker = if doc.get(*child).data().tag() == Some("li") {
+                let child_tag = doc.get(*child).data().tag().unwrap_or("");
+                let child_is_inline_block = (child_style.inline_level
+                    && child_style.display != Display::Inline)
+                    || (matches!(child_tag, "img" | "video" | "canvas")
+                        && child_style.inline_level);
+                if child_is_inline_block {
+                    let ib_box = layout_node(
+                        doc,
+                        styles,
+                        images,
+                        focused_input,
+                        *child,
+                        0.0,
+                        0.0,
+                        content_width,
+                        child_cb_height,
+                        None,
+                    );
+                    pending_inline_blocks.push(ib_box);
+                    continue;
+                }
+                flush_inline_blocks(
+                    &mut pending_inline_blocks,
+                    styles,
+                    content_x,
+                    &mut cursor_y,
+                    content_width,
+                    style.text_align,
+                    &mut children,
+                );
+                let child_marker = if child_tag == "li" {
                     li_index += 1;
                     if parent_tag == "ol" {
                         Some(format!("{li_index}. "))
@@ -1071,7 +1306,7 @@ fn layout_block(
                 } else {
                     None
                 };
-                let child_box = layout_node(
+                let mut child_box = layout_node(
                     doc,
                     styles,
                     images,
@@ -1083,13 +1318,41 @@ fn layout_block(
                     child_cb_height,
                     child_marker,
                 );
+                if parent_tag == "center"
+                    && !child_style.margin_left_auto
+                    && !child_style.margin_right_auto
+                {
+                    let outer_w =
+                        child_style.margin.left + child_box.rect.width + child_style.margin.right;
+                    if outer_w < content_width {
+                        offset_box(&mut child_box, (content_width - outer_w) * 0.5, 0.0);
+                    }
+                }
                 cursor_y +=
                     child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
                 children.push(child_box);
             } else {
+                flush_inline_blocks(
+                    &mut pending_inline_blocks,
+                    styles,
+                    content_x,
+                    &mut cursor_y,
+                    content_width,
+                    style.text_align,
+                    &mut children,
+                );
                 inline_ids.push(*child);
             }
         }
+        flush_inline_blocks(
+            &mut pending_inline_blocks,
+            styles,
+            content_x,
+            &mut cursor_y,
+            content_width,
+            style.text_align,
+            &mut children,
+        );
         place_inlines(
             doc,
             styles,
@@ -1103,14 +1366,24 @@ fn layout_block(
         );
     }
 
+    let chrome_v = padding.top + padding.bottom + border.top + border.bottom;
     let flow_height = cursor_y - (border_y + border.top + padding.top);
     let content_height = match used_length(style.height, containing_height, &style, styles) {
-        Some(height) => height,
+        Some(height) => match style.box_sizing {
+            BoxSizing::ContentBox => height.max(0.0),
+            BoxSizing::BorderBox => (height - chrome_v).max(0.0),
+        },
         None if is_img => data
             .attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
             .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
             .unwrap_or(36.0)
+            .max(flow_height),
+        None if is_canvas => data
+            .attr("height")
+            .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+            .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
+            .unwrap_or(150.0)
             .max(flow_height),
         None if is_checkbox => 18.0,
         None if is_textarea => {
@@ -1124,7 +1397,21 @@ fn layout_block(
         None if is_text_ctrl || is_select => flow_height.max(line_height(style.font_size)),
         None => flow_height,
     };
-    let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
+    let mut border_height = content_height + chrome_v;
+    if let Some(max_h) = used_length(style.max_height, containing_height, &style, styles) {
+        let max_border_h = match style.box_sizing {
+            BoxSizing::ContentBox => (max_h + chrome_v).max(0.0),
+            BoxSizing::BorderBox => max_h.max(chrome_v),
+        };
+        border_height = border_height.min(max_border_h);
+    }
+    if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
+        let min_border_h = match style.box_sizing {
+            BoxSizing::ContentBox => (min_h + chrome_v).max(0.0),
+            BoxSizing::BorderBox => min_h.max(chrome_v),
+        };
+        border_height = border_height.max(min_border_h);
+    }
     let parent_rect = Rect {
         x: border_x,
         y: border_y,
@@ -1868,7 +2155,7 @@ fn layout_grid(
     let border_width = resolve_border_width(&style, containing_width, styles);
     let content_width =
         (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
-    let border_x = x + margin.left;
+    let border_x = resolve_border_x(&style, x, containing_width, border_width);
     let border_y = y + margin.top;
     let content_x = border_x + border.left + padding.left;
     let content_y = border_y + border.top + padding.top;
@@ -1893,7 +2180,40 @@ fn layout_grid(
         }
     }
 
-    let explicit_cols = style.grid_tracks();
+    let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
+    let raw_cols = style.grid_tracks();
+    let explicit_cols: Vec<GridTrack> =
+        if style.grid_auto_repeat != GridAutoRepeat::None && !raw_cols.is_empty() {
+            let pattern_min: f32 = raw_cols
+                .iter()
+                .map(|t| match t {
+                    GridTrack::Px(px) => (*px).max(1.0),
+                    GridTrack::Percent(pct) => (content_width * pct / 100.0).max(1.0),
+                    GridTrack::MinMax(min_b, _) => match min_b {
+                        TrackBreadth::Px(px) => (*px).max(1.0),
+                        TrackBreadth::Percent(pct) => (content_width * pct / 100.0).max(1.0),
+                        _ => 100.0,
+                    },
+                    _ => 100.0,
+                })
+                .sum();
+            let pattern_gaps = column_gap * (raw_cols.len().saturating_sub(1) as f32);
+            let unit_w = (pattern_min + pattern_gaps).max(1.0);
+            let mut reps = ((content_width + column_gap) / (unit_w + column_gap))
+                .floor()
+                .clamp(1.0, 12.0) as usize;
+            if style.grid_auto_repeat == GridAutoRepeat::AutoFit {
+                let needed_reps = (in_flow.len().max(1)).div_ceil(raw_cols.len());
+                reps = reps.min(needed_reps.max(1));
+            }
+            let mut expanded = Vec::with_capacity(raw_cols.len() * reps);
+            for _ in 0..reps {
+                expanded.extend_from_slice(raw_cols);
+            }
+            expanded
+        } else {
+            raw_cols.to_vec()
+        };
     let explicit_rows = style.grid_row_tracks();
     let spans: Vec<(AxisSpan, AxisSpan)> = in_flow
         .iter()
@@ -1935,7 +2255,6 @@ fn layout_grid(
             plan_track(track, Some(content_width), true)
         })
         .collect();
-    let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
     let col_widths = size_tracks(
         &col_plans,
         &vec![0.0; col_count],
@@ -2063,18 +2382,11 @@ struct FlexItem {
     outer_w: f32,
     outer_h: f32,
     grow: f32,
+    shrink: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
 /// Flex layout.
-///
-/// A column stacks children downward with `row-gap` between them and ignores
-/// `justify-content`, `align-items`, `flex-wrap`, and `flex-grow`. A row
-/// measures each item once. `flex-wrap: wrap` starts a new line when the next
-/// item does not fit. `flex-grow` then shares positive free space on each line
-/// and does not shrink an overflowing line. `space-between` with one item
-/// matches start. `align-items: stretch` only increases the border-box height
-/// of an item whose height is `auto`.
 fn layout_flex(
     doc: &Document,
     styles: &StyleMap,
@@ -2090,21 +2402,42 @@ fn layout_flex(
     let padding = style.padding;
     let margin = style.margin;
     let border = style.border;
-    let border_width = resolve_border_width(&style, containing_width, styles);
+    let mut border_width = resolve_border_width(&style, containing_width, styles);
+    if matches!(style.width, Size::Auto) && style.inline_level {
+        border_width = intrinsic_box_width(doc, styles, images, id, containing_width);
+    }
     let content_width =
         (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
-    let border_x = x + margin.left;
+    let border_x = resolve_border_x(&style, x, containing_width, border_width);
     let border_y = y + margin.top;
     let content_x = border_x + border.left + padding.left;
     let content_y = border_y + border.top + padding.top;
-    let specified_height = used_length(style.height, containing_height, &style, styles);
+    let chrome_v = padding.top + padding.bottom + border.top + border.bottom;
+    let specified_height = used_length(style.height, containing_height, &style, styles).map(|h| {
+        match style.box_sizing {
+            BoxSizing::ContentBox => h.max(0.0),
+            BoxSizing::BorderBox => (h - chrome_v).max(0.0),
+        }
+    });
 
-    let visible_children: Vec<NodeId> = doc
-        .children(id)
-        .iter()
-        .copied()
-        .filter(|child| !is_skipped(doc, styles, *child))
-        .collect();
+    let mut visible_children = Vec::new();
+    let mut out_of_flow = Vec::new();
+    for &child in doc.children(id) {
+        if is_skipped(doc, styles, child) {
+            continue;
+        }
+        if let NodeData::Text(t) = doc.get(child).data()
+            && t.trim().is_empty()
+        {
+            continue;
+        }
+        let cstyle = styles.get(child);
+        if matches!(cstyle.position, Position::Absolute | Position::Fixed) {
+            out_of_flow.push(child);
+        } else {
+            visible_children.push(child);
+        }
+    }
     let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
 
     if style.flex_direction == FlexDirection::Column {
@@ -2114,7 +2447,18 @@ fn layout_flex(
             if idx > 0 {
                 cursor_y += row_gap;
             }
-            let child_box = layout_node(
+            let child_style = styles.get(child);
+            let item_align = child_style.align_self.unwrap_or(style.align_items);
+            let item_cb_w =
+                if item_align != AlignItems::Stretch && matches!(child_style.width, Size::Auto) {
+                    (intrinsic_box_width(doc, styles, images, child, content_width)
+                        + child_style.margin.left
+                        + child_style.margin.right)
+                        .min(content_width)
+                } else {
+                    content_width
+                };
+            let mut child_box = layout_node(
                 doc,
                 styles,
                 images,
@@ -2122,24 +2466,113 @@ fn layout_flex(
                 child,
                 content_x,
                 cursor_y,
-                content_width,
+                item_cb_w,
                 specified_height,
                 None,
             );
-            let child_style = styles.get(child);
+            let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
+            let free_x = (content_width - outer_w).max(0.0);
+            let dx = if child_style.margin_left_auto && child_style.margin_right_auto {
+                free_x * 0.5
+            } else if child_style.margin_left_auto {
+                free_x
+            } else {
+                match item_align {
+                    AlignItems::Center => free_x * 0.5,
+                    AlignItems::End => free_x,
+                    AlignItems::Start | AlignItems::Stretch => 0.0,
+                }
+            };
+            if dx != 0.0 {
+                offset_box(&mut child_box, dx, 0.0);
+            }
             cursor_y += child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
             children.push(child_box);
         }
-        let flow_height = (cursor_y - content_y).max(0.0);
-        let content_height = specified_height.unwrap_or(flow_height);
+        let mut flow_height = (cursor_y - content_y).max(0.0);
+        let mut target_h = specified_height.unwrap_or(flow_height);
+        if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
+            let min_content_h = match style.box_sizing {
+                BoxSizing::ContentBox => min_h.max(0.0),
+                BoxSizing::BorderBox => (min_h - chrome_v).max(0.0),
+            };
+            target_h = target_h.max(min_content_h);
+        }
+        if let Some(max_h) = used_length(style.max_height, containing_height, &style, styles) {
+            let max_content_h = match style.box_sizing {
+                BoxSizing::ContentBox => max_h.max(0.0),
+                BoxSizing::BorderBox => (max_h - chrome_v).max(0.0),
+            };
+            target_h = target_h.min(max_content_h);
+        }
+        let free_y = (target_h - flow_height).max(0.0);
+        if free_y > 0.0 && !children.is_empty() {
+            let grow_sum: f32 = children.iter().map(|b| styles.get(b.node).flex_grow).sum();
+            if grow_sum > 0.0 {
+                let mut accumulated_dy = 0.0_f32;
+                for b in &mut children {
+                    if accumulated_dy != 0.0 {
+                        offset_box(b, 0.0, accumulated_dy);
+                    }
+                    let g = styles.get(b.node).flex_grow;
+                    if g > 0.0 {
+                        let extra = free_y * g / grow_sum;
+                        b.rect.height += extra;
+                        accumulated_dy += extra;
+                    }
+                }
+                flow_height += accumulated_dy;
+            } else {
+                let count = children.len();
+                let (start_dy, step_dy) = match style.justify_content {
+                    JustifyContent::Start => (0.0, 0.0),
+                    JustifyContent::Center => (free_y * 0.5, 0.0),
+                    JustifyContent::End => (free_y, 0.0),
+                    JustifyContent::SpaceBetween if count > 1 => {
+                        (0.0, free_y / ((count - 1) as f32))
+                    }
+                    JustifyContent::SpaceBetween => (0.0, 0.0),
+                    JustifyContent::SpaceAround => {
+                        let u = free_y / (count as f32);
+                        (u * 0.5, u)
+                    }
+                    JustifyContent::SpaceEvenly => {
+                        let u = free_y / ((count + 1) as f32);
+                        (u, u)
+                    }
+                };
+                if start_dy != 0.0 || step_dy != 0.0 {
+                    for (idx, b) in children.iter_mut().enumerate() {
+                        offset_box(b, 0.0, start_dy + step_dy * (idx as f32));
+                    }
+                }
+            }
+        }
+        let content_height = if specified_height.is_some() {
+            target_h
+        } else {
+            target_h.max(flow_height)
+        };
+        let parent_rect = Rect {
+            x: border_x,
+            y: border_y,
+            width: border_width,
+            height: content_height + chrome_v,
+        };
+        for oof_id in out_of_flow {
+            children.push(layout_out_of_flow(
+                doc,
+                styles,
+                images,
+                focused_input,
+                oof_id,
+                parent_rect,
+                containing_width,
+            ));
+        }
         return LayoutBox {
             node: id,
-            rect: Rect {
-                x: border_x,
-                y: border_y,
-                width: border_width,
-                height: content_height + padding.top + padding.bottom + border.top + border.bottom,
-            },
+            rect: parent_rect,
             position: style.position,
             z_index: style.z_index,
             overflow: style.overflow,
@@ -2161,15 +2594,32 @@ fn layout_flex(
     let mut items = Vec::new();
     for child in &visible_children {
         let child_style = styles.get(*child);
-        let resolved_content_w =
-            used_length(child_style.width, Some(content_width), child_style, styles);
-        let basis_width = if let Some(w) = resolved_content_w {
-            w + child_style.padding.left
-                + child_style.padding.right
-                + child_style.border.left
-                + child_style.border.right
-                + child_style.margin.left
-                + child_style.margin.right
+        let explicit_basis = if !matches!(child_style.flex_basis, Size::Auto) {
+            used_length(
+                child_style.flex_basis,
+                Some(content_width),
+                child_style,
+                styles,
+            )
+        } else {
+            used_length(child_style.width, Some(content_width), child_style, styles)
+        };
+        let basis_width = if let Some(w) = explicit_basis {
+            let bw = match child_style.box_sizing {
+                BoxSizing::ContentBox => {
+                    w + child_style.padding.left
+                        + child_style.padding.right
+                        + child_style.border.left
+                        + child_style.border.right
+                }
+                BoxSizing::BorderBox => w.max(
+                    child_style.padding.left
+                        + child_style.padding.right
+                        + child_style.border.left
+                        + child_style.border.right,
+                ),
+            };
+            bw + child_style.margin.left + child_style.margin.right
         } else {
             let child_data = doc.get(*child).data();
             let child_tag = child_data.tag().unwrap_or("");
@@ -2198,12 +2648,12 @@ fn layout_flex(
                 + child_style.margin.right)
                 .min(content_width)
         };
-        let item_containing = if resolved_content_w.is_some() {
+        let item_containing = if explicit_basis.is_some() {
             content_width
         } else {
             basis_width
         };
-        let child_box = layout_node(
+        let mut child_box = layout_node(
             doc,
             styles,
             images,
@@ -2215,6 +2665,19 @@ fn layout_flex(
             specified_height,
             None,
         );
+        if let Some(basis_px) = explicit_basis
+            && matches!(child_style.width, Size::Auto)
+        {
+            let chrome_h = child_style.padding.left
+                + child_style.padding.right
+                + child_style.border.left
+                + child_style.border.right;
+            let bw = match child_style.box_sizing {
+                BoxSizing::ContentBox => basis_px + chrome_h,
+                BoxSizing::BorderBox => basis_px.max(chrome_h),
+            };
+            child_box.rect.width = clamp_border_width(child_style, content_width, styles, bw);
+        }
         let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
         let outer_h = child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
         items.push(FlexItem {
@@ -2222,6 +2685,7 @@ fn layout_flex(
             outer_w,
             outer_h,
             grow: child_style.flex_grow,
+            shrink: child_style.flex_shrink,
         });
     }
 
@@ -2261,49 +2725,102 @@ fn layout_flex(
             0.0
         };
         let used: f32 = line.iter().map(|item| item.outer_w).sum();
-        let free_space = (content_width - used - gaps).max(0.0);
-        let grow_sum: f32 = line.iter().map(|item| item.grow).sum();
-        if free_space > 0.0 && grow_sum > 0.0 {
-            for item in line.iter_mut() {
-                if item.grow > 0.0 {
-                    let extra = free_space * item.grow / grow_sum;
-                    item.node_box.rect.width += extra;
-                    item.outer_w += extra;
+        let raw_free = content_width - used - gaps;
+        if raw_free > 0.0 {
+            let grow_sum: f32 = line.iter().map(|item| item.grow).sum();
+            if grow_sum > 0.0 {
+                for item in line.iter_mut() {
+                    if item.grow > 0.0 {
+                        let extra = raw_free * item.grow / grow_sum;
+                        item.node_box.rect.width += extra;
+                        item.outer_w += extra;
+                    }
+                }
+            }
+        } else if !wrap && raw_free < 0.0 {
+            let overflow = -raw_free;
+            let shrink_sum: f32 = line
+                .iter()
+                .map(|item| item.shrink * item.node_box.rect.width.max(1.0))
+                .sum();
+            if shrink_sum > 0.0 {
+                for item in line.iter_mut() {
+                    if item.shrink > 0.0 {
+                        let weight = item.shrink * item.node_box.rect.width.max(1.0);
+                        let delta = (overflow * weight / shrink_sum).min(item.node_box.rect.width);
+                        item.node_box.rect.width -= delta;
+                        item.outer_w -= delta;
+                    }
                 }
             }
         }
         let used_after: f32 = line.iter().map(|item| item.outer_w).sum();
         let free_after = (content_width - used_after - gaps).max(0.0);
-        let (mut cursor_x, step_gap) = match style.justify_content {
-            JustifyContent::Start => (content_x, column_gap),
-            JustifyContent::Center => (content_x + free_after * 0.5, column_gap),
-            JustifyContent::End => (content_x + free_after, column_gap),
-            JustifyContent::SpaceBetween if count > 1 => {
-                (content_x, column_gap + free_after / ((count - 1) as f32))
+        let auto_margins: usize = line
+            .iter()
+            .map(|item| {
+                let cs = styles.get(item.node_box.node);
+                usize::from(cs.margin_left_auto) + usize::from(cs.margin_right_auto)
+            })
+            .sum();
+        let auto_margin_px = if auto_margins > 0 {
+            free_after / (auto_margins as f32)
+        } else {
+            0.0
+        };
+        let (mut cursor_x, step_gap) = if auto_margins > 0 {
+            (content_x, column_gap)
+        } else {
+            match style.justify_content {
+                JustifyContent::Start => (content_x, column_gap),
+                JustifyContent::Center => (content_x + free_after * 0.5, column_gap),
+                JustifyContent::End => (content_x + free_after, column_gap),
+                JustifyContent::SpaceBetween if count > 1 => {
+                    (content_x, column_gap + free_after / ((count - 1) as f32))
+                }
+                JustifyContent::SpaceBetween => (content_x, column_gap),
+                JustifyContent::SpaceAround if count > 0 => {
+                    let u = free_after / (count as f32);
+                    (content_x + u * 0.5, column_gap + u)
+                }
+                JustifyContent::SpaceAround => (content_x, column_gap),
+                JustifyContent::SpaceEvenly if count > 0 => {
+                    let u = free_after / ((count + 1) as f32);
+                    (content_x + u, column_gap + u)
+                }
+                JustifyContent::SpaceEvenly => (content_x, column_gap),
             }
-            JustifyContent::SpaceBetween => (content_x, column_gap),
         };
         let line_height = line.iter().map(|item| item.outer_h).fold(0.0_f32, f32::max);
         for item in line.iter_mut() {
             let child_style = styles.get(item.node_box.node);
-            let y_offset = match style.align_items {
+            let item_align = child_style.align_self.unwrap_or(style.align_items);
+            let y_offset = match item_align {
                 AlignItems::Start | AlignItems::Stretch => 0.0,
                 AlignItems::Center => ((line_height - item.outer_h) * 0.5).max(0.0),
                 AlignItems::End => (line_height - item.outer_h).max(0.0),
             };
-            let dx = (cursor_x + child_style.margin.left) - item.node_box.rect.x;
+            let ml = child_style.margin.left
+                + if child_style.margin_left_auto {
+                    auto_margin_px
+                } else {
+                    0.0
+                };
+            let mr = child_style.margin.right
+                + if child_style.margin_right_auto {
+                    auto_margin_px
+                } else {
+                    0.0
+                };
+            let dx = (cursor_x + ml) - item.node_box.rect.x;
             let dy = (cursor_y + y_offset + child_style.margin.top) - item.node_box.rect.y;
             offset_box(&mut item.node_box, dx, dy);
-            if style.align_items == AlignItems::Stretch && matches!(child_style.height, Size::Auto)
-            {
+            if item_align == AlignItems::Stretch && matches!(child_style.height, Size::Auto) {
                 item.node_box.rect.height =
                     (line_height - child_style.margin.top - child_style.margin.bottom)
                         .max(item.node_box.rect.height);
             }
-            cursor_x += child_style.margin.left
-                + item.node_box.rect.width
-                + child_style.margin.right
-                + step_gap;
+            cursor_x += ml + item.node_box.rect.width + mr + step_gap;
         }
         lines_cross += line_height;
         cursor_y += line_height;
@@ -2312,15 +2829,41 @@ fn layout_flex(
         }
     }
 
-    let content_height = specified_height.unwrap_or(lines_cross);
+    let mut content_height = specified_height.unwrap_or(lines_cross);
+    if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
+        let min_content_h = match style.box_sizing {
+            BoxSizing::ContentBox => min_h.max(0.0),
+            BoxSizing::BorderBox => (min_h - chrome_v).max(0.0),
+        };
+        content_height = content_height.max(min_content_h);
+    }
+    if let Some(max_h) = used_length(style.max_height, containing_height, &style, styles) {
+        let max_content_h = match style.box_sizing {
+            BoxSizing::ContentBox => max_h.max(0.0),
+            BoxSizing::BorderBox => (max_h - chrome_v).max(0.0),
+        };
+        content_height = content_height.min(max_content_h);
+    }
+    let parent_rect = Rect {
+        x: border_x,
+        y: border_y,
+        width: border_width,
+        height: content_height + chrome_v,
+    };
+    for oof_id in out_of_flow {
+        children.push(layout_out_of_flow(
+            doc,
+            styles,
+            images,
+            focused_input,
+            oof_id,
+            parent_rect,
+            containing_width,
+        ));
+    }
     LayoutBox {
         node: id,
-        rect: Rect {
-            x: border_x,
-            y: border_y,
-            width: border_width,
-            height: content_height + padding.top + padding.bottom + border.top + border.bottom,
-        },
+        rect: parent_rect,
         position: style.position,
         z_index: style.z_index,
         overflow: style.overflow,
@@ -2359,6 +2902,34 @@ fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
     }
 }
 
+fn align_runs(runs: &mut [TextRun], origin_x: f32, max_width: f32, align: TextAlign) {
+    if matches!(align, TextAlign::Left | TextAlign::Justify) || runs.is_empty() || max_width <= 0.0
+    {
+        return;
+    }
+    let mut start = 0usize;
+    while start < runs.len() {
+        let line_y = runs[start].y;
+        let mut end = start + 1;
+        while end < runs.len() && (runs[end].y - line_y).abs() < 0.01 {
+            end += 1;
+        }
+        let line_end_x = runs[end - 1].x + runs[end - 1].width;
+        let line_w = (line_end_x - origin_x).max(0.0);
+        let shift = match align {
+            TextAlign::Center => ((max_width - line_w) * 0.5).max(0.0),
+            TextAlign::Right => (max_width - line_w).max(0.0),
+            TextAlign::Left | TextAlign::Justify => 0.0,
+        };
+        if shift > 0.0 {
+            for run in &mut runs[start..end] {
+                run.x += shift;
+            }
+        }
+        start = end;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Flush queued inline children into line boxes and advance `cursor_y`.
 ///
@@ -2378,9 +2949,9 @@ fn place_inlines(
     if inline_ids.is_empty() && pending_marker.is_none() {
         return;
     }
+    let block_style = styles.get(block_id);
     let mut segments = Vec::new();
     if let Some(marker) = pending_marker.take() {
-        let block_style = styles.get(block_id);
         segments.push(Segment {
             node: block_id,
             text: marker,
@@ -2392,7 +2963,15 @@ fn place_inlines(
     for id in inline_ids.drain(..) {
         gather(doc, styles, id, styles.get(id), &mut segments);
     }
-    let (runs, height) = place_lines(&segments, content_x, *cursor_y, content_width);
+    let wrap_width = if block_style.white_space == WhiteSpace::Nowrap
+        || block_style.white_space == WhiteSpace::Pre
+    {
+        content_width.max(16384.0)
+    } else {
+        content_width
+    };
+    let (mut runs, height) = place_lines(&segments, content_x, *cursor_y, wrap_width);
+    align_runs(&mut runs, content_x, content_width, block_style.text_align);
     text.extend(runs);
     *cursor_y += height;
 }
@@ -2450,6 +3029,7 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
         NodeData::Element { tag, .. } => {
             tag == "img"
                 || tag == "video"
+                || tag == "canvas"
                 || matches!(
                     styles.get(id).display,
                     Display::Block | Display::Flex | Display::Grid
@@ -2460,12 +3040,13 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     }
 }
 
-/// True when any descendant is `img`, `video`, block, or flex.
+/// True when any descendant is `img`, `video`, `canvas`, block, or flex.
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     for child in doc.children(id) {
         if let NodeData::Element { tag, .. } = doc.get(*child).data()
             && (tag == "img"
                 || tag == "video"
+                || tag == "canvas"
                 || matches!(
                     styles.get(*child).display,
                     Display::Block | Display::Flex | Display::Grid
@@ -3420,5 +4001,90 @@ mod tests {
         assert_eq!(hit_test(&tree, 110.0, ring.rect.y + 5.0), id("in"));
         assert_ne!(hit_test(&tree, 10.0, ring.rect.y + 5.0), id("in"));
         assert_ne!(hit_test(&tree, 150.0, ring.rect.y + 5.0), id("in"));
+    }
+
+    #[test]
+    fn grid_auto_fill_and_canvas_surface_layout() {
+        let (mut doc, tree) = render(
+            "<style>
+                html, body { margin: 0; padding: 0; }
+                #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); width: 320px; }
+                .cell { height: 24px; }
+             </style>
+             <div id=\"grid\">
+                <div id=\"c1\" class=\"cell\"></div>
+                <div id=\"c2\" class=\"cell\"></div>
+                <div id=\"c3\" class=\"cell\"></div>
+             </div>
+             <canvas id=\"cv\" width=\"64\" height=\"32\"></canvas>",
+            400.0,
+        );
+        let c1 = find_box(&doc, &tree, "c1");
+        let c2 = find_box(&doc, &tree, "c2");
+        let c3 = find_box(&doc, &tree, "c3");
+        // 320px fits 3 columns of minmax(100px, 1fr) on the same row.
+        assert_eq!(c1.rect.y, c2.rect.y);
+        assert_eq!(c2.rect.y, c3.rect.y);
+        assert!(c2.rect.x > c1.rect.x);
+        assert!(c3.rect.x > c2.rect.x);
+
+        let cv_id = doc.get_element_by_id("cv").unwrap();
+        doc.canvas_fill_rect(cv_id, 0, 0, 64, 32, [255, 0, 0, 255]);
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let tree2 = layout_document(&doc, &styles, 400.0);
+        let cv_box = find_box(&doc, &tree2, "cv");
+        assert_eq!(cv_box.rect.width, 64.0);
+        assert_eq!(cv_box.rect.height, 32.0);
+        let img = cv_box
+            .image
+            .as_ref()
+            .expect("canvas surface image attached");
+        assert_eq!(img.width, 64);
+        assert_eq!(img.height, 32);
+    }
+
+    #[test]
+    fn auto_margins_inline_blocks_border_box_and_column_flex_centering() {
+        let (doc, tree) = render(
+            "<style>
+                html, body { margin: 0; padding: 0; }
+                #centered { width: 200px; margin: 0 auto; height: 24px; }
+                #row { text-align: center; width: 400px; }
+                .ib { display: inline-block; width: 60px; height: 20px; margin: 0 5px; }
+                #bbox { box-sizing: border-box; width: 180px; min-height: 40px; padding: 10px; border: 2px solid #111; }
+                #col { display: flex; flex-direction: column; align-items: center; width: 400px; }
+                #col_child { width: 120px; height: 20px; }
+                #ghost { visibility: hidden; width: 100px; height: 30px; background: #ff0000; }
+             </style>
+             <div id=\"centered\"></div>
+             <div id=\"row\"><span id=\"b1\" class=\"ib\"></span><span id=\"b2\" class=\"ib\"></span></div>
+             <div id=\"bbox\"></div>
+             <div id=\"col\"><div id=\"col_child\"></div></div>
+             <div id=\"ghost\">Hidden text</div>",
+            400.0,
+        );
+        let centered = find_box(&doc, &tree, "centered");
+        assert_eq!(centered.rect.x, 100.0);
+        assert_eq!(centered.rect.width, 200.0);
+
+        let b1 = find_box(&doc, &tree, "b1");
+        let b2 = find_box(&doc, &tree, "b2");
+        assert_eq!(b1.rect.y, b2.rect.y);
+        assert!(b2.rect.x > b1.rect.x);
+        // Total row width = (5 + 60 + 5) * 2 = 140; centered in 400 -> starts at 130 + 5 = 135.
+        assert_eq!(b1.rect.x, 135.0);
+
+        let bbox = find_box(&doc, &tree, "bbox");
+        assert_eq!(bbox.rect.width, 180.0);
+        assert_eq!(bbox.rect.height, 40.0);
+
+        let col_child = find_box(&doc, &tree, "col_child");
+        assert_eq!(col_child.rect.x, 140.0);
+
+        let ghost = find_box(&doc, &tree, "ghost");
+        assert_eq!(ghost.rect.width, 100.0);
+        assert_eq!(ghost.rect.height, 30.0);
+        assert!(ghost.background.is_none());
+        assert!(ghost.text.is_empty());
     }
 }

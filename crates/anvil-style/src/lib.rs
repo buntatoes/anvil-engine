@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Style sheets, selector matching, and the cascade.
 //!
@@ -466,13 +466,17 @@ impl Color {
         }
         let lower = value.to_ascii_lowercase();
         if let Some(inner) = lower.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-            return parse_rgb(inner, false);
+            return parse_rgb(inner, false).or_else(|| {
+                anvil_css::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a })
+            });
         }
         if let Some(inner) = lower
             .strip_prefix("rgba(")
             .and_then(|s| s.strip_suffix(')'))
         {
-            return parse_rgb(inner, true);
+            return parse_rgb(inner, true).or_else(|| {
+                anvil_css::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a })
+            });
         }
         Some(match lower.as_str() {
             "black" => Self::BLACK,
@@ -530,7 +534,7 @@ impl Color {
                 b: 0,
                 a: 0,
             },
-            _ => return None,
+            _ => return anvil_css::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a }),
         })
     }
 
@@ -576,7 +580,7 @@ pub enum FlexWrap {
     Wrap,
 }
 
-/// Main-axis packing for a flex line. Only one line is laid out.
+/// Main-axis packing for a flex line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JustifyContent {
     /// Pack against the start. `flex-start` and `start` both map here.
@@ -588,6 +592,60 @@ pub enum JustifyContent {
     /// First item at the start, last at the end, equal gaps between.
     /// A single item is placed at the start.
     SpaceBetween,
+    /// Equal space around each item (`space-around`).
+    SpaceAround,
+    /// Equal space between items and edges (`space-evenly`).
+    SpaceEvenly,
+}
+
+/// `box-sizing` as stored for layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BoxSizing {
+    /// `width` and `height` size the content box. Initial value.
+    #[default]
+    ContentBox,
+    /// `width` and `height` include padding and border.
+    BorderBox,
+}
+
+/// `visibility` as stored for layout and paint. Inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+    /// Box is drawn normally. Initial value.
+    #[default]
+    Visible,
+    /// Box takes up layout space, but its own background, border, and text are not drawn.
+    Hidden,
+    /// Treated like `Hidden` on non-table boxes.
+    Collapse,
+}
+
+/// Horizontal alignment of inline content inside a block container. Inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    /// Align inline runs to the left edge (`left` or `start`). Initial value.
+    #[default]
+    Left,
+    /// Center inline runs within the line (`center`).
+    Center,
+    /// Align inline runs to the right edge (`right` or `end`).
+    Right,
+    /// Justify inline runs (`justify`).
+    Justify,
+}
+
+/// `white-space` handling for inline text runs. Inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WhiteSpace {
+    /// Collapse whitespace and wrap lines. Initial value.
+    #[default]
+    Normal,
+    /// Collapse whitespace and do not wrap lines (`nowrap`).
+    Nowrap,
+    /// Preserve whitespace and newlines (`pre`).
+    Pre,
+    /// Preserve whitespace and wrap lines (`pre-wrap` / `pre-line`).
+    PreWrap,
 }
 
 /// Cross-axis alignment for flex items. Column flex ignores this value.
@@ -782,6 +840,15 @@ pub enum GridTrack {
     MinMax(TrackBreadth, TrackBreadth),
 }
 
+/// Auto-repeating track mode for `repeat(auto-fill, ...)` and `repeat(auto-fit, ...)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GridAutoRepeat {
+    #[default]
+    None,
+    AutoFill,
+    AutoFit,
+}
+
 /// Largest grid line number or span kept by the parser. Bigger values are
 /// clamped, so a typo such as `span 99999` does not build a huge grid.
 pub const MAX_GRID_LINE: i16 = 100;
@@ -906,6 +973,9 @@ impl TransformOrigin {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ComputedStyle {
     pub display: Display,
+    /// True when the box participates in inline horizontal flow (`inline`,
+    /// `inline-block`, `inline-flex`, `inline-grid`).
+    pub inline_level: bool,
     pub position: Position,
     pub top: Size,
     pub right: Size,
@@ -913,29 +983,47 @@ pub struct ComputedStyle {
     pub left: Size,
     pub z_index: i32,
     pub overflow: Overflow,
+    pub visibility: Visibility,
+    pub box_sizing: BoxSizing,
     pub color: Color,
     pub background: Option<Color>,
     pub background_gradient: Option<LinearGradient>,
     pub box_shadow: Option<BoxShadow>,
     pub font_size: f32,
+    pub font_weight: u16,
+    pub italic: bool,
+    pub line_height: Option<f32>,
+    pub text_align: TextAlign,
+    pub white_space: WhiteSpace,
     pub margin: Edge,
+    pub margin_left_auto: bool,
+    pub margin_right_auto: bool,
     pub padding: Edge,
     pub border: Edge,
     pub border_color: Color,
     pub border_radius: f32,
     pub width: Size,
     pub height: Size,
+    pub min_width: Size,
     pub max_width: Size,
+    pub min_height: Size,
+    pub max_height: Size,
     pub underline: bool,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
     /// Main-size growth factor for a flex item. The initial value is 0.
-    /// This is not inherited. Negative values are stored as 0. Column flex ignores it.
+    /// This is not inherited. Negative values are stored as 0.
     pub flex_grow: f32,
+    /// Main-size shrink factor for a flex item. The initial value is 1.
+    pub flex_shrink: f32,
+    /// Initial main size of a flex item (`flex-basis`). The initial value is `auto`.
+    pub flex_basis: Size,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
+    pub align_self: Option<AlignItems>,
     pub grid_template_columns: [GridTrack; 12],
     pub grid_column_count: u8,
+    pub grid_auto_repeat: GridAutoRepeat,
     /// Explicit row tracks from `grid-template-rows`. See [`Self::grid_row_tracks`].
     pub grid_template_rows: [GridTrack; 12],
     pub grid_row_count: u8,
@@ -975,6 +1063,7 @@ impl ComputedStyle {
     pub const fn initial() -> Self {
         Self {
             display: Display::Inline,
+            inline_level: true,
             position: Position::Static,
             top: Size::Auto,
             right: Size::Auto,
@@ -982,27 +1071,43 @@ impl ComputedStyle {
             left: Size::Auto,
             z_index: 0,
             overflow: Overflow::Visible,
+            visibility: Visibility::Visible,
+            box_sizing: BoxSizing::ContentBox,
             color: Color::BLACK,
             background: None,
             background_gradient: None,
             box_shadow: None,
             font_size: 16.0,
+            font_weight: 400,
+            italic: false,
+            line_height: None,
+            text_align: TextAlign::Left,
+            white_space: WhiteSpace::Normal,
             margin: Edge::zero(),
+            margin_left_auto: false,
+            margin_right_auto: false,
             padding: Edge::zero(),
             border: Edge::zero(),
             border_color: Color::BLACK,
             border_radius: 0.0,
             width: Size::Auto,
             height: Size::Auto,
+            min_width: Size::Auto,
             max_width: Size::Auto,
+            min_height: Size::Auto,
+            max_height: Size::Auto,
             underline: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             flex_grow: 0.0,
+            flex_shrink: 0.0,
+            flex_basis: Size::Auto,
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
+            align_self: None,
             grid_template_columns: [GridTrack::Fr(1.0); 12],
             grid_column_count: 0,
+            grid_auto_repeat: GridAutoRepeat::None,
             grid_template_rows: [GridTrack::Auto; 12],
             grid_row_count: 0,
             grid_auto_rows: GridTrack::Auto,
@@ -1035,12 +1140,18 @@ impl ComputedStyle {
         &self.grid_template_rows[..(self.grid_row_count as usize).min(12)]
     }
 
-    /// Style a child element starts from. Copies `color`, `font_size`, and
-    /// `underline`, sets `border_color` to that color, and resets everything else.
+    /// Style a child element starts from. Copies inherited properties, sets
+    /// `border_color` to `color`, and resets everything else.
     fn inherited_child(self) -> Self {
         Self {
             color: self.color,
             font_size: self.font_size,
+            font_weight: self.font_weight,
+            italic: self.italic,
+            line_height: self.line_height,
+            text_align: self.text_align,
+            white_space: self.white_space,
+            visibility: self.visibility,
             underline: self.underline,
             border_color: self.color,
             ..Self::initial()
@@ -1261,6 +1372,19 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
                 None => mq,
             };
             parse_css_rules(body_src, Some(combined), sheet);
+            continue;
+        }
+        if let Some(cond) = selector_src
+            .strip_prefix("@supports")
+            .or_else(|| selector_src.strip_prefix("@SUPPORTS"))
+        {
+            let opts = anvil_css::Options::default();
+            if let Ok(cvs) = anvil_css::parse_component_values(cond.trim(), &opts)
+                && anvil_css::media::parse_supports_condition(&cvs, &opts.limits)
+                    .is_ok_and(|c| c.evaluate())
+            {
+                parse_css_rules(body_src, active_media.clone(), sheet);
+            }
             continue;
         }
         if let Some(name) = selector_src.strip_prefix("@keyframes") {
@@ -1621,8 +1745,30 @@ fn cascade_element(
     let parent_font_px = parent.font_size;
     let mut style = parent.inherited_child();
     apply_user_agent(&mut style, tag);
-    if doc.get(id).data().attr("hidden").is_some() {
+    let data = doc.get(id).data();
+    if data.attr("hidden").is_some()
+        || (tag == "input"
+            && data
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")))
+    {
         style.display = Display::None;
+        style.inline_level = false;
+    }
+    if let Some(align) = data.attr("align") {
+        match align.trim().to_ascii_lowercase().as_str() {
+            "center" | "middle" => {
+                style.text_align = TextAlign::Center;
+                if matches!(tag, "table" | "div" | "p" | "form") {
+                    style.margin_left_auto = true;
+                    style.margin_right_auto = true;
+                }
+            }
+            "right" => style.text_align = TextAlign::Right,
+            "left" => style.text_align = TextAlign::Left,
+            "justify" => style.text_align = TextAlign::Justify,
+            _ => {}
+        }
     }
     apply_author(&mut style, vars, doc, id, cx, parent_font_px);
     style
@@ -1708,12 +1854,55 @@ fn apply_author(
 fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     if is_block_tag(tag) {
         style.display = Display::Block;
+        style.inline_level = false;
     }
     if matches!(
         tag,
-        "base" | "head" | "link" | "meta" | "option" | "script" | "style" | "title"
+        "base"
+            | "head"
+            | "link"
+            | "meta"
+            | "option"
+            | "script"
+            | "style"
+            | "title"
+            | "noscript"
+            | "template"
+            | "datalist"
+            | "rp"
+            | "audio"
+            | "source"
+            | "track"
+            | "param"
+            | "defs"
+            | "symbol"
+            | "clippath"
+            | "mask"
+            | "lineargradient"
+            | "radialgradient"
+            | "pattern"
+            | "filter"
+            | "marker"
+            | "metadata"
+            | "desc"
     ) {
         style.display = Display::None;
+        style.inline_level = false;
+    }
+    if tag == "center" {
+        style.text_align = TextAlign::Center;
+    }
+    if matches!(
+        tag,
+        "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"
+    ) {
+        style.font_weight = 700;
+    }
+    if matches!(tag, "i" | "em" | "cite" | "var" | "dfn") {
+        style.italic = true;
+    }
+    if tag == "pre" {
+        style.white_space = WhiteSpace::Pre;
     }
     if tag == "body" {
         style.margin = Edge::all(8.0);
@@ -1763,6 +1952,7 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     }
     if tag == "input" || tag == "textarea" || tag == "select" {
         style.display = Display::Block;
+        style.inline_level = false;
         style.background = Some(Color::WHITE);
         style.color = Color {
             r: 24,
@@ -1789,6 +1979,7 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     }
     if tag == "button" {
         style.display = Display::Block;
+        style.inline_level = false;
         style.background = Some(Color {
             r: 43,
             g: 53,
@@ -1864,7 +2055,6 @@ fn is_block_tag(tag: &str) -> bool {
             | "li"
             | "main"
             | "nav"
-            | "noscript"
             | "ol"
             | "p"
             | "picture"
@@ -1910,14 +2100,97 @@ fn apply_declaration(
     }
     match declaration.name.as_str() {
         "display" => {
-            style.display = match value {
-                "block" | "inline-block" | "list-item" | "flow-root" => Display::Block,
-                "inline" => Display::Inline,
+            let lower = value.to_ascii_lowercase();
+            style.display = match lower.as_str() {
+                "block" | "inline-block" | "list-item" | "flow-root" | "table"
+                | "table-row-group" | "table-header-group" | "table-footer-group" | "table-row"
+                | "table-cell" => Display::Block,
+                "inline" | "contents" => Display::Inline,
                 "flex" | "inline-flex" => Display::Flex,
                 "grid" | "inline-grid" => Display::Grid,
                 "none" => Display::None,
+                _ => {
+                    if lower.starts_with('-') && (lower.ends_with("flex") || lower.ends_with("box"))
+                    {
+                        Display::Flex
+                    } else {
+                        return;
+                    }
+                }
+            };
+            style.inline_level = matches!(
+                lower.as_str(),
+                "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents"
+            ) || (lower.starts_with('-')
+                && (lower.ends_with("inline-flex") || lower.ends_with("inline-box")));
+        }
+        "box-sizing" => {
+            style.box_sizing = match value.to_ascii_lowercase().as_str() {
+                "border-box" => BoxSizing::BorderBox,
+                "content-box" => BoxSizing::ContentBox,
                 _ => return,
             };
+        }
+        "visibility" => {
+            style.visibility = match value.to_ascii_lowercase().as_str() {
+                "visible" => Visibility::Visible,
+                "hidden" => Visibility::Hidden,
+                "collapse" => Visibility::Collapse,
+                _ => return,
+            };
+        }
+        "text-align" => {
+            let lower = value.to_ascii_lowercase();
+            style.text_align = match lower.as_str() {
+                "left" | "start" => TextAlign::Left,
+                "center" => TextAlign::Center,
+                "right" | "end" => TextAlign::Right,
+                "justify" => TextAlign::Justify,
+                _ if lower.ends_with("-center") => TextAlign::Center,
+                _ if lower.ends_with("-right") => TextAlign::Right,
+                _ if lower.ends_with("-left") => TextAlign::Left,
+                _ => return,
+            };
+        }
+        "white-space" => {
+            style.white_space = match value.to_ascii_lowercase().as_str() {
+                "normal" => WhiteSpace::Normal,
+                "nowrap" => WhiteSpace::Nowrap,
+                "pre" => WhiteSpace::Pre,
+                "pre-wrap" | "pre-line" | "break-spaces" => WhiteSpace::PreWrap,
+                _ => return,
+            };
+        }
+        "font-weight" => {
+            let lower = value.to_ascii_lowercase();
+            match lower.as_str() {
+                "normal" => style.font_weight = 400,
+                "bold" | "bolder" => style.font_weight = 700,
+                "lighter" => style.font_weight = 300,
+                _ => {
+                    if let Ok(w) = lower.parse::<u16>()
+                        && (1..=1000).contains(&w)
+                    {
+                        style.font_weight = w;
+                    }
+                }
+            }
+        }
+        "font-style" => match value.to_ascii_lowercase().as_str() {
+            "italic" | "oblique" => style.italic = true,
+            "normal" => style.italic = false,
+            _ => {}
+        },
+        "line-height" => {
+            if value.eq_ignore_ascii_case("normal") {
+                style.line_height = None;
+            } else if let Ok(mult) = value.parse::<f32>() {
+                if mult.is_finite() && mult >= 0.0 {
+                    style.line_height = Some(style.font_size * mult);
+                }
+            } else if let Some(px) = parse_font_size(value, style.font_size, root_font_px) {
+                style.line_height = Some(px.max(0.0));
+            }
         }
         "color" => {
             if let Some(color) = Color::parse(value) {
@@ -1934,6 +2207,19 @@ fn apply_declaration(
             } else if let Some(color) = Color::parse(value) {
                 style.background = Some(color);
                 style.background_gradient = None;
+            } else {
+                for tok in split_css_tokens(value) {
+                    if tok.eq_ignore_ascii_case("transparent") {
+                        style.background = None;
+                        style.background_gradient = None;
+                        break;
+                    }
+                    if let Some(color) = Color::parse(tok) {
+                        style.background = Some(color);
+                        style.background_gradient = None;
+                        break;
+                    }
+                }
             }
         }
         "box-shadow" => {
@@ -1948,60 +2234,72 @@ fn apply_declaration(
                 style.font_size = size.max(0.0);
             }
         }
-        "text-decoration" => {
-            if value.eq_ignore_ascii_case("underline") {
-                style.underline = true;
-            } else if value.eq_ignore_ascii_case("none") {
-                style.underline = false;
+        "text-decoration" | "text-decoration-line" => {
+            for tok in split_css_tokens(value) {
+                if tok.eq_ignore_ascii_case("underline") {
+                    style.underline = true;
+                } else if tok.eq_ignore_ascii_case("none") {
+                    style.underline = false;
+                }
             }
         }
         "margin" => {
-            if let Some(edge) = parse_edge(value) {
-                style.margin = edge;
-            }
+            apply_margin_shorthand(style, value, root_font_px);
         }
         "margin-top" => {
-            if let Some(px) = parse_px(value) {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.top = 0.0;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.top = px;
             }
         }
         "margin-right" => {
-            if let Some(px) = parse_px(value) {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.right = 0.0;
+                style.margin_right_auto = true;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.right = px;
+                style.margin_right_auto = false;
             }
         }
         "margin-bottom" => {
-            if let Some(px) = parse_px(value) {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.bottom = 0.0;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.bottom = px;
             }
         }
         "margin-left" => {
-            if let Some(px) = parse_px(value) {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.left = 0.0;
+                style.margin_left_auto = true;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.left = px;
+                style.margin_left_auto = false;
             }
         }
         "padding" => {
-            if let Some(edge) = parse_edge(value) {
+            if let Some(edge) = parse_box_edge(value, style.font_size, root_font_px) {
                 style.padding = edge;
             }
         }
         "padding-top" => {
-            if let Some(px) = parse_px(value) {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.padding.top = px;
             }
         }
         "padding-right" => {
-            if let Some(px) = parse_px(value) {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.padding.right = px;
             }
         }
         "padding-bottom" => {
-            if let Some(px) = parse_px(value) {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.padding.bottom = px;
             }
         }
         "padding-left" => {
-            if let Some(px) = parse_px(value) {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.padding.left = px;
             }
         }
@@ -2014,12 +2312,16 @@ fn apply_declaration(
             }
         }
         "border-color" => {
-            if let Some(color) = Color::parse(value) {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.border_color = style.color;
+            } else if let Some(color) = Color::parse(value) {
                 style.border_color = color;
             }
         }
         "border-top" => {
-            if let Some((w, c)) = parse_border_side(value) {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.top = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
                 style.border.top = w;
                 if let Some(color) = c {
                     style.border_color = color;
@@ -2027,7 +2329,9 @@ fn apply_declaration(
             }
         }
         "border-right" => {
-            if let Some((w, c)) = parse_border_side(value) {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.right = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
                 style.border.right = w;
                 if let Some(color) = c {
                     style.border_color = color;
@@ -2035,7 +2339,9 @@ fn apply_declaration(
             }
         }
         "border-bottom" => {
-            if let Some((w, c)) = parse_border_side(value) {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.bottom = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
                 style.border.bottom = w;
                 if let Some(color) = c {
                     style.border_color = color;
@@ -2043,7 +2349,9 @@ fn apply_declaration(
             }
         }
         "border-left" => {
-            if let Some((w, c)) = parse_border_side(value) {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.left = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
                 style.border.left = w;
                 if let Some(color) = c {
                     style.border_color = color;
@@ -2051,13 +2359,18 @@ fn apply_declaration(
             }
         }
         "border-radius" => {
-            if let Some(px) = parse_px(value) {
+            if let Some(first) = split_css_tokens(value).first().copied()
+                && let Some(px) = parse_box_px(first, style.font_size, root_font_px)
+            {
                 style.border_radius = px.max(0.0);
             }
         }
         "width" => style.width = parse_size(value),
         "height" => style.height = parse_size(value),
+        "min-width" => style.min_width = parse_size(value),
         "max-width" => style.max_width = parse_size(value),
+        "min-height" => style.min_height = parse_size(value),
+        "max-height" => style.max_height = parse_size(value),
         "position" => {
             style.position = match value.to_ascii_lowercase().as_str() {
                 "static" => Position::Static,
@@ -2072,6 +2385,40 @@ fn apply_declaration(
         "right" => style.right = parse_size(value),
         "bottom" => style.bottom = parse_size(value),
         "left" => style.left = parse_size(value),
+        "inset" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [all] => {
+                    let s = parse_size(all);
+                    style.top = s;
+                    style.right = s;
+                    style.bottom = s;
+                    style.left = s;
+                }
+                [v, h] => {
+                    let vs = parse_size(v);
+                    let hs = parse_size(h);
+                    style.top = vs;
+                    style.bottom = vs;
+                    style.left = hs;
+                    style.right = hs;
+                }
+                [t, h, b] => {
+                    style.top = parse_size(t);
+                    let hs = parse_size(h);
+                    style.left = hs;
+                    style.right = hs;
+                    style.bottom = parse_size(b);
+                }
+                [t, r, b, l] => {
+                    style.top = parse_size(t);
+                    style.right = parse_size(r);
+                    style.bottom = parse_size(b);
+                    style.left = parse_size(l);
+                }
+                _ => {}
+            }
+        }
         "transform" => {
             if let Some(list) = parse_transform(value) {
                 style.transform = list;
@@ -2116,23 +2463,27 @@ fn apply_declaration(
                 style.z_index = z;
             }
         }
-        "overflow" => {
-            style.overflow = match value.to_ascii_lowercase().as_str() {
-                "hidden" | "scroll" | "auto" => Overflow::Hidden,
+        "overflow" | "overflow-x" | "overflow-y" => {
+            let first = split_css_tokens(value).first().copied().unwrap_or(value);
+            style.overflow = match first.to_ascii_lowercase().as_str() {
+                "hidden" | "scroll" | "auto" | "clip" => Overflow::Hidden,
                 "visible" => Overflow::Visible,
                 _ => return,
             };
         }
+        "flex" => {
+            apply_flex_shorthand(style, value);
+        }
         "flex-direction" => {
-            style.flex_direction = match value {
-                "column" => FlexDirection::Column,
-                "row" => FlexDirection::Row,
+            style.flex_direction = match value.to_ascii_lowercase().as_str() {
+                "column" | "column-reverse" => FlexDirection::Column,
+                "row" | "row-reverse" => FlexDirection::Row,
                 _ => return,
             };
         }
         "flex-wrap" => {
-            style.flex_wrap = match value {
-                "wrap" => FlexWrap::Wrap,
+            style.flex_wrap = match value.to_ascii_lowercase().as_str() {
+                "wrap" | "wrap-reverse" => FlexWrap::Wrap,
                 "nowrap" => FlexWrap::NoWrap,
                 _ => return,
             };
@@ -2144,36 +2495,60 @@ fn apply_declaration(
                 style.flex_grow = grow.max(0.0);
             }
         }
+        "flex-shrink" => {
+            if let Ok(shrink) = value.parse::<f32>()
+                && shrink.is_finite()
+            {
+                style.flex_shrink = shrink.max(0.0);
+            }
+        }
+        "flex-basis" => {
+            style.flex_basis = parse_size(value);
+        }
         "justify-content" => {
-            style.justify_content = match value {
-                "flex-start" | "start" => JustifyContent::Start,
+            style.justify_content = match value.to_ascii_lowercase().as_str() {
+                "flex-start" | "start" | "left" => JustifyContent::Start,
                 "center" => JustifyContent::Center,
-                "flex-end" | "end" => JustifyContent::End,
+                "flex-end" | "end" | "right" => JustifyContent::End,
                 "space-between" => JustifyContent::SpaceBetween,
+                "space-around" => JustifyContent::SpaceAround,
+                "space-evenly" => JustifyContent::SpaceEvenly,
                 _ => return,
             };
         }
         "align-items" => {
-            style.align_items = match value {
-                "flex-start" | "start" => AlignItems::Start,
+            style.align_items = match value.to_ascii_lowercase().as_str() {
+                "flex-start" | "start" | "baseline" => AlignItems::Start,
                 "center" => AlignItems::Center,
                 "flex-end" | "end" => AlignItems::End,
                 "stretch" => AlignItems::Stretch,
                 _ => return,
             };
         }
+        "align-self" => {
+            style.align_self = match value.to_ascii_lowercase().as_str() {
+                "auto" => None,
+                "flex-start" | "start" | "baseline" => Some(AlignItems::Start),
+                "center" => Some(AlignItems::Center),
+                "flex-end" | "end" => Some(AlignItems::End),
+                "stretch" => Some(AlignItems::Stretch),
+                _ => return,
+            };
+        }
         "grid-template-columns" => {
             if value.eq_ignore_ascii_case("none") {
                 style.grid_column_count = 0;
-            } else if let Some((tracks, count)) = parse_grid_template(value) {
+                style.grid_auto_repeat = GridAutoRepeat::None;
+            } else if let Some((tracks, count, auto_rep)) = parse_grid_template(value) {
                 style.grid_template_columns = tracks;
                 style.grid_column_count = count;
+                style.grid_auto_repeat = auto_rep;
             }
         }
         "grid-template-rows" => {
             if value.eq_ignore_ascii_case("none") {
                 style.grid_row_count = 0;
-            } else if let Some((tracks, count)) = parse_grid_template(value) {
+            } else if let Some((tracks, count, _)) = parse_grid_template(value) {
                 style.grid_template_rows = tracks;
                 style.grid_row_count = count;
             }
@@ -2401,11 +2776,12 @@ fn parse_track_breadth(token: &str) -> Option<TrackBreadth> {
 
 /// Track list for `grid-template-columns` or `grid-template-rows`.
 ///
-/// Tokens are tracks or `repeat(N, tracks...)`. At most 12 tracks are kept;
+/// Tokens are tracks or `repeat(N | auto-fill | auto-fit, tracks...)`. At most 12 tracks are kept;
 /// later ones are dropped. `None` when a token does not parse or the list is empty.
-fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8)> {
+fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8, GridAutoRepeat)> {
     let mut tracks = [GridTrack::Fr(1.0); 12];
     let mut count = 0usize;
+    let mut auto_repeat = GridAutoRepeat::None;
     for token in split_css_tokens(value) {
         let lower = token.to_ascii_lowercase();
         if let Some(inner) = lower
@@ -2413,11 +2789,20 @@ fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8)> {
             .and_then(|s| s.strip_suffix(')'))
         {
             let (rep_str, body) = inner.split_once(',')?;
-            let reps = rep_str.trim().parse::<usize>().ok()?.min(12);
             let sub_tokens = split_css_tokens(body.trim());
             if sub_tokens.is_empty() {
                 return None;
             }
+            let rep_trimmed = rep_str.trim();
+            let reps = if rep_trimmed == "auto-fill" {
+                auto_repeat = GridAutoRepeat::AutoFill;
+                1usize
+            } else if rep_trimmed == "auto-fit" {
+                auto_repeat = GridAutoRepeat::AutoFit;
+                1usize
+            } else {
+                rep_trimmed.parse::<usize>().ok()?.min(12)
+            };
             for _ in 0..reps {
                 for &sub in &sub_tokens {
                     if count < 12 {
@@ -2431,7 +2816,7 @@ fn parse_grid_template(value: &str) -> Option<([GridTrack; 12], u8)> {
             count += 1;
         }
     }
-    (count > 0).then_some((tracks, count as u8))
+    (count > 0).then_some((tracks, count as u8, auto_repeat))
 }
 
 fn parse_calc(expr: &str) -> Option<Size> {
@@ -2719,6 +3104,143 @@ fn parse_edge(value: &str) -> Option<Edge> {
         },
         _ => return None,
     })
+}
+
+fn parse_box_px(value: &str, em_px: f32, rem_px: f32) -> Option<f32> {
+    match parse_length(value)? {
+        Size::Px(v) if v.is_finite() => Some(v),
+        Size::Em(v) if v.is_finite() => Some(v * em_px),
+        Size::Rem(v) if v.is_finite() => Some(v * rem_px),
+        Size::Calc {
+            px,
+            percent: 0.0,
+            em,
+            rem,
+        } => {
+            let v = px + em * em_px + rem * rem_px;
+            v.is_finite().then_some(v)
+        }
+        _ => None,
+    }
+}
+
+fn parse_box_edge(value: &str, em_px: f32, rem_px: f32) -> Option<Edge> {
+    let parts: Vec<f32> = split_css_tokens(value)
+        .into_iter()
+        .map(|tok| parse_box_px(tok, em_px, rem_px))
+        .collect::<Option<_>>()?;
+    Some(match parts.as_slice() {
+        [all] => Edge::all(*all),
+        [vertical, horizontal] => Edge {
+            top: *vertical,
+            right: *horizontal,
+            bottom: *vertical,
+            left: *horizontal,
+        },
+        [top, horizontal, bottom] => Edge {
+            top: *top,
+            right: *horizontal,
+            bottom: *bottom,
+            left: *horizontal,
+        },
+        [top, right, bottom, left] => Edge {
+            top: *top,
+            right: *right,
+            bottom: *bottom,
+            left: *left,
+        },
+        _ => return None,
+    })
+}
+
+fn apply_margin_shorthand(style: &mut ComputedStyle, value: &str, root_font_px: f32) {
+    let em_px = style.font_size;
+    let parse_term = |tok: &str| -> Option<(f32, bool)> {
+        if tok.eq_ignore_ascii_case("auto") {
+            Some((0.0, true))
+        } else {
+            parse_box_px(tok, em_px, root_font_px).map(|px| (px, false))
+        }
+    };
+    let Some(parts): Option<Vec<(f32, bool)>> = split_css_tokens(value)
+        .into_iter()
+        .map(parse_term)
+        .collect()
+    else {
+        return;
+    };
+    let (t, (r, r_auto), b, (l, l_auto)) = match parts.as_slice() {
+        &[(all, auto)] => (all, (all, auto), all, (all, auto)),
+        &[(v, _), (h, h_auto)] => (v, (h, h_auto), v, (h, h_auto)),
+        &[(t, _), (h, h_auto), (b, _)] => (t, (h, h_auto), b, (h, h_auto)),
+        &[(t, _), r, (b, _), l] => (t, r, b, l),
+        _ => return,
+    };
+    style.margin = Edge {
+        top: t,
+        right: r,
+        bottom: b,
+        left: l,
+    };
+    style.margin_left_auto = l_auto;
+    style.margin_right_auto = r_auto;
+}
+
+fn apply_flex_shorthand(style: &mut ComputedStyle, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        style.flex_grow = 0.0;
+        style.flex_shrink = 0.0;
+        style.flex_basis = Size::Auto;
+        return;
+    }
+    if trimmed.eq_ignore_ascii_case("auto") {
+        style.flex_grow = 1.0;
+        style.flex_shrink = 1.0;
+        style.flex_basis = Size::Auto;
+        return;
+    }
+    if trimmed.eq_ignore_ascii_case("initial") {
+        style.flex_grow = 0.0;
+        style.flex_shrink = 1.0;
+        style.flex_basis = Size::Auto;
+        return;
+    }
+    let parts = split_css_tokens(trimmed);
+    let non_neg = |s: &str| s.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+    match parts.as_slice() {
+        [one] => {
+            if let Some(grow) = non_neg(one) {
+                style.flex_grow = grow;
+                style.flex_shrink = 1.0;
+                style.flex_basis = Size::Px(0.0);
+            } else {
+                style.flex_grow = 1.0;
+                style.flex_shrink = 1.0;
+                style.flex_basis = parse_size(one);
+            }
+        }
+        [a, b] => {
+            if let Some(grow) = non_neg(a) {
+                style.flex_grow = grow;
+                if let Some(shrink) = non_neg(b) {
+                    style.flex_shrink = shrink;
+                    style.flex_basis = Size::Px(0.0);
+                } else {
+                    style.flex_shrink = 1.0;
+                    style.flex_basis = parse_size(b);
+                }
+            }
+        }
+        [a, b, c] => {
+            if let (Some(grow), Some(shrink)) = (non_neg(a), non_neg(b)) {
+                style.flex_grow = grow;
+                style.flex_shrink = shrink;
+                style.flex_basis = parse_size(c);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parse a `transform` value: `none`, or up to [`MAX_TRANSFORM_FNS`]
@@ -4086,5 +4608,69 @@ mod tests {
         let parallel = compute_styles_parallel(&parallel_doc, &parallel_sheet, 800.0, 600.0);
         assert_eq!(parallel, sequential);
         assert!(!animator.is_animating());
+    }
+
+    #[test]
+    fn parses_modern_colors_box_sizing_auto_margins_and_flex_shorthands() {
+        let doc = parse_html(
+            "<center><div id=\"box\"><b>Bold</b><input id=\"hid\" type=\"hidden\"><noscript><div>Hidden</div></noscript></div></center>",
+        );
+        let sheet = parse_css(
+            "#box, input::-vendor-input-placeholder {
+                margin: 12px auto;
+                box-sizing: border-box;
+                min-width: 240px;
+                min-height: 40px;
+                max-height: 120px;
+                visibility: hidden;
+                white-space: nowrap;
+                flex: 2 0 180px;
+                justify-content: space-around;
+                align-self: center;
+                color: cornflowerblue;
+                background-color: hsl(120, 100%, 50%);
+                border-color: currentColor;
+            }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let box_id = doc.get_element_by_id("box").unwrap();
+        let hid_id = doc.get_element_by_id("hid").unwrap();
+        let st = styles.get(box_id);
+        assert_eq!(st.margin.top, 12.0);
+        assert_eq!(st.margin.bottom, 12.0);
+        assert!(st.margin_left_auto);
+        assert!(st.margin_right_auto);
+        assert_eq!(st.box_sizing, BoxSizing::BorderBox);
+        assert_eq!(st.min_width, Size::Px(240.0));
+        assert_eq!(st.min_height, Size::Px(40.0));
+        assert_eq!(st.max_height, Size::Px(120.0));
+        assert_eq!(st.visibility, Visibility::Hidden);
+        assert_eq!(st.text_align, TextAlign::Center);
+        assert_eq!(st.white_space, WhiteSpace::Nowrap);
+        assert_eq!(st.flex_grow, 2.0);
+        assert_eq!(st.flex_shrink, 0.0);
+        assert_eq!(st.flex_basis, Size::Px(180.0));
+        assert_eq!(st.justify_content, JustifyContent::SpaceAround);
+        assert_eq!(st.align_self, Some(AlignItems::Center));
+        assert_eq!(
+            st.color,
+            Color {
+                r: 100,
+                g: 149,
+                b: 237,
+                a: 255
+            }
+        );
+        assert_eq!(
+            st.background,
+            Some(Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            })
+        );
+        assert_eq!(st.border_color, st.color);
+        assert_eq!(styles.get(hid_id).display, Display::None);
     }
 }

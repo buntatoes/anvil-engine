@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! WebAssembly 1.0 (`\0asm` version `1`) binary decoder, validator, linear memory,
 //! and stack virtual machine for `anvil-script`.

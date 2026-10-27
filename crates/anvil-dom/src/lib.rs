@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Document tree. Nodes live in one list and point at each other by id.
 //!
@@ -236,6 +236,14 @@ impl Node {
     }
 }
 
+/// Pixel backing store for an HTML5 `<canvas>` 2D rendering surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasSurface {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 /// A document and every node it owns.
 ///
 /// Slots are append-only. [`Self::remove_node`], [`Self::set_text_content`],
@@ -248,6 +256,10 @@ pub struct Document {
     html: NodeId,
     head: NodeId,
     body: NodeId,
+    shadow_roots: std::collections::HashMap<NodeId, (NodeId, bool)>,
+    shadow_hosts: std::collections::HashMap<NodeId, NodeId>,
+    custom_elements: Vec<String>,
+    canvas_surfaces: std::collections::HashMap<NodeId, CanvasSurface>,
 }
 
 impl Default for Document {
@@ -291,6 +303,10 @@ impl Document {
             html: NodeId(0),
             head: NodeId(0),
             body: NodeId(0),
+            shadow_roots: std::collections::HashMap::new(),
+            shadow_hosts: std::collections::HashMap::new(),
+            custom_elements: Vec::new(),
+            canvas_surfaces: std::collections::HashMap::new(),
         };
         let root = doc.alloc(NodeData::Document);
         let html = doc.alloc(NodeData::element("html"));
@@ -305,6 +321,285 @@ impl Document {
         doc
     }
 
+    /// Attach a Shadow DOM root to `host` (`open` = true for `mode: "open"`).
+    /// Returns the `NodeId` of the shadow root container node.
+    pub fn attach_shadow(&mut self, host: NodeId, open: bool) -> NodeId {
+        if let Some(&(sr, _)) = self.shadow_roots.get(&host) {
+            return sr;
+        }
+        let sr = self.create_element("shadow-root", Vec::new());
+        let _ = self.append(host, sr);
+        self.shadow_roots.insert(host, (sr, open));
+        self.shadow_hosts.insert(sr, host);
+        sr
+    }
+
+    /// Open shadow root attached to `host`, or `None` if none or closed.
+    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        self.shadow_roots
+            .get(&host)
+            .and_then(|&(sr, open)| if open { Some(sr) } else { None })
+    }
+
+    /// Shadow root attached to `host` regardless of `open`/`closed` mode.
+    pub fn shadow_root_any(&self, host: NodeId) -> Option<NodeId> {
+        self.shadow_roots.get(&host).map(|&(sr, _)| sr)
+    }
+
+    /// Shadow host element for a `shadow-root` node `sr`.
+    pub fn shadow_host(&self, sr: NodeId) -> Option<NodeId> {
+        self.shadow_hosts.get(&sr).copied()
+    }
+
+    /// True when `node` has had `attach_shadow` called on it (or is a `shadow-root` container).
+    pub fn is_shadow_host(&self, node: NodeId) -> bool {
+        self.shadow_roots.contains_key(&node) || self.shadow_hosts.contains_key(&node)
+    }
+
+    /// Enclosing shadow host for `node` (if `node` is inside a shadow tree or is a shadow host).
+    pub fn enclosing_shadow_host(&self, node: NodeId) -> Option<NodeId> {
+        if self.shadow_roots.contains_key(&node) {
+            return Some(node);
+        }
+        let mut cursor = Some(node);
+        while let Some(curr) = cursor {
+            if let Some(&host) = self.shadow_hosts.get(&curr) {
+                return Some(host);
+            }
+            if self.shadow_roots.contains_key(&curr) {
+                return Some(curr);
+            }
+            cursor = self.nodes.get(curr.index()).and_then(|n| n.parent);
+        }
+        None
+    }
+
+    /// Register a custom element tag name (`customElements.define(name, ...)`).
+    pub fn define_custom_element(&mut self, name: &str) {
+        let lower = name.trim().to_ascii_lowercase();
+        if lower.contains('-') && !self.custom_elements.iter().any(|n| n == &lower) {
+            self.custom_elements.push(lower);
+        }
+    }
+
+    /// True when `name` has been registered via [`Self::define_custom_element`].
+    pub fn is_custom_element_defined(&self, name: &str) -> bool {
+        let lower = name.trim().to_ascii_lowercase();
+        self.custom_elements.iter().any(|n| n == &lower)
+    }
+
+    /// Intrinsic pixel dimensions `(width, height)` of a `<canvas>` element
+    /// (defaults to `300x150` per HTML5 specification, clamped to `1..=2048`).
+    pub fn canvas_dimensions(&self, id: NodeId) -> (u32, u32) {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return (300, 150);
+        };
+        let w = node
+            .data()
+            .attr("width")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(300)
+            .clamp(1, 2048);
+        let h = node
+            .data()
+            .attr("height")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(150)
+            .clamp(1, 2048);
+        (w, h)
+    }
+
+    /// Ensure and return a mutable 2D RGBA backing store for `<canvas>` element `id`.
+    pub fn ensure_canvas_surface(&mut self, id: NodeId) -> &mut CanvasSurface {
+        let (w, h) = self.canvas_dimensions(id);
+        let len = (w as usize) * (h as usize) * 4;
+        let entry = self
+            .canvas_surfaces
+            .entry(id)
+            .or_insert_with(|| CanvasSurface {
+                width: w,
+                height: h,
+                rgba: vec![0u8; len],
+            });
+        if entry.width != w || entry.height != h || entry.rgba.len() != len {
+            entry.width = w;
+            entry.height = h;
+            entry.rgba = vec![0u8; len];
+        }
+        entry
+    }
+
+    /// Borrow the 2D RGBA backing store for `<canvas>` element `id`, if initialized.
+    pub fn canvas_surface(&self, id: NodeId) -> Option<&CanvasSurface> {
+        self.canvas_surfaces.get(&id)
+    }
+
+    /// Replace the 2D RGBA backing store for `<canvas>` element `id`.
+    pub fn set_canvas_surface(&mut self, id: NodeId, width: u32, height: u32, rgba: Vec<u8>) {
+        let w = width.clamp(1, 2048);
+        let h = height.clamp(1, 2048);
+        let expected = (w as usize) * (h as usize) * 4;
+        let mut buf = rgba;
+        buf.resize(expected, 0);
+        self.canvas_surfaces.insert(
+            id,
+            CanvasSurface {
+                width: w,
+                height: h,
+                rgba: buf,
+            },
+        );
+    }
+
+    /// Fill a rectangle on `<canvas>` element `id`'s 2D surface (`fillRect`).
+    pub fn canvas_fill_rect(&mut self, id: NodeId, x: i32, y: i32, w: u32, h: u32, rgba: [u8; 4]) {
+        let surf = self.ensure_canvas_surface(id);
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        let x0 = x.clamp(0, cw);
+        let y0 = y.clamp(0, ch);
+        let x1 = (x.saturating_add(w as i32)).clamp(0, cw);
+        let y1 = (y.saturating_add(h as i32)).clamp(0, ch);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                if off + 4 <= surf.rgba.len() {
+                    surf.rgba[off..off + 4].copy_from_slice(&rgba);
+                }
+            }
+        }
+    }
+
+    /// Clear a rectangle to transparent black on `<canvas>` element `id`'s 2D surface (`clearRect`).
+    pub fn canvas_clear_rect(&mut self, id: NodeId, x: i32, y: i32, w: u32, h: u32) {
+        self.canvas_fill_rect(id, x, y, w, h, [0, 0, 0, 0]);
+    }
+
+    /// Stroke a rectangle outline on `<canvas>` element `id`'s 2D surface (`strokeRect`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn canvas_stroke_rect(
+        &mut self,
+        id: NodeId,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        line_width: u32,
+        rgba: [u8; 4],
+    ) {
+        let lw = line_width.max(1);
+        self.canvas_fill_rect(id, x, y, w, lw, rgba);
+        self.canvas_fill_rect(
+            id,
+            x,
+            y.saturating_add(h as i32).saturating_sub(lw as i32),
+            w,
+            lw,
+            rgba,
+        );
+        self.canvas_fill_rect(id, x, y, lw, h, rgba);
+        self.canvas_fill_rect(
+            id,
+            x.saturating_add(w as i32).saturating_sub(lw as i32),
+            y,
+            lw,
+            h,
+            rgba,
+        );
+    }
+
+    /// Blit raw `ImageData` RGBA bytes into `<canvas>` element `id`'s 2D surface (`putImageData`).
+    pub fn canvas_put_image_data(
+        &mut self,
+        id: NodeId,
+        dx: i32,
+        dy: i32,
+        src_w: u32,
+        src_h: u32,
+        src_rgba: &[u8],
+    ) {
+        let surf = self.ensure_canvas_surface(id);
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        for sy in 0..(src_h as i32) {
+            let py = dy + sy;
+            if py < 0 || py >= ch {
+                continue;
+            }
+            for sx in 0..(src_w as i32) {
+                let px = dx + sx;
+                if px < 0 || px >= cw {
+                    continue;
+                }
+                let src_off = ((sy as usize) * (src_w as usize) + (sx as usize)) * 4;
+                let dst_off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                if src_off + 4 <= src_rgba.len() && dst_off + 4 <= surf.rgba.len() {
+                    surf.rgba[dst_off..dst_off + 4]
+                        .copy_from_slice(&src_rgba[src_off..src_off + 4]);
+                }
+            }
+        }
+    }
+
+    /// Draw a Bresenham line segment on `<canvas>` element `id`'s 2D surface (`lineTo` / `stroke`).
+    pub fn canvas_draw_line(
+        &mut self,
+        id: NodeId,
+        mut x0: i32,
+        mut y0: i32,
+        x1: i32,
+        y1: i32,
+        rgba: [u8; 4],
+    ) {
+        let surf = self.ensure_canvas_surface(id);
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        for _ in 0..4096 {
+            if x0 >= 0 && x0 < cw && y0 >= 0 && y0 < ch {
+                let off = ((y0 as usize) * (surf.width as usize) + (x0 as usize)) * 4;
+                if off + 4 <= surf.rgba.len() {
+                    surf.rgba[off..off + 4].copy_from_slice(&rgba);
+                }
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    /// Rasterize a compact 5x7 bitmap glyph string onto `<canvas>` element `id`'s 2D surface (`fillText`).
+    pub fn canvas_draw_text_bitmap(
+        &mut self,
+        id: NodeId,
+        text: &str,
+        x: i32,
+        y: i32,
+        rgba: [u8; 4],
+    ) {
+        let mut cx = x;
+        let top_y = y.saturating_sub(7);
+        for ch in text.chars().take(128) {
+            if !ch.is_whitespace() {
+                self.canvas_fill_rect(id, cx, top_y, 5, 7, rgba);
+            }
+            cx = cx.saturating_add(6);
+        }
+    }
+
     /// The document node. Always slot 0. Not the `html` element.
     pub fn root(&self) -> NodeId {
         NodeId(0)
@@ -315,13 +610,28 @@ impl Document {
         self.html
     }
 
+    /// Alias for [`Self::html`] (`document.documentElement`).
+    pub fn document_element(&self) -> NodeId {
+        self.html
+    }
+
     /// The `head` element created by [`Self::new`].
     pub fn head(&self) -> NodeId {
         self.head
     }
 
+    /// Alias for [`Self::head`] (`document.head`).
+    pub fn head_element(&self) -> NodeId {
+        self.head
+    }
+
     /// The `body` element created by [`Self::new`].
     pub fn body(&self) -> NodeId {
+        self.body
+    }
+
+    /// Alias for [`Self::body`] (`document.body`).
+    pub fn body_element(&self) -> NodeId {
         self.body
     }
 
@@ -978,6 +1288,200 @@ impl Document {
         }
     }
 
+    /// First direct child node (element or text) of `id`.
+    pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes.get(id.index())?.children.first().copied()
+    }
+
+    /// Last direct child node (element or text) of `id`.
+    pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes.get(id.index())?.children.last().copied()
+    }
+
+    /// Next sibling node (element or text) of `id`.
+    pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes.get(id.index())?.parent?;
+        let siblings = &self.nodes.get(parent.index())?.children;
+        let pos = siblings.iter().position(|&cid| cid == id)?;
+        siblings.get(pos + 1).copied()
+    }
+
+    /// Previous sibling node (element or text) of `id`.
+    pub fn previous_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.nodes.get(id.index())?.parent?;
+        let siblings = &self.nodes.get(parent.index())?.children;
+        let pos = siblings.iter().position(|&cid| cid == id)?;
+        pos.checked_sub(1).and_then(|i| siblings.get(i).copied())
+    }
+
+    /// All descendant elements under `scope` matching `tag_name` (case-insensitive, or `*` for all).
+    pub fn get_elements_by_tag_name(&self, scope: NodeId, tag_name: &str) -> Vec<NodeId> {
+        let tag_lower = tag_name.trim().to_ascii_lowercase();
+        if tag_lower.is_empty() || self.nodes.get(scope.index()).is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &child in self.children(scope) {
+            self.collect_by_tag_name(child, &tag_lower, &mut out);
+        }
+        out
+    }
+
+    fn collect_by_tag_name(&self, id: NodeId, tag_lower: &str, out: &mut Vec<NodeId>) {
+        if let Some(t) = self.get(id).data().tag()
+            && (tag_lower == "*" || t == tag_lower)
+        {
+            out.push(id);
+        }
+        for &child in self.children(id) {
+            self.collect_by_tag_name(child, tag_lower, out);
+        }
+    }
+
+    /// All descendant elements under `scope` having every whitespace-separated class in `class_names`.
+    pub fn get_elements_by_class_name(&self, scope: NodeId, class_names: &str) -> Vec<NodeId> {
+        let tokens: Vec<&str> = class_names.split_whitespace().collect();
+        if tokens.is_empty() || self.nodes.get(scope.index()).is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &child in self.children(scope) {
+            self.collect_by_class_tokens(child, &tokens, &mut out);
+        }
+        out
+    }
+
+    fn collect_by_class_tokens(&self, id: NodeId, tokens: &[&str], out: &mut Vec<NodeId>) {
+        let data = self.get(id).data();
+        if data.tag().is_some() && tokens.iter().all(|c| data.has_class(c)) {
+            out.push(id);
+        }
+        for &child in self.children(id) {
+            self.collect_by_class_tokens(child, tokens, out);
+        }
+    }
+
+    /// All elements in the document whose `name` attribute equals `name`.
+    pub fn get_elements_by_name(&self, name: &str) -> Vec<NodeId> {
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.collect_by_attr_name(self.root(), name, &mut out);
+        out
+    }
+
+    fn collect_by_attr_name(&self, id: NodeId, target_name: &str, out: &mut Vec<NodeId>) {
+        let data = self.get(id).data();
+        if data.tag().is_some() && data.attr("name") == Some(target_name) {
+            out.push(id);
+        }
+        for &child in self.children(id) {
+            self.collect_by_attr_name(child, target_name, out);
+        }
+    }
+
+    /// Insert `new_el` relative to `target_id` using `"beforebegin"`, `"afterbegin"`, `"beforeend"`, or `"afterend"`.
+    pub fn insert_adjacent_element(
+        &mut self,
+        target_id: NodeId,
+        position: &str,
+        new_el: NodeId,
+    ) -> Option<NodeId> {
+        match position.trim().to_ascii_lowercase().as_str() {
+            "beforebegin" => {
+                let parent = self.nodes.get(target_id.index())?.parent?;
+                self.insert_before(parent, new_el, Some(target_id)).ok()
+            }
+            "afterbegin" => {
+                let first = self.first_child(target_id);
+                self.insert_before(target_id, new_el, first).ok()
+            }
+            "beforeend" => {
+                self.append(target_id, new_el).ok()?;
+                Some(new_el)
+            }
+            "afterend" => {
+                let parent = self.nodes.get(target_id.index())?.parent?;
+                let next = self.next_sibling(target_id);
+                self.insert_before(parent, new_el, next).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Insert a text node relative to `target_id` using `"beforebegin"`, `"afterbegin"`, `"beforeend"`, or `"afterend"`.
+    pub fn insert_adjacent_text(&mut self, target_id: NodeId, position: &str, text: &str) {
+        if self.nodes.len() >= MAX_DOM_NODES || self.nodes.get(target_id.index()).is_none() {
+            return;
+        }
+        let tid = self.create_text(text);
+        let _ = self.insert_adjacent_element(target_id, position, tid);
+    }
+
+    /// Parse `html_fragment` and insert its nodes relative to `target_id`
+    /// (`"beforebegin"`, `"afterbegin"`, `"beforeend"`, or `"afterend"`).
+    pub fn insert_adjacent_html(&mut self, target_id: NodeId, position: &str, html_fragment: &str) {
+        if html_fragment.trim().is_empty() || self.nodes.get(target_id.index()).is_none() {
+            return;
+        }
+        let parsed = parse_html(html_fragment);
+        let body_children: Vec<NodeId> = parsed.children(parsed.body()).to_vec();
+        let pos = position.trim().to_ascii_lowercase();
+        match pos.as_str() {
+            "beforeend" => {
+                for src_child in body_children {
+                    self.clone_subtree_into(&parsed, src_child, target_id);
+                }
+            }
+            "afterbegin" => {
+                let anchor = self.first_child(target_id);
+                for src_child in body_children {
+                    if let Some(cloned) = self.clone_subtree_detached(&parsed, src_child) {
+                        let _ = self.insert_before(target_id, cloned, anchor);
+                    }
+                }
+            }
+            "beforebegin" => {
+                let Some(parent) = self.nodes.get(target_id.index()).and_then(|n| n.parent) else {
+                    return;
+                };
+                for src_child in body_children {
+                    if let Some(cloned) = self.clone_subtree_detached(&parsed, src_child) {
+                        let _ = self.insert_before(parent, cloned, Some(target_id));
+                    }
+                }
+            }
+            "afterend" => {
+                let Some(parent) = self.nodes.get(target_id.index()).and_then(|n| n.parent) else {
+                    return;
+                };
+                let anchor = self.next_sibling(target_id);
+                for src_child in body_children {
+                    if let Some(cloned) = self.clone_subtree_detached(&parsed, src_child) {
+                        let _ = self.insert_before(parent, cloned, anchor);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn clone_subtree_detached(&mut self, src_doc: &Document, src_id: NodeId) -> Option<NodeId> {
+        if self.nodes.len() >= MAX_DOM_NODES {
+            return None;
+        }
+        let new_node = match src_doc.get(src_id).data() {
+            NodeData::Text(t) => self.create_text(t),
+            NodeData::Element { tag, attrs } => self.create_element(tag, attrs.clone()),
+            NodeData::Document => return None,
+        };
+        for child in src_doc.children(src_id) {
+            self.clone_subtree_into(src_doc, *child, new_node);
+        }
+        Some(new_node)
+    }
+
     /// Direct element children of `id` in tree order.
     pub fn element_children(&self, id: NodeId) -> Vec<NodeId> {
         let Some(node) = self.nodes.get(id.index()) else {
@@ -1085,13 +1589,173 @@ impl Document {
             return false;
         };
         let _ = last_comb;
-        if !matches_simple_selector(self.get(id).data(), last_compound) {
+        if !self.node_matches_compound_selector(id, last_compound) {
             return false;
         }
         if steps.len() == 1 {
             return true;
         }
         self.match_ancestor_steps(id, &steps[..steps.len() - 1], steps[steps.len() - 1].0)
+    }
+
+    fn node_matches_compound_selector(&self, id: NodeId, compound: &str) -> bool {
+        let mut base = String::new();
+        let mut pseudos: Vec<(String, Option<String>)> = Vec::new();
+        let bytes = compound.as_bytes();
+        let mut i = 0usize;
+        let mut bracket_depth = 0i32;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => {
+                    bracket_depth += 1;
+                    base.push('[');
+                    i += 1;
+                }
+                b']' => {
+                    bracket_depth = (bracket_depth - 1).max(0);
+                    base.push(']');
+                    i += 1;
+                }
+                b':' if bracket_depth == 0 => {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b':' {
+                        return false;
+                    }
+                    let start_name = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
+                    {
+                        i += 1;
+                    }
+                    let name = compound[start_name..i].to_ascii_lowercase();
+                    if i < bytes.len() && bytes[i] == b'(' {
+                        i += 1;
+                        let start_arg = i;
+                        let mut pdepth = 1i32;
+                        while i < bytes.len() && pdepth > 0 {
+                            if bytes[i] == b'(' {
+                                pdepth += 1;
+                            } else if bytes[i] == b')' {
+                                pdepth -= 1;
+                            }
+                            i += 1;
+                        }
+                        if pdepth != 0 {
+                            return false;
+                        }
+                        let arg = compound[start_arg..i - 1].trim().to_string();
+                        pseudos.push((name, Some(arg)));
+                    } else {
+                        pseudos.push((name, None));
+                    }
+                }
+                _ => {
+                    let ch = compound[i..].chars().next().unwrap_or(' ');
+                    base.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        let base_trimmed = base.trim();
+        if !base_trimmed.is_empty() && !matches_simple_selector(self.get(id).data(), base_trimmed) {
+            return false;
+        }
+        if base_trimmed.is_empty() && self.get(id).data().tag().is_none() {
+            return false;
+        }
+        for (name, arg) in pseudos {
+            match (name.as_str(), arg.as_deref()) {
+                ("is" | "where" | "matches", Some(inner)) => {
+                    if !self.node_matches_selector(id, inner) {
+                        return false;
+                    }
+                }
+                ("not", Some(inner)) => {
+                    if self.node_matches_selector(id, inner) {
+                        return false;
+                    }
+                }
+                ("has", Some(inner)) => {
+                    let mut matched_desc = false;
+                    for branch in split_selector_commas(inner) {
+                        let rel = branch.trim();
+                        if let Some(child_sel) = rel.strip_prefix('>') {
+                            let child_sel = child_sel.trim();
+                            for &cid in self.children(id) {
+                                if self.node_matches_selector(cid, child_sel) {
+                                    matched_desc = true;
+                                    break;
+                                }
+                            }
+                        } else if self.query_selector_within(id, rel).is_some() {
+                            matched_desc = true;
+                        }
+                        if matched_desc {
+                            break;
+                        }
+                    }
+                    if !matched_desc {
+                        return false;
+                    }
+                }
+                ("host", None) => {
+                    if !self.is_shadow_host(id) {
+                        return false;
+                    }
+                }
+                ("host", Some(inner)) => {
+                    let host_target = self.shadow_host(id).unwrap_or(id);
+                    if !self.is_shadow_host(id) || !self.node_matches_selector(host_target, inner) {
+                        return false;
+                    }
+                }
+                ("host-context", Some(inner)) => {
+                    if !self.is_shadow_host(id) {
+                        return false;
+                    }
+                    let host_target = self.shadow_host(id).unwrap_or(id);
+                    let mut cur = Some(host_target);
+                    let mut found = false;
+                    while let Some(anc) = cur {
+                        if self.node_matches_selector(anc, inner) {
+                            found = true;
+                            break;
+                        }
+                        cur = self.get(anc).parent();
+                    }
+                    if !found {
+                        return false;
+                    }
+                }
+                ("defined", None) => {
+                    let Some(tag) = self.get(id).data().tag() else {
+                        return false;
+                    };
+                    if tag.contains('-') && !self.is_custom_element_defined(tag) {
+                        return false;
+                    }
+                }
+                ("root", None) => {
+                    if id != self.html {
+                        return false;
+                    }
+                }
+                ("empty", None) => {
+                    let has_content =
+                        self.children(id)
+                            .iter()
+                            .any(|&cid| match self.get(cid).data() {
+                                NodeData::Element { .. } => true,
+                                NodeData::Text(t) => !t.is_empty(),
+                                NodeData::Document => false,
+                            });
+                    if has_content {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn match_ancestor_steps(
@@ -1109,7 +1773,7 @@ impl Document {
                 let Some(parent) = self.get(current_id).parent() else {
                     return false;
                 };
-                if !matches_simple_selector(self.get(parent).data(), target_compound) {
+                if !self.node_matches_compound_selector(parent, target_compound) {
                     return false;
                 }
                 if rest.is_empty() {
@@ -1121,7 +1785,7 @@ impl Document {
             SelectorCombinator::Descendant => {
                 let mut cursor = self.get(current_id).parent();
                 while let Some(anc) = cursor {
-                    if matches_simple_selector(self.get(anc).data(), target_compound)
+                    if self.node_matches_compound_selector(anc, target_compound)
                         && (rest.is_empty() || self.match_ancestor_steps(anc, rest, *prev_comb))
                     {
                         return true;
@@ -1381,7 +2045,11 @@ impl Document {
     /// Collect non-empty `style` element text. A `style` element's children are
     /// not walked again, so a nested element inside `style` is not a second block.
     fn collect_style(&self, id: NodeId, out: &mut Vec<String>) {
-        if self.get(id).data().tag() == Some("style") {
+        let tag = self.get(id).data().tag();
+        if matches!(tag, Some("noscript" | "template")) {
+            return;
+        }
+        if tag == Some("style") {
             let css = self.text_content(id);
             if !css.is_empty() {
                 out.push(css);
@@ -1397,6 +2065,9 @@ impl Document {
     /// element's children are not walked again.
     fn collect_style_sheets(&self, id: NodeId, out: &mut Vec<StyleSheetSource>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         let media = || data.attr("media").map(|m| m.trim().to_string());
         match data.tag() {
             Some("style") => {
@@ -1435,6 +2106,9 @@ impl Document {
     /// `anvil-script` runs the strings this returns.
     fn collect_scripts(&self, id: NodeId, out: &mut Vec<String>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         if data.tag() == Some("script") {
             if is_javascript_type(data.attr("type")) {
                 let code = self.text_content(id);
@@ -1454,6 +2128,9 @@ impl Document {
     /// `anvil-browser` fetches these URLs and appends the CSS before `anvil-style` runs.
     fn collect_stylesheet_links(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         if data.tag() == Some("link") {
             let is_stylesheet = data.attr("rel").is_some_and(|rel| {
                 rel.split_ascii_whitespace()
@@ -1477,6 +2154,9 @@ impl Document {
     /// the integrity string is present, then passes the body to `anvil-script`.
     fn collect_external_scripts(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         if data.tag() == Some("script")
             && is_javascript_type(data.attr("type"))
             && let Some(src) = data.attr("src")
@@ -1500,6 +2180,9 @@ impl Document {
     /// supply the URL from an earlier `source`.
     fn collect_images(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         if data.tag() == Some("img") {
             let url = image_url_from(data).or_else(|| self.picture_source_url(id));
             if let Some(url) = url {
@@ -1535,6 +2218,9 @@ impl Document {
     /// passes the fetched body to `anvil-video`.
     fn collect_videos(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         if data.tag() == Some("video") {
             if let Some(src) = data.attr("src") {
                 let src = src.trim();
@@ -1566,6 +2252,9 @@ impl Document {
     /// `anvil-net` parses the joined string as a content security policy.
     fn collect_meta_csp(&self, id: NodeId, out: &mut Vec<String>) {
         let data = self.get(id).data();
+        if matches!(data.tag(), Some("noscript" | "template")) {
+            return;
+        }
         if data.tag() == Some("meta") {
             let is_csp = data
                 .attr("http-equiv")
@@ -1709,6 +2398,7 @@ fn split_selector_commas(selector: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut bracket_depth = 0i32;
+    let mut paren_depth = 0i32;
     let mut quote: Option<char> = None;
     for (idx, ch) in selector.char_indices() {
         if let Some(q) = quote {
@@ -1721,7 +2411,9 @@ fn split_selector_commas(selector: &str) -> Vec<&str> {
             '"' | '\'' => quote = Some(ch),
             '[' => bracket_depth += 1,
             ']' => bracket_depth = (bracket_depth - 1).max(0),
-            ',' if bracket_depth == 0 => {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = (paren_depth - 1).max(0),
+            ',' if bracket_depth == 0 && paren_depth == 0 => {
                 let slice = selector[start..idx].trim();
                 if !slice.is_empty() {
                     out.push(slice);
@@ -1743,6 +2435,7 @@ fn parse_combinator_chain(chain: &str) -> Vec<(SelectorCombinator, String)> {
     let mut current = String::new();
     let mut pending = SelectorCombinator::Descendant;
     let mut bracket_depth = 0i32;
+    let mut paren_depth = 0i32;
     let mut quote: Option<char> = None;
 
     for ch in chain.chars() {
@@ -1766,7 +2459,15 @@ fn parse_combinator_chain(chain: &str) -> Vec<(SelectorCombinator, String)> {
                 bracket_depth = (bracket_depth - 1).max(0);
                 current.push(ch);
             }
-            '>' if bracket_depth == 0 => {
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth = (paren_depth - 1).max(0);
+                current.push(ch);
+            }
+            '>' if bracket_depth == 0 && paren_depth == 0 => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     steps.push((pending, trimmed));
@@ -1774,7 +2475,7 @@ fn parse_combinator_chain(chain: &str) -> Vec<(SelectorCombinator, String)> {
                 }
                 pending = SelectorCombinator::Child;
             }
-            c if c.is_whitespace() && bracket_depth == 0 => {
+            c if c.is_whitespace() && bracket_depth == 0 && paren_depth == 0 => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     steps.push((pending, trimmed));
@@ -2293,5 +2994,50 @@ mod tests {
         }
         let (_, text) = parse_with_deadline("<p>a <\u{e9}</p>").unwrap();
         assert!(text.contains("a <\u{e9}"), "text was {text:?}");
+    }
+
+    #[test]
+    fn isolates_noscript_and_template_styles_and_preserves_regex_slashes_in_scripts() {
+        let mut doc = parse_html(
+            "<html>
+               <head>
+                 <style>body { color: #111111; }</style>
+                 <noscript><style>table,div,span,p{display:none}</style></noscript>
+               </head>
+               <body>
+                 <noscript><div id=\"nojs\">Please enable JavaScript</div></noscript>
+                 <template id=\"tpl\"><style>p { display: none; }</style><p id=\"in-tpl\">Hidden</p></template>
+                 <div id=\"main\" class=\"card hero\" name=\"search-box\"><p>Real Content</p></div>
+                 <script>
+                   let rx = /https?:\\/\\//;
+                   // trailing line comment
+                   let ok = rx.test('https://example.com');
+                 </script>
+               </body>
+             </html>",
+        );
+        assert_eq!(doc.embedded_css(), "body { color: #111111; }");
+        assert!(doc.get_element_by_id("nojs").is_none());
+        let scripts = doc.scripts();
+        assert_eq!(scripts.len(), 1);
+        assert!(
+            scripts[0].contains("/https?:\\/\\//") && scripts[0].contains("rx.test"),
+            "script was {:?}",
+            scripts[0]
+        );
+
+        let main = doc.get_element_by_id("main").unwrap();
+        assert_eq!(doc.document_element(), doc.html());
+        assert_eq!(doc.head_element(), doc.head());
+        assert_eq!(doc.body_element(), doc.body());
+        assert_eq!(doc.get_elements_by_tag_name(doc.body(), "div"), vec![main]);
+        assert_eq!(
+            doc.get_elements_by_class_name(doc.body(), "hero card"),
+            vec![main]
+        );
+        assert_eq!(doc.get_elements_by_name("search-box"), vec![main]);
+
+        doc.insert_adjacent_html(main, "beforeend", "<span id=\"tail\">Tail</span>");
+        assert!(doc.get_element_by_id("tail").is_some());
     }
 }

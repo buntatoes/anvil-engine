@@ -2,18 +2,18 @@
   <h1>Anvil Engine</h1>
   <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.23.2-ff6b24?style=flat-square" alt="v.23.2" />
+    <img src="https://img.shields.io/badge/release-v.23.3-ff6b24?style=flat-square" alt="v.23.3" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Audit_and_use_only-e8c37a?style=flat-square" alt="Audit and use only" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="PolyForm Noncommercial 1.0.0 | Paid Commercial (Non-Compete)" /></a>
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
   </p>
 </div>
 
-Version 0.23.2. Author: Buntato.
+Version 0.23.3 (`v.23.3`). Author: Buntato.
 
-The source is public, so anyone can read it, audit it, and use it as part of Anvil Browser. It's still proprietary, though, not open source: you can't redistribute it on its own or use it to build a different product. [Anvil Browser](https://github.com/buntatoes/anvil-browser) and the eleven companion libraries can be redistributed without it, under their own licenses. See [License](#license).
+This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is dual-licensed under the **PolyForm Noncommercial License 1.0.0** and a **Paid Commercial License with a Non-Compete Clause**. See [License](#license).
 
 There are no crates.io dependencies.
 
@@ -21,12 +21,12 @@ There are no crates.io dependencies.
 
 | Crate | What it is |
 | --- | --- |
-| `anvil-dom` | HTML tree, `<script>` comment-preserving tokenizer, and the simple selector matcher scripts use |
-| `anvil-style` | CSS parsing, selectors, cascade, media queries, animations, and a multi-core cascade (`compute_styles_parallel`) that the browser doesn't use |
-| `anvil-layout` | Block, inline, flex, grid, table, and positioned boxes |
-| `anvil-paint` | Display list and zoom |
-| `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients), bounded LRU glyph coverage cache (sizes in `RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
-| `anvil-script` | Budgeted JavaScript runtime (`anvil-js` self-hosted ES2022+ compiler and Web/DOM runtime on `AnvilVM`), WebAssembly 1.0 (`WASM`) decoder/validator/stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), and the numeric x86-64 compiler |
+| `anvil-dom` | HTML tree (`<noscript>` inert raw-text isolation, sibling/child links, `get_elements_by_tag_name` / `get_elements_by_class_name` / `get_elements_by_name`, `insert_adjacent_*`), Shadow DOM (`attach_shadow`, `shadow_root`), Custom Elements (`define_custom_element`), `<canvas>` 2D RGBA backing store (`CanvasSurface`), regex-safe `<script>` comment-preserving tokenizer, and Selectors Level 4 matcher (`:is()`, `:where()`, `:not()`, `:has()`, `:host`, `:host()`, `:host-context()`, `:defined`) |
+| `anvil-style` | CSS parsing (`anvil-css` 0.3.0), Selectors Level 4, vendor pseudo-element/class forgiveness, CSS Color Level 4 (`parse_css_rgba8`), `box-sizing: border-box`, `visibility`, `text-align`, `white-space`, `inset`, `flex` shorthand, `margin: 0 auto`, Shadow DOM custom property (`--var`) inheritance, `@supports` feature queries, `repeat(auto-fill/auto-fit, ...)` grid tracks, cascade, media queries, animations, and a multi-core cascade (`compute_styles_parallel`) |
+| `anvil-layout` | Block (with `margin: 0 auto` and `<center>` centering, `min/max-width`, `min/max-height`, `box-sizing: border-box`), inline and `inline-block` / `inline-flex` row packing with `text-align`, flex (`row` and `column` with `align-items`, `align-self`, `justify-content`, `flex-grow`, `flex-shrink`, `flex-basis`), grid (including `auto-fill` / `auto-fit`), `<canvas>` 2D surface image blitting, table, and positioned boxes |
+| `anvil-paint` | Display list (honoring `Visibility::Hidden`) and zoom |
+| `anvil-raster` | RGBA framebuffer with persistent per-thread `anvil_gpu::Compositor` (rounded rects, borders, shadows, gradients, and `GpuSceneBatch` command buffers via `build_gpu_scene_batch` / `rasterize_gpu_batch`), bounded LRU glyph coverage cache (sizes in `RasterMemoryStats`), and multi-core tile strip & dirty-tile rasterization (`RasterEngine`) |
+| `anvil-script` | Budgeted JavaScript runtime (`anvil-js` 0.4.0 self-hosted ES2022+ compiler and Web/DOM runtime on `AnvilVM` with Live DOM Host Bridge `eval_webapp_with_live_dom_bridge`, parameterized/unary IIFEs, unified `window`/`self`/`globalThis`/`document`, nested property assignment, `document.readyState`, and no-JS fallback redirect blocking), HTML5 `<canvas>` 2D context (`CanvasRenderingContext2D` + `ImageData`), W3C Media / WebCodecs / MSE APIs (`VideoEncoder`, `VideoDecoder`, `VideoFrame`, `MediaSource`), WebAssembly 1.0 (`WASM`) decoder/validator/stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), and the numeric x86-64 compiler |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
 
@@ -69,17 +69,16 @@ The crate docs list every property. These are the newer parts and their limits.
 ### Parsing and the cascade
 
 - Order: user-agent defaults, then author rules by specificity and source order, then the `style` attribute, then `!important` author rules, then `!important` in the `style` attribute.
-- A rule whose selector list holds one invalid selector is dropped whole.
 - Strings, backslash escapes, and the body of an unquoted `url(...)` are skipped when looking for `{`, `}`, and `;`, so a brace or semicolon inside them doesn't break the sheet.
 - `@media` reads `min-width`, `max-width`, and `prefers-color-scheme` (only `dark` matches). The page is a `screen`, so `all` and `screen` match and `print` doesn't. `not`, `only`, `and`, and comma lists work, and nested `@media` is combined with the outer one.
 - `Document::style_sheets` lists every `<link>` and `<style>` in document order with its `media` attribute. `parse_css_with_media` parses one sheet under that media, and `Stylesheet::append` puts sheets together in order.
 
 ### Selectors
 
-- Supported: all four combinators; attribute selectors with every operator and the `i` and `s` flags; `:is()`, `:where()`, `:not()`, and `:has()`; `:nth-child()`, `:nth-last-child()`, `:nth-of-type()`, and `:nth-last-of-type()`, with `of S` on the child ones; the structural pseudo-classes (`:root`, `:empty`, `:first-child`, and the rest); `:link` and `:any-link`; the form states (`:checked`, `:default`, `:disabled`, `:enabled`, `:required`, `:optional`, `:read-only`, `:read-write`, `:placeholder-shown`, `:indeterminate` on `progress`); `:open`, `:closed`, `:defined`, `:lang()`, and `:dir()`; and CSS escapes. Specificity follows the selector spec.
-- Valid but never match: pseudo-elements; namespace prefixes other than `*|`, since `@namespace` isn't read; and states a static page never has, such as `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within`, `:visited`, `:target`, `:valid`, `:invalid`, `:user-valid`, `:user-invalid`, `:in-range`, `:out-of-range`, `:autofill`, `:fullscreen`, `:modal`, `:popover-open`, the media playback states, `:host`, and `:state()`. The full list is on `Selector`. `:indeterminate` on radio buttons doesn't match either, and `:dir(auto)` reads as left to right.
+- Supported: all four combinators; attribute selectors with every operator and the `i` and `s` flags; `:is()`, `:where()`, `:not()`, and `:has()`; `:host`, `:host()`, and `:host-context()` (on shadow host elements); `:nth-child()`, `:nth-last-child()`, `:nth-of-type()`, and `:nth-last-of-type()`, with `of S` on the child ones; the structural pseudo-classes (`:root`, `:empty`, `:first-child`, and the rest); `:link` and `:any-link`; the form states (`:checked`, `:default`, `:disabled`, `:enabled`, `:required`, `:optional`, `:read-only`, `:read-write`, `:placeholder-shown`, `:indeterminate` on `progress`); `:open`, `:closed`, `:defined`, `:lang()`, and `:dir()`; and CSS escapes. Specificity follows the selector spec.
+- Valid but never match: standard and vendor-prefixed (`-vendor-*`, `-moz-*`, `-ms-*`) pseudo-elements and pseudo-classes; namespace prefixes other than `*|`, since `@namespace` isn't read; and states a static page never has, such as `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within`, `:visited`, `:target`, `:valid`, `:invalid`, `:user-valid`, `:user-invalid`, `:in-range`, `:out-of-range`, `:autofill`, `:fullscreen`, `:modal`, `:popover-open`, the media playback states, and `:state()`. The full list is on `Selector`. `:indeterminate` on radio buttons doesn't match either, and `:dir(auto)` reads as left to right.
 - Not valid: `&` (nesting). A selector nested more than 16 deep (`MAX_SELECTOR_NESTING`) or longer than 64 compounds (`MAX_SELECTOR_COMPOUNDS`) drops its list.
-- Scripts don't use this matcher. `querySelector` and `querySelectorAll` take one compound (`tag`, `#id`, `.class`, `tag#id`, `tag.class`), and `matches` and `closest` add `[attr]`, `[attr=value]`, descendant and child combinators, and comma lists.
+- `Document::query_selector` and `Document::query_selector_all` support combinators, attribute selectors, `:is()`, `:where()`, `:not()`, `:has()`, `:host`, `:host()`, `:host-context()`, and `:defined`.
 
 ### Gaps and sizes
 
@@ -89,8 +88,8 @@ The crate docs list every property. These are the newer parts and their limits.
 
 ### Grid
 
-- Supported: `grid-template-columns` and `grid-template-rows` with `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()`; `grid-auto-rows`; `grid-column`, `grid-row`, their `-start` / `-end` longhands, and numeric `grid-area`, with line numbers, negative lines, and `span N`; sparse row-by-row auto-placement that flows around spanning items; `align-items: center` and `end` inside grid areas.
-- Not supported: named lines, `grid-template-areas` and named `grid-area`, `grid-auto-flow`, `grid-auto-columns`, `auto-fill` / `auto-fit`, `subgrid`, and implicit tracks before line 1 (such an item starts at line 1). Lines past 100 are clamped. An `auto` column acts as `1fr`.
+- Supported: `grid-template-columns` and `grid-template-rows` with `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()` (including `repeat(auto-fill, ...)` and `repeat(auto-fit, ...)` on column tracks); `grid-auto-rows`; `grid-column`, `grid-row`, their `-start` / `-end` longhands, and numeric `grid-area`, with line numbers, negative lines, and `span N`; sparse row-by-row auto-placement that flows around spanning items; `align-items: center` and `end` inside grid areas.
+- Not supported: named lines, `grid-template-areas` and named `grid-area`, `grid-auto-flow`, `grid-auto-columns`, `subgrid`, and implicit tracks before line 1 (such an item starts at line 1). Lines past 100 are clamped. An `auto` column acts as `1fr`.
 
 ### `ch`
 
@@ -126,9 +125,11 @@ Clone this repository and the libraries below as sibling directories. You don't 
 ../anvil-compress
 ../anvil-css
 ../anvil-js
+../anvil-video
+../anvil-cipher
 ```
 
-`anvil-image` links `anvil-compress`.
+`anvil-image` links `anvil-compress`; `anvil-video` links `anvil-cipher`, `anvil-compress`, and `anvil-gpu`.
 
 Rust 1.99.1 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
 
@@ -138,20 +139,4 @@ cargo test
 
 ## License
 
-The engine is public so you can see exactly what it does. It is proprietary, not open source. In short:
-
-- You can read it, audit it, build it, and use it, unchanged, as part of Anvil Browser.
-- You can share Anvil Browser, including builds that have the engine compiled in, as long as `LICENSE` and the copyright notice go with it.
-- You can't redistribute the engine on its own, change it, sell it, or use it in a different product without my permission.
-- Anvil Browser and the eleven libraries can also be redistributed without the engine, under their own licenses.
-
-The full terms are in [LICENSE](./LICENSE). If this summary and `LICENSE` ever disagree, `LICENSE` wins.
-
-| Repository | License |
-| --- | --- |
-| This one (`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, `anvil-script`) | Audit and use only. Not redistributable on its own |
-| `anvil-browser` | Apache-2.0. Not this file |
-| `anvil-css`, `anvil-image`, `anvil-js`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, `anvil-compress` | MPL-2.0, in those repositories. The engine links these |
-| `anvil-cipher`, `anvil-hpack`, `anvil-pqc`, `anvil-video` | MPL-2.0, in those repositories. The engine does not link these |
-
-Revisions of these crates that were already published in `anvil-browser` under the Apache License 2.0 stay under that license for those revisions only.
+Dual-licensed under the **PolyForm Noncommercial License 1.0.0** (free for personal, educational, academic, and noncommercial auditing/research use) and a **Paid Commercial License with a Non-Compete Clause** (required for any commercial, for-profit, or business use). Competing browser, rendering engine, JS VM, or codec use is prohibited without a signed commercial agreement from Buntato. See [LICENSE](./LICENSE).

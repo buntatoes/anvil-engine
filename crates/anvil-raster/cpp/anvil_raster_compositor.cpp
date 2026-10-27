@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Proprietary
+// SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 // C++20 SDF Box-Shadow, Linear-Gradient, Clipped RGBA Blitter, Glyph Coverage, and NV12 Kernels.
 // Author: Buntato
