@@ -93,7 +93,7 @@ The crate docs list every property. These are the newer parts and their limits.
 
 ### `ch`
 
-- Supported on `width`, `height`, `max-width`, and the offsets. One `ch` is the advance of `0` in the system font when anvil-ttf loads one (Linux and Windows); otherwise it is half the font size, the advance layout uses for every character.
+- Supported on `width`, `height`, `max-width`, and the offsets. One `ch` is the advance of `0` in the system font when `anvil-ttf` loads one (Linux and Windows); otherwise it is half the font size, the advance layout uses for every character.
 - Also supported on `row-gap`, `column-gap`, and `gap`.
 - Not supported: `ch` in margin, padding, border, `font-size`, or `calc()`.
 
