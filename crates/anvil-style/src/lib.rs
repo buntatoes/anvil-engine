@@ -2009,6 +2009,62 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
         style.margin.top = 4.0;
         style.margin.bottom = 4.0;
     }
+    if tag == "svg" {
+        style.display = Display::Block;
+        style.inline_level = true;
+    }
+    if matches!(tag, "code" | "kbd" | "samp") {
+        style.background = Some(Color {
+            r: 236,
+            g: 239,
+            b: 244,
+            a: 255,
+        });
+        style.padding = Edge {
+            top: 1.0,
+            right: 4.0,
+            bottom: 1.0,
+            left: 4.0,
+        };
+        style.border_radius = 3.0;
+    }
+    if tag == "mark" {
+        style.background = Some(Color {
+            r: 255,
+            g: 243,
+            b: 163,
+            a: 255,
+        });
+        style.color = Color {
+            r: 24,
+            g: 28,
+            b: 36,
+            a: 255,
+        };
+        style.padding = Edge {
+            top: 1.0,
+            right: 3.0,
+            bottom: 1.0,
+            left: 3.0,
+        };
+        style.border_radius = 2.0;
+    }
+    if tag == "blockquote" {
+        style.margin = Edge {
+            top: 8.0,
+            right: 16.0,
+            bottom: 8.0,
+            left: 16.0,
+        };
+        style.padding.left = 12.0;
+        style.border.left = 3.0;
+        style.border_color = Color {
+            r: 160,
+            g: 168,
+            b: 184,
+            a: 255,
+        };
+    }
     style.font_size = match tag {
         "h1" => 32.0,
         "h2" => 24.0,

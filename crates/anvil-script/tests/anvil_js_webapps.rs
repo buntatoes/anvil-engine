@@ -270,3 +270,186 @@ fn script_runtime_dom_integration_supports_custom_elements_mse_and_location() {
         "/watch|?v=xyz987|#t=30|true|https://video.example.com:443/watch?v=next456"
     );
 }
+
+#[test]
+fn automatic_anvil_vm_dom_routing_seeds_hierarchy_and_applies_mutations() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+
+    let html = r#"<!DOCTYPE html>
+<html>
+<head><title>Initial</title></head>
+<body>
+  <section class="panel" data-section="main">
+    <span class="badge">Old Badge</span>
+    <input id="search-box" value="initial" />
+  </section>
+  <div id="target"></div>
+</body>
+</html>"#;
+    let mut doc = parse_html(html);
+    let mut rt = ScriptRuntime::new();
+    rt.set_page_origin("https://portal.example.com/home");
+    rt.local_storage_set("theme", "slate");
+
+    let script = r#"
+        class PortalUpdater {
+            #prefix = "Portal:";
+            static version = 1;
+            static {
+                PortalUpdater.version = PortalUpdater.version + 4;
+            }
+            apply() {
+                const panel = document.querySelector(".panel");
+                const badge = panel.querySelector(".badge");
+                const sec = panel.getAttribute("data-section");
+                const theme = localStorage.getItem("theme") ?? "light";
+                badge.textContent = this.#prefix + sec + ":" + theme + ":v" + PortalUpdater.version;
+                badge.classList.add("updated");
+                const box = document.getElementById("search-box");
+                box.setValue("anvil-query");
+                const target = document.getElementById("target");
+                target.setInnerHTML("<em>Ready</em>");
+                target.insertAdjacentHTML("beforeend", "<strong>Now</strong>");
+                localStorage.setItem("last_run", "ok");
+                document.title = "Updated Portal";
+            }
+        }
+        new PortalUpdater().apply();
+    "#;
+
+    rt.eval_script(&mut doc, script);
+    assert!(rt.last_script_used_vm());
+    assert_eq!(doc.title(), "Updated Portal");
+    let badge = doc.query_selector(".badge").expect(".badge exists");
+    assert_eq!(doc.text_content(badge), "Portal:main:slate:v5");
+    assert!(doc.get(badge).data().has_class("updated"));
+    let box_id = doc.get_element_by_id("search-box").expect("#search-box");
+    assert_eq!(doc.input_value(box_id), "anvil-query");
+    let target_id = doc.get_element_by_id("target").expect("#target");
+    assert_eq!(doc.text_content(target_id), "ReadyNow");
+    assert_eq!(rt.local_storage_get("last_run"), Some("ok"));
+}
+
+#[test]
+fn interactive_anvil_vm_events_preserve_state_and_honor_prevent_default() {
+    if !is_cpp_jit_kernel_active() {
+        return;
+    }
+
+    let html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <form id="search-form" action="/search">
+    <input id="q-input" name="q" value="" />
+    <button id="inc-btn" type="button">+1</button>
+    <button id="sub-btn" type="submit">Go</button>
+  </form>
+  <div id="status">0</div>
+</body>
+</html>"#;
+    let mut doc = parse_html(html);
+    let mut rt = ScriptRuntime::new();
+    rt.set_page_origin("https://app.example.com/");
+
+    let script = r#"
+        class InteractiveApp {
+            #clicks = 0;
+            #query = "";
+            constructor() {
+                const btn = document.getElementById("inc-btn");
+                const inp = document.getElementById("q-input");
+                const form = document.getElementById("search-form");
+                const status = document.getElementById("status");
+                btn.addEventListener("click", () => {
+                    this.#clicks = this.#clicks + 1;
+                    status.setTextContent("clicks=" + this.#clicks + ",q=" + this.#query);
+                });
+                inp.addEventListener("input", (ev) => {
+                    this.#query = inp.value;
+                    status.setTextContent("clicks=" + this.#clicks + ",q=" + this.#query);
+                });
+                form.addEventListener("submit", (ev) => {
+                    ev.preventDefault();
+                    status.setTextContent("submitted:" + this.#query + ":" + this.#clicks);
+                });
+            }
+        }
+        new InteractiveApp();
+    "#;
+
+    rt.eval_script(&mut doc, script);
+    assert!(rt.last_script_used_vm());
+
+    let btn_id = doc.get_element_by_id("inc-btn").unwrap();
+    let inp_id = doc.get_element_by_id("q-input").unwrap();
+    let form_id = doc.get_element_by_id("search-form").unwrap();
+    let status_id = doc.get_element_by_id("status").unwrap();
+
+    assert!(rt.dispatch_click(&mut doc, btn_id));
+    assert_eq!(doc.text_content(status_id), "clicks=1,q=");
+
+    assert!(rt.dispatch_click(&mut doc, btn_id));
+    assert_eq!(doc.text_content(status_id), "clicks=2,q=");
+
+    assert!(rt.dispatch_input(&mut doc, inp_id, "rust"));
+    assert_eq!(doc.text_content(status_id), "clicks=2,q=rust");
+
+    assert!(rt.dispatch_submit(&mut doc, form_id));
+    assert!(rt.last_event_default_prevented());
+    assert_eq!(doc.text_content(status_id), "submitted:rust:2");
+}
+
+#[test]
+fn mutation_intersection_and_resize_observers_deliver_microtask_callbacks() {
+    let html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <div id="watched"><span id="child">Init</span></div>
+  <div id="log"></div>
+</body>
+</html>"#;
+    let mut doc = parse_html(html);
+    let mut rt = ScriptRuntime::new();
+
+    let script = r#"
+        let events = [];
+        let watched = document.getElementById("watched");
+        let child = document.getElementById("child");
+        let log = document.getElementById("log");
+
+        let mo = new MutationObserver((records) => {
+            events.push("mo:" + records.length + ":" + records[0].type + ":" + records[0].target.id);
+            log.textContent = events.join("|");
+        });
+        mo.observe(watched, { childList: true, attributes: true, subtree: true });
+
+        let io = new IntersectionObserver((entries) => {
+            events.push("io:" + entries[0].isIntersecting + ":" + entries[0].target.id);
+            log.textContent = events.join("|");
+        });
+        io.observe(watched);
+
+        let ro = new ResizeObserver((entries) => {
+            events.push("ro:" + entries[0].contentRect.width + ":" + entries[0].target.id);
+            log.textContent = events.join("|");
+        });
+        ro.observe(watched);
+
+        watched.setAttribute("data-state", "active");
+        child.textContent = "Changed";
+    "#;
+
+    rt.eval_script(&mut doc, script);
+    let _ = rt.run_timers(&mut doc);
+
+    let log_id = doc.get_element_by_id("log").unwrap();
+    let text = doc.text_content(log_id);
+    assert!(text.contains("io:true:watched"), "got: {text}");
+    assert!(text.contains("ro:100:watched"), "got: {text}");
+    assert!(
+        text.contains("mo:2:attributes:watched"),
+        "expected MutationObserver callback in: {text}"
+    );
+}

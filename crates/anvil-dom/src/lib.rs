@@ -1106,6 +1106,38 @@ impl Document {
         self.find_by_id(self.root(), target_id)
     }
 
+    /// Resolve a URL fragment (`#section` or `section`) to a target element in tree order.
+    ///
+    /// Follows HTML fragment navigation rules:
+    /// 1. Strips any leading `#` and percent-decodes `%XX` sequences.
+    /// 2. Searches for the first element with matching `id`.
+    /// 3. Falls back to the first `<a name="...">` element with matching `name`.
+    /// 4. When the fragment is `"top"` (case-insensitive) and no element matched, returns `html`.
+    pub fn find_fragment_target(&self, fragment: &str) -> Option<NodeId> {
+        let raw = fragment.trim().strip_prefix('#').unwrap_or(fragment.trim());
+        if raw.is_empty() {
+            return None;
+        }
+        let decoded = percent_decode_fragment(raw);
+        if let Some(id) = self.get_element_by_id(&decoded) {
+            return Some(id);
+        }
+        if decoded != raw
+            && let Some(id) = self.get_element_by_id(raw)
+        {
+            return Some(id);
+        }
+        for id in self.get_elements_by_name(&decoded) {
+            if self.get(id).data().tag() == Some("a") {
+                return Some(id);
+            }
+        }
+        if raw.eq_ignore_ascii_case("top") {
+            return Some(self.html());
+        }
+        None
+    }
+
     /// First element in tree order that matches a simple selector.
     ///
     /// Accepted forms: `tag`, `#id`, `.class`, `tag#id`, `tag.class`.
@@ -3040,4 +3072,44 @@ mod tests {
         doc.insert_adjacent_html(main, "beforeend", "<span id=\"tail\">Tail</span>");
         assert!(doc.get_element_by_id("tail").is_some());
     }
+
+    #[test]
+    fn resolves_fragment_targets_by_id_anchor_name_and_percent_encoding() {
+        let doc = parse_html(
+            "<html><body>
+               <h2 id=\"intro-section\">Intro</h2>
+               <h2 id=\"sec 2\">Section Two</h2>
+               <a name=\"legacy-anchor\">Legacy</a>
+             </body></html>",
+        );
+        let intro = doc.get_element_by_id("intro-section").unwrap();
+        let sec2 = doc.get_element_by_id("sec 2").unwrap();
+        let legacy = doc.get_elements_by_name("legacy-anchor")[0];
+
+        assert_eq!(doc.find_fragment_target("#intro-section"), Some(intro));
+        assert_eq!(doc.find_fragment_target("sec%202"), Some(sec2));
+        assert_eq!(doc.find_fragment_target("#legacy-anchor"), Some(legacy));
+        assert_eq!(doc.find_fragment_target("#top"), Some(doc.html()));
+        assert_eq!(doc.find_fragment_target("#missing"), None);
+    }
+}
+
+fn percent_decode_fragment(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
 }

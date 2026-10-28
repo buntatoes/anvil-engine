@@ -61,6 +61,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+mod svg;
+
 pub use anvil_dom::NodeId;
 use anvil_dom::{Document, NodeData};
 pub use anvil_image::Image;
@@ -463,6 +465,7 @@ struct Segment {
     node: NodeId,
     text: String,
     font_size: f32,
+    line_height: Option<f32>,
     color: Color,
     underline: bool,
 }
@@ -474,6 +477,7 @@ struct Token {
     node: NodeId,
     text: String,
     font_size: f32,
+    line_height: Option<f32>,
     color: Color,
     underline: bool,
 }
@@ -899,6 +903,8 @@ fn intrinsic_box_width(
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
             .or_else(|| images.get(&id).map(|img| img.width as f32))
             .unwrap_or(120.0)
+    } else if tag == "svg" {
+        svg::intrinsic_svg_size(doc, id).0
     } else if tag == "canvas" {
         data.attr("width")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
@@ -1037,13 +1043,14 @@ fn layout_block(
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
     let is_img = tag == "img" || tag == "video";
+    let is_svg = tag == "svg";
     let is_canvas = tag == "canvas";
     let is_checkbox = doc.is_checkbox_input(id);
     let is_text_ctrl = doc.is_text_input(id);
     let is_textarea = tag == "textarea";
     let is_select = doc.is_select_control(id);
     let is_submit_input = tag == "input" && doc.is_submit_control(id);
-    let decoded_image = if is_img {
+    let mut decoded_image = if is_img {
         images.get(&id).cloned()
     } else if is_canvas {
         doc.canvas_surface(id)
@@ -1061,6 +1068,9 @@ fn layout_block(
                 .or_else(|| decoded_image.as_ref().map(|img| img.width as f32))
                 .unwrap_or(120.0);
             border_width = attr_w + padding.left + padding.right + border.left + border.right;
+        } else if is_svg {
+            let (sw, _) = svg::intrinsic_svg_size(doc, id);
+            border_width = sw + padding.left + padding.right + border.left + border.right;
         } else if is_canvas {
             let attr_w = data
                 .attr("width")
@@ -1107,7 +1117,9 @@ fn layout_block(
                 + border.right
                 + 8.0)
                 .min(containing_width.max(48.0));
-        } else if style.inline_level && style.display != Display::Inline {
+        } else if (style.inline_level && style.display != Display::Inline)
+            || is_decorated_inline(&style)
+        {
             border_width = intrinsic_box_width(doc, styles, images, id, containing_width);
         }
         border_width = clamp_border_width(&style, containing_width, styles, border_width);
@@ -1133,6 +1145,7 @@ fn layout_block(
                 node: id,
                 text: format!("[{alt}]"),
                 font_size: style.font_size,
+                line_height: style.line_height,
                 color: style.color,
                 underline: false,
             }];
@@ -1146,6 +1159,7 @@ fn layout_block(
             node: id,
             text: mark.to_string(),
             font_size: style.font_size,
+            line_height: style.line_height,
             color: style.color,
             underline: false,
         }];
@@ -1158,6 +1172,7 @@ fn layout_block(
             node: id,
             text: label.to_string(),
             font_size: style.font_size,
+            line_height: style.line_height,
             color: style.color,
             underline: false,
         }];
@@ -1170,6 +1185,7 @@ fn layout_block(
             node: id,
             text: label,
             font_size: style.font_size,
+            line_height: style.line_height,
             color: style.color,
             underline: false,
         }];
@@ -1225,6 +1241,7 @@ fn layout_block(
             node: id,
             text: single_line_str,
             font_size: style.font_size,
+            line_height: style.line_height,
             color: text_color,
             underline: false,
         }];
@@ -1244,7 +1261,7 @@ fn layout_block(
     let mut li_index = 0_usize;
     let mut out_of_flow = Vec::new();
 
-    if tag != "input" && !is_textarea && !is_select {
+    if tag != "input" && !is_textarea && !is_select && !is_svg {
         for child in doc.children(id) {
             if is_skipped(doc, styles, *child) {
                 continue;
@@ -1269,7 +1286,8 @@ fn layout_block(
                 let child_tag = doc.get(*child).data().tag().unwrap_or("");
                 let child_is_inline_block = (child_style.inline_level
                     && child_style.display != Display::Inline)
-                    || (matches!(child_tag, "img" | "video" | "canvas")
+                    || is_decorated_inline(child_style)
+                    || (matches!(child_tag, "img" | "video" | "canvas" | "svg")
                         && child_style.inline_level);
                 if child_is_inline_block {
                     let ib_box = layout_node(
@@ -1379,6 +1397,15 @@ fn layout_block(
             .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
             .unwrap_or(36.0)
             .max(flow_height),
+        None if is_svg => {
+            let (sw, sh) = svg::intrinsic_svg_size(doc, id);
+            let scaled_h = if !matches!(style.width, Size::Auto) && sw > 0.0 {
+                (sh * (content_width / sw)).max(1.0)
+            } else {
+                sh
+            };
+            scaled_h.max(flow_height)
+        }
         None if is_canvas => data
             .attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
@@ -1418,6 +1445,11 @@ fn layout_block(
         width: border_width,
         height: border_height,
     };
+    if is_svg && decoded_image.is_none() {
+        let svg_w = content_width.round().clamp(1.0, 1024.0) as u32;
+        let svg_h = content_height.round().clamp(1.0, 1024.0) as u32;
+        decoded_image = svg::render_svg_node(doc, styles, id, svg_w, svg_h);
+    }
 
     for oof_id in out_of_flow {
         let oof_box = layout_out_of_flow(
@@ -1563,8 +1595,20 @@ fn layout_table_row(
         .copied()
         .filter(|cid| !is_skipped(doc, styles, *cid))
         .collect();
-    let col_count = cell_ids.len().max(1);
-    // Equal columns. The floor can make the row wider than the containing block.
+    let cell_span = |cid: NodeId| -> usize {
+        doc.get(cid)
+            .data()
+            .attr("colspan")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 12)
+    };
+    let col_count: usize = cell_ids
+        .iter()
+        .map(|&cid| cell_span(cid))
+        .sum::<usize>()
+        .max(1);
+    // Equal column units, respecting `colspan` on cells.
     let col_width = (content_width / (col_count as f32)).max(24.0);
 
     let mut children = Vec::with_capacity(cell_ids.len());
@@ -1572,6 +1616,7 @@ fn layout_table_row(
     let mut cursor_x = content_x;
 
     for cid in cell_ids {
+        let span_width = col_width * (cell_span(cid) as f32);
         let cell_box = layout_node(
             doc,
             styles,
@@ -1580,7 +1625,7 @@ fn layout_table_row(
             cid,
             cursor_x,
             content_y,
-            col_width,
+            span_width,
             containing_height,
             None,
         );
@@ -2629,6 +2674,8 @@ fn layout_flex(
                     .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
                     .or_else(|| images.get(child).map(|img| img.width as f32))
                     .unwrap_or(120.0)
+            } else if child_tag == "svg" {
+                svg::intrinsic_svg_size(doc, *child).0
             } else if child_tag == "input" && doc.is_text_input(*child) {
                 (content_width - 136.0).clamp(160.0, 560.0)
             } else if child_tag == "input" && doc.is_submit_control(*child) {
@@ -2956,6 +3003,7 @@ fn place_inlines(
             node: block_id,
             text: marker,
             font_size: block_style.font_size,
+            line_height: block_style.line_height,
             color: block_style.color,
             underline: false,
         });
@@ -2990,11 +3038,12 @@ fn gather(
             node: id,
             text: text.clone(),
             font_size: style.font_size,
+            line_height: style.line_height,
             color: style.color,
             underline: style.underline,
         }),
         NodeData::Element { tag, .. } => {
-            if styles.get(id).display == Display::None {
+            if styles.get(id).display == Display::None || tag == "svg" {
                 return;
             }
             if tag == "br" {
@@ -3002,6 +3051,7 @@ fn gather(
                     node: id,
                     text: "\n".to_string(),
                     font_size: style.font_size,
+                    line_height: style.line_height,
                     color: style.color,
                     underline: false,
                 });
@@ -3022,31 +3072,56 @@ fn is_skipped(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
         && styles.get(id).display == Display::None
 }
 
-/// True for `img`, `video`, a block or flex element, or an element that
-/// contains one of those. Text nodes are inline.
+/// True when an inline element has background, border, padding, or explicit
+/// width/height that requires its own box to paint.
+fn is_decorated_inline(style: &ComputedStyle) -> bool {
+    style.display == Display::Inline
+        && (style.background.is_some()
+            || style.background_gradient.is_some()
+            || style.border.top > 0.0
+            || style.border.right > 0.0
+            || style.border.bottom > 0.0
+            || style.border.left > 0.0
+            || style.padding.top > 0.0
+            || style.padding.right > 0.0
+            || style.padding.bottom > 0.0
+            || style.padding.left > 0.0
+            || !matches!(style.width, Size::Auto)
+            || !matches!(style.height, Size::Auto))
+}
+
+/// True for `img`, `video`, `svg`, a block or flex element, a decorated inline
+/// element, or an element that contains a block/replaced descendant.
 fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
+            let style = styles.get(id);
             tag == "img"
                 || tag == "video"
                 || tag == "canvas"
+                || tag == "svg"
                 || matches!(
-                    styles.get(id).display,
+                    style.display,
                     Display::Block | Display::Flex | Display::Grid
                 )
+                || is_decorated_inline(style)
                 || contains_block(doc, styles, id)
         }
         _ => false,
     }
 }
 
-/// True when any descendant is `img`, `video`, `canvas`, block, or flex.
+/// True when any descendant is `img`, `video`, `canvas`, `svg`, block, or flex.
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
+    if doc.get(id).data().tag() == Some("svg") {
+        return false;
+    }
     for child in doc.children(id) {
         if let NodeData::Element { tag, .. } = doc.get(*child).data()
             && (tag == "img"
                 || tag == "video"
                 || tag == "canvas"
+                || tag == "svg"
                 || matches!(
                     styles.get(*child).display,
                     Display::Block | Display::Flex | Display::Grid
@@ -3119,7 +3194,11 @@ fn place_lines(
         }
         let height = line
             .iter()
-            .map(|token| line_height(token.font_size))
+            .map(|token| {
+                token
+                    .line_height
+                    .unwrap_or_else(|| line_height(token.font_size))
+            })
             .fold(0.0_f32, f32::max);
         let mut x = origin_x;
         let mut combined: Option<TextRun> = None;
@@ -3171,6 +3250,7 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                 node: segment.node,
                 text: "\n".to_string(),
                 font_size: segment.font_size,
+                line_height: segment.line_height,
                 color: segment.color,
                 underline: segment.underline,
             });
@@ -3184,6 +3264,7 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                         node: segment.node,
                         text: std::mem::take(&mut word),
                         font_size: segment.font_size,
+                        line_height: segment.line_height,
                         color: segment.color,
                         underline: segment.underline,
                     });
@@ -3192,6 +3273,7 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                     node: segment.node,
                     text: " ".to_string(),
                     font_size: segment.font_size,
+                    line_height: segment.line_height,
                     color: segment.color,
                     underline: segment.underline,
                 });
@@ -3204,6 +3286,7 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                 node: segment.node,
                 text: word,
                 font_size: segment.font_size,
+                line_height: segment.line_height,
                 color: segment.color,
                 underline: segment.underline,
             });
@@ -3233,6 +3316,7 @@ fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
                 node: token.node,
                 text: ch.to_string(),
                 font_size: token.font_size,
+                line_height: token.line_height,
                 color: token.color,
                 underline: token.underline,
             });
@@ -3335,6 +3419,7 @@ mod tests {
             node: NodeId::from_raw(1),
             text: "hello hello".to_string(),
             font_size: 10.0,
+            line_height: None,
             color: Color::BLACK,
             underline: false,
         }];
@@ -4086,5 +4171,50 @@ mod tests {
         assert_eq!(ghost.rect.height, 30.0);
         assert!(ghost.background.is_none());
         assert!(ghost.text.is_empty());
+    }
+
+    #[test]
+    fn rasterizes_inline_svg_icons_decorated_inlines_line_height_and_table_colspan() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, table, tr, td { margin: 0; padding: 0; border: none; }
+                #tall_p { font-size: 16px; line-height: 30px; margin: 0; }
+                .pill { background: #1e40af; color: #ffffff; padding: 4px 10px; border-radius: 6px; }
+                #icon { color: #dc2626; }
+             </style>
+             <svg id=\"icon\" viewBox=\"0 0 24 24\" width=\"24\" height=\"24\">
+               <title>Hidden SVG Title</title>
+               <circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"currentColor\"></circle>
+               <path d=\"M8 12 L11 15 L16 9\" stroke=\"#ffffff\" stroke-width=\"2\" fill=\"none\"></path>
+             </svg>
+             <p id=\"tall_p\">Line one<br>Line two</p>
+             <div><span id=\"badge\" class=\"pill\">Badge</span><code id=\"code_el\">fn main()</code></div>
+             <table>
+               <tr><td id=\"span2\" colspan=\"2\">Wide</td><td id=\"col3\">Narrow</td></tr>
+             </table>",
+            300.0,
+        );
+        let icon = find_box(&doc, &tree, "icon");
+        assert_eq!(icon.rect.width, 24.0);
+        assert_eq!(icon.rect.height, 24.0);
+        assert!(icon.text.is_empty());
+        let svg_img = icon.image.as_ref().expect("svg rasterized to Image");
+        assert_eq!((svg_img.width, svg_img.height), (24, 24));
+        assert!(svg_img.pixels.chunks_exact(4).any(|px| px[3] > 0));
+
+        let tall_p = find_box(&doc, &tree, "tall_p");
+        assert_eq!(tall_p.rect.height, 60.0);
+
+        let badge = find_box(&doc, &tree, "badge");
+        assert!(badge.background.is_some());
+        assert!(badge.rect.width > 20.0);
+        let code_el = find_box(&doc, &tree, "code_el");
+        assert!(code_el.background.is_some());
+
+        let span2 = find_box(&doc, &tree, "span2");
+        let col3 = find_box(&doc, &tree, "col3");
+        assert_eq!(span2.rect.width, 200.0);
+        assert_eq!(col3.rect.x, 200.0);
+        assert_eq!(col3.rect.width, 100.0);
     }
 }

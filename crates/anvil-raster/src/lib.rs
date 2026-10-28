@@ -650,9 +650,9 @@ impl RasterEngine {
         }
     }
 
-    /// Translate vector primitives in `list` into a `GpuSceneBatch` and execute them via the
-    /// thread-local `anvil_gpu::Compositor` when there are no text/image items, or fall back to
-    /// hybrid compositor + glyph rasterization otherwise.
+    /// Translate vector primitives in `list` into `GpuSceneBatch` command buffers and execute
+    /// them via the thread-local `anvil_gpu::Compositor`, interleaving `Text`, `Image`, `Fixed`,
+    /// and `Layer` items in painter's order when present.
     pub fn rasterize_gpu_batch(
         &self,
         list: &DisplayList,
@@ -661,15 +661,10 @@ impl RasterEngine {
         scroll_y: f32,
     ) -> Framebuffer {
         let has_non_batch_items = !list.layers.is_empty()
-            || list.items.iter().any(|item| {
-                matches!(
-                    item,
-                    DisplayItem::Text { .. }
-                        | DisplayItem::Image { .. }
-                        | DisplayItem::PushFixed
-                        | DisplayItem::PopFixed
-                )
-            });
+            || list
+                .items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::Text { .. } | DisplayItem::Image { .. }));
         if !has_non_batch_items && width > 0 && height > 0 {
             let batch = build_gpu_scene_batch(list, width, height, scroll_y);
             let mut fb = Framebuffer::new(width, height, resolve_canvas_bg(list, width));
@@ -691,8 +686,19 @@ impl RasterEngine {
     }
 }
 
+/// Rasterize `list` using batched `anvil_gpu::GpuSceneBatch` execution for vector spans and
+/// hybrid compositor + glyph/image passes in painter's order.
+pub fn rasterize_gpu_batch(
+    list: &DisplayList,
+    width: u32,
+    height: u32,
+    scroll_y: f32,
+) -> Framebuffer {
+    RasterEngine::new().rasterize_gpu_batch(list, width, height, scroll_y)
+}
+
 /// Convert display list vector primitives (`Rect`, `RoundedRect`, `LinearGradientRect`, `BoxShadow`,
-/// `PushClip`, `PopClip`) into a batched `anvil_gpu::GpuSceneBatch` command buffer.
+/// `PushClip`, `PopClip`, `PushFixed`, `PopFixed`) into a batched `anvil_gpu::GpuSceneBatch` command buffer.
 pub fn build_gpu_scene_batch(
     list: &DisplayList,
     width: u32,
@@ -702,8 +708,16 @@ pub fn build_gpu_scene_batch(
     let mut batch = anvil_gpu::GpuSceneBatch::with_capacity(list.items.len() + 1);
     let bg = resolve_canvas_bg(list, width);
     batch.push_clear(anvil_gpu::GpuColor::rgba(bg.r, bg.g, bg.b, bg.a));
+    let mut fixed_depth = 0usize;
     for item in &list.items {
+        let dy = if fixed_depth > 0 { 0.0 } else { scroll_y };
         match item {
+            DisplayItem::PushFixed => {
+                fixed_depth += 1;
+            }
+            DisplayItem::PopFixed => {
+                fixed_depth = fixed_depth.saturating_sub(1);
+            }
             DisplayItem::Rect {
                 x,
                 y,
@@ -712,7 +726,7 @@ pub fn build_gpu_scene_batch(
                 color,
             } => {
                 batch.push_solid_rect(
-                    anvil_gpu::GpuRect::new(*x, *y - scroll_y, *w, *h),
+                    anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h),
                     anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
                 );
             }
@@ -727,7 +741,7 @@ pub fn build_gpu_scene_batch(
                 border_color,
             } => {
                 batch.push_rounded_rect(
-                    anvil_gpu::GpuRect::new(*x, *y - scroll_y, *w, *h),
+                    anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h),
                     anvil_gpu::GpuColor::rgba(
                         fill_color.r,
                         fill_color.g,
@@ -779,16 +793,16 @@ pub fn build_gpu_scene_batch(
                 let _ = (radius, border_width, border_color);
                 let rad = (*angle_deg - 90.0).to_radians();
                 let cx = *x + *w * 0.5;
-                let cy = (*y - scroll_y) + *h * 0.5;
+                let cy = (*y - dy) + *h * 0.5;
                 let dx = rad.cos() * (*w * 0.5);
-                let dy = rad.sin() * (*h * 0.5);
+                let dy_vec = rad.sin() * (*h * 0.5);
                 batch.push_gradient(
-                    anvil_gpu::GpuRect::new(*x, *y - scroll_y, *w, *h),
+                    anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h),
                     anvil_gpu::GradientShape::Linear {
                         start_x: cx - dx,
-                        start_y: cy - dy,
+                        start_y: cy - dy_vec,
                         end_x: cx + dx,
-                        end_y: cy + dy,
+                        end_y: cy + dy_vec,
                     },
                     stops,
                 );
@@ -806,7 +820,7 @@ pub fn build_gpu_scene_batch(
                 color,
             } => {
                 batch.push_box_shadow(anvil_gpu::ShadowDesc {
-                    rect: anvil_gpu::GpuRect::new(*x, *y - scroll_y, *w, *h),
+                    rect: anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h),
                     corner_radius: radius.max(0.0),
                     offset_x: *offset_x,
                     offset_y: *offset_y,
@@ -822,7 +836,7 @@ pub fn build_gpu_scene_batch(
                 width: w,
                 height: h,
             } => {
-                batch.push_clip(anvil_gpu::GpuRect::new(*x, *y - scroll_y, *w, *h));
+                batch.push_clip(anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h));
             }
             DisplayItem::PopClip => {
                 batch.pop_clip();
@@ -2177,10 +2191,314 @@ impl PaintCtx {
     }
 }
 
+fn is_finite_rect_span(x: f32, y: f32, w: f32, h: f32) -> bool {
+    x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w >= 0.0 && h >= 0.0
+}
+
+fn flush_scene_batch(fb: &mut Framebuffer, batch: &mut anvil_gpu::GpuSceneBatch) {
+    if batch.is_empty() {
+        return;
+    }
+    if fb.width > 0
+        && fb.height > 0
+        && let Ok(mut target) =
+            anvil_gpu::RgbaTarget::new(&mut fb.pixels, fb.width, fb.height, (fb.width as usize) * 4)
+    {
+        let _ = with_thread_compositor(|comp| comp.execute_scene_batch(&mut target, batch));
+    }
+    batch.clear_ops();
+}
+
+fn try_push_span_batch_item(
+    fb: &mut Framebuffer,
+    item: &DisplayItem,
+    ctx: &mut PaintCtx,
+    batch: &mut anvil_gpu::GpuSceneBatch,
+) -> bool {
+    let s = ctx.s;
+    let dy = ctx.dy();
+    let px = |x: f32| x * s + ctx.tx;
+    let py = |y: f32| y * s + ctx.ty - dy;
+    match item {
+        DisplayItem::PushClip {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            fb.push_clip(px(*x), py(*y), *width * s, *height * s);
+            true
+        }
+        DisplayItem::PopClip => {
+            fb.pop_clip();
+            true
+        }
+        DisplayItem::PushFixed => {
+            ctx.fixed_depth += 1;
+            true
+        }
+        DisplayItem::PopFixed => {
+            ctx.fixed_depth = ctx.fixed_depth.saturating_sub(1);
+            true
+        }
+        DisplayItem::Rect {
+            x,
+            y,
+            width,
+            height,
+            color,
+        } => {
+            if color.a == 0 {
+                return true;
+            }
+            if color.a == 255 {
+                let Some((x0, y0, x1, y1)) =
+                    fb.clipped_span(px(*x), py(*y), *width * s, *height * s)
+                else {
+                    return true;
+                };
+                batch.push_solid_rect(
+                    anvil_gpu::GpuRect::new(
+                        x0 as f32,
+                        y0 as f32,
+                        (x1 - x0) as f32,
+                        (y1 - y0) as f32,
+                    ),
+                    anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, 255),
+                );
+                return true;
+            }
+            false
+        }
+        DisplayItem::BoxShadow {
+            x,
+            y,
+            width,
+            height,
+            offset_x,
+            offset_y,
+            blur_radius,
+            spread_radius,
+            radius,
+            color,
+        } => {
+            let rx = px(*x);
+            let ry = py(*y);
+            let rw = *width * s;
+            let rh = *height * s;
+            if rw <= 0.0 || rh <= 0.0 || color.a == 0 {
+                return true;
+            }
+            let ox = *offset_x * s;
+            let oy = *offset_y * s;
+            let blur = *blur_radius * s;
+            let spread = *spread_radius * s;
+            let r = *radius * s;
+            if !is_finite_rect_span(rx, ry, rw, rh)
+                || ![ox, oy, blur, spread, r].iter().all(|v| v.is_finite())
+            {
+                return false;
+            }
+            let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+            if cx0 >= cx1 || cy0 >= cy1 {
+                return true;
+            }
+            batch.push_box_shadow(anvil_gpu::ShadowDesc {
+                rect: anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                corner_radius: r.max(0.0),
+                offset_x: ox,
+                offset_y: oy,
+                blur_radius: blur.clamp(0.0, anvil_gpu::MAX_BLUR_RADIUS),
+                spread,
+                color: anvil_gpu::GpuColor::rgba(color.r, color.g, color.b, color.a),
+                clip: Some(anvil_gpu::GpuRect::new(
+                    cx0 as f32,
+                    cy0 as f32,
+                    (cx1 - cx0) as f32,
+                    (cy1 - cy0) as f32,
+                )),
+            });
+            true
+        }
+        DisplayItem::RoundedRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            border_width,
+            fill_color,
+            border_color,
+        } => {
+            let rx = px(*x);
+            let ry = py(*y);
+            let rw = *width * s;
+            let rh = *height * s;
+            let r = *radius * s;
+            let bw = *border_width * s;
+            if rw <= 0.0 || rh <= 0.0 {
+                return true;
+            }
+            if !is_finite_rect_span(rx, ry, rw, rh) || !r.is_finite() || !bw.is_finite() {
+                return false;
+            }
+            let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+            if cx0 >= cx1 || cy0 >= cy1 {
+                return true;
+            }
+            let clip_rect = Some(anvil_gpu::GpuRect::new(
+                cx0 as f32,
+                cy0 as f32,
+                (cx1 - cx0) as f32,
+                (cy1 - cy0) as f32,
+            ));
+            if bw <= 0.0 && fill_color.a > 0 {
+                batch.push_box_shadow(anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    corner_radius: r.max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        fill_color.r,
+                        fill_color.g,
+                        fill_color.b,
+                        fill_color.a,
+                    ),
+                    clip: clip_rect,
+                });
+                return true;
+            }
+            if bw > 0.0
+                && fill_color.a == 255
+                && border_color.a == 255
+                && rw > bw * 2.0
+                && rh > bw * 2.0
+            {
+                batch.push_box_shadow(anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    corner_radius: r.max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        border_color.r,
+                        border_color.g,
+                        border_color.b,
+                        border_color.a,
+                    ),
+                    clip: clip_rect,
+                });
+                batch.push_box_shadow(anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(rx + bw, ry + bw, rw - bw * 2.0, rh - bw * 2.0),
+                    corner_radius: (r - bw).max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        fill_color.r,
+                        fill_color.g,
+                        fill_color.b,
+                        fill_color.a,
+                    ),
+                    clip: clip_rect,
+                });
+                return true;
+            }
+            false
+        }
+        DisplayItem::LinearGradientRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            border_width,
+            angle_deg,
+            start_color,
+            end_color,
+            ..
+        } => {
+            let rx = px(*x);
+            let ry = py(*y);
+            let rw = *width * s;
+            let rh = *height * s;
+            let r = *radius * s;
+            let bw = *border_width * s;
+            if rw <= 0.0 || rh <= 0.0 {
+                return true;
+            }
+            if r <= 0.0 && bw <= 0.0 && is_finite_rect_span(rx, ry, rw, rh) && angle_deg.is_finite()
+            {
+                let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+                let gx0 = (rx.floor() as i32).max(cx0);
+                let gy0 = (ry.floor() as i32).max(cy0);
+                let gx1 = ((rx + rw).ceil() as i32).min(cx1);
+                let gy1 = ((ry + rh).ceil() as i32).min(cy1);
+                if gx0 < gx1 && gy0 < gy1 {
+                    let rad = angle_deg.to_radians();
+                    let dx = rad.sin();
+                    let dy_vec = -rad.cos();
+                    let half_w = rw * 0.5;
+                    let half_h = rh * 0.5;
+                    let max_proj = (half_w * dx.abs() + half_h * dy_vec.abs()).max(0.001);
+                    let cx = rx + half_w;
+                    let cy = ry + half_h;
+                    let stops = vec![
+                        anvil_gpu::GpuGradientStop::new(
+                            0.0,
+                            anvil_gpu::GpuColor::rgba(
+                                start_color.r,
+                                start_color.g,
+                                start_color.b,
+                                start_color.a,
+                            ),
+                        ),
+                        anvil_gpu::GpuGradientStop::new(
+                            1.0,
+                            anvil_gpu::GpuColor::rgba(
+                                end_color.r,
+                                end_color.g,
+                                end_color.b,
+                                end_color.a,
+                            ),
+                        ),
+                    ];
+                    batch.push_clip(anvil_gpu::GpuRect::new(
+                        cx0 as f32,
+                        cy0 as f32,
+                        (cx1 - cx0) as f32,
+                        (cy1 - cy0) as f32,
+                    ));
+                    batch.push_gradient(
+                        anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                        anvil_gpu::GradientShape::Linear {
+                            start_x: cx - dx * max_proj,
+                            start_y: cy - dy_vec * max_proj,
+                            end_x: cx + dx * max_proj,
+                            end_y: cy + dy_vec * max_proj,
+                        },
+                        stops,
+                    );
+                    batch.pop_clip();
+                    return true;
+                }
+                return true;
+            }
+            false
+        }
+        DisplayItem::Image { .. } | DisplayItem::Text { .. } => false,
+    }
+}
+
 /// Draw items `start..end`, handing each layer that starts in the span to
-/// its effect. `next_layer` walks [`DisplayList::layers`] in order; layers
-/// that are malformed (empty, out of range, or not nested) are skipped and
-/// their items are drawn plainly.
+/// its effect and batching contiguous vector/compositor spans through
+/// `anvil_gpu::GpuSceneBatch`. `next_layer` walks [`DisplayList::layers`] in
+/// order; layers that are malformed (empty, out of range, or not nested) are
+/// skipped and their items are drawn plainly.
 fn paint_span(
     fb: &mut Framebuffer,
     list: &DisplayList,
@@ -2190,6 +2508,7 @@ fn paint_span(
     ctx: &mut PaintCtx,
 ) {
     let end = end.min(list.items.len());
+    let mut batch = anvil_gpu::GpuSceneBatch::new();
     let mut i = start;
     while i < end {
         while list
@@ -2201,14 +2520,19 @@ fn paint_span(
         }
         let starts_here = |layer: &Layer| layer.start == i && layer.end <= end;
         if let Some(layer) = list.layers.get(*next_layer).copied().filter(starts_here) {
+            flush_scene_batch(fb, &mut batch);
             *next_layer += 1;
             paint_layer(fb, list, layer, next_layer, ctx);
             i = layer.end;
             continue;
         }
-        paint_item(fb, &list.items[i], ctx);
+        if !try_push_span_batch_item(fb, &list.items[i], ctx, &mut batch) {
+            flush_scene_batch(fb, &mut batch);
+            paint_item(fb, &list.items[i], ctx);
+        }
         i += 1;
     }
+    flush_scene_batch(fb, &mut batch);
 }
 
 /// Draw one layer's range with its effect applied.
@@ -3842,5 +4166,124 @@ mod tests {
         let fb_gpu = engine.rasterize_gpu_batch(&list, 64, 128, 0.0);
         assert_eq!(fb_gpu.pixel(16, 12), Some(fill));
         assert_eq!(fb_gpu.pixel(16, 38), Some(fill));
+    }
+
+    #[test]
+    fn default_gpu_scene_batch_coalesces_mixed_display_lists_with_exact_band_parity() {
+        let batches_before = anvil_gpu::scene_batches_executed();
+        let ops_before = anvil_gpu::scene_ops_executed();
+        let img = Image::from_rgba(2, 2, [20u8, 220, 100, 255].repeat(4)).unwrap();
+        let mixed = DisplayList {
+            items: vec![
+                DisplayItem::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 64.0,
+                    height: 160.0,
+                    color: Color {
+                        r: 18,
+                        g: 22,
+                        b: 30,
+                        a: 255,
+                    },
+                },
+                DisplayItem::BoxShadow {
+                    x: 8.0,
+                    y: 10.0,
+                    width: 40.0,
+                    height: 24.0,
+                    offset_x: 0.0,
+                    offset_y: 2.0,
+                    blur_radius: 4.0,
+                    spread_radius: 0.0,
+                    radius: 4.0,
+                    color: Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 180,
+                    },
+                },
+                DisplayItem::RoundedRect {
+                    x: 8.0,
+                    y: 10.0,
+                    width: 40.0,
+                    height: 24.0,
+                    radius: 4.0,
+                    border_width: 2.0,
+                    fill_color: Color {
+                        r: 40,
+                        g: 120,
+                        b: 220,
+                        a: 255,
+                    },
+                    border_color: Color {
+                        r: 230,
+                        g: 190,
+                        b: 90,
+                        a: 255,
+                    },
+                },
+                DisplayItem::LinearGradientRect {
+                    x: 8.0,
+                    y: 44.0,
+                    width: 40.0,
+                    height: 20.0,
+                    radius: 0.0,
+                    border_width: 0.0,
+                    angle_deg: 90.0,
+                    start_color: Color {
+                        r: 220,
+                        g: 50,
+                        b: 50,
+                        a: 255,
+                    },
+                    end_color: Color {
+                        r: 50,
+                        g: 50,
+                        b: 220,
+                        a: 255,
+                    },
+                    border_color: Color::BLACK,
+                },
+                DisplayItem::Text {
+                    x: 12.0,
+                    y: 14.0,
+                    text: "GPU".to_string(),
+                    color: Color::WHITE,
+                    font_size: 14.0,
+                },
+                DisplayItem::Image {
+                    x: 12.0,
+                    y: 72.0,
+                    width: 16.0,
+                    height: 16.0,
+                    border_radius: 0.0,
+                    image: img,
+                },
+                DisplayItem::PushFixed,
+                DisplayItem::Rect {
+                    x: 4.0,
+                    y: 100.0,
+                    width: 20.0,
+                    height: 12.0,
+                    color: Color {
+                        r: 240,
+                        g: 180,
+                        b: 60,
+                        a: 255,
+                    },
+                },
+                DisplayItem::PopFixed,
+            ],
+            layers: Vec::new(),
+        };
+        let fb_single = rasterize(&mixed, 64, 160, 8.0);
+        assert!(anvil_gpu::scene_batches_executed() > batches_before);
+        assert!(anvil_gpu::scene_ops_executed() >= ops_before + 6);
+        let fb_parallel = rasterize_parallel(&mixed, 64, 160, 8.0);
+        let fb_gpu = rasterize_gpu_batch(&mixed, 64, 160, 8.0);
+        assert_eq!(fb_single.pixels(), fb_parallel.pixels());
+        assert_eq!(fb_single.pixels(), fb_gpu.pixels());
     }
 }

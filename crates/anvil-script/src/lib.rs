@@ -1089,6 +1089,115 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
 /// `AnvilDOMDocument` mutations (`createElement`, `appendChild`, `setAttribute`, `classList`,
 /// `style`, `attachShadow`, `customElements.define`, and 2D `<canvas>` operations) back onto
 /// the live [`anvil_dom::Document`].
+fn append_hierarchical_seed_node(
+    doc: &Document,
+    nid: NodeId,
+    parent_vm_expr: &str,
+    out: &mut String,
+) {
+    let data = doc.get(nid).data();
+    let Some(tag) = data.tag() else {
+        return;
+    };
+    if matches!(
+        tag,
+        "html" | "head" | "body" | "#document" | "#shadow-root" | "script" | "style" | "noscript"
+    ) {
+        return;
+    }
+    let dom_id = nid.index() as u32;
+    let el_id = data.id().unwrap_or("");
+    let cls = data.attr("class").unwrap_or("");
+    let val_attr = doc.input_value(nid);
+    let mut direct_text = String::new();
+    for &ch in doc.children(nid) {
+        if let Some(t) = doc.get(ch).data().text() {
+            direct_text.push_str(t);
+        }
+    }
+    let q_tag = quote_js_string_literal(tag);
+    let q_id = quote_js_string_literal(el_id);
+    let q_cls = quote_js_string_literal(cls);
+    let q_text = quote_js_string_literal(&direct_text);
+    let q_val = quote_js_string_literal(&val_attr);
+    let var_name = format!("__seed_{dom_id}");
+    out.push_str(&format!(
+        "const {var_name} = document.seedHostNode({parent_vm_expr}, {dom_id}, {q_tag}, {q_id}, {q_cls}, {q_text}, {q_val});\n"
+    ));
+    if let anvil_dom::NodeData::Element { attrs, .. } = data {
+        for (k, v) in attrs {
+            if !matches!(
+                k.as_str(),
+                "id" | "class"
+                    | "value"
+                    | "onclick"
+                    | "oninput"
+                    | "onchange"
+                    | "onsubmit"
+                    | "onkeydown"
+            ) {
+                let q_k = quote_js_string_literal(k);
+                let q_v = quote_js_string_literal(v);
+                out.push_str(&format!(
+                    "document.seedHostAttr({var_name}, {q_k}, {q_v});\n"
+                ));
+            }
+        }
+    }
+    let children: Vec<NodeId> = doc.children(nid).to_vec();
+    for ch in children {
+        append_hierarchical_seed_node(doc, ch, &var_name, out);
+    }
+}
+
+fn build_hierarchical_dom_seed_js(
+    doc: &Document,
+    local_storage: &[(String, String)],
+    cookie: Option<&str>,
+) -> String {
+    let mut seed_js = String::new();
+    for (k, v) in local_storage {
+        let q_k = quote_js_string_literal(k);
+        let q_v = quote_js_string_literal(v);
+        seed_js.push_str(&format!("localStorage._seedItem({q_k}, {q_v});\n"));
+    }
+    if let Some(c) = cookie
+        && !c.is_empty()
+    {
+        let q_c = quote_js_string_literal(c);
+        seed_js.push_str(&format!("document.cookie = {q_c};\n"));
+    }
+    if !doc.title().is_empty() {
+        let q_title = quote_js_string_literal(&doc.title());
+        seed_js.push_str(&format!(
+            "document.title = {q_title}; document._lastSyncedTitle = {q_title};\n"
+        ));
+    }
+    seed_js.push_str("document.takeDomMutations();\n");
+    let head_children: Vec<NodeId> = doc.children(doc.head()).to_vec();
+    for ch in head_children {
+        append_hierarchical_seed_node(doc, ch, "2", &mut seed_js);
+    }
+    let body_children: Vec<NodeId> = doc.children(doc.body()).to_vec();
+    for ch in body_children {
+        append_hierarchical_seed_node(doc, ch, "3", &mut seed_js);
+    }
+    seed_js
+}
+
+const ANVIL_VM_MUTATION_EXPORT_FOOTER: &str = r#"
+const __rows = document.exportDomMutationRows();
+for (let __rIdx = 0; __rIdx < __rows.length; __rIdx = __rIdx + 1) {
+    console.log("__ANVIL_DOM_MUT__:" + anvilJsonStringify(__rows[__rIdx]));
+}
+"#;
+
+/// Compile an ES2022+ web application script (`app_script`) via `anvil-js`, execute it
+/// on `AnvilVM` with the self-hosted Web/DOM runtime, and synchronize all recorded
+/// `AnvilDOMDocument` mutations (`createElement`, `appendChild`, `insertBefore`,
+/// `setAttribute`, `setInnerHTML`, `insertAdjacentHTML`, `setValue`, `classList`,
+/// `style`, `attachShadow`, `customElements.define`, `localStorage`, `location`,
+/// and 2D `<canvas>` operations) back onto the live [`anvil_dom::Document`].
 pub fn eval_webapp_with_live_dom_bridge(
     doc: &mut Document,
     initial_url: &str,
@@ -1102,89 +1211,7 @@ pub fn eval_webapp_with_live_dom_bridge(
                 message: msg,
             },
         })?;
-    let mut seed_js = String::new();
-    let mut bind_js = String::new();
-    for idx in 0..doc.node_count() {
-        let nid = NodeId::from_raw(idx as u32);
-        if let Some(tag) = doc.get(nid).data().tag() {
-            if matches!(tag, "html" | "head" | "body" | "#document" | "#shadow-root") {
-                continue;
-            }
-            if let Some(el_id) = doc.get(nid).data().id() {
-                let q_tag = quote_js_string_literal(tag);
-                let q_id = quote_js_string_literal(el_id);
-                seed_js.push_str(&format!(
-                    "{{ const __el = document.createElement({q_tag}); __el.setAttribute(\"id\", {q_id}); document.body.appendChild(__el); }}\n"
-                ));
-                bind_js.push_str(&format!(
-                    "{{ const __b = document.getElementById({q_id}); if (__b) {{ document._recordDomOp({{ op: \"bindSeedId\", nodeId: __b._hostNodeId, htmlId: {q_id} }}); }} }}\n"
-                ));
-            }
-        }
-    }
-    seed_js.push_str("document.takeDomMutations();\n");
-    seed_js.push_str(&bind_js);
-    let sync_footer = r#"
-if (document.title) {
-    document._recordDomOp({ op: "setTitle", title: document.title });
-}
-function __anvilSyncDomTree(node) {
-    if (!node) return;
-    if (typeof node.textContent === "string" && node.textContent.length > 0) {
-        document._recordDomOp({ op: "setTextContent", nodeId: node._hostNodeId, text: node.textContent });
-    }
-    if (typeof node._className === "string" && node._className.length > 0) {
-        document._recordDomOp({ op: "setClassName", nodeId: node._hostNodeId, className: node._className });
-    }
-    if (node.style) {
-        const sKeys = ["backgroundColor", "color", "display", "width", "height", "opacity", "border", "margin", "padding", "position", "top", "left", "fontSize", "fontWeight"];
-        for (let sIdx = 0; sIdx < sKeys.length; sIdx = sIdx + 1) {
-            const prop = sKeys[sIdx];
-            const val = node.style[prop];
-            if (typeof val === "string" && val.length > 0) {
-                document._recordDomOp({ op: "setStyle", nodeId: node._hostNodeId, name: prop, value: val });
-            }
-        }
-    }
-    if (node.shadowRoot) {
-        __anvilSyncDomTree(node.shadowRoot);
-    }
-    if (node.children && node.children.length) {
-        for (let cIdx = 0; cIdx < node.children.length; cIdx = cIdx + 1) {
-            __anvilSyncDomTree(node.children[cIdx]);
-        }
-    }
-}
-__anvilSyncDomTree(document.body);
-const __rawMuts = document.takeDomMutations();
-for (let mIdx = 0; mIdx < __rawMuts.length; mIdx = mIdx + 1) {
-    const m = __rawMuts[mIdx];
-    const c = m.cmd;
-    if (c) {
-        const row = [
-            "canvasDraw",
-            m.nodeId || 0,
-            c.kind || "",
-            c.x || c.dx || 0,
-            c.y || c.dy || 0,
-            c.w || c.width || 0,
-            c.h || c.height || 0,
-            c.style || c.text || "",
-            c.lineWidth || 1
-        ];
-        console.log("__ANVIL_DOM_MUT__:" + anvilJsonStringify(row));
-    } else {
-        const row = [
-            m.op || "",
-            m.nodeId || m.hostId || m.parentId || 0,
-            m.childId || m.shadowRootId || 0,
-            m.tagName || m.name || m.htmlId || m.title || m.className || m.mode || "",
-            m.value || m.text || ""
-        ];
-        console.log("__ANVIL_DOM_MUT__:" + anvilJsonStringify(row));
-    }
-}
-"#;
+    let seed_js = build_hierarchical_dom_seed_js(doc, &[], None);
     let rt_bundle = self_hosted_runtime_bundle();
     let quoted_url = quote_js_string_literal(initial_url);
     let full_program = format!(
@@ -1208,7 +1235,7 @@ const encodeURIComponent = anvilEncodeURIComponent;\n\
 const decodeURIComponent = anvilDecodeURIComponent;\n\
 {seed_js}\n\
 {lowered_app}\n\
-{sync_footer}\n"
+{ANVIL_VM_MUTATION_EXPORT_FOOTER}\n"
     );
     let mut run =
         eval_cpp_vm_with_console_configured(&full_program, 80_000_000, 64 * 1024 * 1024, 10_000)?;
@@ -1232,9 +1259,18 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
 /// Apply a JSON array of DOM mutation records emitted by `AnvilDOMDocument.takeDomMutations()`
 /// inside `AnvilVM` directly onto a live [`anvil_dom::Document`].
 pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
+    let _ = apply_vm_dom_mutations_with_runtime(doc, mutations, None);
+}
+
+fn apply_vm_dom_mutations_with_runtime(
+    doc: &mut Document,
+    mutations: &JsonValue,
+    mut runtime: Option<&mut ScriptRuntime>,
+) -> bool {
     let JsonValue::Array(records) = mutations else {
-        return;
+        return false;
     };
+    let mut default_prevented = false;
     let mut vm_nodes: std::collections::HashMap<u32, NodeId> = std::collections::HashMap::new();
     vm_nodes.insert(1, doc.html());
     vm_nodes.insert(2, doc.head());
@@ -1266,7 +1302,23 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                 .unwrap_or(0);
             let s1 = row.get(3).and_then(|v| v.as_str()).unwrap_or("");
             let s2 = row.get(4).and_then(|v| v.as_str()).unwrap_or("");
+            let ref_u32 = row
+                .get(5)
+                .and_then(|v| match v {
+                    JsonValue::Number(n) => Some(*n as u32),
+                    _ => None,
+                })
+                .unwrap_or(0);
             match op {
+                "bindSeedNode" => {
+                    if child_u32 > 0 && (child_u32 as usize) < doc.node_count() {
+                        vm_nodes.insert(id_u32, NodeId::from_raw(child_u32));
+                    } else if !s1.is_empty()
+                        && let Some(existing) = doc.get_element_by_id(s1)
+                    {
+                        vm_nodes.insert(id_u32, existing);
+                    }
+                }
                 "bindSeedId" => {
                     if let Some(existing) = doc.get_element_by_id(s1) {
                         vm_nodes.insert(id_u32, existing);
@@ -1286,6 +1338,20 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                         (vm_nodes.get(&id_u32), vm_nodes.get(&child_u32))
                     {
                         let _ = doc.append(parent_id, child_id);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "childList", parent_id, None);
+                        }
+                    }
+                }
+                "insertBefore" => {
+                    if let (Some(&parent_id), Some(&child_id)) =
+                        (vm_nodes.get(&id_u32), vm_nodes.get(&child_u32))
+                    {
+                        let ref_id = vm_nodes.get(&ref_u32).copied();
+                        let _ = doc.insert_before(parent_id, child_id, ref_id);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "childList", parent_id, None);
+                        }
                     }
                 }
                 "removeChild" => {
@@ -1293,6 +1359,9 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                         (vm_nodes.get(&id_u32), vm_nodes.get(&child_u32))
                     {
                         let _ = doc.remove_child(parent_id, child_id);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "childList", parent_id, None);
+                        }
                     }
                 }
                 "setAttribute" => {
@@ -1303,16 +1372,46 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                     }
                     if let Some(&nid) = vm_nodes.get(&id_u32) {
                         doc.set_attribute(nid, s1, s2);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "attributes", nid, Some(s1));
+                        }
                     }
                 }
                 "removeAttribute" => {
                     if let Some(&nid) = vm_nodes.get(&id_u32) {
                         doc.remove_attribute(nid, s1);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "attributes", nid, Some(s1));
+                        }
                     }
                 }
                 "setTextContent" => {
                     if let Some(&nid) = vm_nodes.get(&id_u32) {
                         doc.set_text_content(nid, s2);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "childList", nid, None);
+                        }
+                    }
+                }
+                "setInnerHTML" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        doc.set_inner_html(nid, s2);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "childList", nid, None);
+                        }
+                    }
+                }
+                "insertAdjacentHTML" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        doc.insert_adjacent_html(nid, s1, s2);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "childList", nid, None);
+                        }
+                    }
+                }
+                "setValue" => {
+                    if let Some(&nid) = vm_nodes.get(&id_u32) {
+                        doc.set_input_value(nid, s2);
                     }
                 }
                 "setClassName" => {
@@ -1320,12 +1419,18 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                         for cls in s1.split_whitespace() {
                             doc.add_class(nid, cls);
                         }
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "attributes", nid, Some("class"));
+                        }
                     }
                 }
                 "setStyle" => {
                     if let Some(&nid) = vm_nodes.get(&id_u32) {
                         let css_prop = camel_to_kebab(s1);
                         update_inline_style(doc, nid, &css_prop, s2);
+                        if let Some(rt) = runtime.as_deref_mut() {
+                            rt.notify_mutation_observers(doc, "attributes", nid, Some("style"));
+                        }
                     }
                 }
                 "attachShadow" => {
@@ -1343,6 +1448,42 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                 }
                 "setTitle" => {
                     doc.set_title(s1);
+                }
+                "localStorageSet" => {
+                    if let Some(rt) = runtime.as_deref_mut() {
+                        rt.local_storage_set(s1, s2);
+                    }
+                }
+                "localStorageRemove" => {
+                    if let Some(rt) = runtime.as_deref_mut() {
+                        rt.local_storage_remove(s1);
+                    }
+                }
+                "localStorageClear" => {
+                    if let Some(rt) = runtime.as_deref_mut() {
+                        rt.local_storage_clear();
+                    }
+                }
+                "setLocation" => {
+                    if let Some(rt) = runtime.as_deref_mut() {
+                        rt.set_pending_navigation(s2);
+                    }
+                }
+                "addEventListener" => {
+                    let resolved = vm_nodes
+                        .get(&id_u32)
+                        .copied()
+                        .or_else(|| {
+                            (child_u32 > 0 && (child_u32 as usize) < doc.node_count())
+                                .then(|| NodeId::from_raw(child_u32))
+                        })
+                        .unwrap_or_else(|| doc.body());
+                    if let Some(rt) = runtime.as_deref_mut() {
+                        rt.register_vm_event_listener(resolved, s1);
+                    }
+                }
+                "preventDefault" => {
+                    default_prevented = true;
                 }
                 "canvasDraw" => {
                     if let Some(&nid) = vm_nodes.get(&id_u32) {
@@ -1411,6 +1552,18 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
             .or_else(|| extract_u32(rec, "parentId"))
             .unwrap_or(0);
         match op {
+            "bindSeedNode" => {
+                let dom_u32 = extract_u32(rec, "childId")
+                    .or_else(|| extract_u32(rec, "domNodeId"))
+                    .unwrap_or(0);
+                if dom_u32 > 0 && (dom_u32 as usize) < doc.node_count() {
+                    vm_nodes.insert(id_u32, NodeId::from_raw(dom_u32));
+                } else if let Some(html_id) = rec.get("htmlId").and_then(|v| v.as_str())
+                    && let Some(existing) = doc.get_element_by_id(html_id)
+                {
+                    vm_nodes.insert(id_u32, existing);
+                }
+            }
             "bindSeedId" => {
                 if let Some(html_id) = rec.get("htmlId").and_then(|v| v.as_str())
                     && let Some(existing) = doc.get_element_by_id(html_id)
@@ -1439,6 +1592,17 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                     (vm_nodes.get(&parent_u32), vm_nodes.get(&child_u32))
                 {
                     let _ = doc.append(parent_id, child_id);
+                }
+            }
+            "insertBefore" => {
+                let parent_u32 = extract_u32(rec, "parentId").unwrap_or(id_u32);
+                let child_u32 = extract_u32(rec, "childId").unwrap_or(0);
+                let ref_u32 = extract_u32(rec, "refId").unwrap_or(0);
+                if let (Some(&parent_id), Some(&child_id)) =
+                    (vm_nodes.get(&parent_u32), vm_nodes.get(&child_u32))
+                {
+                    let ref_id = vm_nodes.get(&ref_u32).copied();
+                    let _ = doc.insert_before(parent_id, child_id, ref_id);
                 }
             }
             "removeChild" => {
@@ -1475,9 +1639,34 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
                 }
             }
             "setInnerHTML" => {
-                let html = rec.get("html").and_then(|v| v.as_str()).unwrap_or("");
+                let html = rec
+                    .get("html")
+                    .or_else(|| rec.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if let Some(&nid) = vm_nodes.get(&id_u32) {
                     doc.set_inner_html(nid, html);
+                }
+            }
+            "insertAdjacentHTML" => {
+                let pos = rec
+                    .get("position")
+                    .or_else(|| rec.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("beforeend");
+                let html = rec
+                    .get("html")
+                    .or_else(|| rec.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.insert_adjacent_html(nid, pos, html);
+                }
+            }
+            "setValue" => {
+                let val = rec.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(&nid) = vm_nodes.get(&id_u32) {
+                    doc.set_input_value(nid, val);
                 }
             }
             "setClassName" => {
@@ -1663,6 +1852,7 @@ pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
             _ => {}
         }
     }
+    default_prevented
 }
 
 fn json_i32(obj: &JsonValue, key: &str) -> i32 {
@@ -2110,6 +2300,36 @@ enum Job {
         value: Value,
         rejected: bool,
     },
+    /// Flush queued records for a `MutationObserver` instance.
+    MutationObserver { obs_id: usize },
+    /// Deliver initial observation entry for an `IntersectionObserver` or `ResizeObserver`.
+    LayoutObserver { obs_id: usize, target: NodeId },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MutationObserverTarget {
+    node_id: NodeId,
+    child_list: bool,
+    attributes: bool,
+    character_data: bool,
+    subtree: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MutationObserverEntry {
+    id: usize,
+    callback: String,
+    targets: Vec<MutationObserverTarget>,
+    records: Vec<JsonValue>,
+    scheduled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LayoutObserverEntry {
+    id: usize,
+    kind: String,
+    callback: String,
+    targets: Vec<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2305,7 +2525,14 @@ impl Value {
             JsonValue::Array(items) => {
                 Self::Array(items.into_iter().map(Self::from_json_value).collect())
             }
-            other => Self::Json(other),
+            other => {
+                if let Some(JsonValue::Number(idx)) = other.get("__anvil_element_id")
+                    && *idx >= 0.0
+                {
+                    return Self::Element(NodeId::from_raw(*idx as u32));
+                }
+                Self::Json(other)
+            }
         }
     }
 
@@ -2334,6 +2561,17 @@ pub struct ScriptRuntime {
     functions: Vec<(String, Vec<String>, String)>,
     classes: Vec<ClassDef>,
     click_listeners: Vec<(NodeId, String)>,
+    input_listeners: Vec<(NodeId, String)>,
+    change_listeners: Vec<(NodeId, String)>,
+    submit_listeners: Vec<(NodeId, String)>,
+    keydown_listeners: Vec<(NodeId, String)>,
+    mutation_observers: Vec<MutationObserverEntry>,
+    layout_observers: Vec<LayoutObserverEntry>,
+    vm_scripts: Vec<String>,
+    vm_initial_dom_seed: Option<String>,
+    vm_event_listeners: Vec<(NodeId, String)>,
+    vm_event_history: Vec<(u32, String, String)>,
+    event_default_prevented: bool,
     timers: Vec<Timer>,
     microtasks: std::collections::VecDeque<Job>,
     promises: Vec<PromiseRec>,
@@ -2386,6 +2624,17 @@ impl Default for ScriptRuntime {
             functions: Vec::new(),
             classes: Vec::new(),
             click_listeners: Vec::new(),
+            input_listeners: Vec::new(),
+            change_listeners: Vec::new(),
+            submit_listeners: Vec::new(),
+            keydown_listeners: Vec::new(),
+            mutation_observers: Vec::new(),
+            layout_observers: Vec::new(),
+            vm_scripts: Vec::new(),
+            vm_initial_dom_seed: None,
+            vm_event_listeners: Vec::new(),
+            vm_event_history: Vec::new(),
+            event_default_prevented: false,
             timers: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
             promises: Vec::new(),
@@ -3426,6 +3675,188 @@ impl ScriptRuntime {
                     self.run_frame(doc, frame, Some((value, rejected)))
                 }
             },
+            Job::MutationObserver { obs_id } => {
+                let Some(obs) = self.mutation_observers.get_mut(obs_id) else {
+                    return;
+                };
+                obs.scheduled = false;
+                if obs.records.is_empty() {
+                    return;
+                }
+                let records: Vec<Value> = std::mem::take(&mut obs.records)
+                    .into_iter()
+                    .map(Value::Json)
+                    .collect();
+                let callback = obs.callback.clone();
+                let mut obs_obj = JsonValue::empty_object();
+                obs_obj.insert(
+                    "__anvil_kind",
+                    JsonValue::String("MutationObserver".to_string()),
+                );
+                obs_obj.insert("__observer_id", JsonValue::Number(obs_id as f64));
+                self.invoke_observer_callback(
+                    doc,
+                    &callback,
+                    Value::Array(records),
+                    Value::Json(obs_obj),
+                );
+            }
+            Job::LayoutObserver { obs_id, target } => {
+                let Some(obs) = self.layout_observers.get(obs_id).cloned() else {
+                    return;
+                };
+                if !obs.targets.contains(&target) {
+                    return;
+                }
+                let mut rect = JsonValue::empty_object();
+                rect.insert("x", JsonValue::Number(0.0));
+                rect.insert("y", JsonValue::Number(0.0));
+                rect.insert("top", JsonValue::Number(0.0));
+                rect.insert("left", JsonValue::Number(0.0));
+                rect.insert("width", JsonValue::Number(100.0));
+                rect.insert("height", JsonValue::Number(24.0));
+                rect.insert("right", JsonValue::Number(100.0));
+                rect.insert("bottom", JsonValue::Number(24.0));
+                let mut target_ref = JsonValue::empty_object();
+                target_ref.insert(
+                    "__anvil_element_id",
+                    JsonValue::Number(target.index() as f64),
+                );
+                let mut entry = JsonValue::empty_object();
+                entry.insert("target", target_ref);
+                if obs.kind == "IntersectionObserver" {
+                    entry.insert("isIntersecting", JsonValue::Bool(true));
+                    entry.insert("intersectionRatio", JsonValue::Number(1.0));
+                    entry.insert("boundingClientRect", rect.clone());
+                    entry.insert("intersectionRect", rect.clone());
+                    entry.insert("rootBounds", rect);
+                } else {
+                    entry.insert("contentRect", rect);
+                }
+                let mut obs_obj = JsonValue::empty_object();
+                obs_obj.insert("__anvil_kind", JsonValue::String(obs.kind.clone()));
+                obs_obj.insert("__observer_id", JsonValue::Number(obs_id as f64));
+                self.invoke_observer_callback(
+                    doc,
+                    &obs.callback,
+                    Value::Array(vec![Value::Json(entry)]),
+                    Value::Json(obs_obj),
+                );
+            }
+        }
+    }
+
+    fn invoke_observer_callback(
+        &mut self,
+        doc: &mut Document,
+        callback: &str,
+        arg0: Value,
+        arg1: Value,
+    ) {
+        let cb_trimmed = callback.trim();
+        if cb_trimmed.is_empty() {
+            return;
+        }
+        if is_identifier(cb_trimmed) {
+            if let Some((_, params, body)) = self
+                .functions
+                .iter()
+                .find(|(name, _, _)| name == cb_trimmed)
+                .cloned()
+            {
+                let mut env = Vec::new();
+                if let Some(p0) = params.first() {
+                    env.push((p0.clone(), arg0));
+                }
+                if let Some(p1) = params.get(1) {
+                    env.push((p1.clone(), arg1));
+                }
+                self.eval_deferred_env(doc, &body, &env);
+                return;
+            }
+        }
+        let (params, body) = extract_multi_param_callback(cb_trimmed);
+        let mut env = Vec::new();
+        if let Some(p0) = params.first().filter(|s| !s.is_empty()) {
+            env.push((p0.clone(), arg0));
+        }
+        if let Some(p1) = params.get(1).filter(|s| !s.is_empty()) {
+            env.push((p1.clone(), arg1));
+        }
+        self.eval_deferred_env(doc, &body, &env);
+    }
+
+    pub(crate) fn notify_mutation_observers(
+        &mut self,
+        doc: &Document,
+        kind: &str,
+        target: NodeId,
+        attr_name: Option<&str>,
+    ) {
+        if self.mutation_observers.is_empty() {
+            return;
+        }
+        let mut to_schedule = Vec::new();
+        for (obs_id, obs) in self.mutation_observers.iter_mut().enumerate() {
+            let mut matched = false;
+            for watched in &obs.targets {
+                let target_matches = watched.node_id == target
+                    || (watched.subtree && doc.contains_node(watched.node_id, target));
+                if !target_matches {
+                    continue;
+                }
+                match kind {
+                    "childList" if watched.child_list => matched = true,
+                    "attributes" if watched.attributes => matched = true,
+                    "characterData" if watched.character_data || watched.child_list => {
+                        matched = true
+                    }
+                    _ => {}
+                }
+                if matched {
+                    break;
+                }
+            }
+            if matched {
+                let mut target_ref = JsonValue::empty_object();
+                target_ref.insert(
+                    "__anvil_element_id",
+                    JsonValue::Number(target.index() as f64),
+                );
+                let mut rec = JsonValue::empty_object();
+                rec.insert("type", JsonValue::String(kind.to_string()));
+                rec.insert("target", target_ref);
+                rec.insert(
+                    "attributeName",
+                    attr_name
+                        .map(|s| JsonValue::String(s.to_string()))
+                        .unwrap_or(JsonValue::Null),
+                );
+                rec.insert("addedNodes", JsonValue::Array(Vec::new()));
+                rec.insert("removedNodes", JsonValue::Array(Vec::new()));
+                obs.records.push(rec);
+                if !obs.scheduled {
+                    obs.scheduled = true;
+                    to_schedule.push(obs_id);
+                }
+            }
+        }
+        for obs_id in to_schedule {
+            self.schedule_job(Job::MutationObserver { obs_id });
+        }
+    }
+
+    pub(crate) fn register_vm_event_listener(&mut self, node: NodeId, event_type: &str) {
+        let ev = event_type.trim().to_ascii_lowercase();
+        if ev.is_empty() {
+            return;
+        }
+        if !self
+            .vm_event_listeners
+            .iter()
+            .any(|(n, e)| *n == node && e == &ev)
+        {
+            self.vm_event_listeners.push((node, ev));
         }
     }
 
@@ -4144,9 +4575,10 @@ impl ScriptRuntime {
         let _ = self.run_timers(doc);
     }
 
-    /// Hydrate `onclick` attributes, declared functions/classes, and click
-    /// event listeners on a document whose initial script pass already ran
-    /// inside `--tab-worker`, without re-running imperative DOM mutations.
+    /// Hydrate `onclick`/`oninput`/`onchange`/`onsubmit`/`onkeydown` attributes,
+    /// declared functions/classes, and event listeners on a document whose
+    /// initial script pass already ran inside `--tab-worker`, without
+    /// re-running imperative DOM mutations.
     pub fn hydrate_interactive_bindings(&mut self, doc: &mut Document) {
         self.ensure_prelude_loaded(doc);
         self.reset_execution_budget();
@@ -4156,6 +4588,26 @@ impl ScriptRuntime {
                 continue;
             }
             let cleaned = strip_comments(&script);
+            if should_route_dom_script_to_anvil_js(&cleaned) {
+                if self.vm_initial_dom_seed.is_none() {
+                    let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
+                    let env_seed = self.build_vm_storage_and_location_seed();
+                    self.vm_initial_dom_seed = Some(format!("{dom_seed}\n{env_seed}"));
+                }
+                if let Ok(lowered) = compile_es2022_with_anvil_js(cleaned.trim(), false) {
+                    if !self.vm_scripts.iter().any(|s| s == &lowered) {
+                        self.vm_scripts.push(lowered);
+                    }
+                    for ev in ["click", "input", "change", "submit", "keydown"] {
+                        if cleaned.contains(".addEventListener(")
+                            && (cleaned.contains(&format!("'{ev}'"))
+                                || cleaned.contains(&format!("\"{ev}\"")))
+                        {
+                            self.register_vm_event_listener(doc.body(), ev);
+                        }
+                    }
+                }
+            }
             for stmt in split_statements(&cleaned) {
                 let s = stmt.trim();
                 let declaration = s.starts_with("function ")
@@ -4168,9 +4620,18 @@ impl ScriptRuntime {
                         && !s.contains("setInterval(")
                         && !s.contains(".innerHTML")
                         && !s.contains(".textContent");
-                let click_listener = s.contains(".addEventListener(")
-                    && (s.contains("'click'") || s.contains("\"click\""));
-                if declaration || plain_binding || click_listener {
+                let interactive_listener = s.contains(".addEventListener(")
+                    && (s.contains("'click'")
+                        || s.contains("\"click\"")
+                        || s.contains("'input'")
+                        || s.contains("\"input\"")
+                        || s.contains("'change'")
+                        || s.contains("\"change\"")
+                        || s.contains("'submit'")
+                        || s.contains("\"submit\"")
+                        || s.contains("'keydown'")
+                        || s.contains("\"keydown\""));
+                if declaration || plain_binding || interactive_listener {
                     self.exec_statement(doc, s);
                 }
             }
@@ -4194,9 +4655,97 @@ impl ScriptRuntime {
         self.wasm_instances.get_mut(index)
     }
 
+    /// True when the most recently dispatched DOM event (`click`, `input`,
+    /// `submit`, or `keydown`) called `event.preventDefault()` or returned `false`.
+    pub fn last_event_default_prevented(&self) -> bool {
+        self.event_default_prevented
+    }
+
+    fn make_dom_event_value(
+        &self,
+        event_type: &str,
+        target: NodeId,
+        current_target: NodeId,
+        value: Option<&str>,
+        key: Option<&str>,
+    ) -> Value {
+        let mut target_ref = JsonValue::empty_object();
+        target_ref.insert(
+            "__anvil_element_id",
+            JsonValue::Number(target.index() as f64),
+        );
+        let mut cur_ref = JsonValue::empty_object();
+        cur_ref.insert(
+            "__anvil_element_id",
+            JsonValue::Number(current_target.index() as f64),
+        );
+        let mut ev = JsonValue::empty_object();
+        ev.insert("__anvil_kind", JsonValue::String("Event".to_string()));
+        ev.insert("type", JsonValue::String(event_type.to_string()));
+        ev.insert("target", target_ref);
+        ev.insert("currentTarget", cur_ref);
+        ev.insert("bubbles", JsonValue::Bool(true));
+        ev.insert("cancelable", JsonValue::Bool(true));
+        ev.insert(
+            "defaultPrevented",
+            JsonValue::Bool(self.event_default_prevented),
+        );
+        if let Some(v) = value {
+            ev.insert("value", JsonValue::String(v.to_string()));
+            ev.insert("data", JsonValue::String(v.to_string()));
+        }
+        if let Some(k) = key {
+            ev.insert("key", JsonValue::String(k.to_string()));
+            ev.insert("code", JsonValue::String(k.to_string()));
+        }
+        Value::Json(ev)
+    }
+
+    fn run_event_handler_body(
+        &mut self,
+        doc: &mut Document,
+        event_type: &str,
+        target: NodeId,
+        current_target: NodeId,
+        value: Option<&str>,
+        key: Option<&str>,
+        body: &str,
+    ) {
+        let ev = self.make_dom_event_value(event_type, target, current_target, value, key);
+        self.set_var("event", ev);
+        let prev_return = self.return_value.take();
+        self.eval_deferred(doc, body);
+        if self.return_value == Some(Value::Bool(false)) {
+            self.event_default_prevented = true;
+        }
+        self.return_value = prev_return;
+    }
+
+    fn has_vm_listener_in_chain(&self, doc: &Document, target: NodeId, event_type: &str) -> bool {
+        if self.vm_scripts.is_empty() {
+            return false;
+        }
+        let wanted = event_type.to_ascii_lowercase();
+        let mut cursor = Some(target);
+        while let Some(id) = cursor {
+            if self
+                .vm_event_listeners
+                .iter()
+                .any(|(n, ev)| *n == id && ev == &wanted)
+            {
+                return true;
+            }
+            cursor = doc.get(id).parent();
+        }
+        self.vm_event_listeners
+            .iter()
+            .any(|(n, ev)| (*n == doc.body() || *n == doc.root()) && ev == &wanted)
+    }
+
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
         self.ensure_prelude_loaded(doc);
         self.reset_execution_budget();
+        self.event_default_prevented = false;
         let mut cursor = Some(target);
         let mut handled = false;
         while let Some(id) = cursor {
@@ -4207,15 +4756,356 @@ impl ScriptRuntime {
                 .map(|(_, body)| body.clone())
                 .collect();
             for body in handlers {
-                self.eval_deferred(doc, &body);
+                self.run_event_handler_body(doc, "click", target, id, None, None, &body);
                 handled = true;
             }
             cursor = doc.get(id).parent();
+        }
+        if self.has_vm_listener_in_chain(doc, target, "click")
+            && self.dispatch_vm_host_event(doc, target, "click", None, None)
+        {
+            handled = true;
         }
         if handled {
             let _ = self.run_timers(doc);
         }
         handled
+    }
+
+    /// Dispatch a live `input` (and `change`) event on `target` after its input value
+    /// has been updated to `value`.
+    pub fn dispatch_input(&mut self, doc: &mut Document, target: NodeId, value: &str) -> bool {
+        self.ensure_prelude_loaded(doc);
+        self.reset_execution_budget();
+        self.event_default_prevented = false;
+        doc.set_input_value(target, value);
+        let mut cursor = Some(target);
+        let mut handled = false;
+        while let Some(id) = cursor {
+            let handlers: Vec<String> = self
+                .input_listeners
+                .iter()
+                .chain(self.change_listeners.iter())
+                .filter(|(node, _)| *node == id)
+                .map(|(_, body)| body.clone())
+                .collect();
+            for body in handlers {
+                self.run_event_handler_body(doc, "input", target, id, Some(value), None, &body);
+                handled = true;
+            }
+            cursor = doc.get(id).parent();
+        }
+        if (self.has_vm_listener_in_chain(doc, target, "input")
+            || self.has_vm_listener_in_chain(doc, target, "change"))
+            && self.dispatch_vm_host_event(doc, target, "input", Some(value), None)
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.run_timers(doc);
+        }
+        handled
+    }
+
+    /// Dispatch a live `submit` event on `form_target` (or its enclosing `<form>`).
+    /// Check [`Self::last_event_default_prevented`] afterward to see whether native
+    /// form navigation was cancelled via `event.preventDefault()` or `return false`.
+    pub fn dispatch_submit(&mut self, doc: &mut Document, form_target: NodeId) -> bool {
+        self.ensure_prelude_loaded(doc);
+        self.reset_execution_budget();
+        self.event_default_prevented = false;
+        let mut cursor = Some(form_target);
+        let mut handled = false;
+        while let Some(id) = cursor {
+            let handlers: Vec<String> = self
+                .submit_listeners
+                .iter()
+                .filter(|(node, _)| *node == id)
+                .map(|(_, body)| body.clone())
+                .collect();
+            for body in handlers {
+                self.run_event_handler_body(doc, "submit", form_target, id, None, None, &body);
+                handled = true;
+            }
+            cursor = doc.get(id).parent();
+        }
+        if self.has_vm_listener_in_chain(doc, form_target, "submit")
+            && self.dispatch_vm_host_event(doc, form_target, "submit", None, None)
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.run_timers(doc);
+        }
+        handled
+    }
+
+    /// Dispatch a live `keydown` event on `target`.
+    pub fn dispatch_keydown(&mut self, doc: &mut Document, target: NodeId, key: &str) -> bool {
+        self.ensure_prelude_loaded(doc);
+        self.reset_execution_budget();
+        self.event_default_prevented = false;
+        let mut cursor = Some(target);
+        let mut handled = false;
+        while let Some(id) = cursor {
+            let handlers: Vec<String> = self
+                .keydown_listeners
+                .iter()
+                .filter(|(node, _)| *node == id)
+                .map(|(_, body)| body.clone())
+                .collect();
+            for body in handlers {
+                self.run_event_handler_body(doc, "keydown", target, id, None, Some(key), &body);
+                handled = true;
+            }
+            cursor = doc.get(id).parent();
+        }
+        if self.has_vm_listener_in_chain(doc, target, "keydown")
+            && self.dispatch_vm_host_event(doc, target, "keydown", None, Some(key))
+        {
+            handled = true;
+        }
+        if handled {
+            let _ = self.run_timers(doc);
+        }
+        handled
+    }
+
+    fn build_vm_storage_and_location_seed(&self) -> String {
+        let mut out = String::new();
+        if let Some(origin) = self.page_origin.as_deref()
+            && !origin.is_empty()
+        {
+            let q_origin = quote_js_string_literal(origin);
+            out.push_str(&format!(
+                "window.location.href = {q_origin}; document.URL = {q_origin}; document.documentURI = {q_origin};\n"
+            ));
+        }
+        let origin_key = self.storage_origin_key();
+        for (o, k, v) in &self.local_storage {
+            if o == &origin_key {
+                out.push_str(&format!(
+                    "window.localStorage._seedItem({}, {});\n",
+                    quote_js_string_literal(k),
+                    quote_js_string_literal(v)
+                ));
+            }
+        }
+        out
+    }
+
+    /// Compile and run `source` on `AnvilVM` with the live hierarchical DOM bridge,
+    /// applying all DOM, `localStorage`, and `location` mutations back to `doc`
+    /// and `self`.
+    pub fn eval_with_anvil_js_dom_bridge(&mut self, doc: &mut Document, source: &str) -> bool {
+        if !is_cpp_jit_kernel_active() {
+            return false;
+        }
+        let Ok(lowered_app) = compile_es2022_with_anvil_js(source, false) else {
+            return false;
+        };
+        let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
+        let env_seed = self.build_vm_storage_and_location_seed();
+        let initial_seed = format!("{dom_seed}\n{env_seed}");
+        if self.vm_initial_dom_seed.is_none() {
+            self.vm_initial_dom_seed = Some(initial_seed.clone());
+        }
+        let rt_bundle = self_hosted_runtime_bundle();
+        let initial_url = self.page_origin.as_deref().unwrap_or("https://localhost/");
+        let quoted_url = quote_js_string_literal(initial_url);
+        let full_program = format!(
+            "{rt_bundle}\n\
+const env = createBrowserEnv({quoted_url});\n\
+const window = env.window;\n\
+const globalThis = window;\n\
+const self = window;\n\
+const document = env.document;\n\
+const navigator = env.navigator;\n\
+const location = env.location;\n\
+const history = env.history;\n\
+const localStorage = env.localStorage;\n\
+const sessionStorage = env.sessionStorage;\n\
+const customElements = env.customElements;\n\
+const performance = env.performance;\n\
+const JSON = {{ parse: anvilJsonParse, stringify: anvilJsonStringify }};\n\
+const btoa = anvilBtoa;\n\
+const atob = anvilAtob;\n\
+const encodeURIComponent = anvilEncodeURIComponent;\n\
+const decodeURIComponent = anvilDecodeURIComponent;\n\
+{initial_seed}\n\
+{lowered_app}\n\
+{ANVIL_VM_MUTATION_EXPORT_FOOTER}\n"
+        );
+        let Ok(run) = eval_cpp_vm_with_console_configured(
+            &full_program,
+            80_000_000,
+            64 * 1024 * 1024,
+            10_000,
+        ) else {
+            return false;
+        };
+        self.last_script_used_vm = true;
+        self.last_vm_number = Some(run.result);
+        if let Ok(globals) = run.telemetry.exported_globals() {
+            for (name, value) in globals {
+                self.set_var(&name, value);
+            }
+        }
+        let mut parsed_records: Vec<JsonValue> = Vec::new();
+        for line in &run.output {
+            if let Some(rest) = line.strip_prefix("__ANVIL_DOM_MUT__:") {
+                if let Ok(parsed) = parse_json(rest) {
+                    parsed_records.push(parsed);
+                }
+            } else {
+                self.push_console(line.clone());
+            }
+        }
+        if !parsed_records.is_empty() {
+            let _ = apply_vm_dom_mutations_with_runtime(
+                doc,
+                &JsonValue::Array(parsed_records),
+                Some(self),
+            );
+        }
+        if !self.vm_scripts.iter().any(|s| s == &lowered_app) {
+            self.vm_scripts.push(lowered_app);
+        }
+        true
+    }
+
+    fn dispatch_vm_host_event(
+        &mut self,
+        doc: &mut Document,
+        target: NodeId,
+        event_type: &str,
+        value: Option<&str>,
+        key: Option<&str>,
+    ) -> bool {
+        if !is_cpp_jit_kernel_active() || self.vm_scripts.is_empty() {
+            return false;
+        }
+        let base_seed = self.vm_initial_dom_seed.clone().unwrap_or_else(|| {
+            let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
+            let env_seed = self.build_vm_storage_and_location_seed();
+            format!("{dom_seed}\n{env_seed}")
+        });
+        let mut init_parts = Vec::new();
+        if let Some(v) = value {
+            init_parts.push(format!("value: {}", quote_js_string_literal(v)));
+        }
+        if let Some(k) = key {
+            init_parts.push(format!("key: {}", quote_js_string_literal(k)));
+        }
+        let init_js = format!("{{ {} }}", init_parts.join(", "));
+        let scripts_joined = self.vm_scripts.join("\n;\n");
+        let mut prior_events_js = String::new();
+        for (ev_target, ev_type, ev_init) in &self.vm_event_history {
+            prior_events_js.push_str(&format!(
+                "document.dispatchHostEvent({}, {}, {});\n",
+                ev_target,
+                quote_js_string_literal(ev_type),
+                ev_init
+            ));
+        }
+        let mut input_sync_js = String::new();
+        for (idx, node_id) in doc
+            .query_selector_all("input, textarea, select")
+            .into_iter()
+            .enumerate()
+        {
+            let cur_val = doc.input_value(node_id);
+            if !cur_val.is_empty() {
+                let q_val = quote_js_string_literal(&cur_val);
+                input_sync_js.push_str(&format!(
+                    "const __inp_{idx} = document.findByDomNodeId({}); if (__inp_{idx}) {{ __inp_{idx}.value = {q_val}; __inp_{idx}._lastSyncedValue = {q_val}; }}\n",
+                    node_id.index()
+                ));
+            }
+        }
+        let reset_mutations_js = "\
+document.syncDomTree();
+const __kept = [];
+for (let __i = 0; __i < document._domMutations.length; __i = __i + 1) {
+    if (document._domMutations[__i].op === \"bindSeedNode\") {
+        __kept.push(document._domMutations[__i]);
+    }
+}
+document._domMutations = __kept;";
+        let current_event_js = format!(
+            "const __ev = document.dispatchHostEvent({}, {}, {}); if (document._lastEventHandled) {{ console.log(\"__ANVIL_EVENT_HANDLED__:1\"); }} if (!__ev) {{ console.log(\"__ANVIL_EVENT_PREVENTED__:1\"); }}",
+            target.index(),
+            quote_js_string_literal(event_type),
+            init_js
+        );
+        let rt_bundle = self_hosted_runtime_bundle();
+        let initial_url = self.page_origin.as_deref().unwrap_or("https://localhost/");
+        let quoted_url = quote_js_string_literal(initial_url);
+        let full_program = format!(
+            "{rt_bundle}\n\
+const env = createBrowserEnv({quoted_url});\n\
+const window = env.window;\n\
+const globalThis = window;\n\
+const self = window;\n\
+const document = env.document;\n\
+const navigator = env.navigator;\n\
+const location = env.location;\n\
+const history = env.history;\n\
+const localStorage = env.localStorage;\n\
+const sessionStorage = env.sessionStorage;\n\
+const customElements = env.customElements;\n\
+const performance = env.performance;\n\
+const JSON = {{ parse: anvilJsonParse, stringify: anvilJsonStringify }};\n\
+const btoa = anvilBtoa;\n\
+const atob = anvilAtob;\n\
+const encodeURIComponent = anvilEncodeURIComponent;\n\
+const decodeURIComponent = anvilDecodeURIComponent;\n\
+{base_seed}\n\
+{scripts_joined}\n\
+{prior_events_js}\n\
+{input_sync_js}\n\
+{reset_mutations_js}\n\
+{current_event_js}\n\
+{ANVIL_VM_MUTATION_EXPORT_FOOTER}\n"
+        );
+        let Ok(run) = eval_cpp_vm_with_console_configured(
+            &full_program,
+            80_000_000,
+            64 * 1024 * 1024,
+            10_000,
+        ) else {
+            return false;
+        };
+        let mut event_handled = false;
+        let mut parsed_records: Vec<JsonValue> = Vec::new();
+        for line in &run.output {
+            if line == "__ANVIL_EVENT_HANDLED__:1" {
+                event_handled = true;
+            } else if line == "__ANVIL_EVENT_PREVENTED__:1" {
+                self.event_default_prevented = true;
+            } else if let Some(rest) = line.strip_prefix("__ANVIL_DOM_MUT__:") {
+                if let Ok(parsed) = parse_json(rest) {
+                    parsed_records.push(parsed);
+                }
+            } else {
+                self.push_console(line.clone());
+            }
+        }
+        if !event_handled {
+            return false;
+        }
+        if !parsed_records.is_empty() {
+            if apply_vm_dom_mutations_with_runtime(
+                doc,
+                &JsonValue::Array(parsed_records),
+                Some(self),
+            ) {
+                self.event_default_prevented = true;
+            }
+        }
+        self.vm_event_history
+            .push((target.index() as u32, event_type.to_string(), init_js));
+        true
     }
 
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
@@ -4290,6 +5180,12 @@ impl ScriptRuntime {
                     self.last_vm_error = Some(error);
                 }
             }
+        }
+        if !self.in_rust_eval
+            && should_route_dom_script_to_anvil_js(&cleaned)
+            && self.eval_with_anvil_js_dom_bridge(doc, cleaned.trim())
+        {
+            return;
         }
         let outer = self.in_rust_eval;
         self.in_rust_eval = true;
@@ -4622,11 +5518,41 @@ impl ScriptRuntime {
     }
 
     fn collect_onclick_attrs(&mut self, doc: &Document, id: NodeId) {
-        if let Some(code) = doc.get(id).data().attr("onclick") {
-            let code = code.trim();
-            if !code.is_empty() {
-                self.click_listeners.push((id, code.to_string()));
-            }
+        let data = doc.get(id).data();
+        if let Some(code) = data
+            .attr("onclick")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.click_listeners.push((id, code.to_string()));
+        }
+        if let Some(code) = data
+            .attr("oninput")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.input_listeners.push((id, code.to_string()));
+        }
+        if let Some(code) = data
+            .attr("onchange")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.change_listeners.push((id, code.to_string()));
+        }
+        if let Some(code) = data
+            .attr("onsubmit")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.submit_listeners.push((id, code.to_string()));
+        }
+        if let Some(code) = data
+            .attr("onkeydown")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.keydown_listeners.push((id, code.to_string()));
         }
         let children: Vec<NodeId> = doc.children(id).to_vec();
         for child in children {
@@ -5271,6 +6197,26 @@ impl ScriptRuntime {
                     return;
                 }
             }
+            if !is_decl
+                && let Some((obj_expr, prop)) = lhs_trimmed.rsplit_once('.')
+                && matches!(
+                    prop.trim(),
+                    "onclick" | "oninput" | "onchange" | "onsubmit" | "onkeydown"
+                )
+                && let Value::Element(id) = self.eval_expr(doc, obj_expr.trim())
+            {
+                let target_id = if id == doc.root() { doc.body() } else { id };
+                let body = extract_event_callback_body(rhs_trimmed);
+                match prop.trim() {
+                    "onclick" => self.click_listeners.push((target_id, body)),
+                    "oninput" => self.input_listeners.push((target_id, body)),
+                    "onchange" => self.change_listeners.push((target_id, body)),
+                    "onsubmit" => self.submit_listeners.push((target_id, body)),
+                    "onkeydown" => self.keydown_listeners.push((target_id, body)),
+                    _ => {}
+                }
+                return;
+            }
             let value = self.eval_expr(doc, rhs_trimmed);
             self.assign_target(doc, lhs_trimmed, value);
             return;
@@ -5485,6 +6431,7 @@ impl ScriptRuntime {
                             let css_prop = camel_to_kebab(prop_trimmed);
                             update_inline_style(doc, id, &css_prop, &css_val);
                         }
+                        self.notify_mutation_observers(doc, "attributes", id, Some("style"));
                     }
                     return;
                 }
@@ -5493,6 +6440,7 @@ impl ScriptRuntime {
                         let attr_name = format!("data-{}", camel_to_kebab(prop.trim()));
                         let attr_val = value.as_string(doc);
                         doc.set_attribute(id, &attr_name, &attr_val);
+                        self.notify_mutation_observers(doc, "attributes", id, Some(&attr_name));
                     }
                     return;
                 }
@@ -5532,11 +6480,13 @@ impl ScriptRuntime {
                     "textContent" | "innerText" | "nodeValue" => {
                         let text = value.as_string(doc);
                         doc.set_text_content(id, &text);
+                        self.notify_mutation_observers(doc, "childList", id, None);
                     }
                     "innerHTML" | "outerHTML" => {
                         let html = value.as_string(doc);
                         doc.set_inner_html(id, &html);
                         self.dom_cache.clear();
+                        self.notify_mutation_observers(doc, "childList", id, None);
                     }
                     "value" => {
                         let text = value.as_string(doc);
@@ -5551,6 +6501,7 @@ impl ScriptRuntime {
                         } else {
                             doc.remove_attribute(id, "disabled");
                         }
+                        self.notify_mutation_observers(doc, "attributes", id, Some("disabled"));
                     }
                     "hidden" => {
                         if value.is_truthy() {
@@ -5559,20 +6510,25 @@ impl ScriptRuntime {
                         } else {
                             doc.remove_attribute(id, "hidden");
                         }
+                        self.notify_mutation_observers(doc, "attributes", id, Some("hidden"));
                     }
                     "id" => {
                         let text = value.as_string(doc);
                         doc.set_attribute(id, "id", &text);
                         self.dom_cache.clear();
+                        self.notify_mutation_observers(doc, "attributes", id, Some("id"));
                     }
                     "className" => {
                         let text = value.as_string(doc);
                         doc.set_attribute(id, "class", &text);
                         self.dom_cache.clear();
+                        self.notify_mutation_observers(doc, "attributes", id, Some("class"));
                     }
                     "href" | "src" | "type" | "name" | "placeholder" | "title" | "alt" | "role" => {
+                        let attr_name = prop.trim();
                         let text = value.as_string(doc);
-                        doc.set_attribute(id, prop.trim(), &text);
+                        doc.set_attribute(id, attr_name, &text);
+                        self.notify_mutation_observers(doc, "attributes", id, Some(attr_name));
                     }
                     _ => {}
                 }
@@ -6596,11 +7552,45 @@ impl ScriptRuntime {
                 obj.insert("signal", sig);
                 Value::Json(obj)
             }
-            "MutationObserver"
-            | "IntersectionObserver"
-            | "ResizeObserver"
-            | "MediaSource"
-            | "XMLHttpRequest" => {
+            "MutationObserver" => {
+                let cb = args
+                    .first()
+                    .map(|a| a.trim().to_string())
+                    .unwrap_or_default();
+                let obs_id = self.mutation_observers.len();
+                self.mutation_observers.push(MutationObserverEntry {
+                    id: obs_id,
+                    callback: cb,
+                    targets: Vec::new(),
+                    records: Vec::new(),
+                    scheduled: false,
+                });
+                let mut obj = JsonValue::empty_object();
+                obj.insert(
+                    "__anvil_kind",
+                    JsonValue::String("MutationObserver".to_string()),
+                );
+                obj.insert("__observer_id", JsonValue::Number(obs_id as f64));
+                Value::Json(obj)
+            }
+            "IntersectionObserver" | "ResizeObserver" => {
+                let cb = args
+                    .first()
+                    .map(|a| a.trim().to_string())
+                    .unwrap_or_default();
+                let obs_id = self.layout_observers.len();
+                self.layout_observers.push(LayoutObserverEntry {
+                    id: obs_id,
+                    kind: callee.to_string(),
+                    callback: cb,
+                    targets: Vec::new(),
+                });
+                let mut obj = JsonValue::empty_object();
+                obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
+                obj.insert("__observer_id", JsonValue::Number(obs_id as f64));
+                Value::Json(obj)
+            }
+            "MediaSource" | "XMLHttpRequest" => {
                 let mut obj = JsonValue::empty_object();
                 obj.insert("__anvil_kind", JsonValue::String(callee.to_string()));
                 if callee == "MediaSource" {
@@ -7336,19 +8326,22 @@ impl ScriptRuntime {
                 let args = split_args(args_src);
                 if args.len() >= 2 {
                     let event = self.eval_expr(doc, &args[0]).as_string(doc);
-                    let body = extract_callback_body(args[1].trim());
-                    if event.eq_ignore_ascii_case("click") {
-                        self.click_listeners.push((doc.body(), body));
-                    } else if matches!(
-                        event.to_ascii_lowercase().as_str(),
-                        "domcontentloaded" | "load" | "readystatechange"
-                    ) {
-                        let (code, env, is_async) = self.deferred_callback(&args[1]);
-                        self.schedule_job(Job::Script {
-                            code,
-                            env,
-                            is_async,
-                        });
+                    let body = extract_event_callback_body(args[1].trim());
+                    match event.to_ascii_lowercase().as_str() {
+                        "click" => self.click_listeners.push((doc.body(), body)),
+                        "input" => self.input_listeners.push((doc.body(), body)),
+                        "change" => self.change_listeners.push((doc.body(), body)),
+                        "submit" => self.submit_listeners.push((doc.body(), body)),
+                        "keydown" => self.keydown_listeners.push((doc.body(), body)),
+                        "domcontentloaded" | "load" | "readystatechange" => {
+                            let (code, env, is_async) = self.deferred_callback(&args[1]);
+                            self.schedule_job(Job::Script {
+                                code,
+                                env,
+                                is_async,
+                            });
+                        }
+                        _ => {}
                     }
                 }
                 return Value::Null;
@@ -7607,13 +8600,19 @@ impl ScriptRuntime {
                     return match method {
                         "add" => {
                             doc.add_class(id, &cls);
+                            self.notify_mutation_observers(doc, "attributes", id, Some("class"));
                             Value::Null
                         }
                         "remove" => {
                             doc.remove_class(id, &cls);
+                            self.notify_mutation_observers(doc, "attributes", id, Some("class"));
                             Value::Null
                         }
-                        "toggle" => Value::Bool(doc.toggle_class(id, &cls)),
+                        "toggle" => {
+                            let res = doc.toggle_class(id, &cls);
+                            self.notify_mutation_observers(doc, "attributes", id, Some("class"));
+                            Value::Bool(res)
+                        }
                         "contains" => Value::Bool(doc.get(id).data().has_class(&cls)),
                         _ => Value::Null,
                     };
@@ -7630,12 +8629,14 @@ impl ScriptRuntime {
                         "setProperty" if args.len() >= 2 => {
                             let val = self.eval_expr(doc, &args[1]).as_string(doc);
                             update_inline_style(doc, id, &prop, &val);
+                            self.notify_mutation_observers(doc, "attributes", id, Some("style"));
                             Value::Null
                         }
                         "getPropertyValue" => Value::Str(read_inline_style(doc, id, &prop)),
                         "removeProperty" => {
                             let prev = read_inline_style(doc, id, &prop);
                             remove_inline_style_prop(doc, id, &prop);
+                            self.notify_mutation_observers(doc, "attributes", id, Some("style"));
                             Value::Str(prev)
                         }
                         _ => Value::Null,
@@ -7870,19 +8871,22 @@ impl ScriptRuntime {
                         Value::Element(id)
                     }
                     "addEventListener" if args.len() >= 2 => {
-                        let body = extract_callback_body(args[1].trim());
-                        if first.eq_ignore_ascii_case("click") {
-                            self.click_listeners.push((doc.body(), body));
-                        } else if matches!(
-                            first.to_ascii_lowercase().as_str(),
-                            "domcontentloaded" | "load" | "readystatechange"
-                        ) {
-                            let (code, env, is_async) = self.deferred_callback(&args[1]);
-                            self.schedule_job(Job::Script {
-                                code,
-                                env,
-                                is_async,
-                            });
+                        let body = extract_event_callback_body(args[1].trim());
+                        match first.to_ascii_lowercase().as_str() {
+                            "click" => self.click_listeners.push((doc.body(), body)),
+                            "input" => self.input_listeners.push((doc.body(), body)),
+                            "change" => self.change_listeners.push((doc.body(), body)),
+                            "submit" => self.submit_listeners.push((doc.body(), body)),
+                            "keydown" => self.keydown_listeners.push((doc.body(), body)),
+                            "domcontentloaded" | "load" | "readystatechange" => {
+                                let (code, env, is_async) = self.deferred_callback(&args[1]);
+                                self.schedule_job(Job::Script {
+                                    code,
+                                    env,
+                                    is_async,
+                                });
+                            }
+                            _ => {}
                         }
                         Value::Null
                     }
@@ -8756,6 +9760,152 @@ impl ScriptRuntime {
                                     _ => return Value::Null,
                                 }
                             }
+                            ("MutationObserver", "observe" | "disconnect" | "takeRecords") => {
+                                let args = split_args(args_src);
+                                let Some(JsonValue::Number(obs_id_f)) = jval.get("__observer_id")
+                                else {
+                                    return Value::Null;
+                                };
+                                let obs_id = *obs_id_f as usize;
+                                match method {
+                                    "observe" => {
+                                        let Some(first) = args.first() else {
+                                            return Value::Null;
+                                        };
+                                        let Value::Element(target_node) =
+                                            self.eval_expr(doc, first)
+                                        else {
+                                            return Value::Null;
+                                        };
+                                        let mut child_list = false;
+                                        let mut attributes = false;
+                                        let mut character_data = false;
+                                        let mut subtree = false;
+                                        if let Some(opts_arg) = args.get(1)
+                                            && let Value::Json(jopts) =
+                                                self.eval_expr(doc, opts_arg)
+                                        {
+                                            child_list = matches!(
+                                                jopts.get("childList"),
+                                                Some(JsonValue::Bool(true))
+                                            );
+                                            attributes = matches!(
+                                                jopts.get("attributes"),
+                                                Some(JsonValue::Bool(true))
+                                            );
+                                            character_data = matches!(
+                                                jopts.get("characterData"),
+                                                Some(JsonValue::Bool(true))
+                                            );
+                                            subtree = matches!(
+                                                jopts.get("subtree"),
+                                                Some(JsonValue::Bool(true))
+                                            );
+                                        }
+                                        if !child_list && !attributes && !character_data {
+                                            child_list = true;
+                                            attributes = true;
+                                        }
+                                        if let Some(obs) = self.mutation_observers.get_mut(obs_id) {
+                                            obs.targets.push(MutationObserverTarget {
+                                                node_id: target_node,
+                                                child_list,
+                                                attributes,
+                                                character_data,
+                                                subtree,
+                                            });
+                                        }
+                                        return Value::Null;
+                                    }
+                                    "disconnect" => {
+                                        if let Some(obs) = self.mutation_observers.get_mut(obs_id) {
+                                            obs.targets.clear();
+                                            obs.records.clear();
+                                            obs.scheduled = false;
+                                        }
+                                        return Value::Null;
+                                    }
+                                    "takeRecords" => {
+                                        if let Some(obs) = self.mutation_observers.get_mut(obs_id) {
+                                            let recs: Vec<Value> = std::mem::take(&mut obs.records)
+                                                .into_iter()
+                                                .map(Value::Json)
+                                                .collect();
+                                            return Value::Array(recs);
+                                        }
+                                        return Value::Array(Vec::new());
+                                    }
+                                    _ => return Value::Null,
+                                }
+                            }
+                            (
+                                "IntersectionObserver" | "ResizeObserver",
+                                "observe" | "unobserve" | "disconnect",
+                            ) => {
+                                let args = split_args(args_src);
+                                let Some(JsonValue::Number(obs_id_f)) = jval.get("__observer_id")
+                                else {
+                                    return Value::Null;
+                                };
+                                let obs_id = *obs_id_f as usize;
+                                match method {
+                                    "observe" => {
+                                        let Some(first) = args.first() else {
+                                            return Value::Null;
+                                        };
+                                        let Value::Element(target_node) =
+                                            self.eval_expr(doc, first)
+                                        else {
+                                            return Value::Null;
+                                        };
+                                        if let Some(obs) = self.layout_observers.get_mut(obs_id)
+                                            && !obs.targets.contains(&target_node)
+                                        {
+                                            obs.targets.push(target_node);
+                                        }
+                                        self.schedule_job(Job::LayoutObserver {
+                                            obs_id,
+                                            target: target_node,
+                                        });
+                                        return Value::Null;
+                                    }
+                                    "unobserve" => {
+                                        let Some(first) = args.first() else {
+                                            return Value::Null;
+                                        };
+                                        if let Value::Element(target_node) =
+                                            self.eval_expr(doc, first)
+                                            && let Some(obs) = self.layout_observers.get_mut(obs_id)
+                                        {
+                                            obs.targets.retain(|t| *t != target_node);
+                                        }
+                                        return Value::Null;
+                                    }
+                                    "disconnect" => {
+                                        if let Some(obs) = self.layout_observers.get_mut(obs_id) {
+                                            obs.targets.clear();
+                                        }
+                                        return Value::Null;
+                                    }
+                                    _ => return Value::Null,
+                                }
+                            }
+                            (
+                                _,
+                                "preventDefault" | "stopPropagation" | "stopImmediatePropagation",
+                            ) => {
+                                if method == "preventDefault" {
+                                    self.event_default_prevented = true;
+                                    jval.insert("defaultPrevented", JsonValue::Bool(true));
+                                    if is_identifier(obj_expr) {
+                                        self.set_var(obj_expr, Value::Json(jval.clone()));
+                                    }
+                                    if obj_expr != "event" {
+                                        self.set_var("event", Value::Json(jval));
+                                    }
+                                }
+                                return Value::Null;
+                            }
                             (
                                 _,
                                 "observe" | "unobserve" | "disconnect" | "endOfStream" | "open"
@@ -8892,12 +10042,14 @@ impl ScriptRuntime {
                             let value = self.eval_expr(doc, &args[1]).as_string(doc);
                             doc.set_attribute(id, &name, &value);
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "attributes", id, Some(&name));
                             return Value::Null;
                         }
                         "removeAttribute" if !args.is_empty() => {
                             let name = self.eval_expr(doc, &args[0]).as_string(doc);
                             doc.remove_attribute(id, &name);
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "attributes", id, Some(&name));
                             return Value::Null;
                         }
                         "hasAttribute" if !args.is_empty() => {
@@ -8914,12 +10066,14 @@ impl ScriptRuntime {
                                 true
                             };
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "attributes", id, Some(&name));
                             return Value::Bool(present);
                         }
                         "appendChild" if !args.is_empty() => {
                             if let Value::Element(child_id) = self.eval_expr(doc, &args[0]) {
                                 let _ = doc.append(id, child_id);
                                 self.dom_cache.clear();
+                                self.notify_mutation_observers(doc, "childList", id, None);
                                 return Value::Element(child_id);
                             }
                             return Value::Null;
@@ -8938,6 +10092,7 @@ impl ScriptRuntime {
                                 }
                             }
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "childList", id, None);
                             return Value::Null;
                         }
                         "prepend" => {
@@ -8950,6 +10105,7 @@ impl ScriptRuntime {
                                 let _ = doc.insert_before(id, child_id, first_child);
                             }
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "childList", id, None);
                             return Value::Null;
                         }
                         "insertBefore" if !args.is_empty() => {
@@ -8961,6 +10117,7 @@ impl ScriptRuntime {
                                     });
                                 let _ = doc.insert_before(id, new_id, ref_id);
                                 self.dom_cache.clear();
+                                self.notify_mutation_observers(doc, "childList", id, None);
                                 return Value::Element(new_id);
                             }
                             return Value::Null;
@@ -8969,6 +10126,7 @@ impl ScriptRuntime {
                             if let Value::Element(child_id) = self.eval_expr(doc, &args[0]) {
                                 let _ = doc.remove_child(id, child_id);
                                 self.dom_cache.clear();
+                                self.notify_mutation_observers(doc, "childList", id, None);
                                 return Value::Element(child_id);
                             }
                             return Value::Null;
@@ -8981,6 +10139,7 @@ impl ScriptRuntime {
                             {
                                 let _ = doc.replace_child(id, new_id, old_id);
                                 self.dom_cache.clear();
+                                self.notify_mutation_observers(doc, "childList", id, None);
                                 return Value::Element(old_id);
                             }
                             return Value::Null;
@@ -8995,8 +10154,12 @@ impl ScriptRuntime {
                                 .unwrap_or(Value::Null);
                         }
                         "remove" => {
+                            let parent = doc.parent_element(id);
                             doc.remove_node(id);
                             self.dom_cache.clear();
+                            if let Some(p) = parent {
+                                self.notify_mutation_observers(doc, "childList", p, None);
+                            }
                             return Value::Null;
                         }
                         "matches" if !args.is_empty() => {
@@ -9089,6 +10252,7 @@ impl ScriptRuntime {
                             let html = self.eval_expr(doc, &args[1]).as_string(doc);
                             doc.insert_adjacent_html(id, &pos, &html);
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "childList", id, None);
                             return Value::Null;
                         }
                         "insertAdjacentText" if args.len() >= 2 => {
@@ -9096,6 +10260,7 @@ impl ScriptRuntime {
                             let text = self.eval_expr(doc, &args[1]).as_string(doc);
                             doc.insert_adjacent_text(id, &pos, &text);
                             self.dom_cache.clear();
+                            self.notify_mutation_observers(doc, "childList", id, None);
                             return Value::Null;
                         }
                         "insertAdjacentElement" if args.len() >= 2 => {
@@ -9103,6 +10268,7 @@ impl ScriptRuntime {
                             if let Value::Element(new_el) = self.eval_expr(doc, &args[1]) {
                                 let res = doc.insert_adjacent_element(id, &pos, new_el);
                                 self.dom_cache.clear();
+                                self.notify_mutation_observers(doc, "childList", id, None);
                                 return res.map(Value::Element).unwrap_or(Value::Null);
                             }
                             return Value::Null;
@@ -9133,23 +10299,26 @@ impl ScriptRuntime {
                         }
                         "addEventListener" if args.len() >= 2 => {
                             let event = self.eval_expr(doc, &args[0]).as_string(doc);
-                            if event.eq_ignore_ascii_case("click") {
-                                let handler_raw = args[1].trim();
-                                let body = extract_callback_body(handler_raw);
-                                let target_id = if id == doc.root() { doc.body() } else { id };
-                                self.click_listeners.push((target_id, body));
-                            } else if id == doc.root()
-                                && matches!(
-                                    event.to_ascii_lowercase().as_str(),
-                                    "domcontentloaded" | "load" | "readystatechange"
-                                )
-                            {
-                                let (code, env, is_async) = self.deferred_callback(&args[1]);
-                                self.schedule_job(Job::Script {
-                                    code,
-                                    env,
-                                    is_async,
-                                });
+                            let handler_raw = args[1].trim();
+                            let body = extract_event_callback_body(handler_raw);
+                            let target_id = if id == doc.root() { doc.body() } else { id };
+                            match event.to_ascii_lowercase().as_str() {
+                                "click" => self.click_listeners.push((target_id, body)),
+                                "input" => self.input_listeners.push((target_id, body)),
+                                "change" => self.change_listeners.push((target_id, body)),
+                                "submit" => self.submit_listeners.push((target_id, body)),
+                                "keydown" => self.keydown_listeners.push((target_id, body)),
+                                "domcontentloaded" | "load" | "readystatechange"
+                                    if id == doc.root() =>
+                                {
+                                    let (code, env, is_async) = self.deferred_callback(&args[1]);
+                                    self.schedule_job(Job::Script {
+                                        code,
+                                        env,
+                                        is_async,
+                                    });
+                                }
+                                _ => {}
                             }
                             return Value::Null;
                         }
@@ -9980,6 +11149,35 @@ fn make_aggregate_error(errors: &[JsonValue]) -> Value {
     );
     obj.insert("errors", JsonValue::Array(errors.to_vec()));
     Value::Json(obj)
+}
+
+fn should_route_dom_script_to_anvil_js(cleaned: &str) -> bool {
+    if !is_cpp_jit_kernel_active() || !script_stays_on_rust(cleaned) {
+        return false;
+    }
+    let stripped = strip_string_literals(cleaned);
+    stripped.contains('#')
+        || stripped.contains("static {")
+        || stripped.contains("static{")
+        || stripped.contains("??=")
+        || stripped.contains("||=")
+        || stripped.contains("&&=")
+        || cleaned.contains("\"use anvil-vm\"")
+        || cleaned.contains("'use anvil-vm'")
+        || cleaned.contains("@anvil-vm")
+}
+
+fn extract_event_callback_body(handler_raw: &str) -> String {
+    let trimmed = handler_raw.trim();
+    if is_identifier(trimmed) {
+        return format!("{trimmed}(event)");
+    }
+    let (param, body) = extract_single_param_callback(trimmed);
+    if !param.is_empty() && param != "event" && is_identifier(&param) {
+        format!("let {param} = event; {body}")
+    } else {
+        extract_callback_body(trimmed)
+    }
 }
 
 fn extract_callback_body(handler_raw: &str) -> String {
