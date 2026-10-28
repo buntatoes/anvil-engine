@@ -1008,6 +1008,8 @@ pub struct ComputedStyle {
     pub max_width: Size,
     pub min_height: Size,
     pub max_height: Size,
+    /// Preferred `width / height` ratio from CSS `aspect-ratio` (`None` when `auto`).
+    pub aspect_ratio: Option<f32>,
     pub underline: bool,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
@@ -1096,6 +1098,7 @@ impl ComputedStyle {
             max_width: Size::Auto,
             min_height: Size::Auto,
             max_height: Size::Auto,
+            aspect_ratio: None,
             underline: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
@@ -2453,6 +2456,36 @@ fn apply_declaration(
         "max-width" => style.max_width = parse_size(value),
         "min-height" => style.min_height = parse_size(value),
         "max-height" => style.max_height = parse_size(value),
+        "aspect-ratio" => {
+            let lower = value.to_ascii_lowercase();
+            let trimmed = lower.trim();
+            if trimmed == "auto" || trimmed == "initial" || trimmed == "unset" || trimmed == "none"
+            {
+                style.aspect_ratio = None;
+            } else if let Some((w_str, h_str)) = trimmed.split_once('/') {
+                let w_clean = w_str.trim().trim_start_matches("auto").trim();
+                let h_clean = h_str.trim().trim_end_matches("auto").trim();
+                if let (Ok(w), Ok(h)) = (w_clean.parse::<f32>(), h_clean.parse::<f32>())
+                    && w.is_finite()
+                    && h.is_finite()
+                    && w > 0.0
+                    && h > 0.0
+                {
+                    style.aspect_ratio = Some(w / h);
+                }
+            } else {
+                let num_clean = trimmed
+                    .trim_start_matches("auto")
+                    .trim_end_matches("auto")
+                    .trim();
+                if let Ok(r) = num_clean.parse::<f32>()
+                    && r.is_finite()
+                    && r > 0.0
+                {
+                    style.aspect_ratio = Some(r);
+                }
+            }
+        }
         "position" => {
             style.position = match value.to_ascii_lowercase().as_str() {
                 "static" => Position::Static,
@@ -4782,5 +4815,24 @@ mod tests {
         doc.toggle_details(det);
         let styles_open = compute_styles(&doc, &sheet);
         assert_eq!(styles_open.get(det_body).display, Display::Block);
+    }
+
+    #[test]
+    fn parses_aspect_ratio_fractions_numbers_and_auto() {
+        let doc = parse_html(
+            "<div id=\"video\" style=\"aspect-ratio: 16 / 9\"></div>
+             <div id=\"square\" style=\"aspect-ratio: 1\"></div>
+             <div id=\"auto_r\" style=\"aspect-ratio: 4/3; aspect-ratio: auto\"></div>",
+        );
+        let sheet = parse_css("");
+        let styles = compute_styles(&doc, &sheet);
+        let video = doc.get_element_by_id("video").unwrap();
+        let square = doc.get_element_by_id("square").unwrap();
+        let auto_r = doc.get_element_by_id("auto_r").unwrap();
+
+        let vr = styles.get(video).aspect_ratio.expect("16/9 ratio");
+        assert!((vr - (16.0 / 9.0)).abs() < 1e-4);
+        assert_eq!(styles.get(square).aspect_ratio, Some(1.0));
+        assert_eq!(styles.get(auto_r).aspect_ratio, None);
     }
 }

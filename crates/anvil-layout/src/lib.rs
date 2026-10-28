@@ -92,6 +92,18 @@ impl Rect {
     pub fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
     }
+
+    /// True when `self` and `other` have a positive overlapping area.
+    pub fn intersects(self, other: Self) -> bool {
+        self.width > 0.0
+            && self.height > 0.0
+            && other.width > 0.0
+            && other.height > 0.0
+            && self.x < other.x + other.width
+            && self.x + self.width > other.x
+            && self.y < other.y + other.height
+            && self.y + self.height > other.y
+    }
 }
 
 /// One painted line fragment. `text` is owned. `x` and `y` are the top-left
@@ -180,6 +192,24 @@ impl LayoutBox {
             }
         }
         None
+    }
+
+    /// Collect all [`TextRun`] fragments in this layout tree whose bounding rect intersects `region`.
+    pub fn collect_text_runs_in_rect(&self, region: Rect, out: &mut Vec<TextRun>) {
+        for run in &self.text {
+            let r = Rect {
+                x: run.x,
+                y: run.y,
+                width: run.width.max(1.0),
+                height: line_height(run.font_size),
+            };
+            if r.intersects(region) {
+                out.push(run.clone());
+            }
+        }
+        for child in &self.children {
+            child.collect_text_runs_in_rect(region, out);
+        }
     }
 }
 
@@ -919,6 +949,24 @@ fn intrinsic_box_width(
         };
         return clamp_border_width(style, containing_width, styles, bw);
     }
+    if let (Some(ratio), Some(h)) = (
+        style.aspect_ratio,
+        used_length(style.height, None, style, styles),
+    ) && ratio > 0.0
+    {
+        let chrome_v =
+            style.padding.top + style.padding.bottom + style.border.top + style.border.bottom;
+        let content_h = match style.box_sizing {
+            BoxSizing::ContentBox => h.max(0.0),
+            BoxSizing::BorderBox => (h - chrome_v).max(0.0),
+        };
+        return clamp_border_width(
+            style,
+            containing_width,
+            styles,
+            content_h * ratio + chrome_h,
+        );
+    }
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
     let raw_content_w = if tag == "img" || tag == "video" {
@@ -1087,7 +1135,17 @@ fn layout_block(
     };
 
     if matches!(style.width, Size::Auto) {
-        if is_img {
+        if let (Some(ratio), Some(def_h)) = (style.aspect_ratio, child_cb_height)
+            && ratio > 0.0
+        {
+            let chrome_v = padding.top + padding.bottom + border.top + border.bottom;
+            let content_h = match style.box_sizing {
+                BoxSizing::ContentBox => def_h.max(0.0),
+                BoxSizing::BorderBox => (def_h - chrome_v).max(0.0),
+            };
+            border_width =
+                content_h * ratio + padding.left + padding.right + border.left + border.right;
+        } else if is_img {
             let attr_w = data
                 .attr("width")
                 .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
@@ -1510,6 +1568,10 @@ fn layout_block(
             flow_height.max(line_height(style.font_size) * rows)
         }
         None if is_text_ctrl || is_select => flow_height.max(line_height(style.font_size)),
+        None if style.aspect_ratio.is_some_and(|r| r > 0.0) && content_width > 0.0 => {
+            let ratio = style.aspect_ratio.unwrap_or(1.0);
+            (content_width / ratio).max(flow_height)
+        }
         None => flow_height,
     };
     let mut border_height = content_height + chrome_v;
@@ -4492,5 +4554,44 @@ mod tests {
         let mtr_box = find_box(&doc, &tree, "mtr");
         assert!(mtr_box.image.is_some());
         assert!(mtr_box.text.is_empty());
+    }
+
+    #[test]
+    fn resolves_aspect_ratio_dimensions_and_collects_text_runs_in_rect() {
+        let (doc, tree) = render(
+            "<style>
+                html, body { margin: 0; padding: 0; }
+                #video_card { width: 320px; aspect-ratio: 16 / 9; }
+                #avatar { height: 64px; aspect-ratio: 1 / 1; }
+                p { margin: 0; font-size: 16px; }
+             </style>
+             <div id=\"video_card\"></div>
+             <div id=\"avatar\"></div>
+             <p id=\"p1\">Alpha line</p>
+             <p id=\"p2\">Beta line</p>",
+            400.0,
+        );
+        let vc = find_box(&doc, &tree, "video_card");
+        assert_eq!(vc.rect.width, 320.0);
+        assert!((vc.rect.height - 180.0).abs() < 0.5);
+
+        let av = find_box(&doc, &tree, "avatar");
+        assert_eq!(av.rect.width, 64.0);
+        assert_eq!(av.rect.height, 64.0);
+
+        let p1 = find_box(&doc, &tree, "p1");
+        let p2 = find_box(&doc, &tree, "p2");
+        let mut runs = Vec::new();
+        tree.collect_text_runs_in_rect(
+            Rect {
+                x: 0.0,
+                y: p1.rect.y,
+                width: 200.0,
+                height: (p2.rect.y + p2.rect.height) - p1.rect.y,
+            },
+            &mut runs,
+        );
+        let joined: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, vec!["Alpha line", "Beta line"]);
     }
 }
