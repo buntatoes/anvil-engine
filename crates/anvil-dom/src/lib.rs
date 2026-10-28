@@ -260,6 +260,7 @@ pub struct Document {
     shadow_hosts: std::collections::HashMap<NodeId, NodeId>,
     custom_elements: Vec<String>,
     canvas_surfaces: std::collections::HashMap<NodeId, CanvasSurface>,
+    input_cursors: std::collections::HashMap<NodeId, usize>,
 }
 
 impl Default for Document {
@@ -307,6 +308,7 @@ impl Document {
             shadow_hosts: std::collections::HashMap::new(),
             custom_elements: Vec::new(),
             canvas_surfaces: std::collections::HashMap::new(),
+            input_cursors: std::collections::HashMap::new(),
         };
         let root = doc.alloc(NodeData::Document);
         let html = doc.alloc(NodeData::element("html"));
@@ -746,6 +748,115 @@ impl Document {
         if tag.as_deref() == Some("textarea") {
             self.set_text_content(id, value);
         }
+        let max_len = value.chars().count();
+        if let Some(cur) = self.input_cursors.get_mut(&id) {
+            *cur = (*cur).min(max_len);
+        }
+    }
+
+    /// Character caret index (`0..=chars.count()`) for text control `id`.
+    /// Defaults to the end of [`Self::input_value`] when not explicitly set.
+    pub fn input_cursor(&self, id: NodeId) -> usize {
+        let len = self.input_value(id).chars().count();
+        self.input_cursors.get(&id).copied().unwrap_or(len).min(len)
+    }
+
+    /// Set the character caret index (`0..=chars.count()`) for text control `id`.
+    pub fn set_input_cursor(&mut self, id: NodeId, pos: usize) {
+        let len = self.input_value(id).chars().count();
+        self.input_cursors.insert(id, pos.min(len));
+    }
+
+    /// Move the character caret one position left in text control `id`.
+    pub fn move_input_cursor_left(&mut self, id: NodeId) -> usize {
+        let next = self.input_cursor(id).saturating_sub(1);
+        self.input_cursors.insert(id, next);
+        next
+    }
+
+    /// Move the character caret one position right in text control `id`.
+    pub fn move_input_cursor_right(&mut self, id: NodeId) -> usize {
+        let len = self.input_value(id).chars().count();
+        let next = (self.input_cursor(id) + 1).min(len);
+        self.input_cursors.insert(id, next);
+        next
+    }
+
+    /// Move the character caret to index `0` in text control `id`.
+    pub fn move_input_cursor_home(&mut self, id: NodeId) -> usize {
+        self.input_cursors.insert(id, 0);
+        0
+    }
+
+    /// Move the character caret to the end of text control `id`.
+    pub fn move_input_cursor_end(&mut self, id: NodeId) -> usize {
+        let len = self.input_value(id).chars().count();
+        self.input_cursors.insert(id, len);
+        len
+    }
+
+    /// Insert `text` at the current caret index in text control `id` and advance the caret.
+    pub fn insert_input_text_at_cursor(&mut self, id: NodeId, text: &str) -> String {
+        let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let cur = self.input_cursor(id).min(chars.len());
+        let inserted: Vec<char> = text.chars().collect();
+        let ins_len = inserted.len();
+        chars.splice(cur..cur, inserted);
+        let next_val: String = chars.into_iter().collect();
+        self.set_input_value(id, &next_val);
+        self.input_cursors.insert(id, cur + ins_len);
+        next_val
+    }
+
+    /// Delete the character immediately before the caret in text control `id` (`Backspace`).
+    pub fn backspace_input_at_cursor(&mut self, id: NodeId) -> String {
+        let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let cur = self.input_cursor(id).min(chars.len());
+        if cur > 0 {
+            chars.remove(cur - 1);
+            let next_val: String = chars.into_iter().collect();
+            self.set_input_value(id, &next_val);
+            self.input_cursors.insert(id, cur - 1);
+            next_val
+        } else {
+            chars.into_iter().collect()
+        }
+    }
+
+    /// Delete the character at the caret in text control `id` (`Delete`).
+    pub fn delete_input_at_cursor(&mut self, id: NodeId) -> String {
+        let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let cur = self.input_cursor(id).min(chars.len());
+        if cur < chars.len() {
+            chars.remove(cur);
+            let next_val: String = chars.into_iter().collect();
+            self.set_input_value(id, &next_val);
+            self.input_cursors.insert(id, cur);
+            next_val
+        } else {
+            chars.into_iter().collect()
+        }
+    }
+
+    /// Delete the word immediately before the caret in text control `id` (`Ctrl+Backspace`).
+    pub fn delete_input_word_at_cursor(&mut self, id: NodeId) -> String {
+        let mut chars: Vec<char> = self.input_value(id).chars().collect();
+        let cur = self.input_cursor(id).min(chars.len());
+        if cur == 0 {
+            return chars.into_iter().collect();
+        }
+        let mut start = cur;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        chars.drain(start..cur);
+        let next_val: String = chars.into_iter().collect();
+        self.set_input_value(id, &next_val);
+        self.input_cursors.insert(id, start);
+        next_val
     }
 
     /// True when a `checked` attribute is present and is not the word `false`.
@@ -806,6 +917,195 @@ impl Document {
             && data
                 .attr("type")
                 .is_some_and(|t| t.trim().eq_ignore_ascii_case("checkbox"))
+    }
+
+    /// True only for `<input type="radio">`. A missing node is false.
+    pub fn is_radio_input(&self, id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        data.tag() == Some("input")
+            && data
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("radio"))
+    }
+
+    /// Mark `id` checked as a radio button and uncheck sibling radio buttons
+    /// sharing the same non-empty `name` within the same `<form>` (or document
+    /// when not inside a `<form>`). Returns `true` when `id` is a radio input.
+    pub fn select_radio(&mut self, id: NodeId) -> bool {
+        if !self.is_radio_input(id) {
+            return false;
+        }
+        let name = self
+            .get(id)
+            .data()
+            .attr("name")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !name.is_empty() {
+            let form_owner = self.enclosing_form(id);
+            let candidates = self.get_elements_by_name(&name);
+            for other in candidates {
+                if other != id
+                    && self.is_radio_input(other)
+                    && self.enclosing_form(other) == form_owner
+                {
+                    self.set_checked(other, false);
+                }
+            }
+        }
+        self.set_checked(id, true);
+        true
+    }
+
+    /// True when `details_id` is a `<details>` element with an active `open` attribute.
+    pub fn is_details_open(&self, details_id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(details_id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        data.tag() == Some("details")
+            && data
+                .attr("open")
+                .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+    }
+
+    /// If `start` is inside a `<summary>` that is a direct child of a `<details>`
+    /// element, returns that parent `<details>` `NodeId`.
+    pub fn enclosing_summary_details(&self, start: NodeId) -> Option<NodeId> {
+        let mut cursor = Some(start);
+        while let Some(curr) = cursor {
+            let node = self.nodes.get(curr.index())?;
+            if node.data().tag() == Some("summary") {
+                if let Some(parent) = self.parent_element(curr)
+                    && self.get(parent).data().tag() == Some("details")
+                {
+                    return Some(parent);
+                }
+            }
+            cursor = node.parent();
+        }
+        None
+    }
+
+    /// Toggle the `open` attribute on a `<details>` element and return the new open state.
+    pub fn toggle_details(&mut self, details_id: NodeId) -> bool {
+        if self
+            .nodes
+            .get(details_id.index())
+            .and_then(|n| n.data().tag())
+            != Some("details")
+        {
+            return false;
+        }
+        let next = !self.is_details_open(details_id);
+        if next {
+            self.set_attribute(details_id, "open", "open");
+        } else {
+            self.remove_attribute(details_id, "open");
+        }
+        next
+    }
+
+    /// Resolve a click on or inside a `<label>` to its associated form control
+    /// (`for="target_id"` or the first descendant `<input>`, `<textarea>`,
+    /// `<select>`, or `<button>`).
+    pub fn label_target(&self, start: NodeId) -> Option<NodeId> {
+        let mut cursor = Some(start);
+        let mut label_id = None;
+        while let Some(curr) = cursor {
+            let node = self.nodes.get(curr.index())?;
+            if matches!(
+                node.data().tag(),
+                Some("input" | "textarea" | "select" | "button")
+            ) {
+                return Some(curr);
+            }
+            if node.data().tag() == Some("label") {
+                label_id = Some(curr);
+                break;
+            }
+            cursor = node.parent();
+        }
+        let label = label_id?;
+        if let Some(for_attr) = self.get(label).data().attr("for") {
+            let trimmed = for_attr.trim();
+            if !trimmed.is_empty()
+                && let Some(target) = self.get_element_by_id(trimmed)
+            {
+                return Some(target);
+            }
+        }
+        self.find_first_labelable_control(label)
+    }
+
+    fn find_first_labelable_control(&self, root: NodeId) -> Option<NodeId> {
+        for &child in self.children(root) {
+            let data = self.get(child).data();
+            match data.tag() {
+                Some("input") => {
+                    let kind = data.attr("type").unwrap_or("text").trim();
+                    if !kind.eq_ignore_ascii_case("hidden") {
+                        return Some(child);
+                    }
+                }
+                Some("textarea" | "select" | "button") => return Some(child),
+                _ => {}
+            }
+            if let Some(found) = self.find_first_labelable_control(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// All visible, non-disabled text `<input>` and `<textarea>` elements in tree order.
+    pub fn focusable_inputs(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        self.collect_focusable_inputs(self.body(), &mut out);
+        out
+    }
+
+    fn collect_focusable_inputs(&self, id: NodeId, out: &mut Vec<NodeId>) {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return;
+        };
+        let data = node.data();
+        if let Some(tag) = data.tag() {
+            if matches!(tag, "noscript" | "template" | "head" | "script" | "style") {
+                return;
+            }
+            if data.attr("hidden").is_some() {
+                return;
+            }
+            if tag == "dialog"
+                && !data
+                    .attr("open")
+                    .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+            {
+                return;
+            }
+            if self.is_text_input(id)
+                && data.attr("disabled").is_none()
+                && data.attr("readonly").is_none()
+            {
+                out.push(id);
+                return;
+            }
+            if tag == "details" && !self.is_details_open(id) {
+                for &child in self.children(id) {
+                    if self.get(child).data().tag() == Some("summary") {
+                        self.collect_focusable_inputs(child, out);
+                    }
+                }
+                return;
+            }
+        }
+        for &child in self.children(id) {
+            self.collect_focusable_inputs(child, out);
+        }
     }
 
     /// True when `id` is a `select` element. A missing node is false.
@@ -894,6 +1194,150 @@ impl Document {
         let new_val = self.select_value(select_id);
         self.set_attribute(select_id, "value", &new_val);
         Some(new_val)
+    }
+
+    /// Return `(value, display_label, is_selected)` for every direct `<option>` child of `select_id`.
+    pub fn select_options_list(&self, select_id: NodeId) -> Vec<(String, String, bool)> {
+        let opts = self.select_options(select_id);
+        let selected = self.selected_option(select_id);
+        opts.into_iter()
+            .map(|oid| {
+                let text = self.text_content(oid).trim().to_string();
+                let val = self
+                    .get(oid)
+                    .data()
+                    .attr("value")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| text.clone());
+                let label = if text.is_empty() { val.clone() } else { text };
+                (val, label, selected == Some(oid))
+            })
+            .collect()
+    }
+
+    /// Select the direct `<option>` at `index` inside `select_id`, updating `selected` attributes
+    /// and the `<select>`'s `value` attribute. Returns the selected option's value.
+    pub fn select_option_by_index(&mut self, select_id: NodeId, index: usize) -> Option<String> {
+        let opts = self.select_options(select_id);
+        if index >= opts.len() {
+            return None;
+        }
+        for (i, &oid) in opts.iter().enumerate() {
+            if i == index {
+                self.set_attribute(oid, "selected", "selected");
+            } else {
+                self.remove_attribute(oid, "selected");
+            }
+        }
+        let new_val = self.select_value(select_id);
+        self.set_attribute(select_id, "value", &new_val);
+        Some(new_val)
+    }
+
+    /// True only for `<input type="range">`. A missing node is false.
+    pub fn is_range_input(&self, id: NodeId) -> bool {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        data.tag() == Some("input")
+            && data
+                .attr("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("range"))
+    }
+
+    /// Return `(min, max, step, value)` for an `<input type="range">` element.
+    /// Defaults to `min = 0.0`, `max = 100.0`, `step = 1.0`, and `value = (min + max) * 0.5`.
+    pub fn range_state(&self, id: NodeId) -> (f32, f32, f32, f32) {
+        let Some(node) = self.nodes.get(id.index()) else {
+            return (0.0, 100.0, 1.0, 50.0);
+        };
+        let data = node.data();
+        let min = data
+            .attr("min")
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(0.0);
+        let max = data
+            .attr("max")
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(100.0)
+            .max(min + f32::EPSILON);
+        let step = data
+            .attr("step")
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|&v| v > 0.0)
+            .unwrap_or(1.0);
+        let default_val = min + (max - min) * 0.5;
+        let val = data
+            .attr("value")
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(default_val)
+            .clamp(min, max);
+        (min, max, step, val)
+    }
+
+    /// Set the value of `<input type="range">` `id` from a normalized horizontal ratio (`0.0..=1.0`),
+    /// quantizing to `step` within `min..=max`, and return the formatted value string.
+    pub fn set_range_ratio(&mut self, id: NodeId, ratio: f32) -> String {
+        let (min, max, step, _) = self.range_state(id);
+        let clamped = ratio.clamp(0.0, 1.0);
+        let raw = min + clamped * (max - min);
+        let quantized = if step > 0.0 {
+            let steps = ((raw - min) / step).round();
+            (min + steps * step).clamp(min, max)
+        } else {
+            raw.clamp(min, max)
+        };
+        let formatted = if step.fract().abs() < 1e-5 && min.fract().abs() < 1e-5 {
+            format!("{}", quantized.round() as i64)
+        } else {
+            let s = format!("{quantized:.4}");
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        };
+        self.set_input_value(id, &formatted);
+        formatted
+    }
+
+    /// Normalized fill ratio (`0.0..=1.0`) for `<input type="range">`, `<progress>`, or `<meter>`.
+    /// Returns `None` for other elements.
+    pub fn control_fill_ratio(&self, id: NodeId) -> Option<f32> {
+        let node = self.nodes.get(id.index())?;
+        let data = node.data();
+        match data.tag()? {
+            "input" if self.is_range_input(id) => {
+                let (min, max, _, val) = self.range_state(id);
+                Some(((val - min) / (max - min).max(f32::EPSILON)).clamp(0.0, 1.0))
+            }
+            "progress" => {
+                let max = data
+                    .attr("max")
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or(1.0);
+                let val = data
+                    .attr("value")
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(max * 0.5);
+                Some((val / max).clamp(0.0, 1.0))
+            }
+            "meter" => {
+                let min = data
+                    .attr("min")
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let max = data
+                    .attr("max")
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(1.0)
+                    .max(min + f32::EPSILON);
+                let val = data
+                    .attr("value")
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(min);
+                Some(((val - min) / (max - min)).clamp(0.0, 1.0))
+            }
+            _ => None,
+        }
     }
 
     /// True for `<input type="submit">`, or a `button` whose type is `submit`
@@ -3091,6 +3535,100 @@ mod tests {
         assert_eq!(doc.find_fragment_target("#legacy-anchor"), Some(legacy));
         assert_eq!(doc.find_fragment_target("#top"), Some(doc.html()));
         assert_eq!(doc.find_fragment_target("#missing"), None);
+    }
+
+    #[test]
+    fn radio_groups_labels_details_and_focusable_inputs_work() {
+        let mut doc = parse_html(
+            "<html><body>
+               <form id=\"f\">
+                 <label id=\"lbl-a\" for=\"rad-a\">Option A</label>
+                 <input id=\"rad-a\" type=\"radio\" name=\"plan\" value=\"a\" checked>
+                 <label id=\"lbl-b\"><input id=\"rad-b\" type=\"radio\" name=\"plan\" value=\"b\">Option B</label>
+                 <input id=\"user\" type=\"text\" name=\"u\">
+                 <textarea id=\"bio\" name=\"b\"></textarea>
+                 <input id=\"dis\" type=\"text\" disabled>
+               </form>
+               <details id=\"det\">
+                 <summary id=\"sum\"><span id=\"sum-txt\">More</span></summary>
+                 <input id=\"hidden-in-det\" type=\"text\">
+               </details>
+               <dialog id=\"dlg\"><input id=\"in-closed-dlg\" type=\"text\"></dialog>
+             </body></html>",
+        );
+        let rad_a = doc.get_element_by_id("rad-a").unwrap();
+        let rad_b = doc.get_element_by_id("rad-b").unwrap();
+        let lbl_a = doc.get_element_by_id("lbl-a").unwrap();
+        let lbl_b = doc.get_element_by_id("lbl-b").unwrap();
+        let user = doc.get_element_by_id("user").unwrap();
+        let bio = doc.get_element_by_id("bio").unwrap();
+        let det = doc.get_element_by_id("det").unwrap();
+        let sum_txt = doc.get_element_by_id("sum-txt").unwrap();
+        let hidden_in_det = doc.get_element_by_id("hidden-in-det").unwrap();
+
+        assert!(doc.is_radio_input(rad_a));
+        assert!(doc.is_checked(rad_a));
+        assert!(!doc.is_checked(rad_b));
+        assert_eq!(doc.label_target(lbl_a), Some(rad_a));
+        assert_eq!(doc.label_target(lbl_b), Some(rad_b));
+
+        assert!(doc.select_radio(rad_b));
+        assert!(!doc.is_checked(rad_a));
+        assert!(doc.is_checked(rad_b));
+
+        assert_eq!(doc.enclosing_summary_details(sum_txt), Some(det));
+        assert!(!doc.is_details_open(det));
+        assert_eq!(doc.focusable_inputs(), vec![user, bio]);
+
+        assert!(doc.toggle_details(det));
+        assert!(doc.is_details_open(det));
+        assert_eq!(doc.focusable_inputs(), vec![user, bio, hidden_in_det]);
+    }
+
+    #[test]
+    fn input_cursor_select_options_and_range_progress_work() {
+        let mut doc = parse_html(
+            "<html><body>
+               <input id=\"txt\" type=\"text\" value=\"hello world\">
+               <select id=\"sel\">
+                 <option value=\"a\">Alpha</option>
+                 <option value=\"b\" selected>Beta</option>
+                 <option value=\"c\">Gamma</option>
+               </select>
+               <input id=\"rng\" type=\"range\" min=\"0\" max=\"200\" step=\"25\" value=\"50\">
+               <progress id=\"prog\" value=\"30\" max=\"60\"></progress>
+               <meter id=\"mtr\" min=\"10\" max=\"50\" value=\"30\"></meter>
+             </body></html>",
+        );
+        let txt = doc.get_element_by_id("txt").unwrap();
+        let sel = doc.get_element_by_id("sel").unwrap();
+        let rng = doc.get_element_by_id("rng").unwrap();
+        let prog = doc.get_element_by_id("prog").unwrap();
+        let mtr = doc.get_element_by_id("mtr").unwrap();
+
+        assert_eq!(doc.input_cursor(txt), 11);
+        doc.set_input_cursor(txt, 5);
+        assert_eq!(doc.insert_input_text_at_cursor(txt, ","), "hello, world");
+        assert_eq!(doc.input_cursor(txt), 6);
+        assert_eq!(doc.delete_input_at_cursor(txt), "hello,world");
+        assert_eq!(doc.backspace_input_at_cursor(txt), "helloworld");
+        doc.move_input_cursor_end(txt);
+        doc.set_input_value(txt, "alpha beta gamma");
+        doc.move_input_cursor_end(txt);
+        assert_eq!(doc.delete_input_word_at_cursor(txt), "alpha beta ");
+
+        let opts = doc.select_options_list(sel);
+        assert_eq!(opts.len(), 3);
+        assert!(opts[1].2);
+        assert_eq!(doc.select_option_by_index(sel, 2), Some("c".to_string()));
+        assert_eq!(doc.select_value(sel), "c");
+
+        assert!(doc.is_range_input(rng));
+        assert_eq!(doc.range_state(rng), (0.0, 200.0, 25.0, 50.0));
+        assert_eq!(doc.set_range_ratio(rng, 0.62), "125");
+        assert!((doc.control_fill_ratio(rng).unwrap() - 0.625).abs() < 1e-4);
+        assert!((doc.control_fill_ratio(prog).unwrap() - 0.5).abs() < 1e-4);
+        assert!((doc.control_fill_ratio(mtr).unwrap() - 0.5).abs() < 1e-4);
     }
 }
 

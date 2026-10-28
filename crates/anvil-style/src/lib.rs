@@ -1746,7 +1746,17 @@ fn cascade_element(
     let mut style = parent.inherited_child();
     apply_user_agent(&mut style, tag);
     let data = doc.get(id).data();
+    let in_closed_details = tag != "summary"
+        && doc
+            .parent_element(id)
+            .is_some_and(|p| doc.get(p).data().tag() == Some("details") && !doc.is_details_open(p));
+    let is_closed_dialog = tag == "dialog"
+        && !data
+            .attr("open")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
     if data.attr("hidden").is_some()
+        || in_closed_details
+        || is_closed_dialog
         || (tag == "input"
             && data
                 .attr("type")
@@ -1894,7 +1904,7 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     }
     if matches!(
         tag,
-        "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"
+        "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th" | "summary"
     ) {
         style.font_weight = 700;
     }
@@ -1903,6 +1913,22 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     }
     if tag == "pre" {
         style.white_space = WhiteSpace::Pre;
+        style.padding = Edge {
+            top: 8.0,
+            right: 10.0,
+            bottom: 8.0,
+            left: 10.0,
+        };
+        style.border = Edge::all(1.0);
+        style.border_color = Color {
+            r: 68,
+            g: 76,
+            b: 92,
+            a: 255,
+        };
+        style.border_radius = 4.0;
+        style.margin.top = 6.0;
+        style.margin.bottom = 6.0;
     }
     if tag == "body" {
         style.margin = Edge::all(8.0);
@@ -4728,5 +4754,33 @@ mod tests {
         );
         assert_eq!(st.border_color, st.color);
         assert_eq!(styles.get(hid_id).display, Display::None);
+    }
+
+    #[test]
+    fn hides_closed_dialog_and_closed_details_body_until_opened() {
+        let mut doc = parse_html(
+            "<dialog id=\"dlg_closed\">Secret</dialog>
+             <dialog id=\"dlg_open\" open>Visible</dialog>
+             <details id=\"det\">
+               <summary id=\"sum\">Header</summary>
+               <p id=\"det_body\">Body text</p>
+             </details>",
+        );
+        let sheet = parse_css("");
+        let styles = compute_styles(&doc, &sheet);
+        let dlg_closed = doc.get_element_by_id("dlg_closed").unwrap();
+        let dlg_open = doc.get_element_by_id("dlg_open").unwrap();
+        let det = doc.get_element_by_id("det").unwrap();
+        let sum = doc.get_element_by_id("sum").unwrap();
+        let det_body = doc.get_element_by_id("det_body").unwrap();
+
+        assert_eq!(styles.get(dlg_closed).display, Display::None);
+        assert_eq!(styles.get(dlg_open).display, Display::Block);
+        assert_eq!(styles.get(sum).display, Display::Block);
+        assert_eq!(styles.get(det_body).display, Display::None);
+
+        doc.toggle_details(det);
+        let styles_open = compute_styles(&doc, &sheet);
+        assert_eq!(styles_open.get(det_body).display, Display::Block);
     }
 }

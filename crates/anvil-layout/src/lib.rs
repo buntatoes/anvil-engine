@@ -158,6 +158,29 @@ impl LayoutBox {
             self.position == Position::Sticky || self.transform.is_some() || self.opacity < 1.0;
         (self.z_index, u8::from(layered))
     }
+
+    /// Find the border-box [`Rect`] for `target` anywhere in this layout subtree.
+    pub fn find_node_rect(&self, target: NodeId) -> Option<Rect> {
+        if self.node == target {
+            return Some(self.rect);
+        }
+        for child in &self.children {
+            if let Some(r) = child.find_node_rect(target) {
+                return Some(r);
+            }
+        }
+        for run in &self.text {
+            if run.node == target {
+                return Some(Rect {
+                    x: run.x,
+                    y: run.y,
+                    width: run.width,
+                    height: line_height(run.font_size),
+                });
+            }
+        }
+        None
+    }
 }
 
 /// A 2D affine map in page space, y downward.
@@ -1046,6 +1069,9 @@ fn layout_block(
     let is_svg = tag == "svg";
     let is_canvas = tag == "canvas";
     let is_checkbox = doc.is_checkbox_input(id);
+    let is_radio = doc.is_radio_input(id);
+    let is_range = doc.is_range_input(id);
+    let is_bar_ctrl = matches!(tag, "progress" | "meter");
     let is_text_ctrl = doc.is_text_input(id);
     let is_textarea = tag == "textarea";
     let is_select = doc.is_select_control(id);
@@ -1080,6 +1106,10 @@ fn layout_block(
             border_width = attr_w + padding.left + padding.right + border.left + border.right;
         } else if is_checkbox {
             border_width = 20.0;
+        } else if is_radio {
+            border_width = 32.0;
+        } else if is_range || is_bar_ctrl {
+            border_width = 160.0_f32.min(containing_width.max(60.0));
         } else if is_submit_input {
             let label = data.attr("value").unwrap_or("Submit");
             border_width = measure(label, style.font_size)
@@ -1136,6 +1166,17 @@ fn layout_block(
     let mut inline_ids = Vec::new();
     let mut pending_inline_blocks: Vec<LayoutBox> = Vec::new();
     let mut pending_marker = list_marker;
+    if tag == "summary"
+        && pending_marker.is_none()
+        && let Some(parent) = doc.parent_element(id)
+        && doc.get(parent).data().tag() == Some("details")
+    {
+        pending_marker = Some(if doc.is_details_open(parent) {
+            "v ".to_string()
+        } else {
+            "> ".to_string()
+        });
+    }
 
     if is_img && decoded_image.is_none() {
         if let Some(alt) = data.attr("alt")
@@ -1149,7 +1190,7 @@ fn layout_block(
                 color: style.color,
                 underline: false,
             }];
-            let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width);
+            let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width, false);
             text.extend(runs);
             cursor_y += h;
         }
@@ -1163,7 +1204,32 @@ fn layout_block(
             color: style.color,
             underline: false,
         }];
-        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(16.0));
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            cursor_y,
+            content_width.max(16.0),
+            true,
+        );
+        text.extend(runs);
+        cursor_y += h;
+    } else if is_radio {
+        let mark = if doc.is_checked(id) { "(o)" } else { "( )" };
+        let segments = vec![Segment {
+            node: id,
+            text: mark.to_string(),
+            font_size: style.font_size,
+            line_height: style.line_height,
+            color: style.color,
+            underline: false,
+        }];
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            cursor_y,
+            content_width.max(24.0),
+            true,
+        );
         text.extend(runs);
         cursor_y += h;
     } else if is_submit_input {
@@ -1176,7 +1242,13 @@ fn layout_block(
             color: style.color,
             underline: false,
         }];
-        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(24.0));
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            cursor_y,
+            content_width.max(24.0),
+            false,
+        );
         text.extend(runs);
         cursor_y += h;
     } else if is_select {
@@ -1189,7 +1261,13 @@ fn layout_block(
             color: style.color,
             underline: false,
         }];
-        let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width.max(24.0));
+        let (runs, h) = place_lines(
+            &segments,
+            content_x,
+            cursor_y,
+            content_width.max(24.0),
+            false,
+        );
         text.extend(runs);
         cursor_y += h;
     } else if (tag == "input" || is_textarea) && is_text_ctrl {
@@ -1203,8 +1281,12 @@ fn layout_block(
             raw_val
         };
         let is_focused = focused_input == Some(id);
+        let cur_idx = doc.input_cursor(id);
         let (display_str, text_color) = if is_focused {
-            (format!("{val}|"), style.color)
+            let mut vchars: Vec<char> = val.chars().collect();
+            let pos = cur_idx.min(vchars.len());
+            vchars.insert(pos, '|');
+            (vchars.into_iter().collect::<String>(), style.color)
         } else if !val.is_empty() {
             (val, style.color)
         } else if let Some(ph) = data.attr("placeholder") {
@@ -1227,7 +1309,9 @@ fn layout_block(
             let chars: Vec<char> = display_str.chars().collect();
             if chars.len() > max_chars {
                 if is_focused {
-                    chars[chars.len() - max_chars..].iter().collect()
+                    let end = (cur_idx + 2).min(chars.len()).max(max_chars);
+                    let start = end.saturating_sub(max_chars);
+                    chars[start..end].iter().collect()
                 } else {
                     chars[..max_chars].iter().collect()
                 }
@@ -1252,7 +1336,7 @@ fn layout_block(
         } else {
             content_width.max(16.0)
         };
-        let (runs, h) = place_lines(&segments, content_x, cursor_y, wrap_w);
+        let (runs, h) = place_lines(&segments, content_x, cursor_y, wrap_w, is_textarea);
         text.extend(runs);
         cursor_y += h;
     }
@@ -1261,7 +1345,7 @@ fn layout_block(
     let mut li_index = 0_usize;
     let mut out_of_flow = Vec::new();
 
-    if tag != "input" && !is_textarea && !is_select && !is_svg {
+    if tag != "input" && !is_textarea && !is_select && !is_svg && !is_bar_ctrl {
         for child in doc.children(id) {
             if is_skipped(doc, styles, *child) {
                 continue;
@@ -1287,8 +1371,10 @@ fn layout_block(
                 let child_is_inline_block = (child_style.inline_level
                     && child_style.display != Display::Inline)
                     || is_decorated_inline(child_style)
-                    || (matches!(child_tag, "img" | "video" | "canvas" | "svg")
-                        && child_style.inline_level);
+                    || (matches!(
+                        child_tag,
+                        "img" | "video" | "canvas" | "svg" | "progress" | "meter"
+                    ) && child_style.inline_level);
                 if child_is_inline_block {
                     let ib_box = layout_node(
                         doc,
@@ -1412,7 +1498,9 @@ fn layout_block(
             .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
             .unwrap_or(150.0)
             .max(flow_height),
-        None if is_checkbox => 18.0,
+        None if is_checkbox || is_radio => 18.0,
+        None if is_range => 20.0,
+        None if is_bar_ctrl => 14.0,
         None if is_textarea => {
             let rows = data
                 .attr("rows")
@@ -1449,6 +1537,11 @@ fn layout_block(
         let svg_w = content_width.round().clamp(1.0, 1024.0) as u32;
         let svg_h = content_height.round().clamp(1.0, 1024.0) as u32;
         decoded_image = svg::render_svg_node(doc, styles, id, svg_w, svg_h);
+    } else if (is_range || is_bar_ctrl) && decoded_image.is_none() {
+        let ctrl_w = content_width.round().clamp(24.0, 1024.0) as u32;
+        let ctrl_h = content_height.round().clamp(8.0, 128.0) as u32;
+        let ratio = doc.control_fill_ratio(id).unwrap_or(0.5);
+        decoded_image = render_control_bar_image(ctrl_w, ctrl_h, ratio, is_range, tag == "meter");
     }
 
     for oof_id in out_of_flow {
@@ -3018,7 +3111,12 @@ fn place_inlines(
     } else {
         content_width
     };
-    let (mut runs, height) = place_lines(&segments, content_x, *cursor_y, wrap_width);
+    let preserve_spaces = matches!(
+        block_style.white_space,
+        WhiteSpace::Pre | WhiteSpace::PreWrap
+    );
+    let (mut runs, height) =
+        place_lines(&segments, content_x, *cursor_y, wrap_width, preserve_spaces);
     align_runs(&mut runs, content_x, content_width, block_style.text_align);
     text.extend(runs);
     *cursor_y += height;
@@ -3090,8 +3188,8 @@ fn is_decorated_inline(style: &ComputedStyle) -> bool {
             || !matches!(style.height, Size::Auto))
 }
 
-/// True for `img`, `video`, `svg`, a block or flex element, a decorated inline
-/// element, or an element that contains a block/replaced descendant.
+/// True for `img`, `video`, `svg`, `progress`, `meter`, a block or flex element,
+/// a decorated inline element, or an element that contains a block/replaced descendant.
 fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
@@ -3100,6 +3198,8 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
                 || tag == "video"
                 || tag == "canvas"
                 || tag == "svg"
+                || tag == "progress"
+                || tag == "meter"
                 || matches!(
                     style.display,
                     Display::Block | Display::Flex | Display::Grid
@@ -3111,9 +3211,9 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     }
 }
 
-/// True when any descendant is `img`, `video`, `canvas`, `svg`, block, or flex.
+/// True when any descendant is `img`, `video`, `canvas`, `svg`, `progress`, `meter`, block, or flex.
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
-    if doc.get(id).data().tag() == Some("svg") {
+    if matches!(doc.get(id).data().tag(), Some("svg" | "progress" | "meter")) {
         return false;
     }
     for child in doc.children(id) {
@@ -3122,6 +3222,8 @@ fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
                 || tag == "video"
                 || tag == "canvas"
                 || tag == "svg"
+                || tag == "progress"
+                || tag == "meter"
                 || matches!(
                     styles.get(*child).display,
                     Display::Block | Display::Flex | Display::Grid
@@ -3134,6 +3236,89 @@ fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
         }
     }
     false
+}
+
+/// Render a procedural RGBA bitmap for `<input type="range">`, `<progress>`, or `<meter>`.
+fn render_control_bar_image(
+    width: u32,
+    height: u32,
+    ratio: f32,
+    is_range: bool,
+    is_meter: bool,
+) -> Option<Image> {
+    let w = width.clamp(24, 1024);
+    let h = height.clamp(8, 128);
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    let clamped = ratio.clamp(0.0, 1.0);
+    let track_h = if is_range {
+        6u32.min(h)
+    } else {
+        (h.saturating_sub(4)).max(6)
+    };
+    let track_y0 = (h.saturating_sub(track_h)) / 2;
+    let track_y1 = track_y0 + track_h;
+    let pad_x = if is_range { 6u32 } else { 1u32 };
+    let track_x0 = pad_x.min(w / 4);
+    let track_x1 = w.saturating_sub(track_x0).max(track_x0 + 1);
+    let fill_end = track_x0 + (((track_x1 - track_x0) as f32) * clamped).round() as u32;
+    let fill_rgb = if is_meter {
+        if clamped < 0.25 {
+            [230u8, 162, 60]
+        } else {
+            [68u8, 188, 130]
+        }
+    } else {
+        [98u8, 156, 236]
+    };
+    let track_rgb = [42u8, 49, 64];
+    let border_rgb = [76u8, 86, 106];
+
+    for y in track_y0..track_y1 {
+        for x in track_x0..track_x1 {
+            let idx = ((y * w + x) as usize) * 4;
+            let on_edge = y == track_y0 || y + 1 == track_y1 || x == track_x0 || x + 1 == track_x1;
+            let rgb = if on_edge {
+                border_rgb
+            } else if x <= fill_end {
+                fill_rgb
+            } else {
+                track_rgb
+            };
+            rgba[idx] = rgb[0];
+            rgba[idx + 1] = rgb[1];
+            rgba[idx + 2] = rgb[2];
+            rgba[idx + 3] = 255;
+        }
+    }
+
+    if is_range {
+        let thumb_cx = fill_end.clamp(track_x0, track_x1.saturating_sub(1)) as i32;
+        let thumb_cy = (h / 2) as i32;
+        let radius = ((h.min(18) / 2).max(4)) as i32;
+        let r2 = radius * radius;
+        let inner_r2 = (radius - 2).max(1) * (radius - 2).max(1);
+        for y in 0..(h as i32) {
+            for x in 0..(w as i32) {
+                let dx = x - thumb_cx;
+                let dy = y - thumb_cy;
+                let d2 = dx * dx + dy * dy;
+                if d2 <= r2 {
+                    let idx = ((y as u32 * w + x as u32) as usize) * 4;
+                    let rgb = if d2 <= inner_r2 {
+                        [232u8, 195, 122]
+                    } else {
+                        [28u8, 34, 46]
+                    };
+                    rgba[idx] = rgb[0];
+                    rgba[idx + 1] = rgb[1];
+                    rgba[idx + 2] = rgb[2];
+                    rgba[idx + 3] = 255;
+                }
+            }
+        }
+    }
+
+    Image::from_rgba(w, h, rgba).ok()
 }
 
 /// Break `segments` into line boxes inside `max_width`, starting at
@@ -3149,6 +3334,7 @@ fn place_lines(
     origin_x: f32,
     origin_y: f32,
     max_width: f32,
+    preserve_spaces: bool,
 ) -> (Vec<TextRun>, f32) {
     let tokens = explode_wide(tokenize(segments), max_width);
     let mut lines: Vec<Vec<Token>> = Vec::new();
@@ -3162,7 +3348,7 @@ fn place_lines(
             line_width = 0.0;
             continue;
         }
-        if token.text == " " && (current.is_empty() || line_width == 0.0) {
+        if !preserve_spaces && token.text == " " && (current.is_empty() || line_width == 0.0) {
             continue;
         }
         let width = measure(&token.text, token.font_size);
@@ -3173,7 +3359,7 @@ fn place_lines(
                 lines.push(std::mem::take(&mut current));
             }
             line_width = 0.0;
-            if token.text == " " {
+            if !preserve_spaces && token.text == " " {
                 continue;
             }
         }
@@ -3239,9 +3425,7 @@ fn place_lines(
     (runs, y - origin_y)
 }
 
-/// Split segments into words and separate space tokens. A segment whose text
-/// is exactly `\n` stays one forced-break token. Other whitespace was already
-/// collapsed by the HTML parser.
+/// Split segments into words and separate space and newline tokens.
 fn tokenize(segments: &[Segment]) -> Vec<Token> {
     let mut tokens = Vec::new();
     for segment in segments {
@@ -3258,7 +3442,29 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
         }
         let mut word = String::new();
         for ch in segment.text.chars() {
-            if ch == ' ' {
+            if ch == '\r' {
+                continue;
+            }
+            if ch == '\n' {
+                if !word.is_empty() {
+                    tokens.push(Token {
+                        node: segment.node,
+                        text: std::mem::take(&mut word),
+                        font_size: segment.font_size,
+                        line_height: segment.line_height,
+                        color: segment.color,
+                        underline: segment.underline,
+                    });
+                }
+                tokens.push(Token {
+                    node: segment.node,
+                    text: "\n".to_string(),
+                    font_size: segment.font_size,
+                    line_height: segment.line_height,
+                    color: segment.color,
+                    underline: segment.underline,
+                });
+            } else if ch == ' ' {
                 if !word.is_empty() {
                     tokens.push(Token {
                         node: segment.node,
@@ -3423,7 +3629,7 @@ mod tests {
             color: Color::BLACK,
             underline: false,
         }];
-        let (runs, height) = place_lines(&segments, 0.0, 0.0, 30.0);
+        let (runs, height) = place_lines(&segments, 0.0, 0.0, 30.0, false);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "hello");
         assert_eq!(runs[1].text, "hello");
@@ -4216,5 +4422,75 @@ mod tests {
         assert_eq!(span2.rect.width, 200.0);
         assert_eq!(col3.rect.x, 200.0);
         assert_eq!(col3.rect.width, 100.0);
+    }
+
+    #[test]
+    fn preserves_multiline_pre_indentation_textarea_summary_markers_and_radio_buttons() {
+        let (doc, tree) = render(
+            "<pre id=\"code_block\">fn main() {\n    let x = 1;\n}</pre>
+             <textarea id=\"ta\">line 1\n  line 2</textarea>
+             <details id=\"det_closed\"><summary id=\"sum_closed\">More Info</summary><p>Hidden</p></details>
+             <details id=\"det_open\" open><summary id=\"sum_open\">Expanded</summary><p>Shown</p></details>
+             <input id=\"rad_on\" type=\"radio\" checked>
+             <input id=\"rad_off\" type=\"radio\">",
+            400.0,
+        );
+        let code_block = find_box(&doc, &tree, "code_block");
+        assert_eq!(code_block.text.len(), 3);
+        assert_eq!(code_block.text[0].text, "fn main() {");
+        assert_eq!(code_block.text[1].text, "    let x = 1;");
+        assert_eq!(code_block.text[2].text, "}");
+        assert!(code_block.text[1].y > code_block.text[0].y);
+        assert!(code_block.text[2].y > code_block.text[1].y);
+
+        let ta = find_box(&doc, &tree, "ta");
+        assert_eq!(ta.text.len(), 2);
+        assert_eq!(ta.text[0].text, "line 1");
+        assert_eq!(ta.text[1].text, "  line 2");
+
+        let sum_closed = find_box(&doc, &tree, "sum_closed");
+        let closed_str: String = sum_closed.text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(closed_str, "> More Info");
+
+        let sum_open = find_box(&doc, &tree, "sum_open");
+        let open_str: String = sum_open.text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(open_str, "v Expanded");
+
+        let rad_on = find_box(&doc, &tree, "rad_on");
+        assert_eq!(rad_on.text[0].text, "(o)");
+        let rad_off = find_box(&doc, &tree, "rad_off");
+        assert_eq!(rad_off.text[0].text, "( )");
+    }
+
+    #[test]
+    fn renders_mid_string_input_caret_and_range_progress_meter_bitmaps() {
+        let mut doc = parse_html(
+            "<html><body>
+               <input id=\"txt\" type=\"text\" value=\"abcdef\">
+               <input id=\"rng\" type=\"range\" min=\"0\" max=\"100\" value=\"75\">
+               <progress id=\"prog\" value=\"40\" max=\"100\">40%</progress>
+               <meter id=\"mtr\" min=\"0\" max=\"10\" value=\"8\">8/10</meter>
+             </body></html>",
+        );
+        let txt_id = doc.get_element_by_id("txt").unwrap();
+        doc.set_input_cursor(txt_id, 3);
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let tree = layout_document_interactive(&doc, &styles, 400.0, &HashMap::new(), Some(txt_id));
+
+        let txt_box = find_box(&doc, &tree, "txt");
+        assert_eq!(txt_box.text[0].text, "abc|def");
+        assert_eq!(tree.find_node_rect(txt_id), Some(txt_box.rect));
+
+        let rng_box = find_box(&doc, &tree, "rng");
+        assert!(rng_box.image.is_some());
+        assert!(rng_box.rect.width >= 60.0);
+
+        let prog_box = find_box(&doc, &tree, "prog");
+        assert!(prog_box.image.is_some());
+        assert!(prog_box.text.is_empty());
+
+        let mtr_box = find_box(&doc, &tree, "mtr");
+        assert!(mtr_box.image.is_some());
+        assert!(mtr_box.text.is_empty());
     }
 }

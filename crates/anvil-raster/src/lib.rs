@@ -861,10 +861,16 @@ impl Framebuffer {
     /// Allocate `width * height` pixels filled with `clear`. The clip stack starts empty.
     pub fn new(width: u32, height: u32, clear: Color) -> Self {
         let count = (width as usize).saturating_mul(height as usize);
-        let mut pixels = Vec::with_capacity(count * 4);
-        for _ in 0..count {
-            pixels.extend_from_slice(&[clear.r, clear.g, clear.b, clear.a]);
-        }
+        let pixels = if clear.r == clear.g && clear.g == clear.b && clear.b == clear.a {
+            vec![clear.r; count * 4]
+        } else {
+            let mut buf = vec![0u8; count * 4];
+            let pat = [clear.r, clear.g, clear.b, clear.a];
+            for px in buf.chunks_exact_mut(4) {
+                px.copy_from_slice(&pat);
+            }
+            buf
+        };
         Self {
             width,
             height,
@@ -906,6 +912,30 @@ impl Framebuffer {
     /// Raw top-down RGBA bytes. Length is `width * height * 4`.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    /// Mutable top-down RGBA bytes. Length is `width * height * 4`.
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
+        &mut self.pixels
+    }
+
+    /// Copy up to `max_rows` opaque pixel rows from `src` into `self` starting at row `dst_y`.
+    pub fn copy_rows_from(&mut self, src: &Framebuffer, dst_y: u32, max_rows: u32) {
+        let copy_w = src.width.min(self.width) as usize;
+        let avail_dst = self.height.saturating_sub(dst_y);
+        let copy_h = src.height.min(avail_dst).min(max_rows) as usize;
+        if copy_w == 0 || copy_h == 0 {
+            return;
+        }
+        let row_bytes = copy_w * 4;
+        let src_stride = (src.width as usize) * 4;
+        let dst_stride = (self.width as usize) * 4;
+        for row in 0..copy_h {
+            let s_off = row * src_stride;
+            let d_off = ((dst_y as usize) + row) * dst_stride;
+            self.pixels[d_off..d_off + row_bytes]
+                .copy_from_slice(&src.pixels[s_off..s_off + row_bytes]);
+        }
     }
 
     /// Total heap bytes allocated by this framebuffer's pixel and clip storage.
