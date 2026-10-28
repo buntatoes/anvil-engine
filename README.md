@@ -2,7 +2,7 @@
   <h1>Anvil Engine</h1>
   <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.23.3.2-ff6b24?style=flat-square" alt="v.23.3.2" />
+    <img src="https://img.shields.io/badge/release-v.24-ff6b24?style=flat-square" alt="v.24" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
@@ -11,7 +11,7 @@
   </p>
 </div>
 
-Version 23.3.2 (`v.23.3.2`). Author: Buntato.
+Version 24.0.0 (`v.24`). Author: Buntato.
 
 This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is dual-licensed under the **PolyForm Noncommercial License 1.0.0** and a **Paid Commercial License with a Non-Compete Clause**. See [License](#license).
 
