@@ -44,16 +44,16 @@ constexpr u32 MAX_REGISTERS_PER_FRAME   = 65535u;
 constexpr u32 INIT_REGISTERS_PER_FRAME  = 64u;
 constexpr u32 MAX_CALL_ARGS             = 256u;
 constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
-constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
+constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 256u * 1024u * 1024u;
 constexpr u32 ANVIL_DEFAULT_CALL_DEPTH  = 10000u;
 constexpr u32 ANVIL_DEFAULT_PARSE_STACK_BUDGET = 1024u * 1024u;
 constexpr u32 DICT_THRESHOLD            = 64u;
-constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 4096u;
+constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 8192u;
 constexpr u32 ANVIL_MAX_PROGRAM_INSTRUCTIONS = 16777215u;
 constexpr u32 INIT_CODE_BUFFER = 256u;
-constexpr u32 MAX_DOM_IC_ENTRIES        = 128u;
+constexpr u32 MAX_DOM_IC_ENTRIES        = 1280u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
-constexpr u32 MAX_TRY_DEPTH             = 64u;
+constexpr u32 MAX_TRY_DEPTH             = 640u;
 
 // Returned by the allocators and tables when they are full.
 constexpr u32 NO_SLOT = 0xFFFFFFFFu;

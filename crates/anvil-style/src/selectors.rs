@@ -29,11 +29,11 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 /// How deep `:is()`, `:where()`, `:not()`, `:has()`, and `nth-*(... of S)`
 /// may nest inside each other. A deeper selector makes its whole list invalid.
-pub const MAX_SELECTOR_NESTING: usize = 16;
+pub const MAX_SELECTOR_NESTING: usize = 64;
 
 /// Most compounds in one complex selector. A longer selector makes its whole
 /// list invalid.
-pub const MAX_SELECTOR_COMPOUNDS: usize = 64;
+pub const MAX_SELECTOR_COMPOUNDS: usize = 640;
 
 /// Pseudo-classes written without arguments.
 const PSEUDO_CLASSES: &[&str] = &[

@@ -282,7 +282,7 @@ fn media_tokens(src: &str) -> Option<Vec<MediaToken>> {
 
 /// Deepest nesting of parenthesized conditions that is read. Deeper input is
 /// treated as a syntax error, which keeps hostile sheets from using the stack.
-const MAX_MEDIA_NESTING: usize = 16;
+const MAX_MEDIA_NESTING: usize = 64;
 
 /// Parse `not (..)`, or groups joined by only `and` or only `or`.
 /// `allow_or` is false right after a media type. `depth` counts the
@@ -341,6 +341,50 @@ fn parse_media_in_parens(inner: &str, depth: usize) -> Option<MediaCondition> {
     if inner.is_empty() {
         return None;
     }
+    if let Some((lhs, rhs)) = inner.split_once(">=") {
+        let key = lhs.trim();
+        let val = rhs.trim().trim_end_matches("px").trim();
+        if matches!(key, "width" | "inline-size")
+            && let Ok(f) = val.parse::<f32>()
+        {
+            return Some(MediaCondition::MinWidth(f.max(0.0).round() as u32));
+        }
+        return Some(MediaCondition::Ignored);
+    }
+    if let Some((lhs, rhs)) = inner.split_once("<=") {
+        let key = lhs.trim();
+        let val = rhs.trim().trim_end_matches("px").trim();
+        if matches!(key, "width" | "inline-size")
+            && let Ok(f) = val.parse::<f32>()
+        {
+            return Some(MediaCondition::MaxWidth(f.max(0.0).round() as u32));
+        }
+        return Some(MediaCondition::Ignored);
+    }
+    if let Some((lhs, rhs)) = inner.split_once('>') {
+        let key = lhs.trim();
+        let val = rhs.trim().trim_end_matches("px").trim();
+        if matches!(key, "width" | "inline-size")
+            && let Ok(f) = val.parse::<f32>()
+        {
+            return Some(MediaCondition::MinWidth(
+                (f.max(0.0).floor() as u32).saturating_add(1),
+            ));
+        }
+        return Some(MediaCondition::Ignored);
+    }
+    if let Some((lhs, rhs)) = inner.split_once('<') {
+        let key = lhs.trim();
+        let val = rhs.trim().trim_end_matches("px").trim();
+        if matches!(key, "width" | "inline-size")
+            && let Ok(f) = val.parse::<f32>()
+        {
+            return Some(MediaCondition::MaxWidth(
+                (f.max(0.0).ceil() as u32).saturating_sub(1),
+            ));
+        }
+        return Some(MediaCondition::Ignored);
+    }
     let Some((k, v)) = inner.split_once(':') else {
         return Some(MediaCondition::Ignored);
     };
@@ -348,11 +392,103 @@ fn parse_media_in_parens(inner: &str, depth: usize) -> Option<MediaCondition> {
     let val = v.trim().trim_end_matches("px").trim();
     let px = || val.parse::<f32>().ok().map(|f| f.round() as u32);
     Some(match key {
-        "min-width" => px().map_or(MediaCondition::Ignored, MediaCondition::MinWidth),
-        "max-width" => px().map_or(MediaCondition::Ignored, MediaCondition::MaxWidth),
+        "min-width" | "min-inline-size" => {
+            px().map_or(MediaCondition::Ignored, MediaCondition::MinWidth)
+        }
+        "max-width" | "max-inline-size" => {
+            px().map_or(MediaCondition::Ignored, MediaCondition::MaxWidth)
+        }
         "prefers-color-scheme" => MediaCondition::ColorScheme(val.to_string()),
         _ => MediaCondition::Ignored,
     })
+}
+
+/// `@scope (<root>)` or `@scope (<root>) to (<limit>)` boundary condition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeCondition {
+    /// Optional `<scope-start>` selector list. When `None`, the scope root is `html`.
+    pub root: Option<Vec<Selector>>,
+    /// Optional `<scope-end>` selector list (`to (...)`). Elements at or inside a limit are excluded.
+    pub limit: Option<Vec<Selector>>,
+}
+
+impl ScopeCondition {
+    /// Parse an `@scope` prelude such as `(.card)`, `(.card) to (.slot)`, or `to (.slot)`.
+    pub fn parse(prelude: &str) -> Option<Self> {
+        let trimmed = prelude.trim();
+        if trimmed.is_empty() {
+            return Some(Self {
+                root: None,
+                limit: None,
+            });
+        }
+        fn extract_paren(s: &str) -> Option<(&str, &str)> {
+            let s = s.trim_start();
+            if !s.starts_with('(') {
+                return None;
+            }
+            let mut depth = 0usize;
+            for (idx, ch) in s.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((s[1..idx].trim(), s[idx + 1..].trim()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        if let Some(after_to) = trimmed
+            .strip_prefix("to")
+            .or_else(|| trimmed.strip_prefix("TO"))
+            && (after_to.starts_with('(') || after_to.starts_with(char::is_whitespace))
+        {
+            let (limit_src, rest) = extract_paren(after_to)?;
+            if !rest.is_empty() {
+                return None;
+            }
+            let limit = parse_selectors(limit_src)?;
+            return Some(Self {
+                root: None,
+                limit: Some(limit),
+            });
+        }
+        let (root_src, after_root) = extract_paren(trimmed)?;
+        let root = parse_selectors(root_src)?;
+        if after_root.is_empty() {
+            return Some(Self {
+                root: Some(root),
+                limit: None,
+            });
+        }
+        let after_to = after_root
+            .strip_prefix("to")
+            .or_else(|| after_root.strip_prefix("TO"))?;
+        let (limit_src, rest) = extract_paren(after_to)?;
+        if !rest.is_empty() {
+            return None;
+        }
+        let limit = parse_selectors(limit_src)?;
+        Some(Self {
+            root: Some(root),
+            limit: Some(limit),
+        })
+    }
+}
+
+fn parse_container_query(cond: &str) -> MediaQuery {
+    let trimmed = cond.trim();
+    if let Some(open_idx) = trimmed.find('(') {
+        let prefix = trimmed[..open_idx].trim();
+        if !prefix.is_empty() && !prefix.eq_ignore_ascii_case("not") {
+            return MediaQuery::parse(&trimmed[open_idx..]);
+        }
+    }
+    MediaQuery::parse(trimmed)
 }
 
 impl MediaQuery {
@@ -405,12 +541,15 @@ impl MediaQuery {
 }
 
 /// One style rule. Selectors and declarations are owned.
-/// `media` is `None` when the rule was not inside `@media`.
+/// `media`, `container`, and `scope` are `None` when the rule was not inside
+/// `@media`, `@container`, or `@scope`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
     pub media: Option<MediaQuery>,
+    pub container: Option<MediaQuery>,
+    pub scope: Option<ScopeCondition>,
 }
 
 /// One CSS declaration. `name` is owned and lowercase. `value` is owned
@@ -851,7 +990,7 @@ pub enum GridAutoRepeat {
 
 /// Largest grid line number or span kept by the parser. Bigger values are
 /// clamped, so a typo such as `span 99999` does not build a huge grid.
-pub const MAX_GRID_LINE: i16 = 100;
+pub const MAX_GRID_LINE: i16 = 1000;
 
 /// One end of a grid item's placement on an axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -888,7 +1027,7 @@ pub enum TrackBreadth {
 }
 
 /// Most functions one `transform` list keeps. A longer list is ignored.
-pub const MAX_TRANSFORM_FNS: usize = 8;
+pub const MAX_TRANSFORM_FNS: usize = 16;
 
 /// One 2D transform function. Angles are radians. Translations keep their
 /// unit; layout resolves percentages against the border box.
@@ -1345,11 +1484,22 @@ pub(crate) fn find_matching_brace(src: &str) -> usize {
 
 /// Split `rest` into rules and keyframes, appending to `sheet`.
 ///
-/// `active_media` is cloned onto each rule. A nested `@media` is combined
-/// with it, so both must match. A prelude that starts
-/// with `@` and is not `@media` or `@keyframes` is dropped, body included.
-/// A rule whose selector list has an invalid selector is dropped too.
-fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
+/// `active_media`, `active_container`, and `active_scope` are cloned onto each
+/// rule. A nested `@media` or `@container` is combined with its outer condition,
+/// so both must match. A prelude that starts with `@` and is not recognized is
+/// dropped, body included. A rule whose selector list has an invalid selector is
+/// dropped too.
+fn parse_css_rules(rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
+    parse_css_rules_scoped(rest, active_media, None, None, sheet);
+}
+
+fn parse_css_rules_scoped(
+    mut rest: &str,
+    active_media: Option<MediaQuery>,
+    active_container: Option<MediaQuery>,
+    active_scope: Option<ScopeCondition>,
+    sheet: &mut Stylesheet,
+) {
     while let Some(open) = find_unquoted(rest, '{') {
         // An at-rule such as `@import` or `@charset` can end at `;` with no
         // block. Skip it so it does not swallow the rule after it.
@@ -1368,13 +1518,55 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
         } else {
             ""
         };
-        if let Some(cond) = selector_src.strip_prefix("@media") {
+        if let Some(cond) = selector_src
+            .strip_prefix("@media")
+            .or_else(|| selector_src.strip_prefix("@MEDIA"))
+        {
             let mq = MediaQuery::parse(cond);
             let combined = match &active_media {
                 Some(outer) => outer.clone().and(&mq),
                 None => mq,
             };
-            parse_css_rules(body_src, Some(combined), sheet);
+            parse_css_rules_scoped(
+                body_src,
+                Some(combined),
+                active_container.clone(),
+                active_scope.clone(),
+                sheet,
+            );
+            continue;
+        }
+        if let Some(cond) = selector_src
+            .strip_prefix("@container")
+            .or_else(|| selector_src.strip_prefix("@CONTAINER"))
+        {
+            let cq = parse_container_query(cond);
+            let combined = match &active_container {
+                Some(outer) => outer.clone().and(&cq),
+                None => cq,
+            };
+            parse_css_rules_scoped(
+                body_src,
+                active_media.clone(),
+                Some(combined),
+                active_scope.clone(),
+                sheet,
+            );
+            continue;
+        }
+        if let Some(cond) = selector_src
+            .strip_prefix("@scope")
+            .or_else(|| selector_src.strip_prefix("@SCOPE"))
+        {
+            if let Some(scope_cond) = ScopeCondition::parse(cond) {
+                parse_css_rules_scoped(
+                    body_src,
+                    active_media.clone(),
+                    active_container.clone(),
+                    Some(scope_cond),
+                    sheet,
+                );
+            }
             continue;
         }
         if let Some(cond) = selector_src
@@ -1386,7 +1578,13 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
                 && anvil_css::media::parse_supports_condition(&cvs, &opts.limits)
                     .is_ok_and(|c| c.evaluate())
             {
-                parse_css_rules(body_src, active_media.clone(), sheet);
+                parse_css_rules_scoped(
+                    body_src,
+                    active_media.clone(),
+                    active_container.clone(),
+                    active_scope.clone(),
+                    sheet,
+                );
             }
             continue;
         }
@@ -1394,6 +1592,20 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
             sheet
                 .keyframes
                 .extend(animation::parse_keyframes(name, body_src));
+            continue;
+        }
+        if selector_src.starts_with("@layer")
+            || selector_src.starts_with("@LAYER")
+            || selector_src.starts_with("@starting-style")
+            || selector_src.starts_with("@STARTING-STYLE")
+        {
+            parse_css_rules_scoped(
+                body_src,
+                active_media.clone(),
+                active_container.clone(),
+                active_scope.clone(),
+                sheet,
+            );
             continue;
         }
         if selector_src.starts_with('@') {
@@ -1409,6 +1621,8 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, sheet: &mut
             selectors,
             declarations: parse_declarations(body_src),
             media: active_media.clone(),
+            container: active_container.clone(),
+            scope: active_scope.clone(),
         });
     }
 }
@@ -1488,6 +1702,7 @@ pub fn compute_styles_parallel(
             &ComputedStyle::initial(),
             &mut root_vars,
             &cx,
+            viewport_width,
         );
         if tag == "html" {
             cx.root_font_px = html_style.font_size;
@@ -1495,6 +1710,12 @@ pub fn compute_styles_parallel(
         if let Some(slot) = styles.get_mut(html_id.index()) {
             *slot = html_style;
         }
+        let html_container_w = resolve_child_container_width(
+            &html_style,
+            viewport_width,
+            cx.root_font_px,
+            viewport_width,
+        );
         for &child in doc.children(html_id) {
             if child != body_id {
                 walk(
@@ -1504,21 +1725,34 @@ pub fn compute_styles_parallel(
                     &html_style,
                     &root_vars,
                     &mut cx,
+                    html_container_w,
                     &mut styles,
                 );
             }
         }
         let mut body_vars = root_vars.clone();
         let body_style = match doc.get(body_id).data() {
-            NodeData::Element { tag: btag, .. } => {
-                cascade_element(doc, body_id, btag, &html_style, &mut body_vars, &cx)
-            }
+            NodeData::Element { tag: btag, .. } => cascade_element(
+                doc,
+                body_id,
+                btag,
+                &html_style,
+                &mut body_vars,
+                &cx,
+                html_container_w,
+            ),
             _ => html_style,
         };
         if let Some(slot) = styles.get_mut(body_id.index()) {
             *slot = body_style;
         }
         let root_font_px = cx.root_font_px;
+        let body_container_w = resolve_child_container_width(
+            &body_style,
+            html_container_w,
+            root_font_px,
+            viewport_width,
+        );
         let index = &index;
         let chunk_size = body_children.len().div_ceil(workers);
         let branch_results: Vec<Vec<(usize, ComputedStyle)>> = std::thread::scope(|s| {
@@ -1542,6 +1776,7 @@ pub fn compute_styles_parallel(
                             &body_style,
                             body_vars_ref,
                             &worker_cx,
+                            body_container_w,
                             &mut local,
                         );
                     }
@@ -1576,16 +1811,21 @@ fn walk_subtree_into(
     parent: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     cx: &Cascade,
+    container_width: f32,
     out: &mut Vec<(usize, ComputedStyle)>,
 ) {
     let mut vars = parent_vars.clone();
     let style = match doc.get(id).data() {
-        NodeData::Element { tag, .. } => cascade_element(doc, id, tag, parent, &mut vars, cx),
+        NodeData::Element { tag, .. } => {
+            cascade_element(doc, id, tag, parent, &mut vars, cx, container_width)
+        }
         _ => *parent,
     };
     out.push((id.index(), style));
+    let child_container_w =
+        resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
     for &child in doc.children(id) {
-        walk_subtree_into(doc, child, &style, &vars, cx, out);
+        walk_subtree_into(doc, child, &style, &vars, cx, child_container_w, out);
     }
 }
 
@@ -1638,6 +1878,7 @@ fn cascade_document(
         &ComputedStyle::initial(),
         &HashMap::new(),
         &mut cx,
+        viewport_width,
         &mut styles,
     );
     let mut root_font_px = cx.root_font_px;
@@ -1675,6 +1916,70 @@ fn doc_len(doc: &Document) -> usize {
     count
 }
 
+fn resolve_child_container_width(
+    style: &ComputedStyle,
+    parent_container_w: f32,
+    root_font_px: f32,
+    viewport_width: f32,
+) -> f32 {
+    let resolve_sz = |sz: Size| -> Option<f32> {
+        match sz {
+            Size::Px(px) if px.is_finite() => Some(px.max(0.0)),
+            Size::Percent(pct) if pct.is_finite() => {
+                Some((parent_container_w * pct / 100.0).max(0.0))
+            }
+            Size::Em(em) if em.is_finite() => Some((style.font_size * em).max(0.0)),
+            Size::Rem(rem) if rem.is_finite() => Some((root_font_px * rem).max(0.0)),
+            Size::Vw(vw) if vw.is_finite() => Some((viewport_width * vw / 100.0).max(0.0)),
+            Size::Calc {
+                px,
+                percent,
+                em,
+                rem,
+            } => Some(
+                (px + parent_container_w * percent / 100.0
+                    + style.font_size * em
+                    + root_font_px * rem)
+                    .max(0.0),
+            ),
+            _ => None,
+        }
+    };
+    let mut w = resolve_sz(style.width).unwrap_or(parent_container_w);
+    if let Some(max_w) = resolve_sz(style.max_width) {
+        w = w.min(max_w);
+    }
+    if let Some(min_w) = resolve_sz(style.min_width) {
+        w = w.max(min_w);
+    }
+    w
+}
+
+fn matches_scope(
+    doc: &Document,
+    id: NodeId,
+    scope: &ScopeCondition,
+    matcher: &selectors::Matcher,
+) -> bool {
+    let mut cur = Some(id);
+    while let Some(node_id) = cur {
+        let is_root = match &scope.root {
+            Some(roots) => roots.iter().any(|s| matcher.matches(s, node_id)),
+            None => node_id == doc.html(),
+        };
+        if is_root {
+            return true;
+        }
+        if let Some(limits) = &scope.limit
+            && limits.iter().any(|s| matcher.matches(s, node_id))
+        {
+            return false;
+        }
+        cur = doc.parent_element(node_id);
+    }
+    false
+}
+
 /// Write `id`'s used style and recurse to its children.
 ///
 /// Elements start from [`ComputedStyle::inherited_child`], then user-agent
@@ -1693,12 +1998,13 @@ fn walk(
     parent_base: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     cx: &mut Cascade,
+    container_width: f32,
     out: &mut [ComputedStyle],
 ) {
     let mut vars = parent_vars.clone();
     let (style, base) = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
-            let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx);
+            let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx, container_width);
             if tag == "html" {
                 cx.root_font_px = base.font_size;
             }
@@ -1709,7 +2015,7 @@ fn walk(
                     base
                 } else {
                     let mut scratch = parent_vars.clone();
-                    cascade_element(doc, id, tag, parent, &mut scratch, cx)
+                    cascade_element(doc, id, tag, parent, &mut scratch, cx, container_width)
                 };
                 let input = animation::AnimInput {
                     keyframes: &cx.sheet.keyframes,
@@ -1729,9 +2035,11 @@ fn walk(
     if let Some(slot) = out.get_mut(id.index()) {
         *slot = style;
     }
+    let child_container_w =
+        resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
     let children: Vec<NodeId> = doc.children(id).to_vec();
     for child in children {
-        walk(doc, child, &style, &base, &vars, cx, out);
+        walk(doc, child, &style, &base, &vars, cx, child_container_w, out);
     }
 }
 
@@ -1744,6 +2052,7 @@ fn cascade_element(
     parent: &ComputedStyle,
     vars: &mut HashMap<String, String>,
     cx: &Cascade,
+    container_width: f32,
 ) -> ComputedStyle {
     let parent_font_px = parent.font_size;
     let mut style = parent.inherited_child();
@@ -1783,7 +2092,15 @@ fn cascade_element(
             _ => {}
         }
     }
-    apply_author(&mut style, vars, doc, id, cx, parent_font_px);
+    apply_author(
+        &mut style,
+        vars,
+        doc,
+        id,
+        cx,
+        parent_font_px,
+        container_width,
+    );
     style
 }
 
@@ -1803,12 +2120,23 @@ fn apply_author(
     id: NodeId,
     cx: &Cascade,
     parent_font_px: f32,
+    container_width: f32,
 ) {
     let (sheet, viewport_width, root_font_px) = (cx.sheet, cx.viewport_width, cx.root_font_px);
     let mut matched = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
         if let Some(mq) = &rule.media
             && !mq.matches(viewport_width)
+        {
+            continue;
+        }
+        if let Some(cq) = &rule.container
+            && !cq.matches(container_width)
+        {
+            continue;
+        }
+        if let Some(scope) = &rule.scope
+            && !matches_scope(doc, id, scope, cx.matcher)
         {
             continue;
         }
@@ -2450,12 +2778,12 @@ fn apply_declaration(
                 style.border_radius = px.max(0.0);
             }
         }
-        "width" => style.width = parse_size(value),
-        "height" => style.height = parse_size(value),
-        "min-width" => style.min_width = parse_size(value),
-        "max-width" => style.max_width = parse_size(value),
-        "min-height" => style.min_height = parse_size(value),
-        "max-height" => style.max_height = parse_size(value),
+        "width" | "inline-size" => style.width = parse_size(value),
+        "height" | "block-size" => style.height = parse_size(value),
+        "min-width" | "min-inline-size" => style.min_width = parse_size(value),
+        "max-width" | "max-inline-size" => style.max_width = parse_size(value),
+        "min-height" | "min-block-size" => style.min_height = parse_size(value),
+        "max-height" | "max-block-size" => style.max_height = parse_size(value),
         "aspect-ratio" => {
             let lower = value.to_ascii_lowercase();
             let trimmed = lower.trim();
@@ -2496,10 +2824,290 @@ fn apply_declaration(
                 _ => return,
             };
         }
-        "top" => style.top = parse_size(value),
-        "right" => style.right = parse_size(value),
-        "bottom" => style.bottom = parse_size(value),
-        "left" => style.left = parse_size(value),
+        "top" | "inset-block-start" => style.top = parse_size(value),
+        "right" | "inset-inline-end" => style.right = parse_size(value),
+        "bottom" | "inset-block-end" => style.bottom = parse_size(value),
+        "left" | "inset-inline-start" => style.left = parse_size(value),
+        "inset-inline" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [both] => {
+                    let s = parse_size(both);
+                    style.left = s;
+                    style.right = s;
+                }
+                [start, end] => {
+                    style.left = parse_size(start);
+                    style.right = parse_size(end);
+                }
+                _ => {}
+            }
+        }
+        "inset-block" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [both] => {
+                    let s = parse_size(both);
+                    style.top = s;
+                    style.bottom = s;
+                }
+                [start, end] => {
+                    style.top = parse_size(start);
+                    style.bottom = parse_size(end);
+                }
+                _ => {}
+            }
+        }
+        "margin-inline" => {
+            let parts = split_css_tokens(value);
+            let apply_side = |tok: &str| -> Option<(f32, bool)> {
+                if tok.eq_ignore_ascii_case("auto") {
+                    Some((0.0, true))
+                } else {
+                    parse_box_px(tok, style.font_size, root_font_px).map(|px| (px, false))
+                }
+            };
+            match parts.as_slice() {
+                [both] => {
+                    if let Some((px, auto)) = apply_side(both) {
+                        style.margin.left = px;
+                        style.margin.right = px;
+                        style.margin_left_auto = auto;
+                        style.margin_right_auto = auto;
+                    }
+                }
+                [start, end] => {
+                    if let (Some((l_px, l_auto)), Some((r_px, r_auto))) =
+                        (apply_side(start), apply_side(end))
+                    {
+                        style.margin.left = l_px;
+                        style.margin.right = r_px;
+                        style.margin_left_auto = l_auto;
+                        style.margin_right_auto = r_auto;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "margin-inline-start" => {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.left = 0.0;
+                style.margin_left_auto = true;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.margin.left = px;
+                style.margin_left_auto = false;
+            }
+        }
+        "margin-inline-end" => {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.right = 0.0;
+                style.margin_right_auto = true;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.margin.right = px;
+                style.margin_right_auto = false;
+            }
+        }
+        "margin-block" => {
+            let parts = split_css_tokens(value);
+            let apply_side = |tok: &str| -> Option<f32> {
+                if tok.eq_ignore_ascii_case("auto") {
+                    Some(0.0)
+                } else {
+                    parse_box_px(tok, style.font_size, root_font_px)
+                }
+            };
+            match parts.as_slice() {
+                [both] => {
+                    if let Some(px) = apply_side(both) {
+                        style.margin.top = px;
+                        style.margin.bottom = px;
+                    }
+                }
+                [start, end] => {
+                    if let (Some(t), Some(b)) = (apply_side(start), apply_side(end)) {
+                        style.margin.top = t;
+                        style.margin.bottom = b;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "margin-block-start" => {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.top = 0.0;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.margin.top = px;
+            }
+        }
+        "margin-block-end" => {
+            if value.eq_ignore_ascii_case("auto") {
+                style.margin.bottom = 0.0;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.margin.bottom = px;
+            }
+        }
+        "padding-inline" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [both] => {
+                    if let Some(px) = parse_box_px(both, style.font_size, root_font_px) {
+                        style.padding.left = px;
+                        style.padding.right = px;
+                    }
+                }
+                [start, end] => {
+                    if let (Some(l), Some(r)) = (
+                        parse_box_px(start, style.font_size, root_font_px),
+                        parse_box_px(end, style.font_size, root_font_px),
+                    ) {
+                        style.padding.left = l;
+                        style.padding.right = r;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "padding-inline-start" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.padding.left = px;
+            }
+        }
+        "padding-inline-end" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.padding.right = px;
+            }
+        }
+        "padding-block" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [both] => {
+                    if let Some(px) = parse_box_px(both, style.font_size, root_font_px) {
+                        style.padding.top = px;
+                        style.padding.bottom = px;
+                    }
+                }
+                [start, end] => {
+                    if let (Some(t), Some(b)) = (
+                        parse_box_px(start, style.font_size, root_font_px),
+                        parse_box_px(end, style.font_size, root_font_px),
+                    ) {
+                        style.padding.top = t;
+                        style.padding.bottom = b;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "padding-block-start" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.padding.top = px;
+            }
+        }
+        "padding-block-end" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.padding.bottom = px;
+            }
+        }
+        "border-inline" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.left = 0.0;
+                style.border.right = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border.left = w;
+                style.border.right = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-inline-start" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.left = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border.left = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-inline-end" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.right = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border.right = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-block" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.top = 0.0;
+                style.border.bottom = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border.top = w;
+                style.border.bottom = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-block-start" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.top = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border.top = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "border-block-end" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.border.bottom = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.border.bottom = w;
+                if let Some(color) = c {
+                    style.border_color = color;
+                }
+            }
+        }
+        "translate" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.transform = TransformList::NONE;
+            } else {
+                let parts = split_css_tokens(value);
+                if let Some(tf) = parse_transform_fn("translate", &parts)
+                    && let Some(list) = TransformList::new(&[tf])
+                {
+                    style.transform = list;
+                }
+            }
+        }
+        "scale" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.transform = TransformList::NONE;
+            } else {
+                let parts = split_css_tokens(value);
+                if let Some(tf) = parse_transform_fn("scale", &parts)
+                    && let Some(list) = TransformList::new(&[tf])
+                {
+                    style.transform = list;
+                }
+            }
+        }
+        "rotate" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.transform = TransformList::NONE;
+            } else {
+                let parts = split_css_tokens(value);
+                if let Some(tf) = parse_transform_fn("rotate", &parts)
+                    && let Some(list) = TransformList::new(&[tf])
+                {
+                    style.transform = list;
+                }
+            }
+        }
         "inset" => {
             let parts = split_css_tokens(value);
             match parts.as_slice() {
@@ -3122,7 +3730,18 @@ fn parse_length(value: &str) -> Option<Size> {
         .get(..5)
         .is_some_and(|head| head.eq_ignore_ascii_case("calc("));
     if value.len() > 5 && is_calc && value.ends_with(')') {
-        return parse_calc(&value[5..value.len() - 1]);
+        if let Some(sz) = parse_calc(&value[5..value.len() - 1]) {
+            return Some(sz);
+        }
+        return parse_css_math_size(value);
+    }
+    if value.ends_with(')')
+        && let Some(open) = value.find('(')
+    {
+        let fn_name = value[..open].trim();
+        if anvil_css::values::is_math_function(fn_name) {
+            return parse_css_math_size(value);
+        }
     }
     let value = value.trim();
     if value == "0" {
@@ -3154,6 +3773,99 @@ fn parse_length(value: &str) -> Option<Size> {
     }
     if let Some(num) = value.strip_suffix('%') {
         return num.trim().parse::<f32>().ok().map(Size::Percent);
+    }
+    None
+}
+
+fn parse_css_math_size(value: &str) -> Option<Size> {
+    use anvil_css::values::{CalcLeaf, CalcNode, CalcType, LengthUnit};
+    let opts = anvil_css::Options::default();
+    let cvs = anvil_css::parse_component_values(value, &opts).ok()?;
+    let non_ws: Vec<_> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
+    let [cv] = non_ws.as_slice() else {
+        return None;
+    };
+    let calc = anvil_css::values::parse_math(cv, &opts.limits).ok()?;
+    let leaf_to_size = |leaf: CalcLeaf| -> Option<Size> {
+        match leaf {
+            CalcLeaf::Length(len) => {
+                let v = len.value as f32;
+                if !v.is_finite() {
+                    return None;
+                }
+                Some(match len.unit {
+                    LengthUnit::Px => Size::Px(v),
+                    LengthUnit::Em => Size::Em(v),
+                    LengthUnit::Rem => Size::Rem(v),
+                    LengthUnit::Vw | LengthUnit::Svw | LengthUnit::Lvw | LengthUnit::Dvw => {
+                        Size::Vw(v)
+                    }
+                    LengthUnit::Vh | LengthUnit::Svh | LengthUnit::Lvh | LengthUnit::Dvh => {
+                        Size::Vh(v)
+                    }
+                    LengthUnit::Vmin
+                    | LengthUnit::Svmin
+                    | LengthUnit::Lvmin
+                    | LengthUnit::Dvmin => Size::Vmin(v),
+                    LengthUnit::Vmax
+                    | LengthUnit::Svmax
+                    | LengthUnit::Lvmax
+                    | LengthUnit::Dvmax => Size::Vmax(v),
+                    LengthUnit::Ch | LengthUnit::Rch => Size::Ch(v),
+                    _ => Size::Px(len.to_px(&anvil_css::ResolveContext::default()) as f32),
+                })
+            }
+            CalcLeaf::Percentage(p) => {
+                let v = p as f32;
+                v.is_finite().then_some(Size::Percent(v))
+            }
+            CalcLeaf::Number(0.0) => Some(Size::Px(0.0)),
+            _ => None,
+        }
+    };
+    if let Some(leaf) = calc.as_leaf() {
+        return leaf_to_size(leaf);
+    }
+    if let CalcNode::Sum(items) = &calc.node {
+        let mut px = 0.0f32;
+        let mut percent = 0.0f32;
+        let mut em = 0.0f32;
+        let mut rem = 0.0f32;
+        let mut all_convertible = true;
+        for item in items {
+            let CalcNode::Leaf(leaf) = item else {
+                all_convertible = false;
+                break;
+            };
+            match leaf_to_size(*leaf) {
+                Some(Size::Px(v)) => px += v,
+                Some(Size::Percent(v)) => percent += v,
+                Some(Size::Em(v)) => em += v,
+                Some(Size::Rem(v)) => rem += v,
+                _ => {
+                    all_convertible = false;
+                    break;
+                }
+            }
+        }
+        if all_convertible {
+            return Some(if percent == 0.0 && em == 0.0 && rem == 0.0 {
+                Size::Px(px)
+            } else {
+                Size::Calc {
+                    px,
+                    percent,
+                    em,
+                    rem,
+                }
+            });
+        }
+    }
+    if matches!(calc.ty, CalcType::Length | CalcType::LengthPercentage) {
+        let resolved = calc.resolve(&anvil_css::ResolveContext::default()) as f32;
+        if resolved.is_finite() {
+            return Some(Size::Px(resolved));
+        }
     }
     None
 }
@@ -4834,5 +5546,66 @@ mod tests {
         assert!((vr - (16.0 / 9.0)).abs() < 1e-4);
         assert_eq!(styles.get(square).aspect_ratio, Some(1.0));
         assert_eq!(styles.get(auto_r).aspect_ratio, None);
+    }
+
+    #[test]
+    fn evaluates_scope_boundaries_container_size_queries_and_css_values_4_math() {
+        let doc = parse_html(
+            "<div id=\"wide_wrap\" style=\"width: 500px\">
+               <div class=\"card\">
+                 <p id=\"in_scope\">Scoped</p>
+                 <div class=\"slot\">
+                   <p id=\"out_scope\">Slotted</p>
+                 </div>
+               </div>
+             </div>
+             <div id=\"narrow_wrap\" style=\"width: 240px\">
+               <div class=\"card\">
+                 <p id=\"narrow_in_scope\">Narrow Scoped</p>
+               </div>
+             </div>",
+        );
+        let sheet = parse_css(
+            "@scope (.card) to (.slot) {
+               p { color: rgb(20, 40, 60); width: round(230px, 50px); padding-left: mod(140px, 50px); }
+             }
+             @container (min-width: 400px) {
+               p { height: hypot(30px, 40px); }
+             }
+             @container card (width <= 300px) {
+               p { height: calc(sin(30deg) * 100px); }
+             }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let in_scope = doc.get_element_by_id("in_scope").unwrap();
+        let out_scope = doc.get_element_by_id("out_scope").unwrap();
+        let narrow_in_scope = doc.get_element_by_id("narrow_in_scope").unwrap();
+
+        assert_eq!(
+            styles.get(in_scope).color,
+            Color {
+                r: 20,
+                g: 40,
+                b: 60,
+                a: 255
+            }
+        );
+        assert_eq!(styles.get(in_scope).width, Size::Px(250.0));
+        assert_eq!(styles.get(in_scope).padding.left, 40.0);
+        assert_eq!(styles.get(in_scope).height, Size::Px(50.0));
+
+        assert_eq!(styles.get(out_scope).color, Color::BLACK);
+        assert_eq!(styles.get(out_scope).width, Size::Auto);
+
+        assert_eq!(
+            styles.get(narrow_in_scope).color,
+            Color {
+                r: 20,
+                g: 40,
+                b: 60,
+                a: 255
+            }
+        );
+        assert_eq!(styles.get(narrow_in_scope).height, Size::Px(50.0));
     }
 }

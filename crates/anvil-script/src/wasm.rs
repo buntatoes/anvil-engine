@@ -22,16 +22,16 @@ use std::fmt;
 pub const WASM_PAGE_SIZE: usize = 65_536;
 
 /// Maximum linear memory pages allowed per instance (`256` pages = 16 MiB).
-pub const MAX_WASM_PAGES: u32 = 256;
+pub const MAX_WASM_PAGES: u32 = 2_560;
 
 /// Maximum instructions executed in one exported function call.
-pub const MAX_WASM_STEPS: usize = 500_000;
+pub const MAX_WASM_STEPS: usize = 5_000_000;
 
 /// Maximum call frame recursion depth in one invocation.
-pub const MAX_WASM_CALL_DEPTH: usize = 64;
+pub const MAX_WASM_CALL_DEPTH: usize = 640;
 
 /// Maximum operand stack depth during execution.
-pub const MAX_WASM_STACK: usize = 4_096;
+pub const MAX_WASM_STACK: usize = 40_960;
 
 /// WebAssembly 1.0 magic header (`\0asm`).
 pub const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];

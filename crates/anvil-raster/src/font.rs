@@ -243,17 +243,7 @@ pub fn draw_system_text(
                 let cov =
                     ((slice[idx] as u16 + slice[idx + 1] as u16 + slice[idx + 2] as u16) / 3) as u8;
                 if cov > 0 {
-                    let alpha = ((color.a as u16 * cov as u16) / 255) as u8;
-                    fb.set_pixel(
-                        base_x + px,
-                        base_y + py,
-                        Color {
-                            r: color.r,
-                            g: color.g,
-                            b: color.b,
-                            a: alpha,
-                        },
-                    );
+                    fb.set_glyph_pixel_gamma_correct(base_x + px, base_y + py, color, cov);
                 }
             }
         }

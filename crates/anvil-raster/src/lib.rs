@@ -44,7 +44,11 @@ use anvil_gpu::{GpuColor, sample_linear_gradient, sdf_box_shadow_alpha, sdf_roun
 use anvil_image::Image;
 use anvil_paint::{DisplayItem, DisplayList, Layer, LayerEffect, Transform2D};
 pub use anvil_style::Color;
-pub use anvil_ttf::{TtfFont, interpret_type2_charstring, interpret_type2_charstring_with_subrs};
+pub use anvil_ttf::{
+    TtfFont, blend_glyph_pixel_gamma_correct, blend_subpixel_lcd_gamma_correct,
+    enhance_stem_contrast, interpret_type2_charstring, interpret_type2_charstring_with_subrs,
+    linear_u12_to_srgb, srgb_to_linear_u12,
+};
 
 // Scanline and compositor entry points from anvil_raster_accel.cpp and
 // anvil_raster_compositor.cpp. Present only when build.rs set anvil_cpp_accel.
@@ -342,6 +346,7 @@ struct GlyphCacheKey {
     font_fp: u64,
     ch: char,
     size_qpx: u32,
+    subpixel_x_phase: u8,
     subpixel: bool,
 }
 
@@ -446,18 +451,33 @@ fn font_fingerprint(font: &TtfFont) -> u64 {
     h
 }
 
-fn cached_rasterize_glyph(
+/// Quantize the fractional part of a horizontal coordinate `x` into one of 4 quarter-pixel
+/// phase bins (`0` = `0.00px`, `1` = `0.25px`, `2` = `0.50px`, `3` = `0.75px`).
+#[inline]
+pub fn subpixel_x_phase_bin(x: f32) -> u8 {
+    if !x.is_finite() {
+        return 0;
+    }
+    let frac = x - x.floor();
+    ((frac * 4.0).floor() as i32).clamp(0, 3) as u8
+}
+
+/// Rasterize and cache a glyph at `font_size` with a 2-bit horizontal subpixel phase (`0..4`).
+pub fn cached_rasterize_glyph_phased(
     font: &TtfFont,
     ch: char,
     font_size: f32,
+    subpixel_x_phase: u8,
 ) -> Option<anvil_ttf::GlyphBitmap> {
     if !font_size.is_finite() || font_size <= 0.0 {
         return None;
     }
+    let phase = subpixel_x_phase & 3;
     let key = GlyphCacheKey {
         font_fp: font_fingerprint(font),
         ch,
         size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
+        subpixel_x_phase: phase,
         subpixel: false,
     };
     if let Ok(mut guard) = GLYPH_CACHE.lock()
@@ -465,7 +485,7 @@ fn cached_rasterize_glyph(
     {
         return Some(bmp);
     }
-    let bmp = font.rasterize_glyph(ch, font_size)?;
+    let bmp = font.rasterize_glyph_subpixel_positioned(ch, font_size, phase)?;
     if let Ok(mut guard) = GLYPH_CACHE.lock() {
         guard.insert(key, CachedGlyph::Gray(bmp.clone()));
     }
@@ -484,6 +504,7 @@ fn cached_rasterize_subpixel_glyph(
         font_fp: font_fingerprint(font),
         ch,
         size_qpx: (font_size * 4.0).round().clamp(1.0, 65_535.0) as u32,
+        subpixel_x_phase: 0,
         subpixel: true,
     };
     if let Ok(mut guard) = GLYPH_CACHE.lock()
@@ -993,6 +1014,48 @@ impl Framebuffer {
             ((color.g as u16 * alpha + self.pixels[offset + 1] as u16 * inv) / 255) as u8;
         self.pixels[offset + 2] =
             ((color.b as u16 * alpha + self.pixels[offset + 2] as u16 * inv) / 255) as u8;
+        self.pixels[offset + 3] = 255;
+    }
+
+    /// Blend a glyph coverage sample (`0..=255`) at `(x, y)` in gamma-correct linear light space
+    /// with luminance-aware stem contrast enhancement.
+    pub fn set_glyph_pixel_gamma_correct(&mut self, x: i32, y: i32, color: Color, coverage: u8) {
+        if x < 0 || y < 0 || color.a == 0 || coverage == 0 {
+            return;
+        }
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last()
+            && (x < cx0 || x >= cx1 || y < cy0 || y >= cy1)
+        {
+            return;
+        }
+        let (x, y) = (x as u32, y as u32);
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let eff_cov = ((u16::from(color.a) * u16::from(coverage) + 127) / 255) as u8;
+        if eff_cov == 0 {
+            return;
+        }
+        let offset = ((y as usize) * (self.width as usize) + (x as usize)) * 4;
+        if eff_cov == 255 {
+            self.pixels[offset] = color.r;
+            self.pixels[offset + 1] = color.g;
+            self.pixels[offset + 2] = color.b;
+            self.pixels[offset + 3] = 255;
+            return;
+        }
+        let (r, g, b) = blend_glyph_pixel_gamma_correct(
+            (
+                self.pixels[offset],
+                self.pixels[offset + 1],
+                self.pixels[offset + 2],
+            ),
+            (color.r, color.g, color.b),
+            eff_cov,
+        );
+        self.pixels[offset] = r;
+        self.pixels[offset + 1] = g;
+        self.pixels[offset + 2] = b;
         self.pixels[offset + 3] = 255;
     }
 
@@ -1679,9 +1742,10 @@ impl Framebuffer {
         color: Color,
         font: &TtfFont,
     ) -> Option<f32> {
-        let bmp = cached_rasterize_glyph(font, ch, font_size)?;
+        let x_phase = subpixel_x_phase_bin(x);
+        let bmp = cached_rasterize_glyph_phased(font, ch, font_size, x_phase)?;
         let baseline_y = y + (font.ascender as f32) * font_size / (font.units_per_em.max(1) as f32);
-        let gx0 = (x.round() as i32) + bmp.bearing_x;
+        let gx0 = (x.floor() as i32) + bmp.bearing_x;
         let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
 
         #[cfg(anvil_cpp_accel)]
@@ -1977,9 +2041,9 @@ impl Framebuffer {
         self.draw_bitmap_text(x, y, text, font_size, color);
     }
 
-    /// Walk `text` with a parsed `anvil-ttf` font.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn draw_ttf_text(
+    /// Walk `text` with a parsed `anvil-ttf` font using 4-bin (`0.25px`) horizontal subpixel phase
+    /// positioning, vertical stem grid fitting, kerning pairs, and gamma-correct linear-space blending.
+    pub fn draw_ttf_text(
         &mut self,
         x: f32,
         y: f32,
@@ -1994,16 +2058,24 @@ impl Framebuffer {
         }
         let scale = font_size / f32::from(font.units_per_em);
         let baseline = y + f32::from(font.ascender) * scale;
+        let baseline_y = baseline.round() as i32;
         let mut pen = x;
+        let mut prev_gid: Option<u16> = None;
         for ch in text.chars() {
-            if let Some(bmp) = cached_rasterize_glyph(font, ch, font_size) {
+            let gid = font.glyph_id(ch);
+            if let Some(prev) = prev_gid {
+                pen += f32::from(font.kerning_units(prev, gid)) * scale;
+            }
+            let x_phase = subpixel_x_phase_bin(pen);
+            let x_int = pen.floor() as i32;
+            if let Some(bmp) = cached_rasterize_glyph_phased(font, ch, font_size, x_phase) {
                 // Saturating math: a run placed far off the canvas must not overflow.
-                let origin_x = (pen.round() as i32).saturating_add(bmp.bearing_x);
+                let origin_x = x_int.saturating_add(bmp.bearing_x);
                 let width = bmp.width as usize;
                 for row in 0..bmp.height {
                     // Row 0 is the top of the glyph, `bearing_y` above the baseline,
                     // and the framebuffer's y grows downward.
-                    let screen_y = (baseline.round() as i32)
+                    let screen_y = baseline_y
                         .saturating_sub(bmp.bearing_y)
                         .saturating_add(row as i32);
                     for col in 0..bmp.width {
@@ -2011,21 +2083,17 @@ impl Framebuffer {
                         if cov == 0 {
                             continue;
                         }
-                        let a = ((u16::from(color.a) * u16::from(cov)) / 255) as u8;
-                        self.set_pixel(
+                        self.set_glyph_pixel_gamma_correct(
                             origin_x.saturating_add(col as i32),
                             screen_y,
-                            Color {
-                                r: color.r,
-                                g: color.g,
-                                b: color.b,
-                                a,
-                            },
+                            color,
+                            cov,
                         );
                     }
                 }
             }
             pen += font.glyph_advance_px(ch, font_size);
+            prev_gid = Some(gid);
         }
     }
 
@@ -4315,5 +4383,18 @@ mod tests {
         let fb_gpu = rasterize_gpu_batch(&mixed, 64, 160, 8.0);
         assert_eq!(fb_single.pixels(), fb_parallel.pixels());
         assert_eq!(fb_single.pixels(), fb_gpu.pixels());
+    }
+
+    #[test]
+    fn subpixel_x_phase_bin_quantizes_quarter_pixel_offsets() {
+        assert_eq!(subpixel_x_phase_bin(10.0), 0);
+        assert_eq!(subpixel_x_phase_bin(10.12), 0);
+        assert_eq!(subpixel_x_phase_bin(10.25), 1);
+        assert_eq!(subpixel_x_phase_bin(10.49), 1);
+        assert_eq!(subpixel_x_phase_bin(10.50), 2);
+        assert_eq!(subpixel_x_phase_bin(10.74), 2);
+        assert_eq!(subpixel_x_phase_bin(10.75), 3);
+        assert_eq!(subpixel_x_phase_bin(10.99), 3);
+        assert_eq!(subpixel_x_phase_bin(f32::NAN), 0);
     }
 }

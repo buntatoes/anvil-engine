@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 /// Most entries kept in each `transition-*` list. Longer lists are ignored.
-pub const MAX_TRANSITIONS: usize = 8;
+pub const MAX_TRANSITIONS: usize = 16;
 
 /// Where the jumps of `steps()` fall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -838,7 +838,7 @@ impl Decomposed {
 }
 
 /// Most entries kept in each `animation-*` list. Longer lists are ignored.
-pub const MAX_ANIMATIONS: usize = 4;
+pub const MAX_ANIMATIONS: usize = 16;
 
 /// One `@keyframes` block. The name is as written, without quotes.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -2,7 +2,7 @@
   <h1>Anvil Engine</h1>
   <p>Page pipeline for Anvil Browser. Not the window, the network stack, or the profile file.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.24-ff6b24?style=flat-square" alt="v.24" />
+    <img src="https://img.shields.io/badge/release-v.24.1-ff6b24?style=flat-square" alt="v.24.1" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <img src="https://img.shields.io/badge/clean_code-clippy_%2B_rustfmt_%280_warnings%29-2ea44f?style=flat-square" alt="Clean code check: clippy and rustfmt passing with 0 warnings" />
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
@@ -11,7 +11,7 @@
   </p>
 </div>
 
-Version 24.0.0 (`v.24`). Author: Buntato.
+Version 0.24.1 (`v.24.1`). Author: Buntato.
 
 This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is dual-licensed under the **PolyForm Noncommercial License 1.0.0** and a **Paid Commercial License with a Non-Compete Clause**. See [License](#license).
 
@@ -22,11 +22,11 @@ There are no crates.io dependencies.
 | Crate | What it is |
 | --- | --- |
 | `anvil-dom` | HTML parser and DOM tree: `<noscript>` isolation, sibling/child traversal, `get_elements_by_tag_name` / `get_elements_by_class_name` / `get_elements_by_name`, `#fragment` anchor lookup (`find_fragment_target`), `<details>`/`<summary>` disclosure helpers, `<input type="radio">` groups, `<label>` control resolution, per-control text caret and word-deletion helpers, `<select>` option helpers, `<input type="range">` / `<progress>` / `<meter>` state, Shadow DOM, Custom Elements, `<canvas>` 2D RGBA backing surfaces (`CanvasSurface`), and Selectors Level 4 matching (`:is()`, `:where()`, `:not()`, `:has()`, `:host`, `:defined`) |
-| `anvil-style` | CSS parsing (`anvil-css` 0.3.0), Selectors Level 4, CSS Color Level 4, `@media` and `@supports` queries, custom properties (`--var`), `calc()`, `box-sizing: border-box`, `aspect-ratio`, `visibility`, `text-align`, `white-space`, `line-height`, `inset`, `flex` and `grid` shorthands, `margin: 0 auto`, closed `<dialog>` and `<details>` body suppression, keyframe animations, and parallel style resolution (`compute_styles_parallel`) |
+| `anvil-style` | CSS parsing (`anvil-css` 0.4.0), Selectors Level 4, CSS Color Level 4/5, `@media` and `@supports` queries, `@scope (<root>) to (<limit>)` scoped cascade boundaries, `@container` size queries (`min-width`, `max-width`, and range comparisons), `@layer`/`@starting-style` block unwrapping, custom properties (`--var`), `calc()` and CSS Values Level 4 math (`round()`, `mod()`, `rem()`, `sin()`, `cos()`, `tan()`, `asin()`, `acos()`, `atan()`, `atan2()`, `pow()`, `sqrt()`, `hypot()`, `log()`, `exp()`, `abs()`, `sign()`), CSS Logical Properties (`inline-size`, `block-size`, `margin-inline*`, `margin-block*`, `padding-inline*`, `padding-block*`, `border-inline*`, `border-block*`, `inset-inline*`, `inset-block*`), standalone `translate`/`scale`/`rotate`, `box-sizing: border-box`, `aspect-ratio`, `visibility`, `text-align`, `white-space`, `line-height`, `inset`, `flex` and `grid` shorthands, `margin: 0 auto`, closed `<dialog>` and `<details>` body suppression, keyframe animations, and parallel style resolution (`compute_styles_parallel`) |
 | `anvil-layout` | Block, inline, `inline-block`, flex (`row` and `column`), grid (`minmax()`, `auto-fill` / `auto-fit`), table (`colspan`), and positioned layout: `aspect-ratio` sizing, multi-line `<pre>` and `<textarea>` formatting, mid-string caret (`|`) rendering, track/fill/thumb bitmaps for `<input type="range">`, `<progress>`, and `<meter>`, `<summary>` and `<input type="radio">` indicators, inline `<svg>` vector icon and path rasterizer, `<canvas>` surface blitting, hit testing, and range text selection (`collect_text_runs_in_rect`) |
 | `anvil-paint` | Display list builder (honoring `visibility: hidden`, clips, transforms, and fixed/sticky layers) and page zoom |
-| `anvil-raster` | RGBA framebuffer (with fast row-slice blitting `copy_rows_from`), batched `anvil_gpu::Compositor` scene execution (`GpuSceneBatch`), bounded LRU glyph coverage cache, and multi-core tile rasterization (`RasterEngine`) |
-| `anvil-script` | Budgeted JavaScript and WebAssembly 1.0 runtime: Rust interpreter, WebAssembly stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), numeric x86-64 loop compiler, and `anvil-js` 0.5.0 ES2022+ compiler and DOM runtime on `AnvilVM` with live DOM/storage/location sync, interactive `click`/`input`/`change`/`submit`/`keydown` event dispatch, microtask-queued `MutationObserver` / `IntersectionObserver` / `ResizeObserver` callbacks, 2D `<canvas>` context, and WebCodecs/MSE helpers |
+| `anvil-raster` | RGBA framebuffer (with fast row-slice blitting `copy_rows_from` and gamma-correct linear-space glyph alpha blending `set_glyph_pixel_gamma_correct`), batched `anvil_gpu::Compositor` scene execution (`GpuSceneBatch`), bounded LRU glyph coverage cache (`anvil-ttf` 0.9.0 with vertical stem grid fitting, 4-bin `0.25 px` horizontal subpixel phase positioning `cached_rasterize_glyph_phased`, pairwise kerning, and stem contrast enhancement), and multi-core tile rasterization (`RasterEngine`) |
+| `anvil-script` | Budgeted JavaScript and WebAssembly 1.0 runtime: Rust interpreter, WebAssembly stack VM (`WasmModule`, `WasmInstance`, `WasmMemory`), numeric x86-64 loop compiler, and `anvil-js` 0.6.0 ES2022–ES2024 compiler and DOM runtime on `AnvilVM` with live DOM/storage/location sync, live `DOMParser` subtree adoption, `CSSStyleSheet.replaceSync()` / `document.adoptedStyleSheets` stylesheet sync, interactive `click`/`input`/`change`/`submit`/`keydown` event dispatch, microtask-queued `MutationObserver` / `IntersectionObserver` / `ResizeObserver` callbacks, 2D `<canvas>` context, and WebCodecs/MSE helpers |
 
 `anvil-script` does not open a socket. `fetch()` is performed by the host in `anvil-browser`.
 
@@ -36,7 +36,7 @@ There are no crates.io dependencies.
 
 Supported:
 
-- WebAssembly 1.0 (`\0asm` version `1`) binary module decoding (`WasmModule::decode`), validation (`validate_wasm`), bounded 64 KiB page linear memory (`WasmMemory`, up to 256 pages / 16 MiB), and stack machine execution (`WasmInstance::instantiate`, `call_export`, `get_exported_global`, `set_exported_global`) covering `i32`, `i64`, `f32`, and `f64` arithmetic, bitwise, comparison, conversion, load/store, `memory.size`, `memory.grow`, `memory.copy`, `memory.fill`, and structured control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `call`, `call_indirect`, `return`)
+- WebAssembly 1.0 (`\0asm` version `1`) binary module decoding (`WasmModule::decode`), validation (`validate_wasm`), bounded 64 KiB page linear memory (`WasmMemory`, up to 2,560 pages / 160 MiB), and stack machine execution (`WasmInstance::instantiate`, `call_export`, `get_exported_global`, `set_exported_global`) covering `i32`, `i64`, `f32`, and `f64` arithmetic, bitwise, comparison, conversion, load/store, `memory.size`, `memory.grow`, `memory.copy`, `memory.fill`, and structured control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `call`, `call_indirect`, `return`)
 - JavaScript `WebAssembly` API: `WebAssembly.validate`, `WebAssembly.compile`, `WebAssembly.compileStreaming`, `WebAssembly.instantiate`, `WebAssembly.instantiateStreaming`, `new WebAssembly.Module`, `new WebAssembly.Instance`, `new WebAssembly.Memory`, `new WebAssembly.Global`, `new WebAssembly.Table`, calling exported WASM functions (`instance.exports.<fn>(...)`), and `memory.grow(delta)`
 - `TypedArray` and binary web APIs: `Uint8Array`, `Uint8ClampedArray`, `Int8Array`, `Uint16Array`, `Int16Array`, `Uint32Array`, `Int32Array`, `Float32Array`, `Float64Array` (including views over `WasmMemory` buffers), `ArrayBuffer`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `URLSearchParams`, `DOMParser`, `AbortController`, `Event`, and `CustomEvent`
 - Interactive hydration (`ScriptRuntime::hydrate_interactive_bindings`) for documents returned from `--tab-worker`, preserving `onclick`/`oninput`/`onchange`/`onsubmit`/`onkeydown` attributes, `addEventListener('click' | 'input' | 'change' | 'submit' | 'keydown', ...)` listeners, ES2022+ `AnvilVM` interactive scripts, and declared functions/classes in the browser window without re-running initial DOM mutations
@@ -61,7 +61,7 @@ Not supported, or different:
 - No `unhandledrejection` event
 - `IntersectionObserver` and `ResizeObserver` deliver initial microtask entry records when `observe(el)` is called; they do not re-fire continuously during viewport scroll or window resize
 
-Limits: a turn spends at most 200,000 steps (`MAX_EXECUTION_STEPS`), script source and `fetch()` bodies are capped at 256 KiB, and WebAssembly calls are bounded at 500,000 instructions (`MAX_WASM_STEPS`), 64 call frames (`MAX_WASM_CALL_DEPTH`), and 256 linear-memory pages (16 MiB). Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 128 timers and 8,192 queued microtasks are kept at once. ES2022+ DOM scripts (using `#private` fields, `static {}` blocks, logical assignment `??=`/`||=`/`&&=`, or `"use anvil-vm"`) execute on `AnvilVM` through the hierarchical Live DOM Host Bridge; other scripts that use the event loop, DOM, or `WebAssembly` run on the Rust interpreter.
+Limits: a turn spends at most 200,000 steps (`MAX_EXECUTION_STEPS`), script source is capped at 256 KiB, `fetch()` bodies are capped at 2.5 MiB (`MAX_SCRIPT_FETCH_BODY`), and WebAssembly calls are bounded at 5,000,000 instructions (`MAX_WASM_STEPS`), 640 call frames (`MAX_WASM_CALL_DEPTH`), and 2,560 linear-memory pages (160 MiB). Every microtask, timer callback, and resumed `await` costs steps, so a promise flood, a timer that sets itself again, or an endless `setInterval` is stopped with a reason (`abort_reason()`) instead of hanging. At most 128 timers and 8,192 queued microtasks are kept at once. ES2022–ES2024 DOM scripts (using `#private` fields, `static {}` blocks, logical assignment `??=`/`||=`/`&&=`, or `"use anvil-vm"`) execute on `AnvilVM` through the hierarchical Live DOM Host Bridge; other scripts that use the event loop, DOM, or `WebAssembly` run on the Rust interpreter.
 
 ## CSS support
 
@@ -78,7 +78,7 @@ The crate docs list every property. These are the newer parts and their limits.
 
 - Supported: all four combinators; attribute selectors with every operator and the `i` and `s` flags; `:is()`, `:where()`, `:not()`, and `:has()`; `:host`, `:host()`, and `:host-context()` (on shadow host elements); `:nth-child()`, `:nth-last-child()`, `:nth-of-type()`, and `:nth-last-of-type()`, with `of S` on the child ones; the structural pseudo-classes (`:root`, `:empty`, `:first-child`, and the rest); `:link` and `:any-link`; the form states (`:checked`, `:default`, `:disabled`, `:enabled`, `:required`, `:optional`, `:read-only`, `:read-write`, `:placeholder-shown`, `:indeterminate` on `progress`); `:open`, `:closed`, `:defined`, `:lang()`, and `:dir()`; and CSS escapes. Specificity follows the selector spec.
 - Valid but never match: standard and vendor-prefixed (`-vendor-*`, `-moz-*`, `-ms-*`) pseudo-elements and pseudo-classes; namespace prefixes other than `*|`, since `@namespace` isn't read; and states a static page never has, such as `:hover`, `:active`, `:focus`, `:focus-visible`, `:focus-within`, `:visited`, `:target`, `:valid`, `:invalid`, `:user-valid`, `:user-invalid`, `:in-range`, `:out-of-range`, `:autofill`, `:fullscreen`, `:modal`, `:popover-open`, the media playback states, and `:state()`. The full list is on `Selector`. `:indeterminate` on radio buttons doesn't match either, and `:dir(auto)` reads as left to right.
-- Not valid: `&` (nesting). A selector nested more than 16 deep (`MAX_SELECTOR_NESTING`) or longer than 64 compounds (`MAX_SELECTOR_COMPOUNDS`) drops its list.
+- Not valid: `&` (nesting). A selector nested more than 64 deep (`MAX_SELECTOR_NESTING`) or longer than 640 compounds (`MAX_SELECTOR_COMPOUNDS`) drops its list.
 - `Document::query_selector` and `Document::query_selector_all` support combinators, attribute selectors, `:is()`, `:where()`, `:not()`, `:has()`, `:host`, `:host()`, `:host-context()`, and `:defined`.
 
 ### Gaps and sizes
@@ -90,7 +90,7 @@ The crate docs list every property. These are the newer parts and their limits.
 ### Grid
 
 - Supported: `grid-template-columns` and `grid-template-rows` with `px`, `%`, `fr`, `auto`, `minmax()`, and `repeat()` (including `repeat(auto-fill, ...)` and `repeat(auto-fit, ...)` on column tracks); `grid-auto-rows`; `grid-column`, `grid-row`, their `-start` / `-end` longhands, and numeric `grid-area`, with line numbers, negative lines, and `span N`; sparse row-by-row auto-placement that flows around spanning items; `align-items: center` and `end` inside grid areas.
-- Not supported: named lines, `grid-template-areas` and named `grid-area`, `grid-auto-flow`, `grid-auto-columns`, `subgrid`, and implicit tracks before line 1 (such an item starts at line 1). Lines past 100 are clamped. An `auto` column acts as `1fr`.
+- Not supported: named lines, `grid-template-areas` and named `grid-area`, `grid-auto-flow`, `grid-auto-columns`, `subgrid`, and implicit tracks before line 1 (such an item starts at line 1). Lines past 1000 are clamped. An `auto` column acts as `1fr`.
 
 ### `ch`
 
@@ -105,13 +105,13 @@ The crate docs list every property. These are the newer parts and their limits.
 
 ### Transforms
 
-- Supported: `transform` with up to 8 of `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`, `scaleY()`, `rotate()`, `skew()`, `skewX()`, `skewY()`, and `matrix()`; `transform-origin` with keywords, lengths, and percentages. Painting and `hit_test` use the transformed shape. Moves and even scales draw directly; other transforms are resampled with smoothed edges. A box's own clip turns with it; clips from its ancestors stay screen-aligned. A transform that cannot be inverted draws nothing and is never hit.
-- Not supported: 3D functions, `perspective`, `transform-style`, `transform-box`, the standalone `translate`, `rotate`, and `scale` properties, and `calc()` inside a function. Transforms do not change layout or scrollable size, and they do not become the containing block for fixed or absolute descendants (those are still drawn through the transform). Inline boxes are not transformed. A rotated or skewed layer is drawn into a buffer of at most 2048 pixels per side.
+- Supported: `transform` with up to 16 of `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`, `scaleY()`, `rotate()`, `skew()`, `skewX()`, `skewY()`, and `matrix()`; standalone `translate`, `scale`, and `rotate` properties; `transform-origin` with keywords, lengths, and percentages. Painting and `hit_test` use the transformed shape. Moves and even scales draw directly; other transforms are resampled with smoothed edges. A box's own clip turns with it; clips from its ancestors stay screen-aligned. A transform that cannot be inverted draws nothing and is never hit.
+- Not supported: 3D functions, `perspective`, `transform-style`, `transform-box`, and `calc()` inside a function. Transforms do not change layout or scrollable size, and they do not become the containing block for fixed or absolute descendants (those are still drawn through the transform). Inline boxes are not transformed. A rotated or skewed layer is drawn into a buffer of at most 2048 pixels per side.
 
 ### Opacity, transitions, and animations
 
 - Supported: `opacity` (one group per box); `transition` and its longhands; `animation` and its longhands with `@keyframes`, iteration counts including `infinite`, all four directions, and all four fill modes; `ease`, `linear`, `ease-in`, `ease-out`, `ease-in-out`, `cubic-bezier()`, `steps()`, `step-start`, and `step-end`. Lengths, colors, opacity, and transforms blend, along with margins, padding, `border-radius`, `font-size`, `row-gap`, and `column-gap`. They run through `compute_styles_animated` with an `Animator`, whose `tick(now_ms)` takes the time from any clock and says whether another frame is needed.
-- Not supported: transition and animation events, `animation-play-state`, `animation-composition`, `transition-behavior`, shortened reverse transitions, and blending `auto` with a length. `compute_styles` and the other plain cascade functions do not animate. At most 8 transitions and 4 animations per element.
+- Not supported: transition and animation events, `animation-play-state`, `animation-composition`, `transition-behavior`, shortened reverse transitions, and blending `auto` with a length. `compute_styles` and the other plain cascade functions do not animate. At most 16 transitions and 16 animations per element.
 
 ## Build
 

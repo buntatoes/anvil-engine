@@ -54,7 +54,7 @@ use anvil_json::{JsonValue, parse_json, to_json_string};
 ///
 /// A longer body is cut on a character boundary. `anvil-net` also stops reading
 /// a response at its own raw cap before this host callback returns.
-pub const MAX_SCRIPT_FETCH_BODY: usize = 256 * 1024;
+pub const MAX_SCRIPT_FETCH_BODY: usize = 2560 * 1024;
 
 /// Status and body returned by a `fetch()` host callback.
 ///
@@ -1449,6 +1449,10 @@ fn apply_vm_dom_mutations_with_runtime(
                 "setTitle" => {
                     doc.set_title(s1);
                 }
+                "adoptStyleSheets" => {
+                    let css = if !s2.is_empty() { s2 } else { s1 };
+                    apply_adopted_stylesheets(doc, css);
+                }
                 "localStorageSet" => {
                     if let Some(rt) = runtime.as_deref_mut() {
                         rt.local_storage_set(s1, s2);
@@ -1720,6 +1724,15 @@ fn apply_vm_dom_mutations_with_runtime(
                     doc.set_title(title);
                 }
             }
+            "adoptStyleSheets" => {
+                if let Some(css) = rec
+                    .get("value")
+                    .or_else(|| rec.get("css"))
+                    .and_then(|v| v.as_str())
+                {
+                    apply_adopted_stylesheets(doc, css);
+                }
+            }
             "canvasDraw" => {
                 if let Some(&nid) = vm_nodes.get(&id_u32) {
                     let cmd = rec.get("cmd").unwrap_or(rec);
@@ -1853,6 +1866,22 @@ fn apply_vm_dom_mutations_with_runtime(
         }
     }
     default_prevented
+}
+
+fn apply_adopted_stylesheets(doc: &mut Document, css: &str) {
+    if css.trim().is_empty() {
+        return;
+    }
+    if let Some(existing) = doc.get_element_by_id("__anvil_adopted_styles__") {
+        doc.set_text_content(existing, css);
+    } else {
+        let style_id = doc.create_element(
+            "style",
+            vec![("id".to_string(), "__anvil_adopted_styles__".to_string())],
+        );
+        doc.set_text_content(style_id, css);
+        let _ = doc.append(doc.head(), style_id);
+    }
 }
 
 fn json_i32(obj: &JsonValue, key: &str) -> i32 {
@@ -13907,6 +13936,15 @@ mod tests {
             const ctx = stage.getContext('2d');
             ctx.fillStyle = '#00ff00';
             ctx.fillRect(0, 0, 12, 12);
+
+            const parser = new DOMParser();
+            const parsedDoc = parser.parseFromString('<section id=\"parsed-sec\" class=\"from-parser\"><b id=\"parsed-b\">ParsedDOM</b></section>', 'text/html');
+            const parsedSec = parsedDoc.getElementById('parsed-sec');
+            app.appendChild(parsedSec);
+
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync('#parsed-sec { width: 320px; }');
+            document.adoptedStyleSheets = [sheet];
         ";
         let run = eval_webapp_with_live_dom_bridge(&mut doc, "https://example.com/", script)
             .expect("live dom bridge executed");
@@ -13922,6 +13960,23 @@ mod tests {
         assert_eq!(doc.text_content(created), "FromAnvilVM");
         let sr = doc.shadow_root(app).expect("shadow root synced");
         assert_eq!(doc.text_content(sr), "ShadowChild");
+
+        let parsed_sec = doc
+            .get_element_by_id("parsed-sec")
+            .expect("parsed-sec adopted into host doc");
+        assert!(doc.get(parsed_sec).data().has_class("from-parser"));
+        let parsed_b = doc
+            .get_element_by_id("parsed-b")
+            .expect("parsed-b adopted into host doc");
+        assert_eq!(doc.text_content(parsed_b), "ParsedDOM");
+
+        let adopted_style = doc
+            .get_element_by_id("__anvil_adopted_styles__")
+            .expect("adopted style element created");
+        assert!(
+            doc.text_content(adopted_style)
+                .contains("#parsed-sec { width: 320px; }")
+        );
 
         let stage = doc.get_element_by_id("stage").unwrap();
         let surf = doc
