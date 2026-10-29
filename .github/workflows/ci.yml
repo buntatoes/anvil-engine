@@ -10,7 +10,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, testing]
   pull_request:
   workflow_dispatch:
 
@@ -42,7 +42,7 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf; do
+          for repo in anvil-cipher anvil-compress anvil-css anvil-gpu anvil-image anvil-js anvil-json anvil-ttf anvil-video; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
@@ -100,7 +100,7 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf; do
+          for repo in anvil-cipher anvil-compress anvil-css anvil-gpu anvil-image anvil-js anvil-json anvil-ttf anvil-video; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
