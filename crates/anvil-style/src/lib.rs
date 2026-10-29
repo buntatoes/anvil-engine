@@ -57,6 +57,10 @@
 use anvil_dom::{Document, NodeData, NodeId};
 use std::collections::HashMap;
 
+/// Direct linkage to the in-tree `Anvil-CSS` engine (`engines/anvil-css`).
+#[path = "../../../../anvil-browser/engines/anvil-css/src/lib.rs"]
+pub mod anvil_css;
+
 mod animation;
 mod selectors;
 pub use animation::{
@@ -1910,12 +1914,48 @@ fn parse_css_rules_scoped(
         if selector_src.starts_with('@') {
             continue;
         }
-        let Some(selectors) = parse_selectors(selector_src) else {
-            continue;
-        };
-        if selectors.is_empty() {
-            continue;
-        }
+        emit_style_rule_with_nesting(
+            selector_src,
+            body_src,
+            &active_media,
+            &active_container,
+            &active_scope,
+            &active_layer,
+            sheet,
+            0,
+        );
+    }
+    while rest.trim_start().starts_with('@')
+        && let Some(semi) = find_unquoted(rest, ';')
+    {
+        parse_statement_at_rule(&rest[..semi], active_layer.as_deref(), sheet);
+        rest = &rest[semi + 1..];
+    }
+}
+
+const MAX_CSS_NESTING_DEPTH: usize = 16;
+
+#[allow(clippy::too_many_arguments)]
+fn emit_style_rule_with_nesting(
+    selector_src: &str,
+    body_src: &str,
+    active_media: &Option<MediaQuery>,
+    active_container: &Option<MediaQuery>,
+    active_scope: &Option<ScopeCondition>,
+    active_layer: &Option<String>,
+    sheet: &mut Stylesheet,
+    depth: usize,
+) {
+    if depth > MAX_CSS_NESTING_DEPTH {
+        return;
+    }
+    let Some(selectors) = parse_selectors(selector_src) else {
+        return;
+    };
+    if selectors.is_empty() {
+        return;
+    }
+    if find_unquoted(body_src, '{').is_none() {
         let layer = active_layer
             .as_deref()
             .map(|name| intern_layer(&mut sheet.layers, name));
@@ -1927,13 +1967,143 @@ fn parse_css_rules_scoped(
             scope: active_scope.clone(),
             layer,
         });
+        return;
     }
-    while rest.trim_start().starts_with('@')
-        && let Some(semi) = find_unquoted(rest, ';')
-    {
-        parse_statement_at_rule(&rest[..semi], active_layer.as_deref(), sheet);
-        rest = &rest[semi + 1..];
+
+    let (own_decls_src, nested_blocks) = split_rule_body_and_nested(body_src);
+    let declarations = parse_declarations(&own_decls_src);
+    if !declarations.is_empty() || nested_blocks.is_empty() {
+        let layer = active_layer
+            .as_deref()
+            .map(|name| intern_layer(&mut sheet.layers, name));
+        sheet.rules.push(Rule {
+            selectors,
+            declarations,
+            media: active_media.clone(),
+            container: active_container.clone(),
+            scope: active_scope.clone(),
+            layer,
+        });
     }
+
+    for (child_prelude, child_body) in nested_blocks {
+        let trimmed = child_prelude.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('@') {
+            let wrapped = format!("{trimmed} {{ {selector_src} {{ {child_body} }} }}");
+            parse_css_rules_scoped(
+                &wrapped,
+                active_media.clone(),
+                active_container.clone(),
+                active_scope.clone(),
+                active_layer.clone(),
+                sheet,
+            );
+        } else {
+            let combined = combine_nested_selectors(selector_src, trimmed);
+            if !combined.is_empty() {
+                emit_style_rule_with_nesting(
+                    &combined,
+                    &child_body,
+                    active_media,
+                    active_container,
+                    active_scope,
+                    active_layer,
+                    sheet,
+                    depth + 1,
+                );
+            }
+        }
+    }
+}
+
+fn split_rule_body_and_nested(body_src: &str) -> (String, Vec<(String, String)>) {
+    let mut own_decls = String::new();
+    let mut nested = Vec::new();
+    let mut rest = body_src;
+    while !rest.is_empty() {
+        let next_open = find_unquoted(rest, '{');
+        let next_semi = find_unquoted(rest, ';');
+        match (next_semi, next_open) {
+            (Some(semi), Some(open)) if semi < open => {
+                own_decls.push_str(&rest[..=semi]);
+                rest = &rest[semi + 1..];
+            }
+            (Some(semi), None) => {
+                own_decls.push_str(&rest[..=semi]);
+                rest = &rest[semi + 1..];
+            }
+            (_, Some(open)) => {
+                let head = rest[..open].trim();
+                let body_rest = &rest[open + 1..];
+                let close = find_matching_brace(body_rest);
+                let inner_body = &body_rest[..close];
+                let after_close = if close < body_rest.len() {
+                    &body_rest[close + 1..]
+                } else {
+                    ""
+                };
+                if head.starts_with("--") && head.contains(':') {
+                    own_decls.push_str(&rest[..open + 1 + close.min(body_rest.len())]);
+                    if close < body_rest.len() {
+                        own_decls.push('}');
+                    }
+                    rest = after_close;
+                } else {
+                    nested.push((head.to_string(), inner_body.to_string()));
+                    rest = after_close;
+                }
+            }
+            (None, None) => {
+                own_decls.push_str(rest);
+                break;
+            }
+        }
+    }
+    (own_decls, nested)
+}
+
+fn split_selector_commas(src: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in Unquoted::new(src) {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let part = src[start..idx].trim();
+                if !part.is_empty() {
+                    out.push(part);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = src[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn combine_nested_selectors(parent_src: &str, child_src: &str) -> String {
+    let parents = split_selector_commas(parent_src);
+    let children = split_selector_commas(child_src);
+    let mut combined = Vec::new();
+    for p in &parents {
+        for c in &children {
+            if c.contains('&') {
+                combined.push(c.replace('&', p));
+            } else {
+                combined.push(format!("{p} {c}"));
+            }
+        }
+    }
+    combined.join(", ")
 }
 
 /// Cascade `sheet` onto `doc` at a viewport width of 960 CSS pixels.
@@ -6809,5 +6979,115 @@ mod tests {
         assert!(item.margin_right_auto);
         assert!(item.margin_bottom_auto);
         assert!(item.margin_left_auto);
+    }
+
+    #[test]
+    fn evaluates_interactive_pseudo_classes_and_css_nesting() {
+        let mut doc = parse_html(
+            "<div id=\"card\" class=\"card\">
+               <a id=\"cta\" href=\"#sec\">Action</a>
+               <input id=\"email\" type=\"email\" required value=\"bad-email\" />
+               <input id=\"qty\" type=\"number\" min=\"1\" max=\"10\" value=\"25\" />
+             </div>
+             <section id=\"sec\"><p id=\"sec_p\">Target Section</p></section>",
+        );
+        let sheet = parse_css(
+            ".card {
+               padding: 10px;
+               &:hover {
+                 padding: 20px;
+               }
+               &:focus-within {
+                 border: 3px solid rgb(10, 20, 30);
+               }
+               > a {
+                 color: rgb(1, 2, 3);
+                 &:active {
+                   color: rgb(200, 10, 20);
+                 }
+               }
+               input:invalid {
+                 background-color: rgb(255, 0, 0);
+               }
+               input:valid {
+                 background-color: rgb(0, 255, 0);
+               }
+               input:out-of-range {
+                 width: 80px;
+               }
+               input:in-range {
+                 width: 160px;
+               }
+             }
+             #sec:target {
+               margin-top: 32px;
+               p {
+                 font-weight: 700;
+               }
+             }",
+        );
+
+        let card = doc.get_element_by_id("card").unwrap();
+        let cta = doc.get_element_by_id("cta").unwrap();
+        let email = doc.get_element_by_id("email").unwrap();
+        let qty = doc.get_element_by_id("qty").unwrap();
+        let sec = doc.get_element_by_id("sec").unwrap();
+        let sec_p = doc.get_element_by_id("sec_p").unwrap();
+
+        let initial = compute_styles(&doc, &sheet);
+        assert_eq!(initial.get(card).padding.top, 10.0);
+        assert_eq!(initial.get(card).border.top, 0.0);
+        assert_eq!(
+            initial.get(cta).color,
+            Color {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 255
+            }
+        );
+        assert_eq!(
+            initial.get(email).background,
+            Some(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
+        assert_eq!(initial.get(qty).width, Size::Px(80.0));
+        assert_eq!(initial.get(sec).margin.top, 0.0);
+
+        doc.set_hovered_node(Some(cta));
+        doc.set_active_node(Some(cta));
+        doc.set_focused_node(Some(email));
+        doc.set_target_fragment(Some("sec"));
+        doc.set_input_value(email, "user@example.com");
+        doc.set_input_value(qty, "5");
+
+        let updated = compute_styles(&doc, &sheet);
+        assert_eq!(updated.get(card).padding.top, 20.0);
+        assert_eq!(updated.get(card).border.top, 3.0);
+        assert_eq!(
+            updated.get(cta).color,
+            Color {
+                r: 200,
+                g: 10,
+                b: 20,
+                a: 255
+            }
+        );
+        assert_eq!(
+            updated.get(email).background,
+            Some(Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            })
+        );
+        assert_eq!(updated.get(qty).width, Size::Px(160.0));
+        assert_eq!(updated.get(sec).margin.top, 32.0);
+        assert_eq!(updated.get(sec_p).font_weight, 700);
     }
 }

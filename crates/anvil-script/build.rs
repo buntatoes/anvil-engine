@@ -1,28 +1,23 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// Optional C++20 AnvilVM (NaN-boxed heap, hidden classes, Inline Caches, and register VM) build script.
-// Author: Buntato
-//
-// Compiles and archives the freestanding C++20 translation units under `cpp/`:
-//   - cpp/anvil_vm_heap.cpp
-//   - cpp/anvil_vm_ic.cpp
-//   - cpp/anvil_vm_compiler.cpp
-//   - cpp/anvil_jit_accel.cpp
-// when a C++20 compiler (`cl.exe` on Windows or `g++` on Linux) is available,
-// emitting `cfg(anvil_cpp_jit)`. If no compiler is installed, the build succeeds
-// and `anvil-script` falls back to its pure-Rust execution path.
+// Builds and links the native C++20 Anvil-JS engine (`AnvilVM`: NaN-boxed heap,
+// hidden classes, Inline Caches, and register VM) from `../../../anvil-browser/engines/anvil-js/cpp/`
+// directly into `anvil-script`.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CPP_UNITS: &[(&str, &str)] = &[
-    ("cpp/anvil_vm_heap.cpp", "anvil_vm_heap"),
-    ("cpp/anvil_vm_ic.cpp", "anvil_vm_ic"),
-    ("cpp/anvil_vm_compiler.cpp", "anvil_vm_compiler"),
-    ("cpp/anvil_jit_accel.cpp", "anvil_jit_accel"),
-    ("cpp/anvil_jit_native.cpp", "anvil_jit_native"),
+const ENGINE_CPP_DIR: &str = "../../../anvil-browser/engines/anvil-js/cpp";
+const LOCAL_CPP_DIR: &str = "cpp";
+
+const CPP_STEMS: &[&str] = &[
+    "anvil_vm_heap",
+    "anvil_vm_ic",
+    "anvil_vm_compiler",
+    "anvil_jit_accel",
+    "anvil_jit_native",
 ];
 
 fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
@@ -43,7 +38,6 @@ fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
 }
 
 fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<PathBuf> {
-    // Hostx64\x64 sits deeper than eight directories under the Visual Studio root.
     if depth > 12 {
         return None;
     }
@@ -68,12 +62,20 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=cpp/anvil_vm.hpp");
-    for (src, _) in CPP_UNITS {
+    let cpp_dir = if Path::new(ENGINE_CPP_DIR).exists() {
+        ENGINE_CPP_DIR
+    } else {
+        LOCAL_CPP_DIR
+    };
+    println!("cargo:rerun-if-changed={cpp_dir}/anvil_vm.hpp");
+    let mut units = Vec::with_capacity(CPP_STEMS.len());
+    for stem in CPP_STEMS {
+        let src = format!("{cpp_dir}/{stem}.cpp");
         println!("cargo:rerun-if-changed={src}");
-        if !Path::new(src).exists() {
+        if !Path::new(&src).exists() {
             return;
         }
+        units.push((src, *stem));
     }
     println!("cargo:rustc-check-cfg=cfg(anvil_cpp_jit)");
 
@@ -82,23 +84,20 @@ fn main() {
     if cfg!(target_os = "windows") {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
-            let mut obj_paths = Vec::with_capacity(CPP_UNITS.len());
-            for (src, stem) in CPP_UNITS {
+            let mut obj_paths = Vec::with_capacity(units.len());
+            for (src, stem) in &units {
                 let obj_path = out_dir.join(format!("{stem}.obj"));
                 let cl_status = Command::new(&cl_exe)
                     .args([
                         "/nologo",
                         "/c",
                         "/O2",
-                        // Strict IEEE doubles: under /fp:fast cl.exe may treat
-                        // NaN as equal to itself and fold `x - x` to 0, which
-                        // breaks NaN, Infinity and === on numbers.
                         "/fp:precise",
                         "/std:c++20",
                         "/Gs1048576",
                         "/Zl",
-                        "/Icpp",
-                        src,
+                        &format!("/I{cpp_dir}"),
+                        src.as_str(),
                         &format!("/Fo{}", obj_path.display()),
                     ])
                     .status();
@@ -124,8 +123,8 @@ fn main() {
             }
         }
     } else {
-        let mut obj_paths = Vec::with_capacity(CPP_UNITS.len());
-        for (src, stem) in CPP_UNITS {
+        let mut obj_paths = Vec::with_capacity(units.len());
+        for (src, stem) in &units {
             let obj_path = out_dir.join(format!("{stem}.o"));
             let gpp_ok = Command::new("g++")
                 .args([
@@ -134,8 +133,8 @@ fn main() {
                     "-std=c++20",
                     "-fno-exceptions",
                     "-fno-rtti",
-                    "-Icpp",
-                    src,
+                    &format!("-I{cpp_dir}"),
+                    src.as_str(),
                     "-o",
                     obj_path.to_str().unwrap(),
                 ])

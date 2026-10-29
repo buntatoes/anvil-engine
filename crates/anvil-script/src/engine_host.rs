@@ -6,6 +6,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 
+use crate::anvil_js;
 use anvil_dom::{Document, NodeData, NodeId, parse_html};
 use anvil_js::gc::roots::Persistent;
 use anvil_js::value::object::{HostData, ObjectClass};
@@ -59,6 +60,14 @@ pub struct AnvilJsDomHost {
     pub document_obj: Option<ObjectRef>,
     /// Registered live DOM event listeners: `(target_node, event_type_lowercase, callback)`.
     pub listeners: Vec<(NodeId, String, Persistent)>,
+    /// Scheduled virtual timers: `(timer_id, due_ms, interval_ms, callback, is_raf)`.
+    pub timers: Vec<(u32, f64, Option<f64>, Persistent, bool)>,
+    /// Next monotonically increasing timer handle id.
+    pub next_timer_id: u32,
+    /// Active 2D `<canvas>` subpaths per canvas `NodeId`.
+    pub canvas_paths: std::collections::HashMap<NodeId, Vec<(i32, i32)>>,
+    /// Active `MutationObserver` registrations: `(callback, observed_node)`.
+    pub mutation_observers: Vec<(Persistent, NodeId)>,
 }
 
 impl Default for AnvilJsDomHost {
@@ -91,6 +100,10 @@ impl AnvilJsDomHost {
             dataset_proto: None,
             document_obj: None,
             listeners: Vec::new(),
+            timers: Vec::new(),
+            next_timer_id: 1,
+            canvas_paths: std::collections::HashMap::new(),
+            mutation_observers: Vec::new(),
         }
     }
 
@@ -126,14 +139,16 @@ impl AnvilJsDomHost {
             ("contains", el_contains),
             ("attachShadow", el_attach_shadow),
             ("addEventListener", el_add_event_listener),
+            ("removeEventListener", el_remove_event_listener),
+            ("dispatchEvent", el_dispatch_event),
             ("getBoundingClientRect", el_get_bounding_client_rect),
             ("getContext", el_get_context),
             ("setTextContent", el_set_text_content_method),
             ("getTextContent", el_get_text_content_method),
             ("setInnerHTML", el_set_inner_html_method),
             ("setValue", el_set_value_method),
-            ("focus", el_noop),
-            ("blur", el_noop),
+            ("focus", el_focus),
+            ("blur", el_blur),
             ("scrollIntoView", el_noop),
         ] {
             vm.define_method(el_proto, name, func)?;
@@ -319,6 +334,13 @@ impl AnvilJsDomHost {
             ("getElementsByClassName", doc_get_elements_by_class_name),
             ("getElementsByName", doc_get_elements_by_name),
             ("addEventListener", doc_add_event_listener),
+            ("removeEventListener", doc_remove_event_listener),
+            ("dispatchEvent", doc_dispatch_event),
+            ("adoptNode", doc_adopt_node),
+            ("importNode", doc_import_node),
+            ("__parseHTML", doc_parse_html_fragment),
+            ("__addAdoptedSheet", doc_add_adopted_sheet),
+            ("__setAdoptedSheets", doc_set_adopted_sheets),
         ] {
             vm.define_method(doc_obj, name, func)?;
         }
@@ -331,9 +353,12 @@ impl AnvilJsDomHost {
             Some(doc_get_document_element),
             None,
         )?;
+        vm.define_accessor(doc_obj, "activeElement", Some(doc_get_active_element), None)?;
         vm.define_accessor(doc_obj, "readyState", Some(doc_get_ready_state), None)?;
         vm.define_accessor(doc_obj, "URL", Some(doc_get_url), None)?;
         vm.define_accessor(doc_obj, "documentURI", Some(doc_get_url), None)?;
+        let empty_sheets = vm.new_array_from(&[])?;
+        vm.define_data(doc_obj, "_adoptedSheets", empty_sheets)?;
         self.document_obj = Some(doc_obj);
 
         // 6. localStorage & sessionStorage
@@ -396,11 +421,511 @@ impl AnvilJsDomHost {
         vm.define_data(g, "history", JsValue::object(hist_obj))?;
         vm.define_data(g, "navigator", JsValue::object(nav_obj))?;
         vm.define_data(g, "customElements", JsValue::object(ce_obj))?;
-        vm.define_method(g, "getComputedStyle", window_get_computed_style)?;
-        vm.define_method(g, "matchMedia", window_match_media)?;
-        vm.define_method(g, "addEventListener", doc_add_event_listener)?;
+        for (name, func) in [
+            ("getComputedStyle", window_get_computed_style as NativeFn),
+            ("matchMedia", window_match_media),
+            ("addEventListener", doc_add_event_listener),
+            ("removeEventListener", doc_remove_event_listener),
+            ("dispatchEvent", doc_dispatch_event),
+            ("setTimeout", window_set_timeout),
+            ("clearTimeout", window_clear_timer),
+            ("setInterval", window_set_interval),
+            ("clearInterval", window_clear_timer),
+            ("requestAnimationFrame", window_request_animation_frame),
+            ("cancelAnimationFrame", window_clear_timer),
+            (
+                "__registerMutationObserver",
+                window_register_mutation_observer,
+            ),
+            (
+                "__unregisterMutationObserver",
+                window_unregister_mutation_observer,
+            ),
+        ] {
+            vm.define_method(g, name, func)?;
+        }
+
+        self.install_web_api_classes(vm)?;
 
         Ok(())
+    }
+
+    fn install_web_api_classes(&mut self, vm: &mut Vm) -> Result<(), RunError> {
+        let bootstrap = r#"
+(function() {
+    Object.defineProperty(document, 'adoptedStyleSheets', {
+        enumerable: true,
+        configurable: true,
+        get: function() { return this._adoptedSheets || []; },
+        set: function(arr) {
+            var list = Array.isArray(arr) ? arr : [];
+            this._adoptedSheets = list;
+            var texts = [];
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] && typeof list[i]._cssText === 'string') {
+                    texts.push(list[i]._cssText);
+                }
+            }
+            document.__setAdoptedSheets(texts.join('\n'));
+        }
+    });
+
+    class Event {
+        constructor(type, init) {
+            this.type = String(type || '');
+            this.bubbles = Boolean(init && init.bubbles);
+            this.cancelable = Boolean(init && init.cancelable);
+            this.composed = Boolean(init && init.composed);
+            this.defaultPrevented = false;
+            this.target = null;
+            this.currentTarget = null;
+        }
+        preventDefault() {
+            if (this.cancelable) this.defaultPrevented = true;
+        }
+        stopPropagation() {
+            this._stopped = true;
+        }
+        stopImmediatePropagation() {
+            this._stopped = true;
+        }
+    }
+
+    class CustomEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            this.detail = (init && 'detail' in init) ? init.detail : null;
+        }
+    }
+
+    class CSSStyleSheet {
+        constructor() {
+            this._cssText = '';
+            this.cssRules = [];
+        }
+        replaceSync(text) {
+            this._cssText = String(text || '');
+            this.cssRules = this._cssText ? [{ cssText: this._cssText }] : [];
+            var sheets = document._adoptedSheets || [];
+            if (sheets.indexOf(this) !== -1) {
+                document.adoptedStyleSheets = sheets;
+            }
+        }
+        replace(text) {
+            this.replaceSync(text);
+            return Promise.resolve(this);
+        }
+        insertRule(rule, index) {
+            var r = String(rule || '');
+            this._cssText = this._cssText ? (this._cssText + '\n' + r) : r;
+            var idx = (typeof index === 'number') ? index : this.cssRules.length;
+            this.cssRules.push({ cssText: r });
+            var sheets = document._adoptedSheets || [];
+            if (sheets.indexOf(this) !== -1) {
+                document.adoptedStyleSheets = sheets;
+            }
+            return idx;
+        }
+        deleteRule(index) {
+            if (typeof index === 'number' && index >= 0 && index < this.cssRules.length) {
+                this.cssRules.splice(index, 1);
+            }
+        }
+    }
+
+    class DOMParser {
+        parseFromString(markup, type) {
+            return document.__parseHTML(String(markup || ''));
+        }
+    }
+
+    class MutationObserver {
+        constructor(callback) {
+            this._cb = callback;
+            this._records = [];
+            var self = this;
+            this._notify = function(rec) {
+                self._records.push(rec);
+                if (!self._scheduled) {
+                    self._scheduled = true;
+                    queueMicrotask(function() {
+                        self._scheduled = false;
+                        if (self._records.length > 0 && typeof self._cb === 'function') {
+                            var batch = self._records.slice();
+                            self._records = [];
+                            self._cb(batch, self);
+                        }
+                    });
+                }
+            };
+        }
+        observe(target, options) {
+            if (target) {
+                window.__registerMutationObserver(this._notify, target);
+            }
+        }
+        disconnect() {
+            window.__unregisterMutationObserver(this._notify);
+            this._records = [];
+        }
+        takeRecords() {
+            var out = this._records.slice();
+            this._records = [];
+            return out;
+        }
+    }
+
+    class IntersectionObserver {
+        constructor(callback, options) {
+            this._cb = callback;
+            this.root = (options && options.root) || null;
+            this.rootMargin = (options && options.rootMargin) || '0px';
+            this.thresholds = [0];
+            this._entries = [];
+        }
+        observe(target) {
+            if (!target) return;
+            var rect = typeof target.getBoundingClientRect === 'function'
+                ? target.getBoundingClientRect()
+                : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
+            var entry = {
+                target: target,
+                isIntersecting: true,
+                intersectionRatio: 1,
+                boundingClientRect: rect,
+                intersectionRect: rect,
+                rootBounds: rect,
+                time: 0
+            };
+            var cb = this._cb;
+            var self = this;
+            queueMicrotask(function() {
+                if (typeof cb === 'function') cb([entry], self);
+            });
+        }
+        unobserve() {}
+        disconnect() {}
+        takeRecords() { return []; }
+    }
+
+    class ResizeObserver {
+        constructor(callback) {
+            this._cb = callback;
+        }
+        observe(target) {
+            if (!target) return;
+            var rect = typeof target.getBoundingClientRect === 'function'
+                ? target.getBoundingClientRect()
+                : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
+            var entry = {
+                target: target,
+                contentRect: rect,
+                borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
+                contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }]
+            };
+            var cb = this._cb;
+            var self = this;
+            queueMicrotask(function() {
+                if (typeof cb === 'function') cb([entry], self);
+            });
+        }
+        unobserve() {}
+        disconnect() {}
+    }
+
+    class URLSearchParams {
+        constructor(init) {
+            this._pairs = [];
+            if (!init) return;
+            if (typeof init === 'string') {
+                var s = init.charAt(0) === '?' ? init.slice(1) : init;
+                if (!s) return;
+                var parts = s.split('&');
+                for (var i = 0; i < parts.length; i++) {
+                    if (!parts[i]) continue;
+                    var eq = parts[i].indexOf('=');
+                    if (eq === -1) {
+                        this._pairs.push([decodeURIComponent(parts[i].replace(/\+/g, ' ')), '']);
+                    } else {
+                        var k = decodeURIComponent(parts[i].slice(0, eq).replace(/\+/g, ' '));
+                        var v = decodeURIComponent(parts[i].slice(eq + 1).replace(/\+/g, ' '));
+                        this._pairs.push([k, v]);
+                    }
+                }
+            } else if (Array.isArray(init)) {
+                for (var j = 0; j < init.length; j++) {
+                    if (init[j] && init[j].length >= 2) {
+                        this._pairs.push([String(init[j][0]), String(init[j][1])]);
+                    }
+                }
+            } else if (typeof init === 'object') {
+                var keys = Object.keys(init);
+                for (var m = 0; m < keys.length; m++) {
+                    this._pairs.push([keys[m], String(init[keys[m]])]);
+                }
+            }
+        }
+        append(name, value) {
+            this._pairs.push([String(name), String(value)]);
+            if (this._onChange) this._onChange();
+        }
+        set(name, value) {
+            var k = String(name);
+            var v = String(value);
+            var found = false;
+            var next = [];
+            for (var i = 0; i < this._pairs.length; i++) {
+                if (this._pairs[i][0] === k) {
+                    if (!found) {
+                        next.push([k, v]);
+                        found = true;
+                    }
+                } else {
+                    next.push(this._pairs[i]);
+                }
+            }
+            if (!found) next.push([k, v]);
+            this._pairs = next;
+            if (this._onChange) this._onChange();
+        }
+        get(name) {
+            var k = String(name);
+            for (var i = 0; i < this._pairs.length; i++) {
+                if (this._pairs[i][0] === k) return this._pairs[i][1];
+            }
+            return null;
+        }
+        getAll(name) {
+            var k = String(name);
+            var out = [];
+            for (var i = 0; i < this._pairs.length; i++) {
+                if (this._pairs[i][0] === k) out.push(this._pairs[i][1]);
+            }
+            return out;
+        }
+        has(name) {
+            return this.get(name) !== null;
+        }
+        delete(name) {
+            var k = String(name);
+            var next = [];
+            for (var i = 0; i < this._pairs.length; i++) {
+                if (this._pairs[i][0] !== k) next.push(this._pairs[i]);
+            }
+            this._pairs = next;
+            if (this._onChange) this._onChange();
+        }
+        toString() {
+            var out = [];
+            for (var i = 0; i < this._pairs.length; i++) {
+                out.push(encodeURIComponent(this._pairs[i][0]) + '=' + encodeURIComponent(this._pairs[i][1]));
+            }
+            return out.join('&');
+        }
+    }
+
+    class URL {
+        constructor(input, base) {
+            var raw = String(input || '');
+            if (raw.indexOf('://') === -1 && base) {
+                var b = String(base);
+                if (raw.charAt(0) === '/') {
+                    var m = b.match(/^([a-zA-Z]+:\/\/[^\/]+)/);
+                    raw = (m ? m[1] : 'https://localhost') + raw;
+                } else {
+                    var lastSlash = b.lastIndexOf('/');
+                    raw = (lastSlash >= 0 ? b.slice(0, lastSlash + 1) : b + '/') + raw;
+                }
+            }
+            var hashIdx = raw.indexOf('#');
+            this.hash = hashIdx >= 0 ? raw.slice(hashIdx) : '';
+            var beforeHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
+            var qIdx = beforeHash.indexOf('?');
+            var rawSearch = qIdx >= 0 ? beforeHash.slice(qIdx) : '';
+            var beforeQ = qIdx >= 0 ? beforeHash.slice(0, qIdx) : beforeHash;
+            var schemeSep = beforeQ.indexOf('://');
+            this.protocol = schemeSep >= 0 ? beforeQ.slice(0, schemeSep + 1) : 'https:';
+            var afterScheme = schemeSep >= 0 ? beforeQ.slice(schemeSep + 3) : beforeQ;
+            var slashIdx = afterScheme.indexOf('/');
+            this.host = slashIdx >= 0 ? afterScheme.slice(0, slashIdx) : afterScheme;
+            var colonIdx = this.host.indexOf(':');
+            this.hostname = colonIdx >= 0 ? this.host.slice(0, colonIdx) : this.host;
+            this.port = colonIdx >= 0 ? this.host.slice(colonIdx + 1) : '';
+            this.pathname = slashIdx >= 0 ? afterScheme.slice(slashIdx) : '/';
+            this.origin = this.protocol + '//' + this.host;
+            this.searchParams = new URLSearchParams(rawSearch);
+            var self = this;
+            this.searchParams._onChange = function() {
+                var s = self.searchParams.toString();
+                self.search = s ? ('?' + s) : '';
+                self.href = self.origin + self.pathname + self.search + self.hash;
+            };
+            this.searchParams._onChange();
+        }
+        toString() {
+            return this.href;
+        }
+        toJSON() {
+            return this.href;
+        }
+    }
+
+    class FormData {
+        constructor() {
+            this._entries = [];
+        }
+        append(name, value) {
+            this._entries.push([String(name), String(value)]);
+        }
+        set(name, value) {
+            var k = String(name);
+            var v = String(value);
+            var next = [];
+            var placed = false;
+            for (var i = 0; i < this._entries.length; i++) {
+                if (this._entries[i][0] === k) {
+                    if (!placed) {
+                        next.push([k, v]);
+                        placed = true;
+                    }
+                } else {
+                    next.push(this._entries[i]);
+                }
+            }
+            if (!placed) next.push([k, v]);
+            this._entries = next;
+        }
+        get(name) {
+            var k = String(name);
+            for (var i = 0; i < this._entries.length; i++) {
+                if (this._entries[i][0] === k) return this._entries[i][1];
+            }
+            return null;
+        }
+        has(name) {
+            return this.get(name) !== null;
+        }
+        delete(name) {
+            var k = String(name);
+            var next = [];
+            for (var i = 0; i < this._entries.length; i++) {
+                if (this._entries[i][0] !== k) next.push(this._entries[i]);
+            }
+            this._entries = next;
+        }
+    }
+
+    class Blob {
+        constructor(parts, options) {
+            var list = Array.isArray(parts) ? parts : [];
+            var acc = '';
+            for (var i = 0; i < list.length; i++) {
+                acc += String(list[i]);
+            }
+            this._text = acc;
+            this.size = acc.length;
+            this.type = (options && options.type) ? String(options.type) : '';
+        }
+        text() {
+            return Promise.resolve(this._text);
+        }
+    }
+
+    class TextEncoder {
+        constructor() {
+            this.encoding = 'utf-8';
+        }
+        encode(input) {
+            var s = String(input || '');
+            var out = [];
+            for (var i = 0; i < s.length; i++) {
+                out.push(s.charCodeAt(i) & 0xFF);
+            }
+            return out;
+        }
+    }
+
+    class TextDecoder {
+        constructor(label) {
+            this.encoding = String(label || 'utf-8').toLowerCase();
+        }
+        decode(bytes) {
+            if (!bytes) return '';
+            var out = '';
+            for (var i = 0; i < bytes.length; i++) {
+                out += String.fromCharCode(bytes[i]);
+            }
+            return out;
+        }
+    }
+
+    window.Event = Event;
+    window.CustomEvent = CustomEvent;
+    window.CSSStyleSheet = CSSStyleSheet;
+    window.DOMParser = DOMParser;
+    window.MutationObserver = MutationObserver;
+    window.IntersectionObserver = IntersectionObserver;
+    window.ResizeObserver = ResizeObserver;
+    window.URLSearchParams = URLSearchParams;
+    window.URL = URL;
+    window.FormData = FormData;
+    window.Blob = Blob;
+    window.TextEncoder = TextEncoder;
+    window.TextDecoder = TextDecoder;
+})();
+"#;
+        let limits = vm.limits().clone();
+        let code = anvil_js::compile_script(bootstrap, &limits)
+            .map_err(|e| RunError::internal(e.to_string()))?;
+        let id = vm.load(code)?;
+        vm.run(self, id)?;
+        vm.drain_jobs(self)?;
+        Ok(())
+    }
+
+    /// Execute due virtual timers (`setTimeout`, `setInterval`, `requestAnimationFrame`)
+    /// and drain microtasks after each callback.
+    pub fn run_timers(&mut self, vm: &mut Vm) -> Result<bool, RunError> {
+        let mut ran = false;
+        let mut fired_intervals = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let mut next_idx: Option<usize> = None;
+            for (i, (id, due, iv, _, _)) in self.timers.iter().enumerate() {
+                if iv.is_some() && fired_intervals.contains(id) {
+                    continue;
+                }
+                if next_idx.is_none_or(|best| *due < self.timers[best].1) {
+                    next_idx = Some(i);
+                }
+            }
+            let Some(idx) = next_idx else {
+                break;
+            };
+            let (id, due_ms, interval_ms, cb_pers, is_raf) = self.timers[idx];
+            if due_ms > self.clock_ms + 60_000.0 {
+                break;
+            }
+            self.clock_ms = self.clock_ms.max(due_ms);
+            if let Some(iv) = interval_ms {
+                self.timers[idx].1 = self.clock_ms + iv;
+                fired_intervals.insert(id);
+            } else {
+                self.timers.remove(idx);
+            }
+            let cb_val = vm
+                .heap()
+                .persistent(cb_pers)
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let args = if is_raf {
+                vec![JsValue::number(self.clock_ms)]
+            } else {
+                Vec::new()
+            };
+            let _ = vm.call(self, cb_val, JsValue::UNDEFINED, &args)?;
+            vm.drain_jobs(self)?;
+            ran = true;
+        }
+        Ok(ran)
     }
 
     fn install_style_accessor(
@@ -886,6 +1411,141 @@ fn doc_add_event_listener(
     Ok(JsValue::UNDEFINED)
 }
 
+fn doc_remove_event_listener(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let ev_type = arg_str(cx, args, 0)?.trim().to_ascii_lowercase();
+    let Some(cb) = args.get(1).copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let root = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.root());
+    if let Some(root_id) = root {
+        remove_listener_for_node(cx, root_id, &ev_type, cb);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn doc_dispatch_event(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let root = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.root());
+    let Some(root_id) = root else {
+        return Ok(JsValue::TRUE);
+    };
+    dispatch_js_event_on_node(cx, root_id, args)
+}
+
+fn doc_adopt_node(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = args.first().copied().and_then(|v| unwrap_node(cx, v)) else {
+        return Ok(JsValue::NULL);
+    };
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.doc.remove_node(nid);
+    }
+    wrap_node(cx, nid)
+}
+
+fn doc_import_node(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = args.first().copied().and_then(|v| unwrap_node(cx, v)) else {
+        return Ok(JsValue::NULL);
+    };
+    let deep = args
+        .get(1)
+        .copied()
+        .is_none_or(|v| v.is_undefined() || v.as_bool() == Some(true));
+    let cloned = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| h.doc.clone_node(nid, deep));
+    wrap_optional_node(cx, cloned)
+}
+
+fn doc_parse_html_fragment(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let markup = arg_str(cx, args, 0)?;
+    let parsed = parse_html(&markup);
+    let Some(h) = cx.host_as::<AnvilJsDomHost>() else {
+        return Ok(JsValue::NULL);
+    };
+    let doc_root = h.doc.create_element("document", Vec::new());
+    let head_el = h.doc.create_element("head", Vec::new());
+    let body_el = h.doc.create_element("body", Vec::new());
+    let _ = h.doc.append(doc_root, head_el);
+    let _ = h.doc.append(doc_root, body_el);
+    for &c in parsed.children(parsed.head()) {
+        if let Some(imported) = h.doc.import_subtree(&parsed, c, true) {
+            let _ = h.doc.append(head_el, imported);
+        }
+    }
+    for &c in parsed.children(parsed.body()) {
+        if let Some(imported) = h.doc.import_subtree(&parsed, c, true) {
+            let _ = h.doc.append(body_el, imported);
+        }
+    }
+    let doc_val = wrap_node(cx, doc_root)?;
+    let head_val = wrap_node(cx, head_el)?;
+    let body_val = wrap_node(cx, body_el)?;
+    if let Some(obj) = doc_val.as_object() {
+        cx.vm().define_data(obj, "head", head_val)?;
+        cx.vm().define_data(obj, "body", body_val)?;
+        cx.vm().define_data(obj, "documentElement", doc_val)?;
+    }
+    Ok(doc_val)
+}
+
+fn doc_add_adopted_sheet(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let css = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.doc.add_adopted_style_sheet(css);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn doc_set_adopted_sheets(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let joined = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        if joined.trim().is_empty() {
+            h.doc.set_adopted_style_sheets(Vec::new());
+        } else {
+            h.doc.set_adopted_style_sheets(vec![joined]);
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn doc_get_active_element(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let active = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| h.doc.focused_node().or_else(|| Some(h.doc.body())));
+    wrap_optional_node(cx, active)
+}
+
 fn doc_get_title(
     cx: &mut NativeCx<'_>,
     _this: JsValue,
@@ -990,6 +1650,7 @@ fn el_set_attribute(
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.set_attribute(nid, &name, &val);
     }
+    notify_mutation(cx, nid, "attributes", Some(&name))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1005,6 +1666,7 @@ fn el_remove_attribute(
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.remove_attribute(nid, &name);
     }
+    notify_mutation(cx, nid, "attributes", Some(&name))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1045,6 +1707,7 @@ fn el_append_child(
             let _ = h.doc.append(parent_id, child_id);
         }
     }
+    notify_mutation(cx, parent_id, "childList", None)?;
     Ok(child_val)
 }
 
@@ -1062,6 +1725,7 @@ fn el_remove_child(
     {
         let _ = h.doc.remove_child(parent_id, child_id);
     }
+    notify_mutation(cx, parent_id, "childList", None)?;
     Ok(child_val)
 }
 
@@ -1081,6 +1745,7 @@ fn el_insert_before(
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         let _ = h.doc.insert_before(parent_id, new_id, ref_id);
     }
+    notify_mutation(cx, parent_id, "childList", None)?;
     Ok(new_val)
 }
 
@@ -1099,6 +1764,7 @@ fn el_replace_child(
     {
         let _ = h.doc.replace_child(parent_id, new_id, old_id);
     }
+    notify_mutation(cx, parent_id, "childList", None)?;
     Ok(old_val)
 }
 
@@ -1124,8 +1790,14 @@ fn el_remove(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::UNDEFINED);
     };
+    let parent = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| h.doc.get(nid).parent());
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.remove_node(nid);
+    }
+    if let Some(p) = parent {
+        notify_mutation(cx, p, "childList", None)?;
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -1173,10 +1845,23 @@ fn el_query_selector_all(
 
 fn el_get_element_by_id(
     cx: &mut NativeCx<'_>,
-    _this: JsValue,
+    this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    doc_get_element_by_id(cx, _this, args)
+    let id_str = arg_str(cx, args, 0)?;
+    let nid = unwrap_node(cx, this);
+    let found = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+        if let Some(sub_root) = nid
+            && sub_root != h.doc.root()
+        {
+            h.doc
+                .query_selector_within(sub_root, &format!("#{id_str}"))
+                .or_else(|| h.doc.get_element_by_id(&id_str))
+        } else {
+            h.doc.get_element_by_id(&id_str)
+        }
+    });
+    wrap_optional_node(cx, found)
 }
 
 fn el_get_elements_by_tag_name(
@@ -1336,6 +2021,167 @@ fn el_add_event_listener(
     Ok(JsValue::UNDEFINED)
 }
 
+fn el_remove_event_listener(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let ev_type = arg_str(cx, args, 0)?.trim().to_ascii_lowercase();
+    let Some(cb) = args.get(1).copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    remove_listener_for_node(cx, nid, &ev_type, cb);
+    Ok(JsValue::UNDEFINED)
+}
+
+fn remove_listener_for_node(cx: &mut NativeCx<'_>, nid: NodeId, ev_type: &str, cb: JsValue) {
+    let Some(listeners) = cx.host_as::<AnvilJsDomHost>().map(|h| h.listeners.clone()) else {
+        return;
+    };
+    let mut kept = Vec::with_capacity(listeners.len());
+    for (lnid, lev, lpers) in listeners {
+        let is_same = lnid == nid
+            && lev == ev_type
+            && cx
+                .heap()
+                .persistent(lpers)
+                .is_ok_and(|stored| stored.as_object() == cb.as_object());
+        if !is_same {
+            kept.push((lnid, lev, lpers));
+        }
+    }
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.listeners = kept;
+    }
+}
+
+fn el_dispatch_event(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::TRUE);
+    };
+    dispatch_js_event_on_node(cx, nid, args)
+}
+
+fn dispatch_js_event_on_node(
+    cx: &mut NativeCx<'_>,
+    target: NodeId,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(ev_val) = args.first().copied() else {
+        return Ok(JsValue::TRUE);
+    };
+    let Some(ev_obj) = ev_val.as_object() else {
+        return Ok(JsValue::TRUE);
+    };
+    let type_key = cx
+        .heap()
+        .key_from_str("type")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let ev_type = if let Ok(Some(prop)) = cx.heap().get_own(ev_obj, type_key)
+        && let Some(val) = prop.slot.data()
+    {
+        cx.to_display_string(val)?.trim().to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    if ev_type.is_empty() {
+        return Ok(JsValue::TRUE);
+    }
+    let bubbles_key = cx
+        .heap()
+        .key_from_str("bubbles")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let bubbles = if let Ok(Some(prop)) = cx.heap().get_own(ev_obj, bubbles_key)
+        && let Some(val) = prop.slot.data()
+    {
+        val.as_bool().unwrap_or(false)
+    } else {
+        false
+    };
+    let target_val = wrap_node(cx, target)?;
+    cx.vm().define_data(ev_obj, "target", target_val)?;
+
+    let mut chain = vec![target];
+    if bubbles && let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        let mut cur = h.doc.get(target).parent();
+        while let Some(p) = cur {
+            chain.push(p);
+            cur = h.doc.get(p).parent();
+        }
+    }
+    let stopped_key = cx
+        .heap()
+        .key_from_str("_stopped")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    for current_id in chain {
+        if let Ok(Some(prop)) = cx.heap().get_own(ev_obj, stopped_key)
+            && prop.slot.data().and_then(|v| v.as_bool()) == Some(true)
+        {
+            break;
+        }
+        let matching: Vec<Persistent> = cx
+            .host_as::<AnvilJsDomHost>()
+            .map(|h| {
+                h.listeners
+                    .iter()
+                    .filter(|(nid, ev, _)| *nid == current_id && ev == &ev_type)
+                    .map(|(_, _, cb)| *cb)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if matching.is_empty() {
+            continue;
+        }
+        let cur_val = wrap_node(cx, current_id)?;
+        cx.vm().define_data(ev_obj, "currentTarget", cur_val)?;
+        for cb_pers in matching {
+            let cb_val = cx
+                .heap()
+                .persistent(cb_pers)
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let _ = cx.call(cb_val, cur_val, &[ev_val])?;
+        }
+    }
+    let dp_key = cx
+        .heap()
+        .key_from_str("defaultPrevented")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let prevented = if let Ok(Some(prop)) = cx.heap().get_own(ev_obj, dp_key)
+        && let Some(val) = prop.slot.data()
+    {
+        val.as_bool().unwrap_or(false)
+    } else {
+        false
+    };
+    Ok(JsValue::boolean(!prevented))
+}
+
+fn el_focus(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+    {
+        h.doc.set_focused_node(Some(nid));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_blur(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+        && h.doc.focused_node() == Some(nid)
+    {
+        h.doc.set_focused_node(None);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
 fn el_get_bounding_client_rect(
     cx: &mut NativeCx<'_>,
     _this: JsValue,
@@ -1369,19 +2215,61 @@ fn el_get_context(
         .vm()
         .new_host_object(None, HostData(TAG_NODE | (nid.index() as u64)))?;
     let black = cx.vm().string("#000000")?;
+    let font = cx.vm().string("10px sans-serif")?;
+    cx.vm().define_data(ctx_obj, "canvas", this)?;
     cx.vm().define_data(ctx_obj, "fillStyle", black)?;
     cx.vm().define_data(ctx_obj, "strokeStyle", black)?;
+    cx.vm().define_data(ctx_obj, "font", font)?;
     cx.vm()
         .define_data(ctx_obj, "lineWidth", JsValue::number(1.0))?;
+    cx.vm()
+        .define_data(ctx_obj, "globalAlpha", JsValue::number(1.0))?;
     for (name, func) in [
         ("fillRect", canvas_fill_rect as NativeFn),
         ("strokeRect", canvas_stroke_rect),
         ("clearRect", canvas_clear_rect),
         ("fillText", canvas_fill_text),
+        ("strokeText", canvas_fill_text),
+        ("beginPath", canvas_begin_path),
+        ("moveTo", canvas_move_to),
+        ("lineTo", canvas_line_to),
+        ("rect", canvas_rect),
+        ("arc", canvas_arc),
+        ("closePath", canvas_close_path),
+        ("fill", canvas_fill),
+        ("stroke", canvas_stroke),
+        ("measureText", canvas_measure_text),
+        ("getImageData", canvas_get_image_data),
+        ("putImageData", canvas_put_image_data),
+        ("createImageData", canvas_create_image_data),
+        ("save", el_noop),
+        ("restore", el_noop),
+        ("scale", el_noop),
+        ("translate", el_noop),
+        ("rotate", el_noop),
+        ("transform", el_noop),
+        ("setTransform", el_noop),
+        ("resetTransform", el_noop),
+        ("setLineDash", el_noop),
+        ("clip", el_noop),
     ] {
         cx.vm().define_method(ctx_obj, name, func)?;
     }
     Ok(JsValue::object(ctx_obj))
+}
+
+fn canvas_style_color(cx: &mut NativeCx<'_>, this: JsValue, prop_name: &str) -> [u8; 4] {
+    let style_str = if let Some(obj) = this.as_object()
+        && let Ok(key) = cx.heap().key_from_str(prop_name)
+        && let Ok(Some(prop)) = cx.heap().get_own(obj, key)
+        && let Some(val) = prop.slot.data()
+    {
+        cx.to_display_string(val)
+            .unwrap_or_else(|_| "#000000".to_string())
+    } else {
+        "#000000".to_string()
+    };
+    crate::parse_canvas_color(&style_str)
 }
 
 fn canvas_fill_rect(
@@ -1404,17 +2292,7 @@ fn canvas_fill_rect(
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
         .max(0.0) as u32;
-    let style_str = if let Some(obj) = this.as_object()
-        && let Ok(key) = cx.heap().key_from_str("fillStyle")
-        && let Ok(Some(prop)) = cx.heap().get_own(obj, key)
-        && let Some(val) = prop.slot.data()
-    {
-        cx.to_display_string(val)
-            .unwrap_or_else(|_| "#000000".to_string())
-    } else {
-        "#000000".to_string()
-    };
-    let rgba = crate::parse_canvas_color(&style_str);
+    let rgba = canvas_style_color(cx, this, "fillStyle");
     if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
         host.doc.canvas_fill_rect(nid, x, y, w, h, rgba);
     }
@@ -1441,17 +2319,7 @@ fn canvas_stroke_rect(
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
         .max(0.0) as u32;
-    let style_str = if let Some(obj) = this.as_object()
-        && let Ok(key) = cx.heap().key_from_str("strokeStyle")
-        && let Ok(Some(prop)) = cx.heap().get_own(obj, key)
-        && let Some(val) = prop.slot.data()
-    {
-        cx.to_display_string(val)
-            .unwrap_or_else(|_| "#000000".to_string())
-    } else {
-        "#000000".to_string()
-    };
-    let rgba = crate::parse_canvas_color(&style_str);
+    let rgba = canvas_style_color(cx, this, "strokeStyle");
     if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
         host.doc.canvas_stroke_rect(nid, x, y, w, h, 1, rgba);
     }
@@ -1495,15 +2363,514 @@ fn canvas_fill_text(
     let text = arg_str(cx, args, 0)?;
     let x = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let y = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let rgba = canvas_style_color(cx, this, "fillStyle");
     if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
-        host.doc
-            .canvas_draw_text_bitmap(nid, &text, x, y, [0, 0, 0, 255]);
+        host.doc.canvas_draw_text_bitmap(nid, &text, x, y, rgba);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_begin_path(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+    {
+        h.canvas_paths.insert(nid, Vec::new());
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_move_to(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.canvas_paths.entry(nid).or_default().push((x, y));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_line_to(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    canvas_move_to(cx, this, args)
+}
+
+fn canvas_rect(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+        let pts = host.canvas_paths.entry(nid).or_default();
+        pts.push((x, y));
+        pts.push((x + w, y));
+        pts.push((x + w, y + h));
+        pts.push((x, y + h));
+        pts.push((x, y));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_arc(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let cx_pt = args.first().and_then(|v| v.as_number()).unwrap_or(0.0);
+    let cy_pt = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let r = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let a0 = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let a1 = args
+        .get(4)
+        .and_then(|v| v.as_number())
+        .unwrap_or(std::f64::consts::TAU);
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+        let pts = host.canvas_paths.entry(nid).or_default();
+        let steps = 16usize;
+        for i in 0..=steps {
+            let t = a0 + (a1 - a0) * (i as f64 / steps as f64);
+            let px = (cx_pt + r * t.cos()).round() as i32;
+            let py = (cy_pt + r * t.sin()).round() as i32;
+            pts.push((px, py));
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_close_path(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(host) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(pts) = host.canvas_paths.get_mut(&nid)
+        && let Some(&first) = pts.first()
+    {
+        pts.push(first);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_stroke(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let rgba = canvas_style_color(cx, this, "strokeStyle");
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(pts) = host.canvas_paths.get(&nid).cloned()
+    {
+        for win in pts.windows(2) {
+            host.doc
+                .canvas_draw_line(nid, win[0].0, win[0].1, win[1].0, win[1].1, rgba);
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_fill(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let rgba = canvas_style_color(cx, this, "fillStyle");
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(pts) = host.canvas_paths.get(&nid).cloned()
+        && !pts.is_empty()
+    {
+        let min_x = pts.iter().map(|p| p.0).min().unwrap_or(0);
+        let max_x = pts.iter().map(|p| p.0).max().unwrap_or(0);
+        let min_y = pts.iter().map(|p| p.1).min().unwrap_or(0);
+        let max_y = pts.iter().map(|p| p.1).max().unwrap_or(0);
+        let w = (max_x - min_x).max(1) as u32;
+        let h = (max_y - min_y).max(1) as u32;
+        host.doc.canvas_fill_rect(nid, min_x, min_y, w, h, rgba);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn canvas_measure_text(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let text = arg_str(cx, args, 0)?;
+    let metrics = cx.vm().new_plain_object()?;
+    let w = (text.chars().count() as f64) * 6.0;
+    cx.vm().define_data(metrics, "width", JsValue::number(w))?;
+    Ok(JsValue::object(metrics))
+}
+
+fn canvas_create_image_data(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let w = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0)
+        .clamp(1.0, 256.0) as u32;
+    let h = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0)
+        .clamp(1.0, 256.0) as u32;
+    let len = (w as usize) * (h as usize) * 4;
+    let zeros = vec![JsValue::int32(0); len];
+    let data_arr = cx.vm().new_array_from(&zeros)?;
+    cx.keep(data_arr);
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm()
+        .define_data(obj, "width", JsValue::number(w as f64))?;
+    cx.vm()
+        .define_data(obj, "height", JsValue::number(h as f64))?;
+    cx.vm().define_data(obj, "data", data_arr)?;
+    Ok(JsValue::object(obj))
+}
+
+fn canvas_get_image_data(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return canvas_create_image_data(cx, this, args);
+    };
+    let sx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let sy = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let sw = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0)
+        .clamp(1.0, 256.0) as u32;
+    let sh = args
+        .get(3)
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0)
+        .clamp(1.0, 256.0) as u32;
+    let mut bytes = Vec::with_capacity((sw as usize) * (sh as usize) * 4);
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+        let surf = host.doc.ensure_canvas_surface(nid);
+        for ry in 0..(sh as i32) {
+            for rx in 0..(sw as i32) {
+                let px = sx + rx;
+                let py = sy + ry;
+                if px >= 0 && px < surf.width as i32 && py >= 0 && py < surf.height as i32 {
+                    let off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                    if off + 4 <= surf.rgba.len() {
+                        for &b in &surf.rgba[off..off + 4] {
+                            bytes.push(JsValue::int32(b as i32));
+                        }
+                        continue;
+                    }
+                }
+                bytes.extend_from_slice(&[JsValue::int32(0); 4]);
+            }
+        }
+    }
+    let data_arr = cx.vm().new_array_from(&bytes)?;
+    cx.keep(data_arr);
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm()
+        .define_data(obj, "width", JsValue::number(sw as f64))?;
+    cx.vm()
+        .define_data(obj, "height", JsValue::number(sh as f64))?;
+    cx.vm().define_data(obj, "data", data_arr)?;
+    Ok(JsValue::object(obj))
+}
+
+fn canvas_put_image_data(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let Some(img_obj) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let dx = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let dy = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let w_key = cx
+        .heap()
+        .key_from_str("width")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let h_key = cx
+        .heap()
+        .key_from_str("height")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let d_key = cx
+        .heap()
+        .key_from_str("data")
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let sw = cx
+        .heap()
+        .get_own(img_obj, w_key)
+        .ok()
+        .flatten()
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0) as u32;
+    let sh = cx
+        .heap()
+        .get_own(img_obj, h_key)
+        .ok()
+        .flatten()
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0) as u32;
+    let data_obj = cx
+        .heap()
+        .get_own(img_obj, d_key)
+        .ok()
+        .flatten()
+        .and_then(|p| p.slot.data())
+        .and_then(|v| v.as_object());
+    if sw > 0
+        && sh > 0
+        && let Some(arr_ref) = data_obj
+    {
+        let mut rgba = Vec::new();
+        if let Ok(obj) = cx.heap().object(arr_ref)
+            && let ObjectClass::Array { length } = obj.class
+        {
+            rgba.reserve(length as usize);
+            for i in 0..length {
+                let v = obj
+                    .elements
+                    .get(i)
+                    .and_then(|p| p.slot.data())
+                    .unwrap_or(JsValue::int32(0));
+                let b = v.as_number().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
+                rgba.push(b);
+            }
+        }
+        if !rgba.is_empty()
+            && let Some(host) = cx.host_as::<AnvilJsDomHost>()
+        {
+            host.doc.canvas_put_image_data(nid, dx, dy, sw, sh, &rgba);
+        }
     }
     Ok(JsValue::UNDEFINED)
 }
 
 fn el_noop(_cx: &mut NativeCx<'_>, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
     Ok(JsValue::UNDEFINED)
+}
+
+fn window_set_timeout(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::int32(0));
+    };
+    let delay = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let pers = cx
+        .heap()
+        .persist(cb)
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let id = if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        let id = h.next_timer_id;
+        h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
+        let due = h.clock_ms + delay;
+        h.timers.push((id, due, None, pers, false));
+        id
+    } else {
+        0
+    };
+    Ok(JsValue::number(id as f64))
+}
+
+fn window_set_interval(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::int32(0));
+    };
+    let interval = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .unwrap_or(10.0)
+        .max(1.0);
+    let pers = cx
+        .heap()
+        .persist(cb)
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let id = if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        let id = h.next_timer_id;
+        h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
+        let due = h.clock_ms + interval;
+        h.timers.push((id, due, Some(interval), pers, false));
+        id
+    } else {
+        0
+    };
+    Ok(JsValue::number(id as f64))
+}
+
+fn window_request_animation_frame(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::int32(0));
+    };
+    let pers = cx
+        .heap()
+        .persist(cb)
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    let id = if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        let id = h.next_timer_id;
+        h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
+        let due = h.clock_ms + 16.0;
+        h.timers.push((id, due, None, pers, true));
+        id
+    } else {
+        0
+    };
+    Ok(JsValue::number(id as f64))
+}
+
+fn window_clear_timer(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(id_num) = args.first().and_then(|v| v.as_number()) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let target_id = id_num as u32;
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.timers.retain(|(id, _, _, _, _)| *id != target_id);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn window_register_mutation_observer(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let Some(nid) = args.get(1).copied().and_then(|v| unwrap_node(cx, v)) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let pers = cx
+        .heap()
+        .persist(cb)
+        .map_err(|e| RunError::internal(format!("{e:?}")))?;
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.mutation_observers.push((pers, nid));
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn window_unregister_mutation_observer(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(cb) = args.first().copied().filter(|v| v.is_object()) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let Some(existing) = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| h.mutation_observers.clone())
+    else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let mut kept = Vec::new();
+    for (pers, nid) in existing {
+        if cx.heap().persistent(pers).ok().and_then(|v| v.as_object()) != cb.as_object() {
+            kept.push((pers, nid));
+        }
+    }
+    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        h.mutation_observers = kept;
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn notify_mutation(
+    cx: &mut NativeCx<'_>,
+    target: NodeId,
+    mutation_type: &str,
+    attr_name: Option<&str>,
+) -> Result<(), RunError> {
+    let matching: Vec<Persistent> = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| {
+            h.mutation_observers
+                .iter()
+                .filter(|(_, obs_nid)| h.doc.contains_node(*obs_nid, target))
+                .map(|(pers, _)| *pers)
+                .collect()
+        })
+        .unwrap_or_default();
+    if matching.is_empty() {
+        return Ok(());
+    }
+    let target_val = wrap_node(cx, target)?;
+    cx.keep(target_val);
+    let rec = cx.vm().new_plain_object()?;
+    let mtype_val = cx.vm().string(mutation_type)?;
+    cx.vm().define_data(rec, "type", mtype_val)?;
+    cx.vm().define_data(rec, "target", target_val)?;
+    let attr_val = match attr_name {
+        Some(a) => cx.vm().string(a)?,
+        None => JsValue::NULL,
+    };
+    cx.vm().define_data(rec, "attributeName", attr_val)?;
+    let rec_val = JsValue::object(rec);
+    cx.keep(rec_val);
+    for pers in matching {
+        if let Ok(cb_val) = cx.heap().persistent(pers) {
+            let _ = cx.call(cb_val, JsValue::UNDEFINED, &[rec_val]);
+        }
+    }
+    Ok(())
 }
 
 fn el_get_id(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
@@ -1525,6 +2892,7 @@ fn el_set_id(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.set_attribute(nid, "id", &val);
     }
+    notify_mutation(cx, nid, "attributes", Some("id"))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1555,6 +2923,7 @@ fn el_set_class_name(
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.set_attribute(nid, "class", &val);
     }
+    notify_mutation(cx, nid, "attributes", Some("class"))?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1585,6 +2954,7 @@ fn el_set_text_content(
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.set_text_content(nid, &text);
     }
+    notify_mutation(cx, nid, "childList", None)?;
     Ok(JsValue::UNDEFINED)
 }
 
@@ -1631,6 +3001,7 @@ fn el_set_inner_html(
     if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
         h.doc.set_inner_html(nid, &html);
     }
+    notify_mutation(cx, nid, "childList", None)?;
     Ok(JsValue::UNDEFINED)
 }
 

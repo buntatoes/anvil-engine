@@ -34,6 +34,10 @@
 
 use std::sync::Arc;
 
+/// Direct linkage to the in-tree `Anvil-JS` engine (`engines/anvil-js`).
+#[path = "../../../../anvil-browser/engines/anvil-js/src/lib.rs"]
+pub mod anvil_js;
+
 pub mod engine_host;
 pub mod wasm;
 
@@ -564,19 +568,25 @@ impl VmOwner {
         }
         true
     }
+
+    fn release(&mut self) {
+        unsafe {
+            if !self.context.is_null() {
+                std::alloc::dealloc(self.context, self.context_layout);
+                self.context = std::ptr::null_mut();
+            }
+            if !self.compiler.is_null() {
+                std::alloc::dealloc(self.compiler, self.compiler_layout);
+                self.compiler = std::ptr::null_mut();
+            }
+        }
+    }
 }
 
 #[cfg(anvil_cpp_jit)]
 impl Drop for VmOwner {
     fn drop(&mut self) {
-        unsafe {
-            if !self.context.is_null() {
-                std::alloc::dealloc(self.context, self.context_layout);
-            }
-            if !self.compiler.is_null() {
-                std::alloc::dealloc(self.compiler, self.compiler_layout);
-            }
-        }
+        self.release();
     }
 }
 
@@ -616,10 +626,13 @@ fn alloc_vm_bytes(bytes: usize, align: usize) -> Option<(std::alloc::Layout, *mu
         size = size.saturating_add(align - rem);
     }
     let layout = std::alloc::Layout::from_size_align(size, align).ok()?;
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    let ptr = unsafe { std::alloc::alloc(layout) };
     if ptr.is_null() {
         None
     } else {
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size.min(128 * 1024));
+        }
         Some((layout, ptr))
     }
 }
@@ -633,6 +646,8 @@ impl VmOwner {
     fn empty() -> Self {
         Self
     }
+
+    fn release(&mut self) {}
 }
 
 /// Compile and execute a self-contained JS script inside a caller-owned C++20
@@ -2964,6 +2979,7 @@ impl ScriptRuntime {
             self.loop_break = false;
             self.loop_continue = false;
         }
+        self.vm_owner.release();
     }
 
     fn consume_step(&mut self) -> bool {
@@ -4672,6 +4688,13 @@ impl ScriptRuntime {
                     }
                 }
             }
+            if should_route_to_anvil_js_engine(&cleaned)
+                && self.engine_session.inner.is_none()
+                && cleaned.contains(".addEventListener(")
+            {
+                let _ = self.eval_with_anvil_js_engine(doc, cleaned.trim());
+                continue;
+            }
             for stmt in split_statements(&cleaned) {
                 let s = stmt.trim();
                 let declaration = s.starts_with("function ")
@@ -5286,6 +5309,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 .and_then(|code_id| {
                     let val = session.vm.run(&mut session.host, code_id)?;
                     session.vm.drain_jobs(&mut session.host)?;
+                    let _ = session.host.run_timers(&mut session.vm)?;
                     session.vm.inspect(val)
                 })
                 .map_err(|e| e.to_string());
@@ -5354,6 +5378,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 .host
                 .dispatch_event(&mut session.vm, target, event_type, value, key)
                 .unwrap_or(false);
+            let _ = session.host.run_timers(&mut session.vm);
             let default_prevented = session.host.event_default_prevented;
 
             std::mem::swap(&mut session.host.doc, doc);
@@ -11466,6 +11491,11 @@ fn should_route_to_anvil_js_engine(cleaned: &str) -> bool {
         || cleaned.contains(".toSorted(")
         || cleaned.contains(".toReversed(")
         || cleaned.contains(".toSpliced(")
+        || cleaned.contains("new CSSStyleSheet")
+        || cleaned.contains("document.adoptedStyleSheets")
+        || cleaned.contains("new MutationObserver")
+        || cleaned.contains("new IntersectionObserver")
+        || cleaned.contains("new ResizeObserver")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -11883,18 +11913,26 @@ fn strip_string_literals(source: &str) -> String {
 }
 
 #[cfg(anvil_cpp_jit)]
-struct TextHostGuard;
+static TEXT_HOST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(anvil_cpp_jit)]
+struct TextHostGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(anvil_cpp_jit)]
 impl TextHostGuard {
     fn arm(doc: &mut Document) -> Self {
+        let guard = TEXT_HOST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             anvil_cpp_vm_set_text_host(
                 Some(rust_host_set_text),
                 doc as *mut Document as *mut std::ffi::c_void,
             );
         }
-        Self
+        Self { _lock: guard }
     }
 }
 
@@ -14404,5 +14442,144 @@ mod tests {
         assert!(rt.dispatch_submit(&mut doc, form));
         assert!(rt.last_event_default_prevented());
         assert_eq!(doc.text_content(status), "submit:2:alpha");
+    }
+
+    #[test]
+    fn anvil_js_engine_executes_classes_async_canvas_observers_and_web_apis() {
+        let mut doc = parse_html(
+            "<html><body>
+               <div id=\"app\"></div>
+               <input id=\"search\" value=\"initial\" />
+               <canvas id=\"board\" width=\"32\" height=\"16\"></canvas>
+               <p id=\"summary\"></p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://app.example.com/studio?mode=pro#canvas");
+
+        let res = rt
+            .eval_with_anvil_js_engine(
+                &mut doc,
+                r##"
+                class Shape {
+                    #scale = 2;
+                    static registry = [];
+                    static {
+                        Shape.registry.push("init");
+                    }
+                    constructor(label) {
+                        this.label = label;
+                    }
+                    scaled(v) {
+                        return v * this.#scale;
+                    }
+                    hasScale(obj) {
+                        return #scale in obj;
+                    }
+                }
+
+                class BoxShape extends Shape {
+                    constructor(label, w, h) {
+                        super(label);
+                        this.w = w;
+                        this.h = h;
+                    }
+                    get area() {
+                        return this.scaled(this.w * this.h);
+                    }
+                }
+
+                const box = new BoxShape("card", 6, 4);
+                const { label, w: width, extra = 5 } = box;
+                const [firstReg, ...restReg] = Shape.registry;
+                const rxMatch = "item-42-ok".replace(/(\d+)/, "#$1");
+
+                function tag(strings, a, b) {
+                    return strings[0] + a + strings[1] + b;
+                }
+                const tagged = tag`L:${label}|A:${box.area}`;
+
+                const board = document.getElementById("board");
+                const ctx = board.getContext("2d");
+                ctx.fillStyle = "#00ff00";
+                ctx.fillRect(0, 0, 16, 16);
+                ctx.strokeStyle = "#ff0000";
+                ctx.beginPath();
+                ctx.moveTo(16, 0);
+                ctx.lineTo(31, 15);
+                ctx.stroke();
+                const pixel = ctx.getImageData(2, 2, 1, 1);
+
+                const app = document.getElementById("app");
+                let observedMutations = 0;
+                const mo = new MutationObserver((records) => {
+                    observedMutations += records.length;
+                });
+                mo.observe(app, { childList: true, attributes: true });
+
+                let ioEntered = false;
+                const io = new IntersectionObserver((entries) => {
+                    ioEntered = entries[0].isIntersecting;
+                });
+                io.observe(app);
+
+                let roWidth = 0;
+                const ro = new ResizeObserver((entries) => {
+                    roWidth = entries[0].contentRect.width;
+                });
+                ro.observe(app);
+
+                const parser = new DOMParser();
+                const fragDoc = parser.parseFromString("<section id=\"imported\"><span class=\"inner\">DOMParsed</span></section>", "text/html");
+                const imported = document.adoptNode(fragDoc.getElementById("imported"));
+                app.appendChild(imported);
+                app.setAttribute("data-state", "mounted");
+
+                const sheet = new CSSStyleSheet();
+                sheet.replaceSync("#imported { color: rgb(12, 34, 56); }");
+                document.adoptedStyleSheets = [sheet];
+
+                const search = document.getElementById("search");
+                search.focus();
+                const isFocused = document.activeElement === search;
+
+                let customDetail = "";
+                app.addEventListener("widget:ready", (ev) => {
+                    customDetail = ev.detail.status;
+                });
+                app.dispatchEvent(new CustomEvent("widget:ready", { detail: { status: "live" } }));
+
+                const u = new URL("/items?filter=active", "https://app.example.com");
+                u.searchParams.set("page", "2");
+                const enc = new TextEncoder().encode("ok");
+                const dec = new TextDecoder().decode(enc);
+
+                async function finalize() {
+                    const step = await Promise.resolve(extra + width);
+                    return `${tagged}|${rxMatch}|${firstReg}:${restReg.length}|px:${pixel.data[1]}|mo:${observedMutations}|io:${ioEntered}|ro:${roWidth > 0}|focus:${isFocused}|ce:${customDetail}|url:${u.searchParams.get("page")}|td:${dec}|step:${step}`;
+                }
+
+                setTimeout(() => {
+                    finalize().then((out) => {
+                        document.getElementById("summary").textContent = out;
+                    });
+                }, 0);
+                "ok"
+                "##,
+            )
+            .expect("anvil-js full web runtime test should succeed");
+        assert_eq!(res, "ok");
+
+        let summary = doc.get_element_by_id("summary").unwrap();
+        assert_eq!(
+            doc.text_content(summary),
+            "L:card|A:48|item-#42-ok|init:0|px:255|mo:2|io:true|ro:true|focus:true|ce:live|url:2|td:ok|step:11"
+        );
+        assert_eq!(
+            doc.adopted_style_sheets(),
+            &["#imported { color: rgb(12, 34, 56); }".to_string()]
+        );
+        let search = doc.get_element_by_id("search").unwrap();
+        assert_eq!(doc.focused_node(), Some(search));
     }
 }

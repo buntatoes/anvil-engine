@@ -261,6 +261,11 @@ pub struct Document {
     custom_elements: Vec<String>,
     canvas_surfaces: std::collections::HashMap<NodeId, CanvasSurface>,
     input_cursors: std::collections::HashMap<NodeId, usize>,
+    hovered_node: Option<NodeId>,
+    active_node: Option<NodeId>,
+    focused_node: Option<NodeId>,
+    target_fragment: Option<String>,
+    adopted_styles: Vec<String>,
 }
 
 impl Default for Document {
@@ -309,6 +314,11 @@ impl Document {
             custom_elements: Vec::new(),
             canvas_surfaces: std::collections::HashMap::new(),
             input_cursors: std::collections::HashMap::new(),
+            hovered_node: None,
+            active_node: None,
+            focused_node: None,
+            target_fragment: None,
+            adopted_styles: Vec::new(),
         };
         let root = doc.alloc(NodeData::Document);
         let html = doc.alloc(NodeData::element("html"));
@@ -388,6 +398,356 @@ impl Document {
     pub fn is_custom_element_defined(&self, name: &str) -> bool {
         let lower = name.trim().to_ascii_lowercase();
         self.custom_elements.iter().any(|n| n == &lower)
+    }
+
+    /// Currently hovered node id, if any.
+    pub fn hovered_node(&self) -> Option<NodeId> {
+        self.hovered_node
+    }
+
+    /// Update the currently hovered node id.
+    pub fn set_hovered_node(&mut self, id: Option<NodeId>) {
+        self.hovered_node = id.filter(|n| self.nodes.get(n.index()).is_some());
+    }
+
+    /// True when `id` is the hovered node or an element ancestor of the hovered node (`:hover`).
+    pub fn is_hovered(&self, id: NodeId) -> bool {
+        self.hovered_node.is_some_and(|h| self.contains_node(id, h))
+    }
+
+    /// Currently active (pressed) node id, if any.
+    pub fn active_node(&self) -> Option<NodeId> {
+        self.active_node
+    }
+
+    /// Update the currently active (pressed) node id.
+    pub fn set_active_node(&mut self, id: Option<NodeId>) {
+        self.active_node = id.filter(|n| self.nodes.get(n.index()).is_some());
+    }
+
+    /// True when `id` is the active node or an element ancestor of the active node (`:active`).
+    pub fn is_active(&self, id: NodeId) -> bool {
+        self.active_node.is_some_and(|a| self.contains_node(id, a))
+    }
+
+    /// Currently focused node id (`document.activeElement`), if any.
+    pub fn focused_node(&self) -> Option<NodeId> {
+        self.focused_node
+    }
+
+    /// Update the currently focused node id.
+    pub fn set_focused_node(&mut self, id: Option<NodeId>) {
+        self.focused_node = id.filter(|n| self.nodes.get(n.index()).is_some());
+    }
+
+    /// True when `id` is the currently focused node (`:focus`, `:focus-visible`).
+    pub fn is_focused(&self, id: NodeId) -> bool {
+        self.focused_node == Some(id)
+    }
+
+    /// True when `id` is focused or contains the focused node (`:focus-within`).
+    pub fn is_focus_within(&self, id: NodeId) -> bool {
+        self.focused_node.is_some_and(|f| self.contains_node(id, f))
+    }
+
+    /// Current URL fragment target identifier (without `#`), if any.
+    pub fn target_fragment(&self) -> Option<&str> {
+        self.target_fragment.as_deref()
+    }
+
+    /// Set the URL fragment target identifier (`#fragment` or `fragment`).
+    pub fn set_target_fragment(&mut self, fragment: Option<&str>) {
+        self.target_fragment = fragment
+            .map(|s| s.trim().trim_start_matches('#').trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+
+    /// True when `id` matches the active URL fragment target (`:target`).
+    pub fn is_target(&self, id: NodeId) -> bool {
+        let Some(frag) = self.target_fragment.as_deref() else {
+            return false;
+        };
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        let data = node.data();
+        data.id() == Some(frag) || (data.tag() == Some("a") && data.attr("name") == Some(frag))
+    }
+
+    /// True when `id` or any descendant of `id` is the URL fragment target (`:target-within`).
+    pub fn is_target_within(&self, id: NodeId) -> bool {
+        if self.is_target(id) {
+            return true;
+        }
+        let Some(node) = self.nodes.get(id.index()) else {
+            return false;
+        };
+        node.children.iter().any(|&c| self.is_target_within(c))
+    }
+
+    /// Evaluate HTML5 form constraint validity (`:valid` / `:invalid`) for `id`.
+    /// Returns `None` when `id` is not a candidate for constraint validation.
+    pub fn is_control_valid(&self, id: NodeId) -> Option<bool> {
+        let node = self.nodes.get(id.index())?;
+        let data = node.data();
+        let tag = data.tag()?;
+        if tag == "form" || tag == "fieldset" {
+            if !self.subtree_has_constrained_control(id) {
+                return None;
+            }
+            return Some(self.subtree_controls_valid(id));
+        }
+        if !matches!(tag, "input" | "textarea" | "select") {
+            return None;
+        }
+        if data
+            .attr("disabled")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+            || data
+                .attr("readonly")
+                .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+        {
+            return None;
+        }
+        let input_type = if tag == "input" {
+            data.attr("type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase()
+        } else {
+            String::new()
+        };
+        if matches!(
+            input_type.as_str(),
+            "hidden" | "button" | "reset" | "submit" | "image"
+        ) {
+            return None;
+        }
+        let is_required = data
+            .attr("required")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+        let has_constraint = is_required
+            || data.attr("minlength").is_some()
+            || data.attr("maxlength").is_some()
+            || data.attr("min").is_some()
+            || data.attr("max").is_some()
+            || data.attr("pattern").is_some()
+            || matches!(input_type.as_str(), "email" | "url" | "number" | "range");
+        if !has_constraint {
+            return None;
+        }
+        if matches!(input_type.as_str(), "checkbox" | "radio") {
+            if is_required && !self.is_checked(id) {
+                return Some(false);
+            }
+            return Some(true);
+        }
+        let val = self.input_value(id);
+        if is_required && val.trim().is_empty() {
+            return Some(false);
+        }
+        if val.is_empty() {
+            return Some(true);
+        }
+        let char_len = val.chars().count();
+        if let Some(min_len) = data
+            .attr("minlength")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            && char_len < min_len
+        {
+            return Some(false);
+        }
+        if let Some(max_len) = data
+            .attr("maxlength")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            && char_len > max_len
+        {
+            return Some(false);
+        }
+        match input_type.as_str() {
+            "email" => {
+                let trimmed = val.trim();
+                let Some((local, domain)) = trimmed.split_once('@') else {
+                    return Some(false);
+                };
+                if local.is_empty()
+                    || domain.is_empty()
+                    || domain.contains('@')
+                    || trimmed.chars().any(char::is_whitespace)
+                {
+                    return Some(false);
+                }
+            }
+            "url" => {
+                let trimmed = val.trim();
+                let Some((scheme, rest)) = trimmed.split_once("://") else {
+                    return Some(false);
+                };
+                if scheme.is_empty()
+                    || rest.is_empty()
+                    || !scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                    || trimmed.chars().any(char::is_whitespace)
+                {
+                    return Some(false);
+                }
+            }
+            "number" | "range" => {
+                let Ok(num) = val.trim().parse::<f64>() else {
+                    return Some(false);
+                };
+                if let Some(min_v) = data.attr("min").and_then(|s| s.trim().parse::<f64>().ok())
+                    && num < min_v
+                {
+                    return Some(false);
+                }
+                if let Some(max_v) = data.attr("max").and_then(|s| s.trim().parse::<f64>().ok())
+                    && num > max_v
+                {
+                    return Some(false);
+                }
+            }
+            _ => {}
+        }
+        Some(true)
+    }
+
+    fn subtree_has_constrained_control(&self, root: NodeId) -> bool {
+        let Some(node) = self.nodes.get(root.index()) else {
+            return false;
+        };
+        for &child in &node.children {
+            if matches!(
+                self.get(child).data().tag(),
+                Some("input" | "textarea" | "select")
+            ) && self.is_control_valid(child).is_some()
+            {
+                return true;
+            }
+            if self.subtree_has_constrained_control(child) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn subtree_controls_valid(&self, root: NodeId) -> bool {
+        let Some(node) = self.nodes.get(root.index()) else {
+            return true;
+        };
+        for &child in &node.children {
+            if matches!(
+                self.get(child).data().tag(),
+                Some("input" | "textarea" | "select")
+            ) && self.is_control_valid(child) == Some(false)
+            {
+                return false;
+            }
+            if !self.subtree_controls_valid(child) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Evaluate range constraint status (`:in-range` / `:out-of-range`) for `id`.
+    /// Returns `None` when `id` has no range limitations or is not a range-able control.
+    pub fn is_control_in_range(&self, id: NodeId) -> Option<bool> {
+        let node = self.nodes.get(id.index())?;
+        let data = node.data();
+        if data.tag() != Some("input") {
+            return None;
+        }
+        if data
+            .attr("disabled")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+            || data
+                .attr("readonly")
+                .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+        {
+            return None;
+        }
+        let kind = data
+            .attr("type")
+            .unwrap_or("text")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(kind.as_str(), "number" | "range") {
+            return None;
+        }
+        let min_v = data.attr("min").and_then(|s| s.trim().parse::<f64>().ok());
+        let max_v = data.attr("max").and_then(|s| s.trim().parse::<f64>().ok());
+        if min_v.is_none() && max_v.is_none() {
+            return None;
+        }
+        let val = self.input_value(id);
+        let num = if val.trim().is_empty() {
+            if kind == "range" {
+                self.range_state(id).3 as f64
+            } else {
+                return None;
+            }
+        } else {
+            let Ok(parsed) = val.trim().parse::<f64>() else {
+                return Some(false);
+            };
+            parsed
+        };
+        if let Some(lo) = min_v
+            && num < lo
+        {
+            return Some(false);
+        }
+        if let Some(hi) = max_v
+            && num > hi
+        {
+            return Some(false);
+        }
+        Some(true)
+    }
+
+    /// Constructable stylesheets attached via `document.adoptedStyleSheets`.
+    pub fn adopted_style_sheets(&self) -> &[String] {
+        &self.adopted_styles
+    }
+
+    /// Replace `document.adoptedStyleSheets` with `sheets`.
+    pub fn set_adopted_style_sheets(&mut self, sheets: Vec<String>) {
+        self.adopted_styles = sheets
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+    }
+
+    /// Append one constructable stylesheet CSS text to `document.adoptedStyleSheets`.
+    pub fn add_adopted_style_sheet(&mut self, css: String) {
+        if !css.trim().is_empty() {
+            self.adopted_styles.push(css);
+        }
+    }
+
+    /// Clone a node (and optionally its descendants when `deep` is true) from `src_doc`
+    /// as a detached subtree in `self` (`document.importNode` / `document.adoptNode`).
+    pub fn import_subtree(
+        &mut self,
+        src_doc: &Document,
+        src_id: NodeId,
+        deep: bool,
+    ) -> Option<NodeId> {
+        if self.nodes.len() >= MAX_DOM_NODES || src_doc.nodes.get(src_id.index()).is_none() {
+            return None;
+        }
+        if deep {
+            self.clone_subtree_detached(src_doc, src_id)
+        } else {
+            match src_doc.get(src_id).data() {
+                NodeData::Text(t) => Some(self.create_text(t)),
+                NodeData::Element { tag, attrs } => Some(self.create_element(tag, attrs.clone())),
+                NodeData::Document => None,
+            }
+        }
     }
 
     /// Intrinsic pixel dimensions `(width, height)` of a `<canvas>` element
@@ -2228,6 +2588,105 @@ impl Document {
                         return false;
                     }
                 }
+                ("hover", None) => {
+                    if !self.is_hovered(id) {
+                        return false;
+                    }
+                }
+                ("active", None) => {
+                    if !self.is_active(id) {
+                        return false;
+                    }
+                }
+                ("focus" | "focus-visible", None) => {
+                    if !self.is_focused(id) {
+                        return false;
+                    }
+                }
+                ("focus-within", None) => {
+                    if !self.is_focus_within(id) {
+                        return false;
+                    }
+                }
+                ("target", None) => {
+                    if !self.is_target(id) {
+                        return false;
+                    }
+                }
+                ("target-within", None) => {
+                    if !self.is_target_within(id) {
+                        return false;
+                    }
+                }
+                ("valid" | "user-valid", None) => {
+                    if self.is_control_valid(id) != Some(true) {
+                        return false;
+                    }
+                }
+                ("invalid" | "user-invalid", None) => {
+                    if self.is_control_valid(id) != Some(false) {
+                        return false;
+                    }
+                }
+                ("in-range", None) => {
+                    if self.is_control_in_range(id) != Some(true) {
+                        return false;
+                    }
+                }
+                ("out-of-range", None) => {
+                    if self.is_control_in_range(id) != Some(false) {
+                        return false;
+                    }
+                }
+                ("checked", None) => {
+                    if !self.is_checked(id) {
+                        return false;
+                    }
+                }
+                ("disabled", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(
+                        data.tag(),
+                        Some("input" | "button" | "select" | "textarea" | "option" | "fieldset")
+                    ) || !data
+                        .attr("disabled")
+                        .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                    {
+                        return false;
+                    }
+                }
+                ("enabled", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(
+                        data.tag(),
+                        Some("input" | "button" | "select" | "textarea" | "option" | "fieldset")
+                    ) || data
+                        .attr("disabled")
+                        .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                    {
+                        return false;
+                    }
+                }
+                ("required", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(data.tag(), Some("input" | "select" | "textarea"))
+                        || !data
+                            .attr("required")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                    {
+                        return false;
+                    }
+                }
+                ("optional", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(data.tag(), Some("input" | "select" | "textarea"))
+                        || data
+                            .attr("required")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                    {
+                        return false;
+                    }
+                }
                 _ => return false,
             }
         }
@@ -2339,6 +2798,11 @@ impl Document {
     pub fn embedded_css(&self) -> String {
         let mut blocks = Vec::new();
         self.collect_style(self.root(), &mut blocks);
+        for sheet in &self.adopted_styles {
+            if !sheet.is_empty() {
+                blocks.push(sheet.clone());
+            }
+        }
         blocks.join("\n")
     }
 
@@ -2361,6 +2825,14 @@ impl Document {
     pub fn style_sheets(&self) -> Vec<StyleSheetSource> {
         let mut sheets = Vec::new();
         self.collect_style_sheets(self.root(), &mut sheets);
+        for css in &self.adopted_styles {
+            if !css.is_empty() {
+                sheets.push(StyleSheetSource::Style {
+                    css: css.clone(),
+                    media: None,
+                });
+            }
+        }
         sheets
     }
 

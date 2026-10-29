@@ -1,5 +1,5 @@
-# CSS parser and cascade. Reads anvil-dom nodes. Does not place boxes.
-# anvil-layout reads the computed style. anvil-raster also reads style values
+# CSS parser and cascade. Reads anvil-dom nodes and links the Anvil-CSS engine directly.
+# Does not place boxes. anvil-layout reads the computed style. anvil-raster also reads style values
 # that the display list did not fully flatten.
 
 [package]
@@ -13,5 +13,4 @@ license = "LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial"
 publish.workspace = true
 
 [dependencies]
-anvil-css.workspace = true
 anvil-dom = { path = "../anvil-dom" }

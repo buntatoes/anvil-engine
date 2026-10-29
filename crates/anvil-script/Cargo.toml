@@ -1,6 +1,5 @@
-# Budgeted script interpreter. Mutates anvil-dom. Parses JSON with anvil-json.
-# The optional C++ VM is not a general compiler. eval_script uses it only for
-# a script the compiler accepts that does not touch the DOM, fetch(), or storage.
+# Budgeted script interpreter. Mutates anvil-dom, parses JSON with anvil-json,
+# and links the Anvil-JS engine directly (`../anvil-browser/engines/anvil-js`).
 # fetch() is same-origin only and runs in the Rust interpreter.
 # A registered mock wins. Otherwise a host callback runs. This crate does not
 # open a socket and does not link anvil-net. The numeric VM does not perform fetch.
@@ -18,6 +17,5 @@ publish.workspace = true
 
 [dependencies]
 anvil-dom = { path = "../anvil-dom" }
-anvil-js.workspace = true
 anvil-json.workspace = true
 anvil-video.workspace = true
