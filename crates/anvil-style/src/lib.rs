@@ -67,6 +67,15 @@ pub use animation::{
 };
 pub use selectors::{MAX_SELECTOR_COMPOUNDS, MAX_SELECTOR_NESTING, Selector};
 
+/// A custom property registered via `@property --name { ... }`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredProperty {
+    pub name: String,
+    pub syntax: String,
+    pub inherits: bool,
+    pub initial_value: Option<String>,
+}
+
 /// A parsed style sheet. Rules are owned, in source order, including rules
 /// that came from inside `@media`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,14 +83,56 @@ pub struct Stylesheet {
     pub rules: Vec<Rule>,
     /// `@keyframes` blocks in source order, including any inside `@media`.
     pub keyframes: Vec<KeyframesRule>,
+    /// Cascade layers (`@layer`) in first-declared order.
+    pub layers: Vec<String>,
+    /// Custom properties registered with `@property`.
+    pub properties: Vec<RegisteredProperty>,
 }
 
 impl Stylesheet {
     /// Move the rules and keyframes of `later` after this sheet's own, as if
     /// its text came after this one in the same sheet.
     pub fn append(&mut self, later: Stylesheet) {
-        self.rules.extend(later.rules);
+        let mut layer_remap = Vec::with_capacity(later.layers.len());
+        for name in later.layers {
+            let mapped = if name.starts_with("<anon:") || name.contains(".<anon:") {
+                let fresh = format!("<anon:{}>", self.layers.len());
+                intern_layer(&mut self.layers, &fresh)
+            } else {
+                intern_layer(&mut self.layers, &name)
+            };
+            layer_remap.push(mapped);
+        }
+        for mut rule in later.rules {
+            if let Some(old_idx) = rule.layer {
+                rule.layer = layer_remap.get(usize::from(old_idx)).copied();
+            }
+            self.rules.push(rule);
+        }
         self.keyframes.extend(later.keyframes);
+        for prop in later.properties {
+            if let Some(existing) = self.properties.iter_mut().find(|p| p.name == prop.name) {
+                *existing = prop;
+            } else {
+                self.properties.push(prop);
+            }
+        }
+    }
+}
+
+fn intern_layer(layers: &mut Vec<String>, name: &str) -> u16 {
+    if let Some(pos) = layers.iter().position(|existing| existing == name) {
+        return pos.min(usize::from(u16::MAX - 1)) as u16;
+    }
+    let idx = layers.len().min(usize::from(u16::MAX - 1)) as u16;
+    layers.push(name.to_string());
+    idx
+}
+
+fn qualify_layer_name(parent: Option<&str>, child: &str) -> String {
+    match parent {
+        Some(p) if !p.is_empty() => format!("{p}.{child}"),
+        _ => child.to_string(),
     }
 }
 
@@ -541,8 +592,8 @@ impl MediaQuery {
 }
 
 /// One style rule. Selectors and declarations are owned.
-/// `media`, `container`, and `scope` are `None` when the rule was not inside
-/// `@media`, `@container`, or `@scope`.
+/// `media`, `container`, `scope`, and `layer` are `None` when the rule was not
+/// inside `@media`, `@container`, `@scope`, or `@layer`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
@@ -550,6 +601,7 @@ pub struct Rule {
     pub media: Option<MediaQuery>,
     pub container: Option<MediaQuery>,
     pub scope: Option<ScopeCondition>,
+    pub layer: Option<u16>,
 }
 
 /// One CSS declaration. `name` is owned and lowercase. `value` is owned
@@ -699,17 +751,20 @@ pub enum Display {
 }
 
 /// Main axis of a flex container. The initial value is [`Self::Row`].
-/// `row-reverse` and `column-reverse` are not recognized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlexDirection {
-    /// Lay items out on horizontal lines. [`FlexWrap`] decides whether they wrap.
+    /// Lay items out on horizontal lines, start to end.
     Row,
-    /// Lay items out in a single vertical line. Wrap and `flex-grow` are ignored.
+    /// Lay items out on horizontal lines, end to start (`row-reverse`).
+    RowReverse,
+    /// Lay items out on vertical lines, top to bottom.
     Column,
+    /// Lay items out on vertical lines, bottom to top (`column-reverse`).
+    ColumnReverse,
 }
 
-/// Whether a row flex container breaks items onto more than one line.
-/// The initial value is [`Self::NoWrap`]. `wrap-reverse` is not recognized.
+/// Whether a flex container breaks items onto more than one line.
+/// The initial value is [`Self::NoWrap`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlexWrap {
     /// Keep every item on one line, even when the line is wider than the container.
@@ -717,6 +772,28 @@ pub enum FlexWrap {
     /// Start a new line when the next item does not fit. A single item that is
     /// wider than the container stays on its own line.
     Wrap,
+    /// Like [`Self::Wrap`], with cross-axis line order reversed (`wrap-reverse`).
+    WrapReverse,
+}
+
+/// Multi-line cross-axis distribution (`align-content`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlignContent {
+    /// Stretch lines to fill remaining cross-axis space. Initial value.
+    #[default]
+    Stretch,
+    /// Pack lines against the cross start (`flex-start` / `start`).
+    Start,
+    /// Center lines on the cross axis (`center`).
+    Center,
+    /// Pack lines against the cross end (`flex-end` / `end`).
+    End,
+    /// Equal space between lines (`space-between`).
+    SpaceBetween,
+    /// Equal space around each line (`space-around`).
+    SpaceAround,
+    /// Equal space between lines and edges (`space-evenly`).
+    SpaceEvenly,
 }
 
 /// Main-axis packing for a flex line.
@@ -787,18 +864,19 @@ pub enum WhiteSpace {
     PreWrap,
 }
 
-/// Cross-axis alignment for flex items. Column flex ignores this value.
+/// Cross-axis alignment for flex or grid items.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlignItems {
-    /// Align to the cross start. `flex-start` and `start` both map here.
+    /// Align to the start edge. `flex-start`, `self-start`, and `start` map here.
     Start,
-    /// Center on the cross axis.
+    /// Center on the axis.
     Center,
-    /// Align to the cross end. `flex-end` and `end` both map here.
+    /// Align to the end edge. `flex-end`, `self-end`, and `end` map here.
     End,
-    /// Stretch items whose height is `auto` to the line's cross size.
-    /// This is the initial value. Width is not stretched.
+    /// Stretch items whose size on the axis is `auto`. This is the initial value.
     Stretch,
+    /// Align items along their first text baseline (`baseline`).
+    Baseline,
 }
 
 /// `position` as stored for anvil-layout. Unknown values are left unchanged.
@@ -959,11 +1037,7 @@ pub struct LinearGradient {
     pub end_color: Color,
 }
 
-/// One track in `grid-template-columns`, `grid-template-rows`, or `grid-auto-rows`.
-///
-/// Columns size `auto` as `1fr`, because this engine does not measure the
-/// intrinsic width of grid items. Rows size `auto` to the tallest item that
-/// sits only in that row.
+/// One track in `grid-template-columns`, `grid-template-rows`, `grid-auto-rows`, or `grid-auto-columns`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GridTrack {
     /// Fixed pixel size (`120px`).
@@ -973,10 +1047,86 @@ pub enum GridTrack {
     Percent(f32),
     /// Share of remaining free space (`1fr`, `2fr`).
     Fr(f32),
-    /// `auto`. See the type docs for how each axis sizes it.
+    /// `auto`.
     Auto,
+    /// `min-content` intrinsic track sizing.
+    MinContent,
+    /// `max-content` intrinsic track sizing.
+    MaxContent,
+    /// `fit-content(<length>)` clamped intrinsic track sizing in CSS pixels.
+    FitContent(f32),
     /// `minmax(min, max)`. The minimum is never a flexible size.
     MinMax(TrackBreadth, TrackBreadth),
+}
+
+/// Auto-placement algorithm direction and packing mode (`grid-auto-flow`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GridAutoFlow {
+    /// Fill row by row without backtracking. Initial value.
+    #[default]
+    Row,
+    /// Fill column by column without backtracking.
+    Column,
+    /// Fill row by row, backtracking into earlier empty cells (`row dense`).
+    RowDense,
+    /// Fill column by column, backtracking into earlier empty cells (`column dense`).
+    ColumnDense,
+}
+
+/// Parsed `grid-template-areas` cell matrix (up to 6 rows by 6 columns).
+/// Each cell stores `0` for an empty `.` token or [`grid_area_hash`] of the area name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridTemplateAreas {
+    pub rows: u8,
+    pub cols: u8,
+    pub cells: [[u32; 6]; 6],
+}
+
+impl GridTemplateAreas {
+    pub const NONE: Self = Self {
+        rows: 0,
+        cols: 0,
+        cells: [[0; 6]; 6],
+    };
+
+    /// Look up the `(row_start, col_start, row_end, col_end)` 1-based inclusive-start /
+    /// exclusive-end grid lines for an area hash, or `None` if not present.
+    pub fn find_area(&self, hash: u32) -> Option<(i16, i16, i16, i16)> {
+        if hash == 0 || self.rows == 0 || self.cols == 0 {
+            return None;
+        }
+        let mut r_min = i16::MAX;
+        let mut r_max = 0i16;
+        let mut c_min = i16::MAX;
+        let mut c_max = 0i16;
+        for r in 0..usize::from(self.rows).min(6) {
+            for c in 0..usize::from(self.cols).min(6) {
+                if self.cells[r][c] == hash {
+                    let ri = (r as i16) + 1;
+                    let ci = (c as i16) + 1;
+                    r_min = r_min.min(ri);
+                    r_max = r_max.max(ri + 1);
+                    c_min = c_min.min(ci);
+                    c_max = c_max.max(ci + 1);
+                }
+            }
+        }
+        (r_min <= r_max && c_min <= c_max).then_some((r_min, c_min, r_max, c_max))
+    }
+}
+
+/// FNV-1a 32-bit hash for a named grid area identifier (never returns 0 for non-empty names).
+pub fn grid_area_hash(name: &str) -> u32 {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return 0;
+    }
+    let mut h = 0x811c_9dc5u32;
+    for b in trimmed.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    if h == 0 { 1 } else { h }
 }
 
 /// Auto-repeating track mode for `repeat(auto-fill, ...)` and `repeat(auto-fit, ...)`.
@@ -1024,6 +1174,12 @@ pub enum TrackBreadth {
     Fr(f32),
     /// Content size on rows, `1fr` behavior on columns when it is the maximum.
     Auto,
+    /// `min-content` intrinsic sizing.
+    MinContent,
+    /// `max-content` intrinsic sizing.
+    MaxContent,
+    /// `fit-content(<length>)` clamped intrinsic sizing.
+    FitContent(f32),
 }
 
 /// Most functions one `transform` list keeps. A longer list is ignored.
@@ -1135,8 +1291,10 @@ pub struct ComputedStyle {
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
     pub margin: Edge,
-    pub margin_left_auto: bool,
+    pub margin_top_auto: bool,
     pub margin_right_auto: bool,
+    pub margin_bottom_auto: bool,
+    pub margin_left_auto: bool,
     pub padding: Edge,
     pub border: Edge,
     pub border_color: Color,
@@ -1152,6 +1310,8 @@ pub struct ComputedStyle {
     pub underline: bool,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
+    /// Visual order of a flex or grid item (`order`). Initial value is 0.
+    pub order: i32,
     /// Main-size growth factor for a flex item. The initial value is 0.
     /// This is not inherited. Negative values are stored as 0.
     pub flex_grow: f32,
@@ -1162,6 +1322,9 @@ pub struct ComputedStyle {
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
     pub align_self: Option<AlignItems>,
+    pub align_content: AlignContent,
+    pub justify_items: AlignItems,
+    pub justify_self: Option<AlignItems>,
     pub grid_template_columns: [GridTrack; 12],
     pub grid_column_count: u8,
     pub grid_auto_repeat: GridAutoRepeat,
@@ -1170,6 +1333,18 @@ pub struct ComputedStyle {
     pub grid_row_count: u8,
     /// Size of rows past the explicit grid (`grid-auto-rows`). The initial value is `auto`.
     pub grid_auto_rows: GridTrack,
+    /// Multi-track list for `grid-auto-rows` cycling.
+    pub grid_auto_row_list: [GridTrack; 8],
+    pub grid_auto_row_count: u8,
+    /// Multi-track list for `grid-auto-columns` cycling.
+    pub grid_auto_columns: [GridTrack; 8],
+    pub grid_auto_col_count: u8,
+    /// Auto-placement mode (`grid-auto-flow`).
+    pub grid_auto_flow: GridAutoFlow,
+    /// Named grid template areas (`grid-template-areas`).
+    pub grid_template_areas: GridTemplateAreas,
+    /// Hash of a named area from `grid-area: <ident>` (`0` when unset).
+    pub grid_area_name: u32,
     /// Placement from `grid-column` and its longhands. Not inherited.
     pub grid_column: GridPlacement,
     /// Placement from `grid-row` and its longhands. Not inherited.
@@ -1225,8 +1400,10 @@ impl ComputedStyle {
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
             margin: Edge::zero(),
-            margin_left_auto: false,
+            margin_top_auto: false,
             margin_right_auto: false,
+            margin_bottom_auto: false,
+            margin_left_auto: false,
             padding: Edge::zero(),
             border: Edge::zero(),
             border_color: Color::BLACK,
@@ -1241,18 +1418,29 @@ impl ComputedStyle {
             underline: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
+            order: 0,
             flex_grow: 0.0,
             flex_shrink: 0.0,
             flex_basis: Size::Auto,
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
             align_self: None,
+            align_content: AlignContent::Stretch,
+            justify_items: AlignItems::Stretch,
+            justify_self: None,
             grid_template_columns: [GridTrack::Fr(1.0); 12],
             grid_column_count: 0,
             grid_auto_repeat: GridAutoRepeat::None,
             grid_template_rows: [GridTrack::Auto; 12],
             grid_row_count: 0,
             grid_auto_rows: GridTrack::Auto,
+            grid_auto_row_list: [GridTrack::Auto; 8],
+            grid_auto_row_count: 0,
+            grid_auto_columns: [GridTrack::Auto; 8],
+            grid_auto_col_count: 0,
+            grid_auto_flow: GridAutoFlow::Row,
+            grid_template_areas: GridTemplateAreas::NONE,
+            grid_area_name: 0,
             grid_column: GridPlacement {
                 start: GridLine::Auto,
                 end: GridLine::Auto,
@@ -1280,6 +1468,16 @@ impl ComputedStyle {
     /// Empty when the property is unset; every row is then a `grid-auto-rows` row.
     pub fn grid_row_tracks(&self) -> &[GridTrack] {
         &self.grid_template_rows[..(self.grid_row_count as usize).min(12)]
+    }
+
+    /// Active implicit row tracks parsed from `grid-auto-rows`.
+    pub fn grid_auto_row_tracks(&self) -> &[GridTrack] {
+        &self.grid_auto_row_list[..(self.grid_auto_row_count as usize).min(8)]
+    }
+
+    /// Active implicit column tracks parsed from `grid-auto-columns`.
+    pub fn grid_auto_column_tracks(&self) -> &[GridTrack] {
+        &self.grid_auto_columns[..(self.grid_auto_col_count as usize).min(8)]
     }
 
     /// Style a child element starts from. Copies inherited properties, sets
@@ -1490,7 +1688,23 @@ pub(crate) fn find_matching_brace(src: &str) -> usize {
 /// dropped, body included. A rule whose selector list has an invalid selector is
 /// dropped too.
 fn parse_css_rules(rest: &str, active_media: Option<MediaQuery>, sheet: &mut Stylesheet) {
-    parse_css_rules_scoped(rest, active_media, None, None, sheet);
+    parse_css_rules_scoped(rest, active_media, None, None, None, sheet);
+}
+
+fn parse_statement_at_rule(stmt: &str, active_layer: Option<&str>, sheet: &mut Stylesheet) {
+    let trimmed = stmt.trim();
+    if let Some(names) = trimmed
+        .strip_prefix("@layer")
+        .or_else(|| trimmed.strip_prefix("@LAYER"))
+    {
+        for raw_name in names.split(',') {
+            let name = raw_name.trim();
+            if !name.is_empty() {
+                let full = qualify_layer_name(active_layer, name);
+                intern_layer(&mut sheet.layers, &full);
+            }
+        }
+    }
 }
 
 fn parse_css_rules_scoped(
@@ -1498,16 +1712,27 @@ fn parse_css_rules_scoped(
     active_media: Option<MediaQuery>,
     active_container: Option<MediaQuery>,
     active_scope: Option<ScopeCondition>,
+    active_layer: Option<String>,
     sheet: &mut Stylesheet,
 ) {
-    while let Some(open) = find_unquoted(rest, '{') {
-        // An at-rule such as `@import` or `@charset` can end at `;` with no
-        // block. Skip it so it does not swallow the rule after it.
-        if rest.trim_start().starts_with('@')
+    while let Some(mut open) = find_unquoted(rest, '{') {
+        // Statement at-rules such as `@layer a, b;`, `@import`, or `@charset`
+        // end at `;` with no block.
+        while rest.trim_start().starts_with('@')
             && let Some(semi) = find_unquoted(&rest[..open], ';')
         {
+            parse_statement_at_rule(&rest[..semi], active_layer.as_deref(), sheet);
             rest = &rest[semi + 1..];
-            continue;
+            let Some(next_open) = find_unquoted(rest, '{') else {
+                while rest.trim_start().starts_with('@')
+                    && let Some(tail_semi) = find_unquoted(rest, ';')
+                {
+                    parse_statement_at_rule(&rest[..tail_semi], active_layer.as_deref(), sheet);
+                    rest = &rest[tail_semi + 1..];
+                }
+                return;
+            };
+            open = next_open;
         }
         let selector_src = rest[..open].trim();
         rest = &rest[open + 1..];
@@ -1532,6 +1757,7 @@ fn parse_css_rules_scoped(
                 Some(combined),
                 active_container.clone(),
                 active_scope.clone(),
+                active_layer.clone(),
                 sheet,
             );
             continue;
@@ -1550,6 +1776,7 @@ fn parse_css_rules_scoped(
                 active_media.clone(),
                 Some(combined),
                 active_scope.clone(),
+                active_layer.clone(),
                 sheet,
             );
             continue;
@@ -1564,6 +1791,7 @@ fn parse_css_rules_scoped(
                     active_media.clone(),
                     active_container.clone(),
                     Some(scope_cond),
+                    active_layer.clone(),
                     sheet,
                 );
             }
@@ -1583,6 +1811,7 @@ fn parse_css_rules_scoped(
                     active_media.clone(),
                     active_container.clone(),
                     active_scope.clone(),
+                    active_layer.clone(),
                     sheet,
                 );
             }
@@ -1594,9 +1823,78 @@ fn parse_css_rules_scoped(
                 .extend(animation::parse_keyframes(name, body_src));
             continue;
         }
-        if selector_src.starts_with("@layer")
-            || selector_src.starts_with("@LAYER")
-            || selector_src.starts_with("@starting-style")
+        if let Some(cond) = selector_src
+            .strip_prefix("@layer")
+            .or_else(|| selector_src.strip_prefix("@LAYER"))
+        {
+            let name = cond.trim();
+            let full = if name.is_empty() {
+                let anon = format!("<anon:{}>", sheet.layers.len());
+                qualify_layer_name(active_layer.as_deref(), &anon)
+            } else {
+                qualify_layer_name(active_layer.as_deref(), name)
+            };
+            intern_layer(&mut sheet.layers, &full);
+            parse_css_rules_scoped(
+                body_src,
+                active_media.clone(),
+                active_container.clone(),
+                active_scope.clone(),
+                Some(full),
+                sheet,
+            );
+            continue;
+        }
+        if let Some(prop_name) = selector_src
+            .strip_prefix("@property")
+            .or_else(|| selector_src.strip_prefix("@PROPERTY"))
+        {
+            let name = prop_name.trim();
+            if name.starts_with("--") && name.len() > 2 && !name.chars().any(char::is_whitespace) {
+                let decls = parse_declarations(body_src);
+                let mut syntax = "*".to_string();
+                let mut inherits = None;
+                let mut initial_value = None;
+                for d in decls {
+                    match d.name.as_str() {
+                        "syntax" => {
+                            let v = d.value.trim().trim_matches(['"', '\'']).trim();
+                            if !v.is_empty() {
+                                syntax = v.to_string();
+                            }
+                        }
+                        "inherits" => {
+                            if d.value.eq_ignore_ascii_case("true") {
+                                inherits = Some(true);
+                            } else if d.value.eq_ignore_ascii_case("false") {
+                                inherits = Some(false);
+                            }
+                        }
+                        "initial-value" => {
+                            initial_value = Some(d.value.trim().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(inh) = inherits {
+                    let prop = RegisteredProperty {
+                        name: name.to_ascii_lowercase(),
+                        syntax,
+                        inherits: inh,
+                        initial_value,
+                    };
+                    if let Some(existing) =
+                        sheet.properties.iter_mut().find(|p| p.name == prop.name)
+                    {
+                        *existing = prop;
+                    } else {
+                        sheet.properties.push(prop);
+                    }
+                }
+            }
+            continue;
+        }
+        if selector_src.starts_with("@starting-style")
             || selector_src.starts_with("@STARTING-STYLE")
         {
             parse_css_rules_scoped(
@@ -1604,6 +1902,7 @@ fn parse_css_rules_scoped(
                 active_media.clone(),
                 active_container.clone(),
                 active_scope.clone(),
+                active_layer.clone(),
                 sheet,
             );
             continue;
@@ -1617,13 +1916,23 @@ fn parse_css_rules_scoped(
         if selectors.is_empty() {
             continue;
         }
+        let layer = active_layer
+            .as_deref()
+            .map(|name| intern_layer(&mut sheet.layers, name));
         sheet.rules.push(Rule {
             selectors,
             declarations: parse_declarations(body_src),
             media: active_media.clone(),
             container: active_container.clone(),
             scope: active_scope.clone(),
+            layer,
         });
+    }
+    while rest.trim_start().starts_with('@')
+        && let Some(semi) = find_unquoted(rest, ';')
+    {
+        parse_statement_at_rule(&rest[..semi], active_layer.as_deref(), sheet);
+        rest = &rest[semi + 1..];
     }
 }
 
@@ -1684,7 +1993,7 @@ pub fn compute_styles_parallel(
     }
     let mut styles = vec![ComputedStyle::initial(); total_nodes];
     let html_id = doc.html();
-    let mut root_vars = HashMap::new();
+    let mut root_vars = inherit_custom_properties(&HashMap::new(), &sheet.properties);
     let index = selectors::DocIndex::build(doc);
     let matcher = selectors::Matcher::new(doc, Some(&index));
     let mut cx = Cascade {
@@ -1730,7 +2039,7 @@ pub fn compute_styles_parallel(
                 );
             }
         }
-        let mut body_vars = root_vars.clone();
+        let mut body_vars = inherit_custom_properties(&root_vars, &sheet.properties);
         let body_style = match doc.get(body_id).data() {
             NodeData::Element { tag: btag, .. } => cascade_element(
                 doc,
@@ -1805,6 +2114,26 @@ pub fn compute_styles_parallel(
     compute_styles_for_viewport(doc, sheet, viewport_width, viewport_height)
 }
 
+fn inherit_custom_properties(
+    parent_vars: &HashMap<String, String>,
+    registered: &[RegisteredProperty],
+) -> HashMap<String, String> {
+    let mut vars = parent_vars.clone();
+    for prop in registered {
+        if !prop.inherits {
+            vars.remove(&prop.name);
+            if let Some(init) = &prop.initial_value {
+                vars.insert(prop.name.clone(), init.clone());
+            }
+        } else if !vars.contains_key(&prop.name)
+            && let Some(init) = &prop.initial_value
+        {
+            vars.insert(prop.name.clone(), init.clone());
+        }
+    }
+    vars
+}
+
 fn walk_subtree_into(
     doc: &Document,
     id: NodeId,
@@ -1814,7 +2143,7 @@ fn walk_subtree_into(
     container_width: f32,
     out: &mut Vec<(usize, ComputedStyle)>,
 ) {
-    let mut vars = parent_vars.clone();
+    let mut vars = inherit_custom_properties(parent_vars, &cx.sheet.properties);
     let style = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             cascade_element(doc, id, tag, parent, &mut vars, cx, container_width)
@@ -1955,29 +2284,33 @@ fn resolve_child_container_width(
     w
 }
 
-fn matches_scope(
+fn scope_proximity(
     doc: &Document,
     id: NodeId,
     scope: &ScopeCondition,
     matcher: &selectors::Matcher,
-) -> bool {
+) -> Option<(u16, NodeId)> {
     let mut cur = Some(id);
+    let mut hops = 0u16;
     while let Some(node_id) = cur {
         let is_root = match &scope.root {
-            Some(roots) => roots.iter().any(|s| matcher.matches(s, node_id)),
+            Some(roots) => roots
+                .iter()
+                .any(|s| matcher.matches_with_scope(s, node_id, Some(node_id))),
             None => node_id == doc.html(),
         };
         if is_root {
-            return true;
+            return Some((hops, node_id));
         }
         if let Some(limits) = &scope.limit
             && limits.iter().any(|s| matcher.matches(s, node_id))
         {
-            return false;
+            return None;
         }
+        hops = hops.saturating_add(1);
         cur = doc.parent_element(node_id);
     }
-    false
+    None
 }
 
 /// Write `id`'s used style and recurse to its children.
@@ -2001,7 +2334,35 @@ fn walk(
     container_width: f32,
     out: &mut [ComputedStyle],
 ) {
-    let mut vars = parent_vars.clone();
+    let (style, base, vars, child_container_w) = walk_node_step(
+        doc,
+        id,
+        parent,
+        parent_base,
+        parent_vars,
+        cx,
+        container_width,
+        out,
+    );
+    let children: Vec<NodeId> = doc.children(id).to_vec();
+    for child in children {
+        walk(doc, child, &style, &base, &vars, cx, child_container_w, out);
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn walk_node_step(
+    doc: &Document,
+    id: NodeId,
+    parent: &ComputedStyle,
+    parent_base: &ComputedStyle,
+    parent_vars: &HashMap<String, String>,
+    cx: &mut Cascade,
+    container_width: f32,
+    out: &mut [ComputedStyle],
+) -> (ComputedStyle, ComputedStyle, HashMap<String, String>, f32) {
+    let mut vars = inherit_custom_properties(parent_vars, &cx.sheet.properties);
     let (style, base) = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             let base = cascade_element(doc, id, tag, parent_base, &mut vars, cx, container_width);
@@ -2014,7 +2375,7 @@ fn walk(
                 let mut style = if parent == parent_base {
                     base
                 } else {
-                    let mut scratch = parent_vars.clone();
+                    let mut scratch = inherit_custom_properties(parent_vars, &cx.sheet.properties);
                     cascade_element(doc, id, tag, parent, &mut scratch, cx, container_width)
                 };
                 let input = animation::AnimInput {
@@ -2037,14 +2398,12 @@ fn walk(
     }
     let child_container_w =
         resolve_child_container_width(&style, container_width, cx.root_font_px, cx.viewport_width);
-    let children: Vec<NodeId> = doc.children(id).to_vec();
-    for child in children {
-        walk(doc, child, &style, &base, &vars, cx, child_container_w, out);
-    }
+    (style, base, vars, child_container_w)
 }
 
 /// Cascade one element from `parent`: inherited values, user-agent
 /// defaults, author rules, then the inline `style` attribute.
+#[inline(never)]
 fn cascade_element(
     doc: &Document,
     id: NodeId,
@@ -2055,7 +2414,9 @@ fn cascade_element(
     container_width: f32,
 ) -> ComputedStyle {
     let parent_font_px = parent.font_size;
-    let mut style = parent.inherited_child();
+    let inherited_vars = vars.clone();
+    let inherited_style = parent.inherited_child();
+    let mut style = inherited_style;
     apply_user_agent(&mut style, tag);
     let data = doc.get(id).data();
     let in_closed_details = tag != "summary"
@@ -2092,9 +2453,14 @@ fn cascade_element(
             _ => {}
         }
     }
+    let ua_style = style;
     apply_author(
         &mut style,
         vars,
+        &inherited_vars,
+        parent,
+        &inherited_style,
+        &ua_style,
         doc,
         id,
         cx,
@@ -2105,17 +2471,15 @@ fn cascade_element(
 }
 
 /// Apply author rules that match `id` and then its inline `style` attribute.
-///
-/// A rule whose `@media` does not match `viewport_width` is skipped. Only the
-/// winning selector's specificity is kept per rule. Rules are sorted by
-/// specificity, then source order, so a later tied rule overrides an earlier
-/// one. Declarations are applied in four groups, each later group winning:
-/// normal author declarations, normal inline ones, important author ones,
-/// and important inline ones. Custom properties are resolved in the same
-/// order before any other property is applied.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn apply_author(
     style: &mut ComputedStyle,
     vars: &mut HashMap<String, String>,
+    inherited_vars: &HashMap<String, String>,
+    parent: &ComputedStyle,
+    inherited_style: &ComputedStyle,
+    ua_style: &ComputedStyle,
     doc: &Document,
     id: NodeId,
     cx: &Cascade,
@@ -2123,7 +2487,30 @@ fn apply_author(
     container_width: f32,
 ) {
     let (sheet, viewport_width, root_font_px) = (cx.sheet, cx.viewport_width, cx.root_font_px);
-    let mut matched = Vec::new();
+    struct MatchedDecl<'a> {
+        important: bool,
+        layer_rank: u32,
+        specificity: (u16, u16, u16),
+        inv_scope_hops: u16,
+        rule_order: usize,
+        decl_order: usize,
+        decl: &'a Declaration,
+    }
+    let normal_layer_rank = |layer: Option<u16>| -> u32 {
+        match layer {
+            Some(l) => u32::from(l),
+            None => u32::from(u16::MAX),
+        }
+    };
+    let important_layer_rank = |layer: Option<u16>| -> u32 {
+        match layer {
+            Some(l) => u32::from(u16::MAX).saturating_sub(u32::from(l)),
+            None => 0,
+        }
+    };
+    let inline_rank = u32::from(u16::MAX) + 1;
+
+    let mut entries: Vec<MatchedDecl> = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
         if let Some(mq) = &rule.media
             && !mq.matches(viewport_width)
@@ -2135,53 +2522,358 @@ fn apply_author(
         {
             continue;
         }
-        if let Some(scope) = &rule.scope
-            && !matches_scope(doc, id, scope, cx.matcher)
-        {
-            continue;
-        }
+        let (scope_hops, scope_root) = match &rule.scope {
+            Some(scope) => match scope_proximity(doc, id, scope, cx.matcher) {
+                Some((hops, root_id)) => (hops, Some(root_id)),
+                None => continue,
+            },
+            None => (u16::MAX, None),
+        };
         let specificity = rule
             .selectors
             .iter()
-            .filter(|selector| cx.matcher.matches(selector, id))
+            .filter(|selector| cx.matcher.matches_with_scope(selector, id, scope_root))
             .map(Selector::specificity)
             .max();
         if let Some(specificity) = specificity {
-            matched.push((specificity, order, rule));
+            let inv_hops = u16::MAX - scope_hops;
+            for (decl_idx, decl) in rule.declarations.iter().enumerate() {
+                let layer_rank = if decl.important {
+                    important_layer_rank(rule.layer)
+                } else {
+                    normal_layer_rank(rule.layer)
+                };
+                entries.push(MatchedDecl {
+                    important: decl.important,
+                    layer_rank,
+                    specificity,
+                    inv_scope_hops: inv_hops,
+                    rule_order: order,
+                    decl_order: decl_idx,
+                    decl,
+                });
+            }
         }
     }
-    matched.sort_by_key(|(specificity, order, _)| (*specificity, *order));
     let inline = doc
         .get(id)
         .data()
         .attr("style")
         .map(parse_declarations)
         .unwrap_or_default();
-    let mut ordered: Vec<&Declaration> = Vec::new();
-    for important in [false, true] {
-        for (_, _, rule) in &matched {
-            ordered.extend(
-                rule.declarations
-                    .iter()
-                    .filter(|declaration| declaration.important == important),
-            );
-        }
-        ordered.extend(
-            inline
-                .iter()
-                .filter(|declaration| declaration.important == important),
-        );
+    let inline_rule_order = sheet.rules.len();
+    for (decl_idx, decl) in inline.iter().enumerate() {
+        entries.push(MatchedDecl {
+            important: decl.important,
+            layer_rank: inline_rank,
+            specificity: (u16::MAX, u16::MAX, u16::MAX),
+            inv_scope_hops: u16::MAX,
+            rule_order: inline_rule_order,
+            decl_order: decl_idx,
+            decl,
+        });
     }
-    for declaration in &ordered {
+    entries.sort_by_key(|e| {
+        (
+            e.important,
+            e.layer_rank,
+            e.specificity,
+            e.inv_scope_hops,
+            e.rule_order,
+            e.decl_order,
+        )
+    });
+
+    let mut prev_layer_vars = inherited_vars.clone();
+    let mut current_var_layer: Option<(bool, u32)> = None;
+    for entry in &entries {
+        let declaration = entry.decl;
         if declaration.name.starts_with("--") {
-            let resolved = resolve_css_vars(declaration.value.trim(), vars);
-            if !resolved.is_empty() {
-                vars.insert(declaration.name.clone(), resolved);
+            let key = (entry.important, entry.layer_rank);
+            if current_var_layer != Some(key) {
+                if current_var_layer.is_some() {
+                    prev_layer_vars = vars.clone();
+                }
+                current_var_layer = Some(key);
+            }
+            let raw = declaration.value.trim();
+            let reg = sheet.properties.iter().find(|p| p.name == declaration.name);
+            let apply_initial_var = |vars: &mut HashMap<String, String>| {
+                if let Some(r) = reg
+                    && let Some(init) = &r.initial_value
+                {
+                    vars.insert(declaration.name.clone(), init.clone());
+                } else {
+                    vars.remove(&declaration.name);
+                }
+            };
+            let apply_inherit_var = |vars: &mut HashMap<String, String>| {
+                if let Some(pv) = inherited_vars.get(&declaration.name) {
+                    vars.insert(declaration.name.clone(), pv.clone());
+                } else {
+                    apply_initial_var(vars);
+                }
+            };
+            if raw.eq_ignore_ascii_case("initial") || raw.eq_ignore_ascii_case("revert") {
+                apply_initial_var(vars);
+            } else if raw.eq_ignore_ascii_case("inherit") {
+                apply_inherit_var(vars);
+            } else if raw.eq_ignore_ascii_case("unset") {
+                if reg.is_none_or(|r| r.inherits) {
+                    apply_inherit_var(vars);
+                } else {
+                    apply_initial_var(vars);
+                }
+            } else if raw.eq_ignore_ascii_case("revert-layer") {
+                if let Some(plv) = prev_layer_vars.get(&declaration.name) {
+                    vars.insert(declaration.name.clone(), plv.clone());
+                } else {
+                    vars.remove(&declaration.name);
+                }
+            } else {
+                let resolved = resolve_css_vars(raw, vars);
+                if !resolved.is_empty() {
+                    vars.insert(declaration.name.clone(), resolved);
+                }
             }
         }
     }
-    for declaration in ordered {
+
+    let initial_style = ComputedStyle::initial();
+    let mut prev_layer_style = *ua_style;
+    let mut current_layer: Option<(bool, u32)> = None;
+    for entry in &entries {
+        let declaration = entry.decl;
+        if declaration.name.starts_with("--") {
+            continue;
+        }
+        let key = (entry.important, entry.layer_rank);
+        if current_layer != Some(key) {
+            if current_layer.is_some() {
+                prev_layer_style = *style;
+            }
+            current_layer = Some(key);
+        }
+        let resolved = resolve_css_vars(declaration.value.trim(), vars);
+        let val = resolved.trim();
+        let kw_source = if val.eq_ignore_ascii_case("initial") {
+            Some(&initial_style)
+        } else if val.eq_ignore_ascii_case("inherit") {
+            Some(parent)
+        } else if val.eq_ignore_ascii_case("unset") {
+            Some(inherited_style)
+        } else if val.eq_ignore_ascii_case("revert") {
+            Some(ua_style)
+        } else if val.eq_ignore_ascii_case("revert-layer") {
+            Some(&prev_layer_style)
+        } else {
+            None
+        };
+        if let Some(src) = kw_source {
+            copy_property(style, src, declaration.name.as_str());
+            continue;
+        }
         apply_declaration(style, vars, declaration, parent_font_px, root_font_px);
+    }
+}
+
+fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
+    match name {
+        "all" => *dst = *src,
+        "display" => {
+            dst.display = src.display;
+            dst.inline_level = src.inline_level;
+        }
+        "position" => dst.position = src.position,
+        "top" | "inset-block-start" => dst.top = src.top,
+        "right" | "inset-inline-end" => dst.right = src.right,
+        "bottom" | "inset-block-end" => dst.bottom = src.bottom,
+        "left" | "inset-inline-start" => dst.left = src.left,
+        "inset" => {
+            dst.top = src.top;
+            dst.right = src.right;
+            dst.bottom = src.bottom;
+            dst.left = src.left;
+        }
+        "inset-inline" => {
+            dst.left = src.left;
+            dst.right = src.right;
+        }
+        "inset-block" => {
+            dst.top = src.top;
+            dst.bottom = src.bottom;
+        }
+        "z-index" => dst.z_index = src.z_index,
+        "overflow" | "overflow-x" | "overflow-y" => dst.overflow = src.overflow,
+        "visibility" => dst.visibility = src.visibility,
+        "box-sizing" => dst.box_sizing = src.box_sizing,
+        "color" => dst.color = src.color,
+        "background" | "background-color" | "background-image" => {
+            dst.background = src.background;
+            dst.background_gradient = src.background_gradient;
+        }
+        "box-shadow" => dst.box_shadow = src.box_shadow,
+        "font-size" => dst.font_size = src.font_size,
+        "font-weight" => dst.font_weight = src.font_weight,
+        "font-style" => dst.italic = src.italic,
+        "line-height" => dst.line_height = src.line_height,
+        "text-align" => dst.text_align = src.text_align,
+        "white-space" => dst.white_space = src.white_space,
+        "text-decoration" | "text-decoration-line" => dst.underline = src.underline,
+        "margin" => {
+            dst.margin = src.margin;
+            dst.margin_top_auto = src.margin_top_auto;
+            dst.margin_right_auto = src.margin_right_auto;
+            dst.margin_bottom_auto = src.margin_bottom_auto;
+            dst.margin_left_auto = src.margin_left_auto;
+        }
+        "margin-top" | "margin-block-start" => {
+            dst.margin.top = src.margin.top;
+            dst.margin_top_auto = src.margin_top_auto;
+        }
+        "margin-right" | "margin-inline-end" => {
+            dst.margin.right = src.margin.right;
+            dst.margin_right_auto = src.margin_right_auto;
+        }
+        "margin-bottom" | "margin-block-end" => {
+            dst.margin.bottom = src.margin.bottom;
+            dst.margin_bottom_auto = src.margin_bottom_auto;
+        }
+        "margin-left" | "margin-inline-start" => {
+            dst.margin.left = src.margin.left;
+            dst.margin_left_auto = src.margin_left_auto;
+        }
+        "margin-inline" => {
+            dst.margin.left = src.margin.left;
+            dst.margin.right = src.margin.right;
+            dst.margin_left_auto = src.margin_left_auto;
+            dst.margin_right_auto = src.margin_right_auto;
+        }
+        "margin-block" => {
+            dst.margin.top = src.margin.top;
+            dst.margin.bottom = src.margin.bottom;
+            dst.margin_top_auto = src.margin_top_auto;
+            dst.margin_bottom_auto = src.margin_bottom_auto;
+        }
+        "padding" => dst.padding = src.padding,
+        "padding-top" | "padding-block-start" => dst.padding.top = src.padding.top,
+        "padding-right" | "padding-inline-end" => dst.padding.right = src.padding.right,
+        "padding-bottom" | "padding-block-end" => dst.padding.bottom = src.padding.bottom,
+        "padding-left" | "padding-inline-start" => dst.padding.left = src.padding.left,
+        "padding-inline" => {
+            dst.padding.left = src.padding.left;
+            dst.padding.right = src.padding.right;
+        }
+        "padding-block" => {
+            dst.padding.top = src.padding.top;
+            dst.padding.bottom = src.padding.bottom;
+        }
+        "border" => {
+            dst.border = src.border;
+            dst.border_color = src.border_color;
+        }
+        "border-width" => dst.border = src.border,
+        "border-color" => dst.border_color = src.border_color,
+        "border-top" | "border-block-start" => dst.border.top = src.border.top,
+        "border-right" | "border-inline-end" => dst.border.right = src.border.right,
+        "border-bottom" | "border-block-end" => dst.border.bottom = src.border.bottom,
+        "border-left" | "border-inline-start" => dst.border.left = src.border.left,
+        "border-radius" => dst.border_radius = src.border_radius,
+        "width" | "inline-size" => dst.width = src.width,
+        "height" | "block-size" => dst.height = src.height,
+        "min-width" | "min-inline-size" => dst.min_width = src.min_width,
+        "max-width" | "max-inline-size" => dst.max_width = src.max_width,
+        "min-height" | "min-block-size" => dst.min_height = src.min_height,
+        "max-height" | "max-block-size" => dst.max_height = src.max_height,
+        "aspect-ratio" => dst.aspect_ratio = src.aspect_ratio,
+        "flex" => {
+            dst.flex_grow = src.flex_grow;
+            dst.flex_shrink = src.flex_shrink;
+            dst.flex_basis = src.flex_basis;
+        }
+        "flex-direction" => dst.flex_direction = src.flex_direction,
+        "flex-wrap" => dst.flex_wrap = src.flex_wrap,
+        "flex-flow" => {
+            dst.flex_direction = src.flex_direction;
+            dst.flex_wrap = src.flex_wrap;
+        }
+        "order" => dst.order = src.order,
+        "flex-grow" => dst.flex_grow = src.flex_grow,
+        "flex-shrink" => dst.flex_shrink = src.flex_shrink,
+        "flex-basis" => dst.flex_basis = src.flex_basis,
+        "justify-content" => dst.justify_content = src.justify_content,
+        "align-items" => dst.align_items = src.align_items,
+        "align-self" => dst.align_self = src.align_self,
+        "align-content" => dst.align_content = src.align_content,
+        "justify-items" => dst.justify_items = src.justify_items,
+        "justify-self" => dst.justify_self = src.justify_self,
+        "place-items" => {
+            dst.align_items = src.align_items;
+            dst.justify_items = src.justify_items;
+        }
+        "place-self" => {
+            dst.align_self = src.align_self;
+            dst.justify_self = src.justify_self;
+        }
+        "place-content" => {
+            dst.align_content = src.align_content;
+            dst.justify_content = src.justify_content;
+        }
+        "grid-template-columns" => {
+            dst.grid_template_columns = src.grid_template_columns;
+            dst.grid_column_count = src.grid_column_count;
+            dst.grid_auto_repeat = src.grid_auto_repeat;
+        }
+        "grid-template-rows" => {
+            dst.grid_template_rows = src.grid_template_rows;
+            dst.grid_row_count = src.grid_row_count;
+        }
+        "grid-template-areas" => dst.grid_template_areas = src.grid_template_areas,
+        "grid-auto-rows" => {
+            dst.grid_auto_rows = src.grid_auto_rows;
+            dst.grid_auto_row_list = src.grid_auto_row_list;
+            dst.grid_auto_row_count = src.grid_auto_row_count;
+        }
+        "grid-auto-columns" => {
+            dst.grid_auto_columns = src.grid_auto_columns;
+            dst.grid_auto_col_count = src.grid_auto_col_count;
+        }
+        "grid-auto-flow" => dst.grid_auto_flow = src.grid_auto_flow,
+        "grid-column" => dst.grid_column = src.grid_column,
+        "grid-column-start" => dst.grid_column.start = src.grid_column.start,
+        "grid-column-end" => dst.grid_column.end = src.grid_column.end,
+        "grid-row" => dst.grid_row = src.grid_row,
+        "grid-row-start" => dst.grid_row.start = src.grid_row.start,
+        "grid-row-end" => dst.grid_row.end = src.grid_row.end,
+        "grid-area" => {
+            dst.grid_row = src.grid_row;
+            dst.grid_column = src.grid_column;
+            dst.grid_area_name = src.grid_area_name;
+        }
+        "row-gap" | "grid-row-gap" => dst.row_gap = src.row_gap,
+        "column-gap" | "grid-column-gap" => dst.column_gap = src.column_gap,
+        "gap" | "grid-gap" => {
+            dst.row_gap = src.row_gap;
+            dst.column_gap = src.column_gap;
+        }
+        "transform" | "translate" | "scale" | "rotate" => dst.transform = src.transform,
+        "transform-origin" => dst.transform_origin = src.transform_origin,
+        "opacity" => dst.opacity = src.opacity,
+        "transition"
+        | "transition-property"
+        | "transition-duration"
+        | "transition-delay"
+        | "transition-timing-function" => dst.transitions = src.transitions,
+        "animation"
+        | "animation-name"
+        | "animation-duration"
+        | "animation-delay"
+        | "animation-iteration-count"
+        | "animation-direction"
+        | "animation-fill-mode"
+        | "animation-timing-function"
+        | "animation-play-state" => dst.animations = src.animations,
+        _ => {}
     }
 }
 
@@ -2662,8 +3354,10 @@ fn apply_declaration(
         "margin-top" => {
             if value.eq_ignore_ascii_case("auto") {
                 style.margin.top = 0.0;
+                style.margin_top_auto = true;
             } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.top = px;
+                style.margin_top_auto = false;
             }
         }
         "margin-right" => {
@@ -2678,8 +3372,10 @@ fn apply_declaration(
         "margin-bottom" => {
             if value.eq_ignore_ascii_case("auto") {
                 style.margin.bottom = 0.0;
+                style.margin_bottom_auto = true;
             } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.bottom = px;
+                style.margin_bottom_auto = false;
             }
         }
         "margin-left" => {
@@ -2909,24 +3605,30 @@ fn apply_declaration(
         }
         "margin-block" => {
             let parts = split_css_tokens(value);
-            let apply_side = |tok: &str| -> Option<f32> {
+            let apply_side = |tok: &str| -> Option<(f32, bool)> {
                 if tok.eq_ignore_ascii_case("auto") {
-                    Some(0.0)
+                    Some((0.0, true))
                 } else {
-                    parse_box_px(tok, style.font_size, root_font_px)
+                    parse_box_px(tok, style.font_size, root_font_px).map(|px| (px, false))
                 }
             };
             match parts.as_slice() {
                 [both] => {
-                    if let Some(px) = apply_side(both) {
+                    if let Some((px, auto)) = apply_side(both) {
                         style.margin.top = px;
                         style.margin.bottom = px;
+                        style.margin_top_auto = auto;
+                        style.margin_bottom_auto = auto;
                     }
                 }
                 [start, end] => {
-                    if let (Some(t), Some(b)) = (apply_side(start), apply_side(end)) {
-                        style.margin.top = t;
-                        style.margin.bottom = b;
+                    if let (Some((t_px, t_auto)), Some((b_px, b_auto))) =
+                        (apply_side(start), apply_side(end))
+                    {
+                        style.margin.top = t_px;
+                        style.margin.bottom = b_px;
+                        style.margin_top_auto = t_auto;
+                        style.margin_bottom_auto = b_auto;
                     }
                 }
                 _ => {}
@@ -2935,15 +3637,19 @@ fn apply_declaration(
         "margin-block-start" => {
             if value.eq_ignore_ascii_case("auto") {
                 style.margin.top = 0.0;
+                style.margin_top_auto = true;
             } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.top = px;
+                style.margin_top_auto = false;
             }
         }
         "margin-block-end" => {
             if value.eq_ignore_ascii_case("auto") {
                 style.margin.bottom = 0.0;
+                style.margin_bottom_auto = true;
             } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
                 style.margin.bottom = px;
+                style.margin_bottom_auto = false;
             }
         }
         "padding-inline" => {
@@ -3199,17 +3905,47 @@ fn apply_declaration(
         }
         "flex-direction" => {
             style.flex_direction = match value.to_ascii_lowercase().as_str() {
-                "column" | "column-reverse" => FlexDirection::Column,
-                "row" | "row-reverse" => FlexDirection::Row,
+                "row" => FlexDirection::Row,
+                "row-reverse" => FlexDirection::RowReverse,
+                "column" => FlexDirection::Column,
+                "column-reverse" => FlexDirection::ColumnReverse,
                 _ => return,
             };
         }
         "flex-wrap" => {
             style.flex_wrap = match value.to_ascii_lowercase().as_str() {
-                "wrap" | "wrap-reverse" => FlexWrap::Wrap,
                 "nowrap" => FlexWrap::NoWrap,
+                "wrap" => FlexWrap::Wrap,
+                "wrap-reverse" => FlexWrap::WrapReverse,
                 _ => return,
             };
+        }
+        "flex-flow" => {
+            let mut dir = None;
+            let mut wrap = None;
+            for tok in split_css_tokens(value) {
+                match tok.to_ascii_lowercase().as_str() {
+                    "row" if dir.is_none() => dir = Some(FlexDirection::Row),
+                    "row-reverse" if dir.is_none() => dir = Some(FlexDirection::RowReverse),
+                    "column" if dir.is_none() => dir = Some(FlexDirection::Column),
+                    "column-reverse" if dir.is_none() => dir = Some(FlexDirection::ColumnReverse),
+                    "nowrap" if wrap.is_none() => wrap = Some(FlexWrap::NoWrap),
+                    "wrap" if wrap.is_none() => wrap = Some(FlexWrap::Wrap),
+                    "wrap-reverse" if wrap.is_none() => wrap = Some(FlexWrap::WrapReverse),
+                    _ => return,
+                }
+            }
+            if let Some(d) = dir {
+                style.flex_direction = d;
+            }
+            if let Some(w) = wrap {
+                style.flex_wrap = w;
+            }
+        }
+        "order" => {
+            if let Ok(ord) = value.parse::<i32>() {
+                style.order = ord;
+            }
         }
         "flex-grow" => {
             if let Ok(grow) = value.parse::<f32>()
@@ -3229,34 +3965,109 @@ fn apply_declaration(
             style.flex_basis = parse_size(value);
         }
         "justify-content" => {
-            style.justify_content = match value.to_ascii_lowercase().as_str() {
-                "flex-start" | "start" | "left" => JustifyContent::Start,
-                "center" => JustifyContent::Center,
-                "flex-end" | "end" | "right" => JustifyContent::End,
-                "space-between" => JustifyContent::SpaceBetween,
-                "space-around" => JustifyContent::SpaceAround,
-                "space-evenly" => JustifyContent::SpaceEvenly,
-                _ => return,
-            };
+            if let Some(jc) = parse_justify_content_keyword(value) {
+                style.justify_content = jc;
+            }
+        }
+        "align-content" => {
+            if let Some(ac) = parse_align_content_keyword(value) {
+                style.align_content = ac;
+            }
         }
         "align-items" => {
-            style.align_items = match value.to_ascii_lowercase().as_str() {
-                "flex-start" | "start" | "baseline" => AlignItems::Start,
-                "center" => AlignItems::Center,
-                "flex-end" | "end" => AlignItems::End,
-                "stretch" => AlignItems::Stretch,
-                _ => return,
-            };
+            if let Some(ai) = parse_align_items_keyword(value) {
+                style.align_items = ai;
+            }
         }
         "align-self" => {
-            style.align_self = match value.to_ascii_lowercase().as_str() {
-                "auto" => None,
-                "flex-start" | "start" | "baseline" => Some(AlignItems::Start),
-                "center" => Some(AlignItems::Center),
-                "flex-end" | "end" => Some(AlignItems::End),
-                "stretch" => Some(AlignItems::Stretch),
-                _ => return,
+            if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("normal") {
+                style.align_self = None;
+            } else if let Some(ai) = parse_align_items_keyword(value) {
+                style.align_self = Some(ai);
+            }
+        }
+        "justify-items" => {
+            if let Some(ji) = parse_align_items_keyword(value) {
+                style.justify_items = ji;
+            }
+        }
+        "justify-self" => {
+            if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("normal") {
+                style.justify_self = None;
+            } else if let Some(js) = parse_align_items_keyword(value) {
+                style.justify_self = Some(js);
+            }
+        }
+        "place-items" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [both] => {
+                    if let Some(ai) = parse_align_items_keyword(both) {
+                        style.align_items = ai;
+                        style.justify_items = ai;
+                    }
+                }
+                [align, justify] => {
+                    if let (Some(ai), Some(ji)) = (
+                        parse_align_items_keyword(align),
+                        parse_align_items_keyword(justify),
+                    ) {
+                        style.align_items = ai;
+                        style.justify_items = ji;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "place-self" => {
+            let parts = split_css_tokens(value);
+            let parse_self = |tok: &str| -> Result<Option<AlignItems>, ()> {
+                if tok.eq_ignore_ascii_case("auto") || tok.eq_ignore_ascii_case("normal") {
+                    Ok(None)
+                } else {
+                    parse_align_items_keyword(tok).map(Some).ok_or(())
+                }
             };
+            match parts.as_slice() {
+                [both] => {
+                    if let Ok(val) = parse_self(both) {
+                        style.align_self = val;
+                        style.justify_self = val;
+                    }
+                }
+                [align, justify] => {
+                    if let (Ok(a), Ok(j)) = (parse_self(align), parse_self(justify)) {
+                        style.align_self = a;
+                        style.justify_self = j;
+                    }
+                }
+                _ => {}
+            }
+        }
+        "place-content" => {
+            let parts = split_css_tokens(value);
+            match parts.as_slice() {
+                [both] => {
+                    if let Some(ac) = parse_align_content_keyword(both) {
+                        style.align_content = ac;
+                        if let Some(jc) = parse_justify_content_keyword(both) {
+                            style.justify_content = jc;
+                        } else if matches!(ac, AlignContent::Stretch) {
+                            style.justify_content = JustifyContent::Start;
+                        }
+                    }
+                }
+                [align, justify] => {
+                    if let (Some(ac), Some(jc)) = (
+                        parse_align_content_keyword(align),
+                        parse_justify_content_keyword(justify),
+                    ) {
+                        style.align_content = ac;
+                        style.justify_content = jc;
+                    }
+                }
+                _ => {}
+            }
         }
         "grid-template-columns" => {
             if value.eq_ignore_ascii_case("none") {
@@ -3274,6 +4085,13 @@ fn apply_declaration(
             } else if let Some((tracks, count, _)) = parse_grid_template(value) {
                 style.grid_template_rows = tracks;
                 style.grid_row_count = count;
+            }
+        }
+        "grid-template-areas" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.grid_template_areas = GridTemplateAreas::NONE;
+            } else if let Some(areas) = parse_grid_template_areas(value) {
+                style.grid_template_areas = areas;
             }
         }
         "grid-column" => {
@@ -3310,12 +4128,38 @@ fn apply_declaration(
             if let Some((row, column)) = parse_grid_area(value) {
                 style.grid_row = row;
                 style.grid_column = column;
+                style.grid_area_name = 0;
+            } else {
+                let trimmed = value.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.contains('/')
+                    && !trimmed.contains(char::is_whitespace)
+                    && !trimmed.eq_ignore_ascii_case("none")
+                    && !trimmed.eq_ignore_ascii_case("span")
+                    && trimmed.parse::<i64>().is_err()
+                {
+                    style.grid_area_name = grid_area_hash(trimmed);
+                    style.grid_row = GridPlacement::default();
+                    style.grid_column = GridPlacement::default();
+                }
             }
         }
         "grid-auto-rows" => {
-            // Only one track is kept. A list such as `10px 20px` is not cycled.
-            if let Some(track) = parse_single_grid_track(value) {
-                style.grid_auto_rows = track;
+            if let Some((tracks, count)) = parse_grid_auto_tracks(value) {
+                style.grid_auto_rows = tracks[0];
+                style.grid_auto_row_list = tracks;
+                style.grid_auto_row_count = count;
+            }
+        }
+        "grid-auto-columns" => {
+            if let Some((tracks, count)) = parse_grid_auto_tracks(value) {
+                style.grid_auto_columns = tracks;
+                style.grid_auto_col_count = count;
+            }
+        }
+        "grid-auto-flow" => {
+            if let Some(flow) = parse_grid_auto_flow(value) {
+                style.grid_auto_flow = flow;
             }
         }
         "row-gap" | "grid-row-gap" => {
@@ -3342,6 +4186,149 @@ fn apply_declaration(
         }
         _ => {}
     }
+}
+
+fn parse_justify_content_keyword(value: &str) -> Option<JustifyContent> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "flex-start" | "start" | "left" | "normal" => Some(JustifyContent::Start),
+        "center" => Some(JustifyContent::Center),
+        "flex-end" | "end" | "right" => Some(JustifyContent::End),
+        "space-between" => Some(JustifyContent::SpaceBetween),
+        "space-around" => Some(JustifyContent::SpaceAround),
+        "space-evenly" => Some(JustifyContent::SpaceEvenly),
+        _ => None,
+    }
+}
+
+fn parse_align_content_keyword(value: &str) -> Option<AlignContent> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "stretch" | "normal" => Some(AlignContent::Stretch),
+        "flex-start" | "start" => Some(AlignContent::Start),
+        "center" => Some(AlignContent::Center),
+        "flex-end" | "end" => Some(AlignContent::End),
+        "space-between" => Some(AlignContent::SpaceBetween),
+        "space-around" => Some(AlignContent::SpaceAround),
+        "space-evenly" => Some(AlignContent::SpaceEvenly),
+        _ => None,
+    }
+}
+
+fn parse_align_items_keyword(value: &str) -> Option<AlignItems> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "flex-start" | "start" | "self-start" | "left" => Some(AlignItems::Start),
+        "center" => Some(AlignItems::Center),
+        "flex-end" | "end" | "self-end" | "right" => Some(AlignItems::End),
+        "stretch" | "normal" => Some(AlignItems::Stretch),
+        "baseline" | "first baseline" | "last baseline" => Some(AlignItems::Baseline),
+        _ => None,
+    }
+}
+
+fn parse_grid_auto_flow(value: &str) -> Option<GridAutoFlow> {
+    let tokens: Vec<String> = value
+        .split_whitespace()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    match tokens.as_slice() {
+        [one] if one == "row" => Some(GridAutoFlow::Row),
+        [one] if one == "column" => Some(GridAutoFlow::Column),
+        [one] if one == "dense" => Some(GridAutoFlow::RowDense),
+        [a, b] if (a == "row" && b == "dense") || (a == "dense" && b == "row") => {
+            Some(GridAutoFlow::RowDense)
+        }
+        [a, b] if (a == "column" && b == "dense") || (a == "dense" && b == "column") => {
+            Some(GridAutoFlow::ColumnDense)
+        }
+        _ => None,
+    }
+}
+
+fn parse_grid_auto_tracks(value: &str) -> Option<([GridTrack; 8], u8)> {
+    let mut tracks = [GridTrack::Auto; 8];
+    let mut count = 0usize;
+    for tok in split_css_tokens(value) {
+        let track = parse_single_grid_track(tok)?;
+        if count < 8 {
+            tracks[count] = track;
+            count += 1;
+        }
+    }
+    (count > 0).then_some((tracks, count as u8))
+}
+
+fn parse_grid_template_areas(value: &str) -> Option<GridTemplateAreas> {
+    let mut rows_vec: Vec<Vec<u32>> = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let mut row_str = String::new();
+            let mut closed = false;
+            for inner in chars.by_ref() {
+                if inner == quote {
+                    closed = true;
+                    break;
+                }
+                row_str.push(inner);
+            }
+            if !closed {
+                return None;
+            }
+            let mut row_cells = Vec::new();
+            for cell in row_str.split_whitespace() {
+                if cell.chars().all(|c| c == '.') {
+                    row_cells.push(0);
+                } else {
+                    row_cells.push(grid_area_hash(cell));
+                }
+            }
+            if row_cells.is_empty() || row_cells.len() > 6 {
+                return None;
+            }
+            rows_vec.push(row_cells);
+            if rows_vec.len() > 6 {
+                return None;
+            }
+        } else if !ch.is_whitespace() {
+            return None;
+        }
+    }
+    if rows_vec.is_empty() {
+        return None;
+    }
+    let cols = rows_vec[0].len();
+    if rows_vec.iter().any(|r| r.len() != cols) {
+        return None;
+    }
+    let mut cells = [[0u32; 6]; 6];
+    for (r_idx, row) in rows_vec.iter().enumerate() {
+        for (c_idx, &hash) in row.iter().enumerate() {
+            cells[r_idx][c_idx] = hash;
+        }
+    }
+    let areas = GridTemplateAreas {
+        rows: rows_vec.len() as u8,
+        cols: cols as u8,
+        cells,
+    };
+    // Validate that every named area forms a single filled rectangle.
+    for r in 0..areas.rows as usize {
+        for c in 0..areas.cols as usize {
+            let h = areas.cells[r][c];
+            if h == 0 {
+                continue;
+            }
+            let (r0, c0, r1, c1) = areas.find_area(h)?;
+            for rr in r0..r1 {
+                for cc in c0..c1 {
+                    if areas.cells[(rr - 1) as usize][(cc - 1) as usize] != h {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(areas)
 }
 
 /// `border: none` and `border: 0` clear the width. Otherwise the first parsed
@@ -3454,7 +4441,8 @@ fn parse_grid_area(value: &str) -> Option<(GridPlacement, GridPlacement)> {
     ))
 }
 
-/// One track: a length, a percentage, `Nfr`, `auto`, or `minmax(min, max)`.
+/// One track: a length, a percentage, `Nfr`, `auto`, `min-content`,
+/// `max-content`, `fit-content(<length>)`, or `minmax(min, max)`.
 /// `None` for anything else, including a flexible minimum such as `minmax(1fr, 2fr)`.
 fn parse_single_grid_track(token: &str) -> Option<GridTrack> {
     let t = token.trim();
@@ -3476,15 +4464,38 @@ fn parse_single_grid_track(token: &str) -> Option<GridTrack> {
         TrackBreadth::Percent(pct) => GridTrack::Percent(pct),
         TrackBreadth::Fr(fr) => GridTrack::Fr(fr),
         TrackBreadth::Auto => GridTrack::Auto,
+        TrackBreadth::MinContent => GridTrack::MinContent,
+        TrackBreadth::MaxContent => GridTrack::MaxContent,
+        TrackBreadth::FitContent(px) => GridTrack::FitContent(px),
     })
 }
 
-/// A single track size: `auto`, `Nfr`, a pixel length, or a percentage.
+/// A single track size: `auto`, `min-content`, `max-content`,
+/// `fit-content(<length>)`, `Nfr`, a pixel length, or a percentage.
 /// Negative sizes are clamped to 0. A flexible size is at least `0.01fr`.
 fn parse_track_breadth(token: &str) -> Option<TrackBreadth> {
     let t = token.trim();
     if t.eq_ignore_ascii_case("auto") {
         return Some(TrackBreadth::Auto);
+    }
+    if t.eq_ignore_ascii_case("min-content") {
+        return Some(TrackBreadth::MinContent);
+    }
+    if t.eq_ignore_ascii_case("max-content") {
+        return Some(TrackBreadth::MaxContent);
+    }
+    let is_fit_content = t
+        .get(..12)
+        .is_some_and(|head| head.eq_ignore_ascii_case("fit-content("));
+    if is_fit_content && t.ends_with(')') && t.len() > 12 {
+        let inner = t[12..t.len() - 1].trim();
+        let px = match parse_length(inner)? {
+            Size::Px(v) if v.is_finite() => v.max(0.0),
+            Size::Em(v) if v.is_finite() => (v * 16.0).max(0.0),
+            Size::Rem(v) if v.is_finite() => (v * 16.0).max(0.0),
+            _ => return None,
+        };
+        return Some(TrackBreadth::FitContent(px));
     }
     if let Some(fr_str) = strip_unit(t, "fr") {
         let fr = fr_str.parse::<f32>().ok()?;
@@ -3996,11 +5007,11 @@ fn apply_margin_shorthand(style: &mut ComputedStyle, value: &str, root_font_px: 
     else {
         return;
     };
-    let (t, (r, r_auto), b, (l, l_auto)) = match parts.as_slice() {
-        &[(all, auto)] => (all, (all, auto), all, (all, auto)),
-        &[(v, _), (h, h_auto)] => (v, (h, h_auto), v, (h, h_auto)),
-        &[(t, _), (h, h_auto), (b, _)] => (t, (h, h_auto), b, (h, h_auto)),
-        &[(t, _), r, (b, _), l] => (t, r, b, l),
+    let ((t, t_auto), (r, r_auto), (b, b_auto), (l, l_auto)) = match parts.as_slice() {
+        &[all] => (all, all, all, all),
+        &[v, h] => (v, h, v, h),
+        &[t, h, b] => (t, h, b, h),
+        &[t, r, b, l] => (t, r, b, l),
         _ => return,
     };
     style.margin = Edge {
@@ -4009,8 +5020,10 @@ fn apply_margin_shorthand(style: &mut ComputedStyle, value: &str, root_font_px: 
         bottom: b,
         left: l,
     };
-    style.margin_left_auto = l_auto;
+    style.margin_top_auto = t_auto;
     style.margin_right_auto = r_auto;
+    style.margin_bottom_auto = b_auto;
+    style.margin_left_auto = l_auto;
 }
 
 fn apply_flex_shorthand(style: &mut ComputedStyle, value: &str) {
@@ -5607,5 +6620,194 @@ mod tests {
             }
         );
         assert_eq!(styles.get(narrow_in_scope).height, Size::Px(50.0));
+    }
+
+    #[test]
+    fn resolves_cascade_layers_important_inversion_and_revert_layer() {
+        let doc = parse_html(
+            "<div id=\"normal\" class=\"btn\"></div>
+             <div id=\"imp\" class=\"btn\"></div>
+             <div id=\"rev\" class=\"btn\"></div>",
+        );
+        let sheet = parse_css(
+            "@layer base, theme, utilities;
+             @layer utilities {
+               #normal { width: 100px; }
+               #imp { height: 90px !important; }
+               #rev { width: 300px; width: revert-layer; }
+             }
+             @layer base {
+               .btn { width: 40px; height: 25px !important; }
+             }
+             @layer theme {
+               #normal { width: 80px; }
+               #imp { height: 50px !important; }
+               #rev { width: 140px; }
+             }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let normal = doc.get_element_by_id("normal").unwrap();
+        let imp = doc.get_element_by_id("imp").unwrap();
+        let rev = doc.get_element_by_id("rev").unwrap();
+
+        // Normal rules: later declared layer (`utilities`) beats earlier (`theme`, `base`).
+        assert_eq!(styles.get(normal).width, Size::Px(100.0));
+        // `!important` rules: earlier declared layer (`base`) beats later (`theme`, `utilities`)
+        // even when `utilities` has higher selector specificity (`#imp` vs `.btn`).
+        assert_eq!(styles.get(imp).height, Size::Px(25.0));
+        // `revert-layer` in `utilities` rolls back to the value from `theme` (140px).
+        assert_eq!(styles.get(rev).width, Size::Px(140.0));
+    }
+
+    #[test]
+    fn resolves_scope_proximity_scope_pseudo_and_registered_properties() {
+        let doc = parse_html(
+            "<div class=\"outer\" id=\"outer_root\">
+               <div class=\"inner\" id=\"inner_root\">
+                 <p id=\"target\">Text</p>
+               </div>
+             </div>",
+        );
+        let sheet = parse_css(
+            "@property --box-gap {
+               syntax: \"<length>\";
+               inherits: false;
+               initial-value: 18px;
+             }
+             @scope (.outer) {
+               :scope { --box-gap: 44px; padding-top: var(--box-gap); }
+               p { width: 100px; }
+             }
+             @scope (.inner) {
+               :scope { padding-bottom: 12px; }
+               p { width: 220px; }
+             }
+             @scope (.outer) {
+               p { width: 999px; margin-top: var(--box-gap); }
+             }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let outer_root = doc.get_element_by_id("outer_root").unwrap();
+        let inner_root = doc.get_element_by_id("inner_root").unwrap();
+        let target = doc.get_element_by_id("target").unwrap();
+
+        // `:scope` matches `.outer` and `.inner` roots respectively.
+        assert_eq!(styles.get(outer_root).padding.top, 44.0);
+        assert_eq!(styles.get(inner_root).padding.bottom, 12.0);
+        // `@scope (.inner)` has 1 ancestor hop to `#target`, beating `@scope (.outer)` (2 hops)
+        // even though the second `@scope (.outer)` rule appears later in source order.
+        assert_eq!(styles.get(target).width, Size::Px(220.0));
+        // `--box-gap` is registered with `inherits: false` and `initial-value: 18px`,
+        // so `#target` does not inherit `44px` from `#outer_root` and falls back to `18px`.
+        assert_eq!(styles.get(target).margin.top, 18.0);
+    }
+
+    #[test]
+    fn resolves_css_wide_keywords_and_all_shorthand() {
+        let doc = parse_html(
+            "<div id=\"parent\" style=\"color: rgb(10, 20, 30); width: 240px\">
+               <h1 id=\"heading\">Title</h1>
+               <p id=\"child\">Body</p>
+               <div id=\"reset_box\">Reset</div>
+             </div>",
+        );
+        let sheet = parse_css(
+            "#heading { font-size: 40px; font-weight: 400; font-size: revert; font-weight: revert; }
+             #child { width: inherit; color: initial; }
+             #reset_box { display: flex; width: 180px; padding: 12px; all: initial; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let heading = doc.get_element_by_id("heading").unwrap();
+        let child = doc.get_element_by_id("child").unwrap();
+        let reset_box = doc.get_element_by_id("reset_box").unwrap();
+
+        // `revert` restores UA `<h1>` defaults (32px, bold 700).
+        assert_eq!(styles.get(heading).font_size, 32.0);
+        assert_eq!(styles.get(heading).font_weight, 700);
+        // `inherit` on non-inherited `width` copies parent's 240px; `initial` on `color` resets to black.
+        assert_eq!(styles.get(child).width, Size::Px(240.0));
+        assert_eq!(styles.get(child).color, Color::BLACK);
+        // `all: initial` resets `display`, `width`, and `padding` to initial values.
+        assert_eq!(styles.get(reset_box).display, Display::Inline);
+        assert_eq!(styles.get(reset_box).width, Size::Auto);
+        assert_eq!(styles.get(reset_box).padding, Edge::zero());
+    }
+
+    #[test]
+    fn parses_complete_flexbox_and_grid_declarations() {
+        let doc =
+            parse_html("<div id=\"flex\"></div><div id=\"grid\"></div><div id=\"item\"></div>");
+        let sheet = parse_css(
+            "#flex {
+               display: flex;
+               flex-flow: column-reverse wrap-reverse;
+               align-content: space-between;
+               align-items: baseline;
+             }
+             #grid {
+               display: grid;
+               grid-template-columns: min-content max-content fit-content(160px);
+               grid-template-areas: \"header header\" \"nav main\";
+               grid-auto-rows: 30px 50px;
+               grid-auto-columns: 70px 90px;
+               grid-auto-flow: row dense;
+               place-items: center end;
+               place-content: space-evenly center;
+             }
+             #item {
+               order: -2;
+               grid-area: main;
+               place-self: end start;
+               margin: auto;
+             }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let flex = styles.get(doc.get_element_by_id("flex").unwrap());
+        let grid = styles.get(doc.get_element_by_id("grid").unwrap());
+        let item = styles.get(doc.get_element_by_id("item").unwrap());
+
+        assert_eq!(flex.flex_direction, FlexDirection::ColumnReverse);
+        assert_eq!(flex.flex_wrap, FlexWrap::WrapReverse);
+        assert_eq!(flex.align_content, AlignContent::SpaceBetween);
+        assert_eq!(flex.align_items, AlignItems::Baseline);
+
+        assert_eq!(
+            grid.grid_tracks(),
+            &[
+                GridTrack::MinContent,
+                GridTrack::MaxContent,
+                GridTrack::FitContent(160.0),
+            ]
+        );
+        assert_eq!(
+            grid.grid_template_areas.find_area(grid_area_hash("header")),
+            Some((1, 1, 2, 3))
+        );
+        assert_eq!(
+            grid.grid_template_areas.find_area(grid_area_hash("main")),
+            Some((2, 2, 3, 3))
+        );
+        assert_eq!(
+            grid.grid_auto_row_tracks(),
+            &[GridTrack::Px(30.0), GridTrack::Px(50.0)]
+        );
+        assert_eq!(
+            grid.grid_auto_column_tracks(),
+            &[GridTrack::Px(70.0), GridTrack::Px(90.0)]
+        );
+        assert_eq!(grid.grid_auto_flow, GridAutoFlow::RowDense);
+        assert_eq!(grid.align_items, AlignItems::Center);
+        assert_eq!(grid.justify_items, AlignItems::End);
+        assert_eq!(grid.align_content, AlignContent::SpaceEvenly);
+        assert_eq!(grid.justify_content, JustifyContent::Center);
+
+        assert_eq!(item.order, -2);
+        assert_eq!(item.grid_area_name, grid_area_hash("main"));
+        assert_eq!(item.align_self, Some(AlignItems::End));
+        assert_eq!(item.justify_self, Some(AlignItems::Start));
+        assert!(item.margin_top_auto);
+        assert!(item.margin_right_auto);
+        assert!(item.margin_bottom_auto);
+        assert!(item.margin_left_auto);
     }
 }

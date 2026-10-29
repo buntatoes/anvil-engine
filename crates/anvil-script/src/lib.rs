@@ -34,8 +34,10 @@
 
 use std::sync::Arc;
 
+pub mod engine_host;
 pub mod wasm;
 
+pub use engine_host::AnvilJsDomHost;
 pub use wasm::{
     MAX_WASM_CALL_DEPTH, MAX_WASM_PAGES, MAX_WASM_STACK, MAX_WASM_STEPS, WASM_MAGIC,
     WASM_PAGE_SIZE, WASM_VERSION, WasmCodeBody, WasmDataSegment, WasmElementSegment, WasmError,
@@ -2583,6 +2585,37 @@ struct ClassDef {
     async_methods: Vec<String>,
 }
 
+struct EngineSession {
+    vm: anvil_js::vm::Vm,
+    host: AnvilJsDomHost,
+}
+
+#[derive(Default)]
+struct EngineSessionOwner {
+    inner: Option<Box<EngineSession>>,
+}
+
+impl Clone for EngineSessionOwner {
+    fn clone(&self) -> Self {
+        Self { inner: None }
+    }
+}
+
+impl PartialEq for EngineSessionOwner {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for EngineSessionOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineSessionOwner")
+            .field("active", &self.inner.is_some())
+            .finish()
+    }
+}
+
 /// Interpreter and C++20 `AnvilVM` runtime state for one page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptRuntime {
@@ -2600,6 +2633,7 @@ pub struct ScriptRuntime {
     vm_initial_dom_seed: Option<String>,
     vm_event_listeners: Vec<(NodeId, String)>,
     vm_event_history: Vec<(u32, String, String)>,
+    engine_session: EngineSessionOwner,
     event_default_prevented: bool,
     timers: Vec<Timer>,
     microtasks: std::collections::VecDeque<Job>,
@@ -2663,6 +2697,7 @@ impl Default for ScriptRuntime {
             vm_initial_dom_seed: None,
             vm_event_listeners: Vec::new(),
             vm_event_history: Vec::new(),
+            engine_session: EngineSessionOwner::default(),
             event_default_prevented: false,
             timers: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
@@ -4771,6 +4806,35 @@ impl ScriptRuntime {
             .any(|(n, ev)| (*n == doc.body() || *n == doc.root()) && ev == &wanted)
     }
 
+    fn has_engine_listener_in_chain(
+        &self,
+        doc: &Document,
+        target: NodeId,
+        event_type: &str,
+    ) -> bool {
+        let Some(session) = self.engine_session.inner.as_ref() else {
+            return false;
+        };
+        let wanted = event_type.to_ascii_lowercase();
+        let mut cursor = Some(target);
+        while let Some(id) = cursor {
+            if session
+                .host
+                .listeners
+                .iter()
+                .any(|(n, ev, _)| *n == id && ev == &wanted)
+            {
+                return true;
+            }
+            cursor = doc.get(id).parent();
+        }
+        session
+            .host
+            .listeners
+            .iter()
+            .any(|(n, ev, _)| (*n == doc.body() || *n == doc.root()) && ev == &wanted)
+    }
+
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
         self.ensure_prelude_loaded(doc);
         self.reset_execution_budget();
@@ -4792,6 +4856,11 @@ impl ScriptRuntime {
         }
         if self.has_vm_listener_in_chain(doc, target, "click")
             && self.dispatch_vm_host_event(doc, target, "click", None, None)
+        {
+            handled = true;
+        }
+        if self.has_engine_listener_in_chain(doc, target, "click")
+            && self.dispatch_engine_host_event(doc, target, "click", None, None)
         {
             handled = true;
         }
@@ -4830,6 +4899,12 @@ impl ScriptRuntime {
         {
             handled = true;
         }
+        if (self.has_engine_listener_in_chain(doc, target, "input")
+            || self.has_engine_listener_in_chain(doc, target, "change"))
+            && self.dispatch_engine_host_event(doc, target, "input", Some(value), None)
+        {
+            handled = true;
+        }
         if handled {
             let _ = self.run_timers(doc);
         }
@@ -4863,6 +4938,11 @@ impl ScriptRuntime {
         {
             handled = true;
         }
+        if self.has_engine_listener_in_chain(doc, form_target, "submit")
+            && self.dispatch_engine_host_event(doc, form_target, "submit", None, None)
+        {
+            handled = true;
+        }
         if handled {
             let _ = self.run_timers(doc);
         }
@@ -4891,6 +4971,11 @@ impl ScriptRuntime {
         }
         if self.has_vm_listener_in_chain(doc, target, "keydown")
             && self.dispatch_vm_host_event(doc, target, "keydown", None, Some(key))
+        {
+            handled = true;
+        }
+        if self.has_engine_listener_in_chain(doc, target, "keydown")
+            && self.dispatch_engine_host_event(doc, target, "keydown", None, Some(key))
         {
             handled = true;
         }
@@ -5137,6 +5222,175 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         true
     }
 
+    /// Compile and execute `source` directly on the `anvil-js` register bytecode VM
+    /// (`anvil_js::vm::Vm`) with live [`AnvilJsDomHost`] bindings against `doc`.
+    ///
+    /// Returns the formatted completion value on success, or the compiler/runtime
+    /// diagnostic message on failure.
+    pub fn eval_with_anvil_js_engine(
+        &mut self,
+        doc: &mut Document,
+        source: &str,
+    ) -> Result<String, String> {
+        let origin_key = self.storage_origin_key();
+        let initial_url = self
+            .page_origin
+            .clone()
+            .unwrap_or_else(|| "https://localhost/".to_string());
+        if self.engine_session.inner.is_none() {
+            let mut vm =
+                anvil_js::vm::Vm::new(anvil_js::Limits::default()).map_err(|e| e.to_string())?;
+            anvil_js::install(&mut vm).map_err(|e| e.to_string())?;
+            let mut host = AnvilJsDomHost::new(Document::new(), &initial_url);
+            host.install(&mut vm).map_err(|e| e.to_string())?;
+            self.engine_session.inner = Some(Box::new(EngineSession { vm, host }));
+        }
+        let local_seed: Vec<(String, String)> = self
+            .local_storage
+            .iter()
+            .filter(|(o, _, _)| o == &origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect();
+        let session_seed: Vec<(String, String)> = self
+            .session_storage
+            .iter()
+            .filter(|(o, _, _)| o == &origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let (run_res, console_lines, local_items, session_items, pending_nav) = {
+            let session = self.engine_session.inner.as_mut().unwrap();
+            std::mem::swap(&mut session.host.doc, doc);
+            session.host.location_href = initial_url;
+            session.host.local_storage = local_seed;
+            session.host.session_storage = session_seed;
+            session.host.console.clear();
+
+            let limits = session.vm.limits().clone();
+            let block = match anvil_js::compile_script(source, &limits) {
+                Ok(b) => b,
+                Err(first_err) => {
+                    if let Ok(lowered) = compile_es2022_with_anvil_js(source, false)
+                        && let Ok(b) = anvil_js::compile_script(&lowered, &limits)
+                    {
+                        b
+                    } else {
+                        std::mem::swap(&mut session.host.doc, doc);
+                        return Err(first_err.to_string());
+                    }
+                }
+            };
+            let res: Result<String, String> = session
+                .vm
+                .load(block)
+                .and_then(|code_id| {
+                    let val = session.vm.run(&mut session.host, code_id)?;
+                    session.vm.drain_jobs(&mut session.host)?;
+                    session.vm.inspect(val)
+                })
+                .map_err(|e| e.to_string());
+
+            std::mem::swap(&mut session.host.doc, doc);
+            let console_lines = std::mem::take(&mut session.host.console);
+            let local_items: Vec<(String, String)> = session.host.local_storage.clone();
+            let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+            let pending_nav = session.host.pending_navigation.take();
+            (res, console_lines, local_items, session_items, pending_nav)
+        };
+
+        for line in console_lines {
+            self.push_console(line);
+        }
+        self.local_storage.retain(|(o, _, _)| o != &origin_key);
+        for (k, v) in local_items {
+            storage_put(&mut self.local_storage, &origin_key, &k, &v);
+        }
+        self.session_storage.retain(|(o, _, _)| o != &origin_key);
+        for (k, v) in session_items {
+            storage_put(&mut self.session_storage, &origin_key, &k, &v);
+        }
+        if let Some(nav) = pending_nav {
+            self.pending_navigation = Some(nav);
+        }
+        if run_res.is_ok() {
+            self.last_script_used_vm = true;
+        }
+        run_res
+    }
+
+    fn dispatch_engine_host_event(
+        &mut self,
+        doc: &mut Document,
+        target: NodeId,
+        event_type: &str,
+        value: Option<&str>,
+        key: Option<&str>,
+    ) -> bool {
+        if self.engine_session.inner.is_none() {
+            return false;
+        }
+        let origin_key = self.storage_origin_key();
+        let local_seed: Vec<(String, String)> = self
+            .local_storage
+            .iter()
+            .filter(|(o, _, _)| o == &origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect();
+        let session_seed: Vec<(String, String)> = self
+            .session_storage
+            .iter()
+            .filter(|(o, _, _)| o == &origin_key)
+            .map(|(_, k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let (handled, default_prevented, console_lines, local_items, session_items, pending_nav) = {
+            let session = self.engine_session.inner.as_mut().unwrap();
+            std::mem::swap(&mut session.host.doc, doc);
+            session.host.local_storage = local_seed;
+            session.host.session_storage = session_seed;
+            session.host.console.clear();
+
+            let handled = session
+                .host
+                .dispatch_event(&mut session.vm, target, event_type, value, key)
+                .unwrap_or(false);
+            let default_prevented = session.host.event_default_prevented;
+
+            std::mem::swap(&mut session.host.doc, doc);
+            let console_lines = std::mem::take(&mut session.host.console);
+            let local_items: Vec<(String, String)> = session.host.local_storage.clone();
+            let session_items: Vec<(String, String)> = session.host.session_storage.clone();
+            let pending_nav = session.host.pending_navigation.take();
+            (
+                handled,
+                default_prevented,
+                console_lines,
+                local_items,
+                session_items,
+                pending_nav,
+            )
+        };
+
+        for line in console_lines {
+            self.push_console(line);
+        }
+        if default_prevented {
+            self.event_default_prevented = true;
+        }
+        self.local_storage.retain(|(o, _, _)| o != &origin_key);
+        for (k, v) in local_items {
+            storage_put(&mut self.local_storage, &origin_key, &k, &v);
+        }
+        self.session_storage.retain(|(o, _, _)| o != &origin_key);
+        for (k, v) in session_items {
+            storage_put(&mut self.session_storage, &origin_key, &k, &v);
+        }
+        if let Some(nav) = pending_nav {
+            self.pending_navigation = Some(nav);
+        }
+        handled
+    }
+
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
         if self.aborted {
             return;
@@ -5213,6 +5467,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if !self.in_rust_eval
             && should_route_dom_script_to_anvil_js(&cleaned)
             && self.eval_with_anvil_js_dom_bridge(doc, cleaned.trim())
+        {
+            return;
+        }
+        if !self.in_rust_eval
+            && should_route_to_anvil_js_engine(&cleaned)
+            && self.eval_with_anvil_js_engine(doc, cleaned.trim()).is_ok()
         {
             return;
         }
@@ -11196,6 +11456,18 @@ fn should_route_dom_script_to_anvil_js(cleaned: &str) -> bool {
         || cleaned.contains("@anvil-vm")
 }
 
+fn should_route_to_anvil_js_engine(cleaned: &str) -> bool {
+    cleaned.contains("\"use anvil-js\"")
+        || cleaned.contains("'use anvil-js'")
+        || cleaned.contains("@anvil-js")
+        || cleaned.contains("Promise.withResolvers")
+        || cleaned.contains("Object.groupBy")
+        || cleaned.contains("Map.groupBy")
+        || cleaned.contains(".toSorted(")
+        || cleaned.contains(".toReversed(")
+        || cleaned.contains(".toSpliced(")
+}
+
 fn extract_event_callback_body(handler_raw: &str) -> String {
     let trimmed = handler_raw.trim();
     if is_identifier(trimmed) {
@@ -14010,5 +14282,127 @@ mod tests {
         assert!(rt.take_pending_navigation().is_none());
         let added = doc.get_element_by_id("added").expect("added span");
         assert_eq!(doc.text_content(added), "complete:1:1:ok");
+    }
+
+    #[test]
+    fn anvil_js_engine_executes_es2024_builtins_promises_and_live_dom_host() {
+        let mut doc = parse_html(
+            "<html><head><title>Old</title></head>
+             <body>
+               <div id=\"root\" data-mode=\"dark\">
+                 <span class=\"item\">b</span>
+                 <span class=\"item\">a</span>
+               </div>
+               <div id=\"out\"></div>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://engine.example.com/app?tab=1#top");
+        rt.local_storage_set("seed", "42");
+
+        let res = rt
+            .eval_with_anvil_js_engine(
+                &mut doc,
+                r#"
+                const root = document.getElementById("root");
+                root.classList.add("ready");
+                root.style.color = "rgb(1, 2, 3)";
+                root.dataset.theme = "obsidian";
+
+                const spans = document.querySelectorAll(".item");
+                const raw = [spans[0].textContent, spans[1].textContent, "c"];
+                const sorted = raw.toSorted();
+                const grouped = Object.groupBy([1, 2, 3, 4], (n) => (n % 2 === 0 ? "even" : "odd"));
+
+                const badge = document.createElement("strong");
+                badge.id = "badge";
+                badge.textContent = sorted.join("-") + ":" + grouped.even.length + ":" + root.dataset.mode + ":" + root.dataset.theme;
+                root.appendChild(badge);
+
+                const { promise, resolve } = Promise.withResolvers();
+                promise.then((msg) => {
+                    document.getElementById("out").textContent = msg + ":" + localStorage.getItem("seed");
+                    localStorage.setItem("saved", "done");
+                });
+                resolve("settled");
+                document.title = "EngineActive";
+                console.log("engine-ok", sorted.length);
+                sorted.join("")
+                "#,
+            )
+            .expect("anvil-js engine should execute script");
+        assert_eq!(res, "abc");
+        assert!(rt.last_script_used_vm());
+        assert_eq!(doc.title(), "EngineActive");
+        assert_eq!(rt.console_logs(), &["engine-ok 3".to_string()]);
+        assert_eq!(rt.local_storage_get("saved"), Some("done"));
+
+        let root_id = doc.get_element_by_id("root").unwrap();
+        assert!(doc.get(root_id).data().has_class("ready"));
+        assert_eq!(doc.get(root_id).data().attr("data-theme"), Some("obsidian"));
+
+        let badge_id = doc.get_element_by_id("badge").unwrap();
+        assert_eq!(doc.text_content(badge_id), "a-b-c:2:dark:obsidian");
+
+        let out_id = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out_id), "settled:42");
+    }
+
+    #[test]
+    fn anvil_js_engine_interactive_events_maintain_closure_state_and_prevent_default() {
+        let mut doc = parse_html(
+            "<html><body>
+               <form id=\"f\">
+                 <input id=\"inp\" value=\"init\" />
+                 <button id=\"btn\" type=\"button\">Click</button>
+               </form>
+               <p id=\"status\">0</p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_script(
+            &mut doc,
+            r#"
+            "use anvil-js";
+            let count = 0;
+            const seen = new Set();
+            const btn = document.getElementById("btn");
+            const inp = document.getElementById("inp");
+            const form = document.getElementById("f");
+            const status = document.getElementById("status");
+
+            btn.addEventListener("click", () => {
+                count = count + 1;
+                status.textContent = "clicks:" + count;
+            });
+            inp.addEventListener("input", (ev) => {
+                seen.add(ev.value);
+                status.textContent = "input:" + inp.value + ":" + seen.size;
+            });
+            form.addEventListener("submit", (ev) => {
+                ev.preventDefault();
+                status.textContent = "submit:" + count + ":" + inp.value;
+            });
+            "#,
+        );
+        assert!(rt.last_script_used_vm());
+
+        let btn = doc.get_element_by_id("btn").unwrap();
+        let inp = doc.get_element_by_id("inp").unwrap();
+        let form = doc.get_element_by_id("f").unwrap();
+        let status = doc.get_element_by_id("status").unwrap();
+
+        assert!(rt.dispatch_click(&mut doc, btn));
+        assert_eq!(doc.text_content(status), "clicks:1");
+
+        assert!(rt.dispatch_click(&mut doc, btn));
+        assert_eq!(doc.text_content(status), "clicks:2");
+
+        assert!(rt.dispatch_input(&mut doc, inp, "alpha"));
+        assert_eq!(doc.text_content(status), "input:alpha:1");
+
+        assert!(rt.dispatch_submit(&mut doc, form));
+        assert!(rt.last_event_default_prevented());
+        assert_eq!(doc.text_content(status), "submit:2:alpha");
     }
 }

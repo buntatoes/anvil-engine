@@ -317,6 +317,7 @@ impl Simple {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Root,
+    Scope,
     Empty,
     FirstChild,
     LastChild,
@@ -399,7 +400,8 @@ fn is_known_vendor_pseudo(lower: &str) -> bool {
 
 fn state_for(name: &str) -> Option<State> {
     let state = match name {
-        "root" | "scope" => State::Root,
+        "root" => State::Root,
+        "scope" => State::Scope,
         "empty" => State::Empty,
         "first-child" => State::FirstChild,
         "last-child" => State::LastChild,
@@ -1458,8 +1460,8 @@ enum Outcome {
     Nowhere,
 }
 
-/// Cache key: selector, compound, node, `:has()` element, walk.
-type MemoKey = (usize, u32, u32, u32, Walk);
+/// Cache key: selector, compound, node, `:has()` element, scope root, walk.
+type MemoKey = (usize, u32, u32, u32, u32, Walk);
 
 /// Matches selectors against one document, caching as it goes.
 ///
@@ -1479,6 +1481,8 @@ pub(crate) struct Matcher<'d> {
     /// The last element asked about and its [`element_bits`]. The cascade
     /// asks about one element for every rule in a row.
     last_bits: Cell<(u32, u64)>,
+    /// Active `@scope` root element, or [`NONE`] when outside `@scope`.
+    scope_root: Cell<u32>,
 }
 
 impl<'d> Matcher<'d> {
@@ -1491,7 +1495,22 @@ impl<'d> Matcher<'d> {
             selected: RefCell::default(),
             default_button: RefCell::default(),
             last_bits: Cell::new((NONE, 0)),
+            scope_root: Cell::new(NONE),
         }
+    }
+
+    pub(crate) fn matches_with_scope(
+        &self,
+        sel: &Selector,
+        node: NodeId,
+        scope_root: Option<NodeId>,
+    ) -> bool {
+        let prev = self.scope_root.get();
+        self.scope_root
+            .set(scope_root.map_or(NONE, |id| id.index() as u32));
+        let res = self.matches(sel, node);
+        self.scope_root.set(prev);
+        res
     }
 
     pub(crate) fn matches(&self, sel: &Selector, node: NodeId) -> bool {
@@ -1697,7 +1716,8 @@ impl<'d> Matcher<'d> {
     /// kept per element, so a long run of siblings is walked once per
     /// selector instead of once per element.
     fn any_earlier(&self, sel: &Selector, idx: usize, start: u32, anchor: u32) -> Outcome {
-        let key = |n: u32| (sel.key(), idx as u32, n, anchor, Walk::Back);
+        let sr = self.scope_root.get();
+        let key = |n: u32| (sel.key(), idx as u32, n, anchor, sr, Walk::Back);
         let mut pending = Vec::new();
         let mut cur = start;
         let mut outcome = Outcome::TryAncestor;
@@ -1825,7 +1845,7 @@ impl<'d> Matcher<'d> {
     // ----- :has() -----
 
     fn has(&self, rel: &Selector, anchor: u32) -> bool {
-        let key = (rel.key(), 0, anchor, NONE, Walk::Has);
+        let key = (rel.key(), 0, anchor, NONE, self.scope_root.get(), Walk::Has);
         if let Some(&known) = self.memo.borrow().get(&key) {
             return known;
         }
@@ -1890,7 +1910,8 @@ impl<'d> Matcher<'d> {
     /// [`Walk::Down`]) match `only`? Each node's answer is kept, so asking
     /// for every element of the tree costs one pass over it.
     fn any_after(&self, rel: &Selector, only: &Compound, start: u32, walk: Walk) -> bool {
-        let key = |n: u32| (rel.key(), 0, n, NONE, walk);
+        let sr = self.scope_root.get();
+        let key = |n: u32| (rel.key(), 0, n, NONE, sr, walk);
         if walk == Walk::Forward {
             let mut pending = Vec::new();
             let mut cur = start;
@@ -2004,6 +2025,17 @@ impl<'d> Matcher<'d> {
                 .get(Self::node_id(n))
                 .parent()
                 .is_some_and(|p| matches!(self.doc.get(p).data(), NodeData::Document)),
+            State::Scope => {
+                let sr = self.scope_root.get();
+                if sr != NONE {
+                    n == sr
+                } else {
+                    self.doc
+                        .get(Self::node_id(n))
+                        .parent()
+                        .is_some_and(|p| matches!(self.doc.get(p).data(), NodeData::Document))
+                }
+            }
             State::Empty => self.doc.children(Self::node_id(n)).iter().all(|&kid| {
                 match self.doc.get(kid).data() {
                     NodeData::Text(text) => text.is_empty(),

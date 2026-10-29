@@ -67,8 +67,9 @@ pub use anvil_dom::NodeId;
 use anvil_dom::{Document, NodeData};
 pub use anvil_image::Image;
 pub use anvil_style::{
-    AlignItems, BoxShadow, BoxSizing, Color, Edge, FlexDirection, FlexWrap, JustifyContent,
-    LinearGradient, Overflow, Position, TextAlign, Visibility, WhiteSpace,
+    AlignContent, AlignItems, BoxShadow, BoxSizing, Color, Edge, FlexDirection, FlexWrap,
+    GridAutoFlow, JustifyContent, LinearGradient, Overflow, Position, TextAlign, Visibility,
+    WhiteSpace,
 };
 use anvil_style::{
     ComputedStyle, Display, GridAutoRepeat, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE,
@@ -1005,7 +1006,12 @@ fn intrinsic_box_width(
                 let cw = intrinsic_box_width(doc, styles, images, cid, containing_width)
                     + cstyle.margin.left
                     + cstyle.margin.right;
-                if style.display == Display::Flex && style.flex_direction == FlexDirection::Row {
+                if style.display == Display::Flex
+                    && matches!(
+                        style.flex_direction,
+                        FlexDirection::Row | FlexDirection::RowReverse
+                    )
+                {
                     child_row_w += cw;
                 } else if cstyle.inline_level {
                     child_row_w += cw;
@@ -1018,6 +1024,85 @@ fn intrinsic_box_width(
     };
     let bw = (raw_content_w.max(0.0) + chrome_h).min(containing_width.max(chrome_h));
     clamp_border_width(style, containing_width, styles, bw)
+}
+
+fn min_content_box_width(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    id: NodeId,
+    containing_width: f32,
+) -> f32 {
+    if let NodeData::Text(t) = doc.get(id).data() {
+        let style = styles.get(id);
+        return t
+            .split_whitespace()
+            .map(|w| measure(w, style.font_size))
+            .fold(0.0_f32, f32::max);
+    }
+    let style = styles.get(id);
+    let chrome_h =
+        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    if let Some(w) = used_length(style.width, Some(containing_width), style, styles) {
+        let bw = match style.box_sizing {
+            BoxSizing::ContentBox => w + chrome_h,
+            BoxSizing::BorderBox => w.max(chrome_h),
+        };
+        return clamp_border_width(style, containing_width, styles, bw);
+    }
+    let data = doc.get(id).data();
+    let tag = data.tag().unwrap_or("");
+    let raw_content_w = if tag == "img" || tag == "video" || tag == "svg" || tag == "canvas" {
+        return intrinsic_box_width(doc, styles, images, id, containing_width);
+    } else if style.white_space == WhiteSpace::Nowrap || style.white_space == WhiteSpace::Pre {
+        measure(doc.text_content(id).trim(), style.font_size)
+    } else {
+        let longest_word = doc
+            .text_content(id)
+            .split_whitespace()
+            .map(|w| measure(w, style.font_size))
+            .fold(0.0_f32, f32::max);
+        let mut child_min_w = 0.0_f32;
+        for &cid in doc.children(id) {
+            if is_skipped(doc, styles, cid) {
+                continue;
+            }
+            if matches!(doc.get(cid).data(), NodeData::Element { .. }) {
+                let cstyle = styles.get(cid);
+                let cw = min_content_box_width(doc, styles, images, cid, containing_width)
+                    + cstyle.margin.left
+                    + cstyle.margin.right;
+                child_min_w = child_min_w.max(cw);
+            }
+        }
+        longest_word.max(child_min_w)
+    };
+    let bw = raw_content_w.max(0.0) + chrome_h;
+    clamp_border_width(style, containing_width, styles, bw)
+}
+
+fn max_content_box_width(
+    doc: &Document,
+    styles: &StyleMap,
+    images: &HashMap<NodeId, Image>,
+    id: NodeId,
+    containing_width: f32,
+) -> f32 {
+    if let NodeData::Text(t) = doc.get(id).data() {
+        let style = styles.get(id);
+        return measure(t.trim(), style.font_size);
+    }
+    let style = styles.get(id);
+    if let Some(w) = used_length(style.width, Some(containing_width), style, styles) {
+        let chrome_h =
+            style.padding.left + style.padding.right + style.border.left + style.border.right;
+        let bw = match style.box_sizing {
+            BoxSizing::ContentBox => w + chrome_h,
+            BoxSizing::BorderBox => w.max(chrome_h),
+        };
+        return clamp_border_width(style, containing_width, styles, bw);
+    }
+    intrinsic_box_width(doc, styles, images, id, f32::MAX)
 }
 
 fn flush_inline_blocks(
@@ -1851,11 +1936,22 @@ enum TrackPlan {
 /// Turn a track into a plan. `basis` is the container content size on this
 /// axis, or `None` when it is not definite. `auto_is_flex` is true for
 /// columns, where `auto` behaves like `1fr`.
-fn plan_track(track: GridTrack, basis: Option<f32>, auto_is_flex: bool) -> TrackPlan {
+fn plan_track(
+    track: GridTrack,
+    basis: Option<f32>,
+    auto_is_flex: bool,
+    min_content_px: f32,
+    max_content_px: f32,
+) -> TrackPlan {
+    let min_c = min_content_px.max(0.0);
+    let max_c = max_content_px.max(min_c);
     let breadth = |b: TrackBreadth| -> Option<f32> {
         match b {
             TrackBreadth::Px(px) => Some(px.max(0.0)),
             TrackBreadth::Percent(pct) => basis.map(|size| (size * pct / 100.0).max(0.0)),
+            TrackBreadth::MinContent => Some(min_c),
+            TrackBreadth::MaxContent => Some(max_c),
+            TrackBreadth::FitContent(limit) => Some(max_c.min(limit.max(min_c))),
             TrackBreadth::Fr(_) | TrackBreadth::Auto => None,
         }
     };
@@ -1878,6 +1974,46 @@ fn plan_track(track: GridTrack, basis: Option<f32>, auto_is_flex: bool) -> Track
             min: 0.0,
         },
         GridTrack::Auto => auto,
+        GridTrack::MinContent => {
+            if auto_is_flex {
+                TrackPlan::Content {
+                    min: min_c,
+                    max: min_c,
+                }
+            } else {
+                TrackPlan::Content {
+                    min: 0.0,
+                    max: f32::INFINITY,
+                }
+            }
+        }
+        GridTrack::MaxContent => {
+            if auto_is_flex {
+                TrackPlan::Content {
+                    min: max_c,
+                    max: max_c,
+                }
+            } else {
+                TrackPlan::Content {
+                    min: 0.0,
+                    max: f32::INFINITY,
+                }
+            }
+        }
+        GridTrack::FitContent(limit) => {
+            if auto_is_flex {
+                let cap = max_c.min(limit.max(min_c));
+                TrackPlan::Grow {
+                    min: min_c,
+                    max: cap.max(min_c),
+                }
+            } else {
+                TrackPlan::Content {
+                    min: 0.0,
+                    max: limit.max(0.0),
+                }
+            }
+        }
         GridTrack::MinMax(min, max) => {
             let min_px = breadth(min);
             match max {
@@ -1893,7 +2029,11 @@ fn plan_track(track: GridTrack, basis: Option<f32>, auto_is_flex: bool) -> Track
                     min: min_px.unwrap_or(0.0),
                     max: f32::INFINITY,
                 },
-                TrackBreadth::Px(_) | TrackBreadth::Percent(_) => {
+                TrackBreadth::Px(_)
+                | TrackBreadth::Percent(_)
+                | TrackBreadth::MinContent
+                | TrackBreadth::MaxContent
+                | TrackBreadth::FitContent(_) => {
                     let max_px = breadth(max);
                     match (min_px, max_px) {
                         (Some(lo), Some(hi)) => TrackPlan::Grow {
@@ -2201,6 +2341,29 @@ impl Occupancy {
         })
     }
 
+    fn fits_in_rows(
+        &self,
+        row: usize,
+        col: usize,
+        row_span: usize,
+        col_span: usize,
+        max_rows: usize,
+    ) -> bool {
+        if row + row_span > max_rows {
+            return false;
+        }
+        (row..row + row_span).all(|r| {
+            self.cells.get(r).is_none_or(|cells| {
+                let end = (col + col_span).min(cells.len());
+                if col >= end {
+                    true
+                } else {
+                    cells[col..end].iter().all(|taken| !taken)
+                }
+            })
+        })
+    }
+
     fn take(&mut self, area: GridArea) {
         if area.col + area.col_span > self.cols {
             let cols = area.col + area.col_span;
@@ -2220,18 +2383,18 @@ impl Occupancy {
     }
 }
 
-/// Place grid items with row-major sparse auto-placement.
-///
-/// Items with a definite row and column go first. Items with only a definite
-/// row go next, each after the ones already put in that row. The rest walk
-/// a cursor left to right and then down, skipping taken cells. An item with
-/// a definite column moves the cursor to that column, to the next row when
-/// the column is behind the cursor. Spans wider than the explicit columns
-/// add implicit columns before anything is placed.
-fn place_grid_items(items: &[(AxisSpan, AxisSpan)], explicit_cols: usize) -> Vec<GridArea> {
+/// Place grid items according to `grid-auto-flow` (`row`, `column`, `row dense`, `column dense`).
+fn place_grid_items(
+    items: &[(AxisSpan, AxisSpan)],
+    explicit_cols: usize,
+    explicit_rows: usize,
+    flow: GridAutoFlow,
+) -> Vec<GridArea> {
     let mut cols = explicit_cols.max(1);
-    for (_, col) in items {
+    let mut rows = explicit_rows.max(1);
+    for (row, col) in items {
         cols = cols.max(col.start.unwrap_or(0) + col.span);
+        rows = rows.max(row.start.unwrap_or(0) + row.span);
     }
     let mut grid = Occupancy {
         cols,
@@ -2252,66 +2415,185 @@ fn place_grid_items(items: &[(AxisSpan, AxisSpan)], explicit_cols: usize) -> Vec
         }
     }
 
-    let mut row_cursor: HashMap<usize, usize> = HashMap::new();
-    for (i, (row, col)) in items.iter().enumerate() {
-        let (Some(r), None) = (row.start, col.start) else {
-            continue;
-        };
-        let mut c = row_cursor.get(&r).copied().unwrap_or(0);
-        while !grid.fits(r, c, row.span, col.span) && c + col.span <= grid.cols {
-            c += 1;
-        }
-        let area = GridArea {
-            row: r,
-            col: c,
-            row_span: row.span,
-            col_span: col.span,
-        };
-        grid.take(area);
-        row_cursor.insert(r, c + col.span);
-        areas[i] = Some(area);
-    }
+    let dense = matches!(flow, GridAutoFlow::RowDense | GridAutoFlow::ColumnDense);
+    let col_major = matches!(flow, GridAutoFlow::Column | GridAutoFlow::ColumnDense);
 
-    let (mut cur_row, mut cur_col) = (0usize, 0usize);
-    for (i, (row, col)) in items.iter().enumerate() {
-        if row.start.is_some() {
-            continue;
-        }
-        let area = if let Some(c) = col.start {
-            if c < cur_col {
-                cur_row += 1;
+    if col_major {
+        let mut col_cursor: HashMap<usize, usize> = HashMap::new();
+        for (i, (row, col)) in items.iter().enumerate() {
+            let (None, Some(c)) = (row.start, col.start) else {
+                continue;
+            };
+            let mut r = if dense {
+                0
+            } else {
+                col_cursor.get(&c).copied().unwrap_or(0)
+            };
+            while !grid.fits_in_rows(r, c, row.span, col.span, rows) && r + row.span <= rows {
+                r += 1;
             }
-            cur_col = c;
-            while !grid.fits(cur_row, c, row.span, col.span) {
-                cur_row += 1;
-            }
-            GridArea {
-                row: cur_row,
+            let area = GridArea {
+                row: r,
                 col: c,
                 row_span: row.span,
                 col_span: col.span,
+            };
+            grid.take(area);
+            col_cursor.insert(c, r + row.span);
+            areas[i] = Some(area);
+        }
+
+        let (mut cur_row, mut cur_col) = (0usize, 0usize);
+        for (i, (row, col)) in items.iter().enumerate() {
+            if col.start.is_some() {
+                continue;
             }
-        } else {
-            loop {
-                if cur_col + col.span > grid.cols {
-                    cur_row += 1;
-                    cur_col = 0;
-                    continue;
+            let area = if let Some(r) = row.start {
+                if dense {
+                    let mut c = 0usize;
+                    while !grid.fits_in_rows(r, c, row.span, col.span, rows) {
+                        c += 1;
+                    }
+                    GridArea {
+                        row: r,
+                        col: c,
+                        row_span: row.span,
+                        col_span: col.span,
+                    }
+                } else {
+                    if r < cur_row {
+                        cur_col += 1;
+                    }
+                    cur_row = r;
+                    while !grid.fits_in_rows(r, cur_col, row.span, col.span, rows) {
+                        cur_col += 1;
+                    }
+                    GridArea {
+                        row: r,
+                        col: cur_col,
+                        row_span: row.span,
+                        col_span: col.span,
+                    }
                 }
-                if grid.fits(cur_row, cur_col, row.span, col.span) {
-                    break;
+            } else {
+                let (mut r, mut c) = if dense {
+                    (0usize, 0usize)
+                } else {
+                    (cur_row, cur_col)
+                };
+                loop {
+                    if r + row.span > rows {
+                        c += 1;
+                        r = 0;
+                        continue;
+                    }
+                    if grid.fits_in_rows(r, c, row.span, col.span, rows) {
+                        break;
+                    }
+                    r += 1;
                 }
-                cur_col += 1;
+                if !dense {
+                    cur_row = r;
+                    cur_col = c;
+                }
+                GridArea {
+                    row: r,
+                    col: c,
+                    row_span: row.span,
+                    col_span: col.span,
+                }
+            };
+            grid.take(area);
+            areas[i] = Some(area);
+        }
+    } else {
+        let mut row_cursor: HashMap<usize, usize> = HashMap::new();
+        for (i, (row, col)) in items.iter().enumerate() {
+            let (Some(r), None) = (row.start, col.start) else {
+                continue;
+            };
+            let mut c = if dense {
+                0
+            } else {
+                row_cursor.get(&r).copied().unwrap_or(0)
+            };
+            while !grid.fits(r, c, row.span, col.span) && c + col.span <= grid.cols {
+                c += 1;
             }
-            GridArea {
-                row: cur_row,
-                col: cur_col,
+            let area = GridArea {
+                row: r,
+                col: c,
                 row_span: row.span,
                 col_span: col.span,
+            };
+            grid.take(area);
+            row_cursor.insert(r, c + col.span);
+            areas[i] = Some(area);
+        }
+
+        let (mut cur_row, mut cur_col) = (0usize, 0usize);
+        for (i, (row, col)) in items.iter().enumerate() {
+            if row.start.is_some() {
+                continue;
             }
-        };
-        grid.take(area);
-        areas[i] = Some(area);
+            let area = if let Some(c) = col.start {
+                if dense {
+                    let mut r = 0usize;
+                    while !grid.fits(r, c, row.span, col.span) {
+                        r += 1;
+                    }
+                    GridArea {
+                        row: r,
+                        col: c,
+                        row_span: row.span,
+                        col_span: col.span,
+                    }
+                } else {
+                    if c < cur_col {
+                        cur_row += 1;
+                    }
+                    cur_col = c;
+                    while !grid.fits(cur_row, c, row.span, col.span) {
+                        cur_row += 1;
+                    }
+                    GridArea {
+                        row: cur_row,
+                        col: c,
+                        row_span: row.span,
+                        col_span: col.span,
+                    }
+                }
+            } else {
+                let (mut r, mut c) = if dense {
+                    (0usize, 0usize)
+                } else {
+                    (cur_row, cur_col)
+                };
+                loop {
+                    if c + col.span > grid.cols {
+                        r += 1;
+                        c = 0;
+                        continue;
+                    }
+                    if grid.fits(r, c, row.span, col.span) {
+                        break;
+                    }
+                    c += 1;
+                }
+                if !dense {
+                    cur_row = r;
+                    cur_col = c;
+                }
+                GridArea {
+                    row: r,
+                    col: c,
+                    row_span: row.span,
+                    col_span: col.span,
+                }
+            };
+            grid.take(area);
+            areas[i] = Some(area);
+        }
     }
     areas
         .into_iter()
@@ -2379,6 +2661,13 @@ fn layout_grid(
             in_flow.push(cid);
         }
     }
+    in_flow.sort_by_key(|&cid| {
+        if matches!(doc.get(cid).data(), NodeData::Text(_)) {
+            0
+        } else {
+            styles.get(cid).order
+        }
+    });
 
     let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
     let raw_cols = style.grid_tracks();
@@ -2415,6 +2704,10 @@ fn layout_grid(
             raw_cols.to_vec()
         };
     let explicit_rows = style.grid_row_tracks();
+    let area_cols = style.grid_template_areas.cols as usize;
+    let area_rows = style.grid_template_areas.rows as usize;
+    let explicit_col_count = explicit_cols.len().max(area_cols).max(1);
+    let explicit_row_count = explicit_rows.len().max(area_rows);
     let spans: Vec<(AxisSpan, AxisSpan)> = in_flow
         .iter()
         .map(|&cid| {
@@ -2428,14 +2721,33 @@ fn layout_grid(
                 return (auto, auto);
             }
             let cstyle = styles.get(cid);
+            if cstyle.grid_area_name != 0
+                && let Some((rs, cs, re, ce)) =
+                    style.grid_template_areas.find_area(cstyle.grid_area_name)
+            {
+                return (
+                    AxisSpan {
+                        start: Some((rs - 1) as usize),
+                        span: (re - rs).max(1) as usize,
+                    },
+                    AxisSpan {
+                        start: Some((cs - 1) as usize),
+                        span: (ce - cs).max(1) as usize,
+                    },
+                );
+            }
             (
-                resolve_axis(cstyle.grid_row, explicit_rows.len()),
-                resolve_axis(cstyle.grid_column, explicit_cols.len()),
+                resolve_axis(cstyle.grid_row, explicit_row_count),
+                resolve_axis(cstyle.grid_column, explicit_cols.len().max(area_cols)),
             )
         })
         .collect();
-    let areas = place_grid_items(&spans, explicit_cols.len());
-    let explicit_col_count = explicit_cols.len().max(1);
+    let areas = place_grid_items(
+        &spans,
+        explicit_col_count,
+        explicit_row_count.max(1),
+        style.grid_auto_flow,
+    );
     let col_count = areas
         .iter()
         .map(|a| a.col + a.col_span)
@@ -2447,27 +2759,113 @@ fn layout_grid(
         .map(|a| a.row + a.row_span)
         .max()
         .unwrap_or(0)
-        .max(explicit_rows.len());
+        .max(explicit_row_count);
+
+    let auto_cols = style.grid_auto_column_tracks();
+    let col_track_at = |i: usize| -> GridTrack {
+        if let Some(&t) = explicit_cols.get(i) {
+            t
+        } else if !auto_cols.is_empty() {
+            auto_cols[(i - explicit_cols.len()) % auto_cols.len()]
+        } else {
+            GridTrack::Auto
+        }
+    };
+    let breadth_is_intrinsic = |b: TrackBreadth| {
+        matches!(
+            b,
+            TrackBreadth::MinContent | TrackBreadth::MaxContent | TrackBreadth::FitContent(_)
+        )
+    };
+    let track_is_intrinsic = |t: GridTrack| match t {
+        GridTrack::MinContent | GridTrack::MaxContent | GridTrack::FitContent(_) => true,
+        GridTrack::MinMax(a, b) => breadth_is_intrinsic(a) || breadth_is_intrinsic(b),
+        _ => false,
+    };
+    let mut col_min_content = vec![0.0_f32; col_count];
+    let mut col_max_content = vec![0.0_f32; col_count];
+    for (&cid, area) in in_flow.iter().zip(&areas) {
+        if area.col_span == 1 && area.col < col_count && track_is_intrinsic(col_track_at(area.col))
+        {
+            let cstyle = styles.get(cid);
+            let h_margin = cstyle.margin.left + cstyle.margin.right;
+            let min_w = min_content_box_width(doc, styles, images, cid, content_width) + h_margin;
+            let max_w = max_content_box_width(doc, styles, images, cid, content_width) + h_margin;
+            col_min_content[area.col] = col_min_content[area.col].max(min_w);
+            col_max_content[area.col] = col_max_content[area.col].max(max_w);
+        }
+    }
 
     let col_plans: Vec<TrackPlan> = (0..col_count)
         .map(|i| {
-            let track = explicit_cols.get(i).copied().unwrap_or(GridTrack::Auto);
-            plan_track(track, Some(content_width), true)
+            let track = col_track_at(i);
+            plan_track(
+                track,
+                Some(content_width),
+                true,
+                col_min_content[i],
+                col_max_content[i],
+            )
         })
         .collect();
     let col_widths = size_tracks(
         &col_plans,
-        &vec![0.0; col_count],
+        &col_max_content,
         &[],
         Some(content_width),
         column_gap,
     );
-    let col_offsets = track_offsets(&col_widths, content_x, column_gap);
+    let base_col_offsets = track_offsets(&col_widths, content_x, column_gap);
+    let used_cols_w = if col_count == 0 {
+        0.0
+    } else {
+        (base_col_offsets[col_count] - content_x).max(0.0)
+    };
+    let free_cols_w = (content_width - used_cols_w).max(0.0);
+    let (col_start_dx, col_step_dx) = if free_cols_w > 0.0 && col_count > 0 {
+        match style.justify_content {
+            JustifyContent::Start => (0.0, 0.0),
+            JustifyContent::Center => (free_cols_w * 0.5, 0.0),
+            JustifyContent::End => (free_cols_w, 0.0),
+            JustifyContent::SpaceBetween if col_count > 1 => {
+                (0.0, free_cols_w / ((col_count - 1) as f32))
+            }
+            JustifyContent::SpaceBetween => (0.0, 0.0),
+            JustifyContent::SpaceAround => {
+                let u = free_cols_w / (col_count as f32);
+                (u * 0.5, u)
+            }
+            JustifyContent::SpaceEvenly => {
+                let u = free_cols_w / ((col_count + 1) as f32);
+                (u, u)
+            }
+        }
+    } else {
+        (0.0, 0.0)
+    };
+    let effective_col_gap = column_gap + col_step_dx;
+    let col_offsets = track_offsets(&col_widths, content_x + col_start_dx, effective_col_gap);
 
-    // Lay each item out at its area width to learn its height.
+    // Lay each item out at its area width (or shrink-to-fit width when aligned) to learn its height.
     let mut boxes = Vec::with_capacity(in_flow.len());
+    let mut item_cb_widths = Vec::with_capacity(in_flow.len());
     for (&cid, area) in in_flow.iter().zip(&areas) {
-        let cell_w = span_size(&col_widths, area.col, area.col_span, column_gap);
+        let cell_w = span_size(&col_widths, area.col, area.col_span, effective_col_gap);
+        let is_text = matches!(doc.get(cid).data(), NodeData::Text(_));
+        let cstyle = styles.get(cid);
+        let item_justify = cstyle.justify_self.unwrap_or(style.justify_items);
+        let has_h_auto = cstyle.margin_left_auto || cstyle.margin_right_auto;
+        let item_cb_w = if !is_text
+            && matches!(cstyle.width, Size::Auto)
+            && (item_justify != AlignItems::Stretch || has_h_auto)
+        {
+            (intrinsic_box_width(doc, styles, images, cid, cell_w)
+                + cstyle.margin.left
+                + cstyle.margin.right)
+                .min(cell_w)
+        } else {
+            cell_w
+        };
         let child_box = layout_node(
             doc,
             styles,
@@ -2476,20 +2874,24 @@ fn layout_grid(
             cid,
             col_offsets[area.col],
             content_y,
-            cell_w,
+            item_cb_w,
             specified_height,
             None,
         );
         boxes.push(child_box);
+        item_cb_widths.push(item_cb_w);
     }
 
-    let row_tracks = explicit_rows;
-    let row_plans: Vec<TrackPlan> = (0..row_count)
-        .map(|i| {
-            let track = row_tracks.get(i).copied().unwrap_or(style.grid_auto_rows);
-            plan_track(track, specified_height, false)
-        })
-        .collect();
+    let auto_rows = style.grid_auto_row_tracks();
+    let row_track_at = |i: usize| -> GridTrack {
+        if let Some(&t) = explicit_rows.get(i) {
+            t
+        } else if !auto_rows.is_empty() {
+            auto_rows[(i - explicit_rows.len()) % auto_rows.len()]
+        } else {
+            style.grid_auto_rows
+        }
+    };
     let mut row_content = vec![0.0_f32; row_count];
     let mut row_spanning = Vec::new();
     for (child_box, area) in boxes.iter().zip(&areas) {
@@ -2501,6 +2903,18 @@ fn layout_grid(
             row_spanning.push((area.row, area.row_span, outer_h));
         }
     }
+    let row_plans: Vec<TrackPlan> = (0..row_count)
+        .map(|i| {
+            let track = row_track_at(i);
+            plan_track(
+                track,
+                specified_height,
+                false,
+                row_content[i],
+                row_content[i],
+            )
+        })
+        .collect();
     row_spanning.sort_by_key(|(_, span, _)| *span);
     let row_heights = size_tracks(
         &row_plans,
@@ -2509,21 +2923,84 @@ fn layout_grid(
         specified_height,
         row_gap,
     );
-    let row_offsets = track_offsets(&row_heights, content_y, row_gap);
+    let base_row_offsets = track_offsets(&row_heights, content_y, row_gap);
+    let base_flow_h = if row_count == 0 {
+        0.0
+    } else {
+        (base_row_offsets[row_count] - content_y).max(0.0)
+    };
+    let free_rows_h = specified_height
+        .map(|sh| (sh - base_flow_h).max(0.0))
+        .unwrap_or(0.0);
+    let (row_start_dy, row_step_dy) = if free_rows_h > 0.0 && row_count > 0 {
+        match style.align_content {
+            AlignContent::Stretch | AlignContent::Start => (0.0, 0.0),
+            AlignContent::Center => (free_rows_h * 0.5, 0.0),
+            AlignContent::End => (free_rows_h, 0.0),
+            AlignContent::SpaceBetween if row_count > 1 => {
+                (0.0, free_rows_h / ((row_count - 1) as f32))
+            }
+            AlignContent::SpaceBetween => (0.0, 0.0),
+            AlignContent::SpaceAround => {
+                let u = free_rows_h / (row_count as f32);
+                (u * 0.5, u)
+            }
+            AlignContent::SpaceEvenly => {
+                let u = free_rows_h / ((row_count + 1) as f32);
+                (u, u)
+            }
+        }
+    } else {
+        (0.0, 0.0)
+    };
+    let effective_row_gap = row_gap + row_step_dy;
+    let row_offsets = track_offsets(&row_heights, content_y + row_start_dy, effective_row_gap);
 
     let mut children = Vec::with_capacity(in_flow.len() + out_of_flow.len());
-    for (mut item_box, area) in boxes.into_iter().zip(&areas) {
+    for ((mut item_box, area), item_cb_w) in boxes.into_iter().zip(&areas).zip(item_cb_widths) {
         let cstyle = styles.get(item_box.node);
-        let area_h = span_size(&row_heights, area.row, area.row_span, row_gap);
+        let cell_w = span_size(&col_widths, area.col, area.col_span, effective_col_gap);
+        let area_h = span_size(&row_heights, area.row, area.row_span, effective_row_gap);
+        let outer_w = cstyle.margin.left + item_box.rect.width + cstyle.margin.right;
         let outer_h = cstyle.margin.top + item_box.rect.height + cstyle.margin.bottom;
-        let dy_in_area = match style.align_items {
-            AlignItems::Start | AlignItems::Stretch => 0.0,
-            AlignItems::Center => ((area_h - outer_h) * 0.5).max(0.0),
-            AlignItems::End => (area_h - outer_h).max(0.0),
+        let free_x = (cell_w - outer_w).max(0.0);
+        let free_y = (area_h - outer_h).max(0.0);
+        let item_justify = cstyle.justify_self.unwrap_or(style.justify_items);
+        let item_align = cstyle.align_self.unwrap_or(style.align_items);
+
+        let already_dx =
+            resolve_border_x(cstyle, 0.0, item_cb_w, item_box.rect.width) - cstyle.margin.left;
+        let dx_in_area = if cstyle.margin_left_auto && cstyle.margin_right_auto {
+            free_x * 0.5
+        } else if cstyle.margin_left_auto {
+            free_x
+        } else if cstyle.margin_right_auto {
+            0.0
+        } else {
+            match item_justify {
+                AlignItems::Center => free_x * 0.5,
+                AlignItems::End => free_x,
+                AlignItems::Start | AlignItems::Stretch | AlignItems::Baseline => 0.0,
+            }
         };
+        let dy_in_area = if cstyle.margin_top_auto && cstyle.margin_bottom_auto {
+            free_y * 0.5
+        } else if cstyle.margin_top_auto {
+            free_y
+        } else if cstyle.margin_bottom_auto {
+            0.0
+        } else {
+            match item_align {
+                AlignItems::Start | AlignItems::Stretch | AlignItems::Baseline => 0.0,
+                AlignItems::Center => free_y * 0.5,
+                AlignItems::End => free_y,
+            }
+        };
+        let dx = dx_in_area - already_dx;
         let dy = row_offsets[area.row] + dy_in_area - content_y;
-        offset_box(&mut item_box, 0.0, dy);
-        if style.align_items == AlignItems::Stretch && matches!(cstyle.height, Size::Auto) {
+        offset_box(&mut item_box, dx, dy);
+        let has_v_auto = cstyle.margin_top_auto || cstyle.margin_bottom_auto;
+        if !has_v_auto && item_align == AlignItems::Stretch && matches!(cstyle.height, Size::Auto) {
             item_box.rect.height =
                 (area_h - cstyle.margin.top - cstyle.margin.bottom).max(item_box.rect.height);
         }
@@ -2583,6 +3060,205 @@ struct FlexItem {
     outer_h: f32,
     grow: f32,
     shrink: f32,
+    min_main: f32,
+    max_main: f32,
+    item_cb_w: f32,
+}
+
+/// First baseline offset of a box relative to its border-box top (`rect.y`).
+fn box_first_baseline(b: &LayoutBox, styles: &StyleMap) -> f32 {
+    if let Some(run) = b.text.first() {
+        return (run.y - b.rect.y) + run.font_size * 0.8;
+    }
+    for child in &b.children {
+        if !child.text.is_empty() || !child.children.is_empty() {
+            return (child.rect.y - b.rect.y) + box_first_baseline(child, styles);
+        }
+    }
+    let cs = styles.get(b.node);
+    let synth = cs.border.top + cs.padding.top + cs.font_size * 0.8;
+    if b.rect.height > 0.0 {
+        synth.min(b.rect.height)
+    } else {
+        synth
+    }
+}
+
+/// Iterative CSS Flexbox flexible length resolution with `min`/`max` clamping freeze loop.
+fn resolve_flexible_lengths(
+    line: &mut [FlexItem],
+    available_main: f32,
+    main_gap: f32,
+    can_shrink: bool,
+    is_row: bool,
+) {
+    if line.is_empty() {
+        return;
+    }
+    let count = line.len();
+    let gaps = if count > 1 {
+        main_gap * ((count - 1) as f32)
+    } else {
+        0.0
+    };
+    let main_size = |it: &FlexItem| {
+        if is_row {
+            it.node_box.rect.width
+        } else {
+            it.node_box.rect.height
+        }
+    };
+    let outer_main = |it: &FlexItem| if is_row { it.outer_w } else { it.outer_h };
+    let set_main = |it: &mut FlexItem, new_main: f32| {
+        if is_row {
+            let margin_h = it.outer_w - it.node_box.rect.width;
+            it.node_box.rect.width = new_main;
+            it.outer_w = new_main + margin_h;
+        } else {
+            let margin_v = it.outer_h - it.node_box.rect.height;
+            it.node_box.rect.height = new_main;
+            it.outer_h = new_main + margin_v;
+        }
+    };
+
+    let base_sizes: Vec<f32> = line.iter().map(main_size).collect();
+    let margins: Vec<f32> = line
+        .iter()
+        .map(|it| outer_main(it) - main_size(it))
+        .collect();
+    let initial_used: f32 = line.iter().map(outer_main).sum::<f32>() + gaps;
+    let growing = available_main > initial_used;
+    let shrinking = can_shrink && available_main < initial_used;
+    if !growing && !shrinking {
+        return;
+    }
+
+    let mut frozen = vec![false; count];
+    for (i, it) in line.iter_mut().enumerate() {
+        if (growing && it.grow <= 0.0) || (shrinking && it.shrink <= 0.0) {
+            let clamped = base_sizes[i].clamp(it.min_main, it.max_main);
+            set_main(it, clamped);
+            frozen[i] = true;
+        }
+    }
+
+    let mut targets = base_sizes.clone();
+    for _ in 0..=count {
+        if frozen.iter().all(|&f| f) {
+            break;
+        }
+        let used_frozen: f32 = line
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| frozen[*i])
+            .map(|(_, it)| outer_main(it))
+            .sum();
+        let unfrozen_base: f32 = (0..count)
+            .filter(|&i| !frozen[i])
+            .map(|i| base_sizes[i] + margins[i])
+            .sum();
+        let remaining_free = available_main - gaps - used_frozen - unfrozen_base;
+
+        if growing {
+            let grow_sum: f32 = line
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !frozen[*i])
+                .map(|(_, it)| it.grow)
+                .sum();
+            if grow_sum <= 0.0 {
+                break;
+            }
+            for i in 0..count {
+                if !frozen[i] {
+                    targets[i] = if remaining_free > 0.0 {
+                        base_sizes[i] + remaining_free * line[i].grow / grow_sum
+                    } else {
+                        base_sizes[i]
+                    };
+                }
+            }
+        } else {
+            let shrink_sum: f32 = line
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !frozen[*i])
+                .map(|(i, it)| it.shrink * base_sizes[i].max(1.0))
+                .sum();
+            if shrink_sum <= 0.0 {
+                break;
+            }
+            let overflow = (-remaining_free).max(0.0);
+            for i in 0..count {
+                if !frozen[i] {
+                    let scaled = line[i].shrink * base_sizes[i].max(1.0);
+                    targets[i] = (base_sizes[i] - overflow * scaled / shrink_sum).max(0.0);
+                }
+            }
+        }
+
+        let mut any_violation = false;
+        for i in 0..count {
+            if !frozen[i] {
+                if targets[i] < line[i].min_main - 0.01 || targets[i] > line[i].max_main + 0.01 {
+                    let clamped = targets[i].clamp(line[i].min_main, line[i].max_main);
+                    set_main(&mut line[i], clamped);
+                    frozen[i] = true;
+                    any_violation = true;
+                }
+            }
+        }
+        if !any_violation {
+            for i in 0..count {
+                if !frozen[i] {
+                    let clamped = targets[i].clamp(line[i].min_main, line[i].max_main);
+                    set_main(&mut line[i], clamped);
+                    frozen[i] = true;
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Compute `(start_offset, step_gap)` for cross-axis multi-line distribution (`align-content`).
+fn distribute_align_content(
+    align: AlignContent,
+    free_cross: f32,
+    base_gap: f32,
+    line_count: usize,
+    wrap_reverse: bool,
+) -> (f32, f32, f32) {
+    if line_count == 0 || free_cross <= 0.0 {
+        return (0.0, base_gap, 0.0);
+    }
+    let effective_align = if wrap_reverse {
+        match align {
+            AlignContent::Start => AlignContent::End,
+            AlignContent::End => AlignContent::Start,
+            other => other,
+        }
+    } else {
+        align
+    };
+    match effective_align {
+        AlignContent::Stretch => (0.0, base_gap, free_cross / (line_count as f32)),
+        AlignContent::Start => (0.0, base_gap, 0.0),
+        AlignContent::Center => (free_cross * 0.5, base_gap, 0.0),
+        AlignContent::End => (free_cross, base_gap, 0.0),
+        AlignContent::SpaceBetween if line_count > 1 => {
+            (0.0, base_gap + free_cross / ((line_count - 1) as f32), 0.0)
+        }
+        AlignContent::SpaceBetween => (0.0, base_gap, 0.0),
+        AlignContent::SpaceAround => {
+            let u = free_cross / (line_count as f32);
+            (u * 0.5, base_gap + u, 0.0)
+        }
+        AlignContent::SpaceEvenly => {
+            let u = free_cross / ((line_count + 1) as f32);
+            (u, base_gap + u, 0.0)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2638,26 +3314,37 @@ fn layout_flex(
             visible_children.push(child);
         }
     }
+    visible_children.sort_by_key(|&cid| {
+        if matches!(doc.get(cid).data(), NodeData::Text(_)) {
+            0
+        } else {
+            styles.get(cid).order
+        }
+    });
     let (row_gap, column_gap) = used_gaps(&style, content_width, specified_height, styles);
+    let wrap = matches!(style.flex_wrap, FlexWrap::Wrap | FlexWrap::WrapReverse);
+    let wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
 
-    if style.flex_direction == FlexDirection::Column {
-        let mut cursor_y = content_y;
-        let mut children = Vec::new();
-        for (idx, child) in visible_children.iter().copied().enumerate() {
-            if idx > 0 {
-                cursor_y += row_gap;
-            }
+    if matches!(
+        style.flex_direction,
+        FlexDirection::Column | FlexDirection::ColumnReverse
+    ) {
+        let is_reverse = style.flex_direction == FlexDirection::ColumnReverse;
+        let mut items = Vec::with_capacity(visible_children.len());
+        for &child in &visible_children {
             let child_style = styles.get(child);
             let item_align = child_style.align_self.unwrap_or(style.align_items);
-            let item_cb_w =
-                if item_align != AlignItems::Stretch && matches!(child_style.width, Size::Auto) {
-                    (intrinsic_box_width(doc, styles, images, child, content_width)
-                        + child_style.margin.left
-                        + child_style.margin.right)
-                        .min(content_width)
-                } else {
-                    content_width
-                };
+            let has_h_auto = child_style.margin_left_auto || child_style.margin_right_auto;
+            let item_cb_w = if matches!(child_style.width, Size::Auto)
+                && (item_align != AlignItems::Stretch || has_h_auto)
+            {
+                (intrinsic_box_width(doc, styles, images, child, content_width)
+                    + child_style.margin.left
+                    + child_style.margin.right)
+                    .min(content_width)
+            } else {
+                content_width
+            };
             let mut child_box = layout_node(
                 doc,
                 styles,
@@ -2665,32 +3352,138 @@ fn layout_flex(
                 focused_input,
                 child,
                 content_x,
-                cursor_y,
+                content_y,
                 item_cb_w,
                 specified_height,
                 None,
             );
-            let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
-            let free_x = (content_width - outer_w).max(0.0);
-            let dx = if child_style.margin_left_auto && child_style.margin_right_auto {
-                free_x * 0.5
-            } else if child_style.margin_left_auto {
-                free_x
-            } else {
-                match item_align {
-                    AlignItems::Center => free_x * 0.5,
-                    AlignItems::End => free_x,
-                    AlignItems::Start | AlignItems::Stretch => 0.0,
-                }
+            let child_chrome_v = child_style.padding.top
+                + child_style.padding.bottom
+                + child_style.border.top
+                + child_style.border.bottom;
+            let to_border_v = |len: f32| match child_style.box_sizing {
+                BoxSizing::ContentBox => (len + child_chrome_v).max(0.0),
+                BoxSizing::BorderBox => len.max(child_chrome_v),
             };
-            if dx != 0.0 {
-                offset_box(&mut child_box, dx, 0.0);
+            let min_main = used_length(
+                child_style.min_height,
+                specified_height,
+                child_style,
+                styles,
+            )
+            .map(to_border_v)
+            .unwrap_or(0.0);
+            let max_main = used_length(
+                child_style.max_height,
+                specified_height,
+                child_style,
+                styles,
+            )
+            .map(to_border_v)
+            .unwrap_or(f32::INFINITY)
+            .max(min_main);
+            if !matches!(child_style.flex_basis, Size::Auto)
+                && let Some(basis_px) = used_length(
+                    child_style.flex_basis,
+                    specified_height,
+                    child_style,
+                    styles,
+                )
+            {
+                child_box.rect.height = to_border_v(basis_px).clamp(min_main, max_main);
+            } else {
+                child_box.rect.height = child_box.rect.height.clamp(min_main, max_main);
             }
-            cursor_y += child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
-            children.push(child_box);
+            let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
+            let outer_h =
+                child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
+            items.push(FlexItem {
+                node_box: child_box,
+                outer_w,
+                outer_h,
+                grow: child_style.flex_grow,
+                shrink: child_style.flex_shrink,
+                min_main,
+                max_main,
+                item_cb_w,
+            });
         }
-        let mut flow_height = (cursor_y - content_y).max(0.0);
-        let mut target_h = specified_height.unwrap_or(flow_height);
+
+        let max_col_h = specified_height.or_else(|| {
+            used_length(style.max_height, containing_height, &style, styles).map(|mh| {
+                match style.box_sizing {
+                    BoxSizing::ContentBox => mh.max(0.0),
+                    BoxSizing::BorderBox => (mh - chrome_v).max(0.0),
+                }
+            })
+        });
+        let mut lines: Vec<Vec<FlexItem>> = Vec::new();
+        let mut current: Vec<FlexItem> = Vec::new();
+        let mut col_h = 0.0_f32;
+        for item in items {
+            let gap = if current.is_empty() { 0.0 } else { row_gap };
+            if wrap
+                && let Some(limit_h) = max_col_h
+                && !current.is_empty()
+                && col_h + gap + item.outer_h > limit_h
+            {
+                lines.push(std::mem::take(&mut current));
+                col_h = 0.0;
+            }
+            let gap = if current.is_empty() { 0.0 } else { row_gap };
+            col_h += gap + item.outer_h;
+            current.push(item);
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+        if wrap_reverse && lines.len() > 1 {
+            lines.reverse();
+        }
+
+        let line_count = lines.len();
+        let mut line_widths: Vec<f32> = if line_count == 1 {
+            vec![content_width]
+        } else {
+            lines
+                .iter()
+                .map(|line| line.iter().map(|it| it.outer_w).fold(0.0_f32, f32::max))
+                .collect()
+        };
+        let cross_gaps = if line_count > 1 {
+            column_gap * ((line_count - 1) as f32)
+        } else {
+            0.0
+        };
+        let total_line_w: f32 = line_widths.iter().sum::<f32>() + cross_gaps;
+        let free_cross_x = (content_width - total_line_w).max(0.0);
+        let (start_cross_x, step_cross_gap, stretch_extra_w) = distribute_align_content(
+            style.align_content,
+            free_cross_x,
+            column_gap,
+            line_count,
+            wrap_reverse,
+        );
+        if stretch_extra_w > 0.0 && line_count > 1 {
+            for lw in &mut line_widths {
+                *lw += stretch_extra_w;
+            }
+        }
+
+        let mut max_flow_height = 0.0_f32;
+        for line in &lines {
+            let gaps = if line.len() > 1 {
+                row_gap * ((line.len() - 1) as f32)
+            } else {
+                0.0
+            };
+            let h: f32 = line.iter().map(|it| it.outer_h).sum::<f32>() + gaps;
+            max_flow_height = max_flow_height.max(h);
+        }
+        let mut target_h = specified_height.unwrap_or(max_flow_height);
         if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
             let min_content_h = match style.box_sizing {
                 BoxSizing::ContentBox => min_h.max(0.0),
@@ -2705,53 +3498,132 @@ fn layout_flex(
             };
             target_h = target_h.min(max_content_h);
         }
-        let free_y = (target_h - flow_height).max(0.0);
-        if free_y > 0.0 && !children.is_empty() {
-            let grow_sum: f32 = children.iter().map(|b| styles.get(b.node).flex_grow).sum();
-            if grow_sum > 0.0 {
-                let mut accumulated_dy = 0.0_f32;
-                for b in &mut children {
-                    if accumulated_dy != 0.0 {
-                        offset_box(b, 0.0, accumulated_dy);
-                    }
-                    let g = styles.get(b.node).flex_grow;
-                    if g > 0.0 {
-                        let extra = free_y * g / grow_sum;
-                        b.rect.height += extra;
-                        accumulated_dy += extra;
-                    }
-                }
-                flow_height += accumulated_dy;
+
+        let can_shrink_v = specified_height.is_some() || !matches!(style.max_height, Size::Auto);
+        let mut children = Vec::new();
+        let mut col_x = content_x + start_cross_x;
+        let mut actual_max_h = 0.0_f32;
+
+        for (line_idx, line) in lines.iter_mut().enumerate() {
+            let col_w = line_widths[line_idx];
+            resolve_flexible_lengths(line, target_h, row_gap, can_shrink_v, false);
+            if is_reverse {
+                line.reverse();
+            }
+            let count = line.len();
+            let gaps = if count > 1 {
+                row_gap * ((count - 1) as f32)
             } else {
-                let count = children.len();
-                let (start_dy, step_dy) = match style.justify_content {
-                    JustifyContent::Start => (0.0, 0.0),
-                    JustifyContent::Center => (free_y * 0.5, 0.0),
-                    JustifyContent::End => (free_y, 0.0),
+                0.0
+            };
+            let used_h: f32 = line.iter().map(|it| it.outer_h).sum();
+            let free_y = (target_h - used_h - gaps).max(0.0);
+            let auto_v_margins: usize = line
+                .iter()
+                .map(|it| {
+                    let cs = styles.get(it.node_box.node);
+                    usize::from(cs.margin_top_auto) + usize::from(cs.margin_bottom_auto)
+                })
+                .sum();
+            let auto_v_px = if auto_v_margins > 0 {
+                free_y / (auto_v_margins as f32)
+            } else {
+                0.0
+            };
+            let effective_justify = if is_reverse {
+                match style.justify_content {
+                    JustifyContent::Start => JustifyContent::End,
+                    JustifyContent::End => JustifyContent::Start,
+                    other => other,
+                }
+            } else {
+                style.justify_content
+            };
+            let (mut cursor_y, step_y) = if auto_v_margins > 0 {
+                (content_y, row_gap)
+            } else {
+                match effective_justify {
+                    JustifyContent::Start => (content_y, row_gap),
+                    JustifyContent::Center => (content_y + free_y * 0.5, row_gap),
+                    JustifyContent::End => (content_y + free_y, row_gap),
                     JustifyContent::SpaceBetween if count > 1 => {
-                        (0.0, free_y / ((count - 1) as f32))
+                        (content_y, row_gap + free_y / ((count - 1) as f32))
                     }
-                    JustifyContent::SpaceBetween => (0.0, 0.0),
-                    JustifyContent::SpaceAround => {
+                    JustifyContent::SpaceBetween => (content_y, row_gap),
+                    JustifyContent::SpaceAround if count > 0 => {
                         let u = free_y / (count as f32);
-                        (u * 0.5, u)
+                        (content_y + u * 0.5, row_gap + u)
                     }
-                    JustifyContent::SpaceEvenly => {
+                    JustifyContent::SpaceAround => (content_y, row_gap),
+                    JustifyContent::SpaceEvenly if count > 0 => {
                         let u = free_y / ((count + 1) as f32);
-                        (u, u)
+                        (content_y + u, row_gap + u)
+                    }
+                    JustifyContent::SpaceEvenly => (content_y, row_gap),
+                }
+            };
+
+            for item in line.iter_mut() {
+                let child_style = styles.get(item.node_box.node);
+                let item_align = child_style.align_self.unwrap_or(style.align_items);
+                let has_h_auto = child_style.margin_left_auto || child_style.margin_right_auto;
+                if !has_h_auto
+                    && item_align == AlignItems::Stretch
+                    && matches!(child_style.width, Size::Auto)
+                {
+                    item.node_box.rect.width =
+                        (col_w - child_style.margin.left - child_style.margin.right).max(0.0);
+                    item.outer_w = child_style.margin.left
+                        + item.node_box.rect.width
+                        + child_style.margin.right;
+                }
+                let free_x = (col_w - item.outer_w).max(0.0);
+                let dx_in_col = if child_style.margin_left_auto && child_style.margin_right_auto {
+                    free_x * 0.5
+                } else if child_style.margin_left_auto {
+                    free_x
+                } else if child_style.margin_right_auto {
+                    0.0
+                } else {
+                    match item_align {
+                        AlignItems::Center => free_x * 0.5,
+                        AlignItems::End => free_x,
+                        AlignItems::Start | AlignItems::Stretch | AlignItems::Baseline => 0.0,
                     }
                 };
-                if start_dy != 0.0 || step_dy != 0.0 {
-                    for (idx, b) in children.iter_mut().enumerate() {
-                        offset_box(b, 0.0, start_dy + step_dy * (idx as f32));
-                    }
-                }
+                let already_dx =
+                    resolve_border_x(child_style, 0.0, item.item_cb_w, item.node_box.rect.width)
+                        - child_style.margin.left;
+                let mt = child_style.margin.top
+                    + if child_style.margin_top_auto {
+                        auto_v_px
+                    } else {
+                        0.0
+                    };
+                let mb = child_style.margin.bottom
+                    + if child_style.margin_bottom_auto {
+                        auto_v_px
+                    } else {
+                        0.0
+                    };
+                let target_x = col_x + child_style.margin.left + dx_in_col;
+                let target_y = cursor_y + mt;
+                let dx = target_x - (item.node_box.rect.x - already_dx);
+                let dy = target_y - item.node_box.rect.y;
+                offset_box(&mut item.node_box, dx, dy);
+                cursor_y += mt + item.node_box.rect.height + mb + step_y;
+            }
+            actual_max_h = actual_max_h.max(used_h + gaps);
+            col_x += col_w + step_cross_gap;
+            for item in line.drain(..) {
+                children.push(item.node_box);
             }
         }
+
         let content_height = if specified_height.is_some() {
             target_h
         } else {
-            target_h.max(flow_height)
+            target_h.max(actual_max_h)
         };
         let parent_rect = Rect {
             x: border_x,
@@ -2791,6 +3663,7 @@ fn layout_flex(
         };
     }
 
+    let is_reverse = style.flex_direction == FlexDirection::RowReverse;
     let mut items = Vec::new();
     for child in &visible_children {
         let child_style = styles.get(*child);
@@ -2867,17 +3740,35 @@ fn layout_flex(
             specified_height,
             None,
         );
+        let chrome_h = child_style.padding.left
+            + child_style.padding.right
+            + child_style.border.left
+            + child_style.border.right;
+        let to_border = |len: f32| match child_style.box_sizing {
+            BoxSizing::ContentBox => (len + chrome_h).max(0.0),
+            BoxSizing::BorderBox => len.max(chrome_h),
+        };
+        let min_main = used_length(
+            child_style.min_width,
+            Some(content_width),
+            child_style,
+            styles,
+        )
+        .map(to_border)
+        .unwrap_or(0.0);
+        let max_main = used_length(
+            child_style.max_width,
+            Some(content_width),
+            child_style,
+            styles,
+        )
+        .map(to_border)
+        .unwrap_or(f32::INFINITY)
+        .max(min_main);
         if let Some(basis_px) = explicit_basis
             && matches!(child_style.width, Size::Auto)
         {
-            let chrome_h = child_style.padding.left
-                + child_style.padding.right
-                + child_style.border.left
-                + child_style.border.right;
-            let bw = match child_style.box_sizing {
-                BoxSizing::ContentBox => basis_px + chrome_h,
-                BoxSizing::BorderBox => basis_px.max(chrome_h),
-            };
+            let bw = to_border(basis_px);
             child_box.rect.width = clamp_border_width(child_style, content_width, styles, bw);
         }
         let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
@@ -2888,10 +3779,12 @@ fn layout_flex(
             outer_h,
             grow: child_style.flex_grow,
             shrink: child_style.flex_shrink,
+            min_main,
+            max_main,
+            item_cb_w: item_containing,
         });
     }
 
-    let wrap = style.flex_wrap == FlexWrap::Wrap;
     let mut lines: Vec<Vec<FlexItem>> = Vec::new();
     let mut current: Vec<FlexItem> = Vec::new();
     let mut line_width = 0.0_f32;
@@ -2911,14 +3804,83 @@ fn layout_flex(
     if lines.is_empty() {
         lines.push(Vec::new());
     }
+    if wrap_reverse && lines.len() > 1 {
+        lines.reverse();
+    }
+
+    let line_count = lines.len();
+    let mut line_heights = Vec::with_capacity(line_count);
+    let mut line_baselines = Vec::with_capacity(line_count);
+    for line in &mut lines {
+        let can_shrink = !wrap || line.len() == 1;
+        resolve_flexible_lengths(line, content_width, column_gap, can_shrink, true);
+        if is_reverse {
+            line.reverse();
+        }
+        let mut max_asc = 0.0_f32;
+        let mut max_desc = 0.0_f32;
+        let mut has_baseline = false;
+        for item in line.iter() {
+            let cs = styles.get(item.node_box.node);
+            let item_align = cs.align_self.unwrap_or(style.align_items);
+            if item_align == AlignItems::Baseline && !cs.margin_top_auto && !cs.margin_bottom_auto {
+                let asc = cs.margin.top + box_first_baseline(&item.node_box, styles);
+                let desc = (item.outer_h - asc).max(0.0);
+                max_asc = max_asc.max(asc);
+                max_desc = max_desc.max(desc);
+                has_baseline = true;
+            }
+        }
+        let base_h = if has_baseline {
+            max_asc + max_desc
+        } else {
+            0.0
+        };
+        let lh = line.iter().map(|item| item.outer_h).fold(base_h, f32::max);
+        line_heights.push(lh);
+        line_baselines.push(max_asc);
+    }
+
+    let cross_gaps = if line_count > 1 {
+        row_gap * ((line_count - 1) as f32)
+    } else {
+        0.0
+    };
+    let base_lines_cross: f32 = line_heights.iter().sum::<f32>() + cross_gaps;
+    let mut target_cross_h = specified_height.unwrap_or(base_lines_cross);
+    if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
+        let min_content_h = match style.box_sizing {
+            BoxSizing::ContentBox => min_h.max(0.0),
+            BoxSizing::BorderBox => (min_h - chrome_v).max(0.0),
+        };
+        target_cross_h = target_cross_h.max(min_content_h);
+    }
+    if let Some(max_h) = used_length(style.max_height, containing_height, &style, styles) {
+        let max_content_h = match style.box_sizing {
+            BoxSizing::ContentBox => max_h.max(0.0),
+            BoxSizing::BorderBox => (max_h - chrome_v).max(0.0),
+        };
+        target_cross_h = target_cross_h.min(max_content_h);
+    }
+    let free_cross_y = (target_cross_h - base_lines_cross).max(0.0);
+    let (start_cross_y, step_row_gap, stretch_extra_h) = distribute_align_content(
+        style.align_content,
+        free_cross_y,
+        row_gap,
+        line_count,
+        wrap_reverse,
+    );
+    if stretch_extra_h > 0.0 {
+        for lh in &mut line_heights {
+            *lh += stretch_extra_h;
+        }
+    }
 
     let mut children = Vec::new();
-    let mut cursor_y = content_y;
-    let mut lines_cross = 0.0_f32;
+    let mut cursor_y = content_y + start_cross_y;
     for (line_index, line) in lines.iter_mut().enumerate() {
         if line_index > 0 {
-            cursor_y += row_gap;
-            lines_cross += row_gap;
+            cursor_y += step_row_gap;
         }
         let count = line.len();
         let gaps = if count > 1 {
@@ -2926,36 +3888,6 @@ fn layout_flex(
         } else {
             0.0
         };
-        let used: f32 = line.iter().map(|item| item.outer_w).sum();
-        let raw_free = content_width - used - gaps;
-        if raw_free > 0.0 {
-            let grow_sum: f32 = line.iter().map(|item| item.grow).sum();
-            if grow_sum > 0.0 {
-                for item in line.iter_mut() {
-                    if item.grow > 0.0 {
-                        let extra = raw_free * item.grow / grow_sum;
-                        item.node_box.rect.width += extra;
-                        item.outer_w += extra;
-                    }
-                }
-            }
-        } else if !wrap && raw_free < 0.0 {
-            let overflow = -raw_free;
-            let shrink_sum: f32 = line
-                .iter()
-                .map(|item| item.shrink * item.node_box.rect.width.max(1.0))
-                .sum();
-            if shrink_sum > 0.0 {
-                for item in line.iter_mut() {
-                    if item.shrink > 0.0 {
-                        let weight = item.shrink * item.node_box.rect.width.max(1.0);
-                        let delta = (overflow * weight / shrink_sum).min(item.node_box.rect.width);
-                        item.node_box.rect.width -= delta;
-                        item.outer_w -= delta;
-                    }
-                }
-            }
-        }
         let used_after: f32 = line.iter().map(|item| item.outer_w).sum();
         let free_after = (content_width - used_after - gaps).max(0.0);
         let auto_margins: usize = line
@@ -2970,10 +3902,19 @@ fn layout_flex(
         } else {
             0.0
         };
+        let effective_justify = if is_reverse {
+            match style.justify_content {
+                JustifyContent::Start => JustifyContent::End,
+                JustifyContent::End => JustifyContent::Start,
+                other => other,
+            }
+        } else {
+            style.justify_content
+        };
         let (mut cursor_x, step_gap) = if auto_margins > 0 {
             (content_x, column_gap)
         } else {
-            match style.justify_content {
+            match effective_justify {
                 JustifyContent::Start => (content_x, column_gap),
                 JustifyContent::Center => (content_x + free_after * 0.5, column_gap),
                 JustifyContent::End => (content_x + free_after, column_gap),
@@ -2993,14 +3934,30 @@ fn layout_flex(
                 JustifyContent::SpaceEvenly => (content_x, column_gap),
             }
         };
-        let line_height = line.iter().map(|item| item.outer_h).fold(0.0_f32, f32::max);
+        let line_height = line_heights[line_index];
+        let line_baseline = line_baselines[line_index];
         for item in line.iter_mut() {
             let child_style = styles.get(item.node_box.node);
             let item_align = child_style.align_self.unwrap_or(style.align_items);
-            let y_offset = match item_align {
-                AlignItems::Start | AlignItems::Stretch => 0.0,
-                AlignItems::Center => ((line_height - item.outer_h) * 0.5).max(0.0),
-                AlignItems::End => (line_height - item.outer_h).max(0.0),
+            let free_item_y = (line_height - item.outer_h).max(0.0);
+            let has_v_auto = child_style.margin_top_auto || child_style.margin_bottom_auto;
+            let y_offset = if child_style.margin_top_auto && child_style.margin_bottom_auto {
+                free_item_y * 0.5
+            } else if child_style.margin_top_auto {
+                free_item_y
+            } else if child_style.margin_bottom_auto {
+                0.0
+            } else {
+                match item_align {
+                    AlignItems::Start | AlignItems::Stretch => 0.0,
+                    AlignItems::Center => free_item_y * 0.5,
+                    AlignItems::End => free_item_y,
+                    AlignItems::Baseline => {
+                        let asc =
+                            child_style.margin.top + box_first_baseline(&item.node_box, styles);
+                        (line_baseline - asc).max(0.0)
+                    }
+                }
             };
             let ml = child_style.margin.left
                 + if child_style.margin_left_auto {
@@ -3017,35 +3974,23 @@ fn layout_flex(
             let dx = (cursor_x + ml) - item.node_box.rect.x;
             let dy = (cursor_y + y_offset + child_style.margin.top) - item.node_box.rect.y;
             offset_box(&mut item.node_box, dx, dy);
-            if item_align == AlignItems::Stretch && matches!(child_style.height, Size::Auto) {
+            if !has_v_auto
+                && item_align == AlignItems::Stretch
+                && matches!(child_style.height, Size::Auto)
+            {
                 item.node_box.rect.height =
                     (line_height - child_style.margin.top - child_style.margin.bottom)
                         .max(item.node_box.rect.height);
             }
             cursor_x += ml + item.node_box.rect.width + mr + step_gap;
         }
-        lines_cross += line_height;
         cursor_y += line_height;
         for item in line.drain(..) {
             children.push(item.node_box);
         }
     }
 
-    let mut content_height = specified_height.unwrap_or(lines_cross);
-    if let Some(min_h) = used_length(style.min_height, containing_height, &style, styles) {
-        let min_content_h = match style.box_sizing {
-            BoxSizing::ContentBox => min_h.max(0.0),
-            BoxSizing::BorderBox => (min_h - chrome_v).max(0.0),
-        };
-        content_height = content_height.max(min_content_h);
-    }
-    if let Some(max_h) = used_length(style.max_height, containing_height, &style, styles) {
-        let max_content_h = match style.box_sizing {
-            BoxSizing::ContentBox => max_h.max(0.0),
-            BoxSizing::BorderBox => (max_h - chrome_v).max(0.0),
-        };
-        content_height = content_height.min(max_content_h);
-    }
+    let content_height = target_cross_h;
     let parent_rect = Rect {
         x: border_x,
         y: border_y,
@@ -4593,5 +5538,197 @@ mod tests {
         );
         let joined: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(joined, vec!["Alpha line", "Beta line"]);
+    }
+
+    #[test]
+    fn lays_out_flex_directions_wrap_reverse_order_freeze_loop_align_content_and_baseline() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #rr { display: flex; flex-direction: row-reverse; width: 200px; }
+                #rr div { height: 20px; }
+                #r1 { width: 40px; order: 2; }
+                #r2 { width: 60px; order: 1; }
+                #freeze { display: flex; width: 300px; }
+                #f1 { width: 200px; min-width: 170px; flex-shrink: 1; height: 20px; }
+                #f2 { width: 200px; flex-shrink: 1; height: 20px; }
+                #wraprev { display: flex; flex-flow: row wrap-reverse; align-content: space-between; width: 100px; height: 100px; }
+                #wraprev div { width: 60px; height: 20px; }
+                #base { display: flex; align-items: baseline; width: 200px; }
+                #b_big { font-size: 30px; width: 60px; height: 40px; }
+                #b_small { font-size: 10px; width: 60px; height: 20px; }
+                #colrev { display: flex; flex-direction: column-reverse; width: 100px; height: 100px; }
+                #c1 { width: 50px; height: 20px; }
+                #c2 { width: 50px; height: 30px; margin-top: auto; }
+             </style>
+             <div id=\"rr\"><div id=\"r1\"></div><div id=\"r2\"></div></div>
+             <div id=\"freeze\"><div id=\"f1\"></div><div id=\"f2\"></div></div>
+             <div id=\"wraprev\"><div id=\"w1\"></div><div id=\"w2\"></div></div>
+             <div id=\"base\"><div id=\"b_big\">Big</div><div id=\"b_small\">Sm</div></div>
+             <div id=\"colrev\"><div id=\"c1\"></div><div id=\"c2\"></div></div>",
+            400.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+
+        // #r2 has order 1, #r1 has order 2; in row-reverse, #r2 is at the right edge (140..200) and #r1 is left of it (100..140).
+        assert_eq!((r("r2").x, r("r2").width), (140.0, 60.0));
+        assert_eq!((r("r1").x, r("r1").width), (100.0, 40.0));
+
+        // Freeze loop: #f1 clamps at min-width 170px, #f2 shrinks from 200px to 130px.
+        assert_eq!(r("f1").width, 170.0);
+        assert_eq!(r("f2").width, 130.0);
+        assert_eq!(r("f2").x, 170.0);
+
+        // wrap-reverse + align-content: space-between in 100px height -> line 1 (w1) at bottom (+80), line 2 (w2) at top (+0).
+        let wr_top = r("wraprev").y;
+        assert_eq!(r("w2").y - wr_top, 0.0);
+        assert_eq!(r("w1").y - wr_top, 80.0);
+
+        // Baseline alignment: #b_big has 30px font (baseline 24px), #b_small has 10px font (baseline 8px) -> shifted down by 16px.
+        let base_top = r("base").y;
+        assert_eq!(r("b_big").y - base_top, 0.0);
+        assert!((r("b_small").y - base_top - 16.0).abs() < 0.5);
+
+        // column-reverse with margin-top: auto on #c2: #c1 sits at bottom (y + 80), #c2 sits at top (y + 50 after 50px auto margin? Wait: c2 has margin-top: auto, so auto margin is above c2 pushing c2 down to 50..80!).
+        let cr_top = r("colrev").y;
+        assert_eq!(r("c1").y - cr_top, 80.0);
+        assert_eq!(r("c2").y - cr_top, 50.0);
+    }
+
+    #[test]
+    fn lays_out_named_grid_areas_dense_auto_flow_intrinsic_tracks_and_box_alignment() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                #areas {
+                    display: grid;
+                    width: 300px;
+                    grid-template-columns: 100px 200px;
+                    grid-template-rows: 40px 80px;
+                    grid-template-areas: \"hdr hdr\" \"nav main\";
+                }
+                #hdr { grid-area: hdr; }
+                #nav { grid-area: nav; }
+                #main { grid-area: main; }
+                #dense {
+                    display: grid;
+                    width: 200px;
+                    grid-template-columns: 100px 100px;
+                    grid-auto-rows: 20px;
+                    grid-auto-flow: row dense;
+                }
+                #d1 { grid-column: 2; }
+                #d2 { grid-column: span 2; }
+                #d3 { }
+                #colflow {
+                    display: grid;
+                    width: 300px;
+                    grid-template-rows: 30px 30px;
+                    grid-template-columns: 50px;
+                    grid-auto-columns: 40px 80px;
+                    grid-auto-flow: column;
+                }
+                #intr {
+                    display: grid;
+                    width: 300px;
+                    grid-template-columns: min-content max-content fit-content(70px);
+                }
+                #i1 { width: 35px; height: 20px; }
+                #i2 { width: 65px; height: 20px; }
+                #i3 { width: 120px; height: 20px; }
+                #align_grid {
+                    display: grid;
+                    width: 200px;
+                    height: 100px;
+                    grid-template-columns: 100px 100px;
+                    grid-template-rows: 60px;
+                    place-items: center end;
+                    align-content: end;
+                }
+                #ag1 { width: 40px; height: 20px; }
+                #ag2 { width: 40px; height: 20px; margin: auto; }
+             </style>
+             <div id=\"areas\"><div id=\"main\"></div><div id=\"hdr\"></div><div id=\"nav\"></div></div>
+             <div id=\"dense\"><div id=\"d1\"></div><div id=\"d2\"></div><div id=\"d3\"></div></div>
+             <div id=\"colflow\"><div id=\"cf1\"></div><div id=\"cf2\"></div><div id=\"cf3\"></div><div id=\"cf4\"></div><div id=\"cf5\"></div></div>
+             <div id=\"intr\"><div id=\"i1\"></div><div id=\"i2\"></div><div id=\"i3\"></div></div>
+             <div id=\"align_grid\"><div id=\"ag1\"></div><div id=\"ag2\"></div></div>",
+            400.0,
+        );
+        let r = |id: &str| rect_of(&doc, &tree, id);
+
+        // Named grid areas: hdr spans both columns on row 0 (300x40), nav is (0, 40, 100x80), main is (100, 40, 200x80).
+        let ar_top = r("areas").y;
+        assert_eq!(
+            (
+                r("hdr").x,
+                r("hdr").y - ar_top,
+                r("hdr").width,
+                r("hdr").height
+            ),
+            (0.0, 0.0, 300.0, 40.0)
+        );
+        assert_eq!(
+            (
+                r("nav").x,
+                r("nav").y - ar_top,
+                r("nav").width,
+                r("nav").height
+            ),
+            (0.0, 40.0, 100.0, 80.0)
+        );
+        assert_eq!(
+            (
+                r("main").x,
+                r("main").y - ar_top,
+                r("main").width,
+                r("main").height
+            ),
+            (100.0, 40.0, 200.0, 80.0)
+        );
+
+        // Dense row auto-flow: #d1 takes (row 0, col 1), #d2 spans 2 cols on row 1, and #d3 backfills (row 0, col 0)!
+        let dn_top = r("dense").y;
+        assert_eq!((r("d1").x, r("d1").y - dn_top), (100.0, 0.0));
+        assert_eq!(
+            (r("d2").x, r("d2").y - dn_top, r("d2").width),
+            (0.0, 20.0, 200.0)
+        );
+        assert_eq!((r("d3").x, r("d3").y - dn_top), (0.0, 0.0));
+
+        // Column auto-flow + grid-auto-columns: 40px 80px cycling after 50px explicit column.
+        let cf_top = r("colflow").y;
+        assert_eq!(
+            (r("cf1").x, r("cf1").y - cf_top, r("cf1").width),
+            (0.0, 0.0, 50.0)
+        );
+        assert_eq!(
+            (r("cf2").x, r("cf2").y - cf_top, r("cf2").width),
+            (0.0, 30.0, 50.0)
+        );
+        assert_eq!(
+            (r("cf3").x, r("cf3").y - cf_top, r("cf3").width),
+            (50.0, 0.0, 40.0)
+        );
+        assert_eq!(
+            (r("cf4").x, r("cf4").y - cf_top, r("cf4").width),
+            (50.0, 30.0, 40.0)
+        );
+        assert_eq!(
+            (r("cf5").x, r("cf5").y - cf_top, r("cf5").width),
+            (90.0, 0.0, 80.0)
+        );
+
+        // Intrinsic tracks: min-content (35px), max-content (65px), fit-content(70px).
+        assert_eq!(r("i1").width, 35.0);
+        assert_eq!((r("i2").x, r("i2").width), (35.0, 65.0));
+        assert_eq!(r("i3").x, 100.0);
+
+        // Grid box alignment: align-content: end pushes the 60px row to y + 40 in 100px grid.
+        // place-items: center end -> align-items: center (dy = +20), justify-items: end (dx = +60).
+        // #ag2 has margin: auto -> centered both horizontally (x = 100 + 30 = 130) and vertically (dy = +20).
+        let ag_top = r("align_grid").y;
+        assert_eq!((r("ag1").x, r("ag1").y - ag_top), (60.0, 60.0));
+        assert_eq!((r("ag2").x, r("ag2").y - ag_top), (130.0, 60.0));
     }
 }
