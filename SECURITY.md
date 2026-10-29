@@ -1,12 +1,8 @@
 # Security
 
-Report problems in private:
+Report problems in private. Private reporting isn't turned on for this repository yet, so for now the private report form on `anvil-js` takes reports for the whole Anvil project, the browser and the engine included. Please say which repository the problem is in:
 
-https://github.com/buntatoes/anvil-engine/security/advisories/new
-
-The browser repository takes the same kind of report:
-
-https://github.com/buntatoes/anvil-browser/security/advisories/new
+https://github.com/buntatoes/anvil-js/security/advisories/new
 
 Do not put the details in a public issue.
 
