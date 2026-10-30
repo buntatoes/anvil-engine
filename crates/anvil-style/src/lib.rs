@@ -7,30 +7,30 @@
 //! and writes one [`ComputedStyle`] per reachable node. anvil-layout reads the
 //! [`StyleMap`] and places boxes. This crate does not lay out or paint.
 //!
-//! `width`, `height`, `max-width`, and the offset properties keep `px`, `%`,
-//! `em`, `rem`, `vw`, `vh`, `vmin`, `vmax`, and `ch`. Any other unit becomes
-//! [`Size::Auto`]. `font-size` accepts `px`, `%`, `em`, and `rem` and resolves
-//! them here: `%` and `em` use the parent font size, and `rem` uses the
-//! `html` font size (16px until that element sets one). Margin, padding,
-//! and border still accept only `px` and `0`. `row-gap`, `column-gap`, and
+//! `width`, `height`, `min-width`, `min-height`, `max-width`, `max-height`, and
+//! the offset properties (`top`, `right`, `bottom`, `left`, `inset`) keep `px`,
+//! `%`, `em`, `rem`, `vw`, `vh`, `vmin`, `vmax`, `ch`, and `calc()` / `min()` /
+//! `max()` / `clamp()`. `font-size`, `line-height`, `margin`, `padding`,
+//! `border-width`, and `border-radius` resolve `px`, `em`, `rem`, `%`, viewport
+//! units, `ch`, and math functions (`calc()`, `min()`, `max()`, `clamp()`) against
+//! the parent/root font size and viewport dimensions. `row-gap`, `column-gap`, and
 //! the `gap` shorthand keep lengths, percentages, `calc()`, and `normal`;
-//! flex and grid layout use them, and multi-column layout does not exist. `calc()` does not mix
-//! viewport units or `ch`. `display` accepts `block`, `inline`, `inline-block`,
+//! flex and grid layout use them, and multi-column layout does not exist. `display` accepts `block`, `inline`, `inline-block`,
 //! `list-item`, `flow-root`, `flex`, `inline-flex`, `grid`, `inline-grid`,
-//! and `none`. Selectors take all four combinators, attribute selectors with
+//! `table`, `table-row-group`, `table-header-group`, `table-footer-group`,
+//! `table-row`, `table-cell`, `contents`, and `none`. Selectors take all four combinators, attribute selectors with
 //! every operator and the `i` and `s` flags, `:is()`, `:where()`, `:not()`,
-//! `:has()`, the `nth-*()` family with `of S`, and the structural, link,
+//! `:has()`, `:host`, the `nth-*()` family with `of S`, and the structural, link,
 //! form, and language pseudo-classes the document can answer; see
 //! [`Selector`]. A rule whose selector list holds an invalid selector is
 //! dropped whole.
 //!
 //! `transform` keeps up to [`MAX_TRANSFORM_FNS`] 2D functions:
 //! `translate()`, `translateX()`, `translateY()`, `scale()`, `scaleX()`,
-//! `scaleY()`, `rotate()`, `skew()`, `skewX()`, `skewY()`, and `matrix()`.
-//! Angles take `deg`, `rad`, `grad`, `turn`, or `0`. 3D functions,
-//! `calc()` inside a function, and the standalone `translate`, `scale`,
-//! and `rotate` properties are not parsed; a list holding any of them is
-//! ignored. `transform-origin` takes one or two keywords, lengths, or
+//! `scaleY()`, `rotate()`, `skew()`, `skewX()`, `skewY()`, and `matrix()`,
+//! plus the standalone `translate`, `scale`, and `rotate` properties.
+//! Angles take `deg`, `rad`, `grad`, `turn`, or `0`. 3D functions are not parsed.
+//! `transform-origin` takes one or two keywords, lengths, or
 //! percentages; a third (z) length is accepted and ignored.
 //!
 //! `opacity` takes a number or a percentage, clamped to `0..=1`.
@@ -43,15 +43,16 @@
 //! [`compute_styles_animated`] runs both through an [`Animator`]; the plain
 //! `compute_styles` functions ignore them. See [`Animator`] for what moves.
 //!
-//! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
-//! Only `dark` matches a color scheme; `light` and any other value do not.
+//! `@media` reads `min-width`, `max-width`, `min-height`, `max-height`, and `prefers-color-scheme`.
+//! Both `dark` and `light` match the active color scheme.
 //! The page is a `screen`: `all` and `screen` match, `print` and other media
 //! types do not. `not`, `only`, `and`, and comma lists work, and an inner
 //! `@media` is combined with the outer one. See [`MediaQuery`].
-//! `@keyframes` blocks are kept on the [`Stylesheet`], whether or not they sit
-//! inside `@media`. Other at-rules are skipped. The cascade is user-agent defaults, then author
-//! rules by specificity `(ids, classes, types)` and source order, then the
-//! `style` attribute, then `!important` author rules in the same order, then
+//! `@supports`, `@layer`, `@scope`, `@container`, `@property`, `@font-face`,
+//! `@starting-style`, and `@keyframes` blocks are parsed and retained on the
+//! [`Stylesheet`]. The cascade applies user-agent defaults, then author
+//! rules ordered by `@layer`, specificity `(ids, classes, types)`, and source order, then the
+//! `style` attribute, then `!important` author rules, then
 //! `!important` declarations in the `style` attribute.
 
 use anvil_dom::{Document, NodeData, NodeId};

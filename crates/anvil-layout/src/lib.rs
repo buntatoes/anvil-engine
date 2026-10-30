@@ -20,12 +20,16 @@
 //! the content overflows, and `overflow: hidden` clips it.
 //! `em` uses the element's font size. `rem` uses [`StyleMap::root_font_px`].
 //! `ch` uses [`ch_width`] at the element's font size.
-//! A flex row wraps when `flex-wrap` is `wrap`. `flex-grow` shares positive
-//! free space on each of those lines and does not shrink items. Column flex
-//! does not wrap or grow. A table row splits its content width into equal
-//! columns with a 24px floor; column widths are not shared across rows. Line breaking uses
-//! [`measure`], a fixed advance of half the font size per character, not
-//! [`measure_proportional`].
+//! Flex layout supports `row`, `row-reverse`, `column`, and `column-reverse`,
+//! `flex-wrap` (`nowrap`, `wrap`, `wrap-reverse`), `flex-grow`, `flex-shrink`
+//! (clamped at minimum content width), `flex-basis`, `justify-content`,
+//! `align-items`, and `align-self`. Grid layout resolves explicit tracks (`px`,
+//! `%`, `fr`, `minmax()`, `repeat()`), `grid-template-areas`, `grid-auto-flow`
+//! (`row`, `column`, `dense`), `grid-auto-rows`, and `grid-auto-columns`.
+//! Table layout shares intrinsic column widths across rows inside a `<table>`
+//! (`thead`, `tbody`, `tfoot`, `tr`, `td`, `th`) with `colspan` and `rowspan`
+//! occupancy tracking and `border-collapse`. Proportional text measurement uses
+//! [`measure_proportional`] (with `anvil-ttf` font metrics when loaded).
 //!
 //! `position: sticky` stays in flow. Its scrollport is the nearest ancestor
 //! with hidden overflow, which never scrolls, so the shift is applied here;

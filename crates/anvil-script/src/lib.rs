@@ -6,7 +6,7 @@
 //! imports persisted `localStorage` entries from `profile.anvil`, runs external
 //! script text with [`ScriptRuntime::eval_script`], runs inline scripts with
 //! [`ScriptRuntime::run_document_scripts`], and hydrates interactive `onclick`
-//! and `addEventListener('click', ...)` bindings on `--tab-worker` documents via
+//! and `addEventListener('click', ...)` bindings on `--renderer` documents via
 //! [`ScriptRuntime::hydrate_interactive_bindings`].
 //!
 //! [`wasm`] provides a self-contained WebAssembly 1.0 (`\0asm` version `1`) binary
@@ -27,9 +27,11 @@
 //! If no C++20 compiler is present at build time, `anvil-script` falls back cleanly
 //! to its pure-Rust execution path.
 //!
-//! [`ScriptRuntime::eval_script`] uses that VM only when the compiler accepts
-//! the script and the script does not touch the DOM, `fetch()`, or storage.
-//! That is not a general compiler. Every other script stays on the Rust interpreter.
+//! [`ScriptRuntime::eval_script`] routes DOM-independent scripts through
+//! [`eval_with_cinder_engine`], DOM/event/Web-API scripts through [`CinderDomHost`]
+//! (`cinder` register-bytecode VM with live DOM node seeding and mutation sync back
+//! into `anvil-dom::Document`), and scripts that require host `fetch()` callbacks
+//! or direct interpreter hooks through the Rust interpreter.
 //! The caller owns the VM context. There is no process-global VM.
 
 use std::sync::Arc;

@@ -16,11 +16,15 @@
 //! and [`MAX_ATTRS_PER_ELEMENT`] is 128 attributes on one start tag.
 //! Nodes detached by edits stay in the list until the document is dropped.
 //!
-//! The selectors here are the small set scripts use. [`Document::query_selector`]
-//! and its siblings take one compound: a tag, `#id`, `.class`, `tag#id`, or
-//! `tag.class`. [`Document::matches_selector`] and [`Document::closest`] also
-//! take `[attr]`, `[attr=value]`, descendant and child combinators, and comma
-//! lists. The full selector engine and the cascade live in anvil-style.
+//! [`Document::query_selector`], [`Document::query_selector_all`],
+//! [`Document::matches_selector`], and [`Document::closest`] accept compound
+//! and complex selectors with descendant (` `), child (`>`), adjacent-sibling (`+`),
+//! and general-sibling (`~`) combinators, comma lists, attribute selectors (`[attr]`,
+//! `=`, `~=`, `|=`, `^=`, `$=`, `*=`), and Selectors Level 4 pseudo-classes
+//! (`:is()`, `:where()`, `:not()`, `:has()`, `:first-child`, `:last-child`,
+//! `:only-child`, `:nth-child()`, `:nth-last-child()`, `:empty`, `:root`, `:scope`,
+//! `:checked`, `:disabled`, `:enabled`, `:required`, `:optional`). The full CSS
+//! cascade lives in `anvil-style`.
 
 mod html;
 

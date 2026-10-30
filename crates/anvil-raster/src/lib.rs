@@ -7,17 +7,18 @@
 //! pixel, with the top row first. [`rasterize_quad_on_device`] shades one quad
 //! through the anvil-gpu tile device.
 //!
-//! Box shadows, unrounded linear gradients, and rounded boxes that are filled,
-//! or have an opaque border and fill, run through `anvil_gpu::Compositor`
-//! (OpenGL 3.3 on Linux or Direct3D 11 on Windows when its self-test matches the
-//! CPU, and software otherwise). Other rounded boxes and gradients, and
-//! anything the compositor turns down, are drawn as quads on
+//! Box shadows, linear and rounded-corner gradients, and rounded boxes that are filled,
+//! or have an opaque border and fill, run through `anvil_gpu::Compositor` and
+//! `GpuSceneBatch` (OpenGL 3.3 on Linux or Direct3D 11 on Windows when its
+//! self-test matches the CPU, and software otherwise). Other rounded boxes and
+//! gradients, and anything the compositor turns down, are drawn as quads on
 //! `anvil_gpu::GpuDevice`. Plain rectangles, image blits, blurs, and the
 //! bottom-up BGRA copy use the C++20 helpers when `forge_cpp_accel` is linked,
 //! and Rust loops otherwise. Images are `anvil-image` buffers. `draw_image`
-//! resizes with that crate's bilinear filter and samples the result. This
-//! crate does not call `anvil-video`. A video frame is drawn only after the
-//! browser has already copied the surface into an `Image` on the display list.
+//! downscales large images with `anvil-image`'s 2x2 mipmap pyramid plus bilinear
+//! filter and samples the result. This crate does not call `anvil-video`. A video
+//! frame is drawn only after the browser has already copied the surface into an
+//! `Image` on the display list.
 //!
 //! Display list layers: a sticky layer is moved by its constraint for the
 //! current scroll and the viewport size, then drawn like any other items.
@@ -30,10 +31,11 @@
 //! drawn the same way with no transform and blended at its opacity; at 0 it
 //! draws nothing.
 //!
-//! Text on Windows tries Win32 GDI in `font` and, if that returns false, the
-//! built-in 5x7 bitmap. Text on Linux loads DejaVu Sans or Liberation Sans
-//! through `anvil-ttf` when one of those files parses. Otherwise the same
-//! bitmap font is used.
+//! Text on Linux and Windows loads system TrueType/OpenType fonts (`.ttf`/`.otf`)
+//! across sans-serif, serif, and monospace family slots through `anvil-ttf` (with
+//! 4x horizontal subpixel phase offsets and gamma-correct linear-space alpha
+//! blending). On Windows, if no `anvil-ttf` glyph is available, `font` falls back
+//! to Win32 GDI; otherwise the built-in 5x7 bitmap font is used.
 
 // Windows only. GDI text. Linux does not compile this module.
 #[cfg(windows)]
