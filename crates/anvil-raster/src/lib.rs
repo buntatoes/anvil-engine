@@ -890,8 +890,8 @@ impl Framebuffer {
         } else {
             let mut buf = vec![0u8; count * 4];
             let pat = [clear.r, clear.g, clear.b, clear.a];
-            for px in buf.chunks_exact_mut(4) {
-                px.copy_from_slice(&pat);
+            for px in buf.as_chunks_mut::<4>().0 {
+                *px = pat;
             }
             buf
         };
