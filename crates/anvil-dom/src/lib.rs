@@ -1115,7 +1115,7 @@ impl Document {
                 j = i;
             }
             nodes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            for pair in nodes.chunks_exact(2) {
+            for pair in nodes.as_chunks::<2>().0 {
                 let x_start = (pair[0].floor() as i32).clamp(0, cw);
                 let x_end = (pair[1].ceil() as i32).clamp(0, cw);
                 for px in x_start..x_end {
@@ -1564,12 +1564,11 @@ impl Document {
         let mut cursor = Some(start);
         while let Some(curr) = cursor {
             let node = self.nodes.get(curr.index())?;
-            if node.data().tag() == Some("summary") {
-                if let Some(parent) = self.parent_element(curr)
-                    && self.get(parent).data().tag() == Some("details")
-                {
-                    return Some(parent);
-                }
+            if node.data().tag() == Some("summary")
+                && let Some(parent) = self.parent_element(curr)
+                && self.get(parent).data().tag() == Some("details")
+            {
+                return Some(parent);
             }
             cursor = node.parent();
         }

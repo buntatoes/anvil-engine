@@ -597,9 +597,7 @@ fn walk(
                 },
             });
             let ratio = (client_h / tree.scroll_size.1).clamp(0.1, 1.0);
-            let thumb_h = ((client_h - 2.0) * ratio)
-                .max(12.0)
-                .min((client_h - 2.0).max(1.0));
+            let thumb_h = ((client_h - 2.0) * ratio).clamp(12.0, (client_h - 2.0).max(12.0));
             let max_scroll = (tree.scroll_size.1 - client_h).max(1.0);
             let scroll_frac = (tree.scroll_offset.1 / max_scroll).clamp(0.0, 1.0);
             let thumb_y = client_y + 1.0 + ((client_h - 2.0 - thumb_h).max(0.0) * scroll_frac);

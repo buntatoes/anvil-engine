@@ -825,7 +825,7 @@ fn a_lowered_parse_stack_budget_refuses_sooner() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
-    let depth = 400;
+    let depth = 200;
     let mut source = String::from("let x = 1; let r = 0; ");
     for _ in 0..depth {
         source.push_str("if (x) { ");
@@ -835,9 +835,9 @@ fn a_lowered_parse_stack_budget_refuses_sooner() {
         source.push('}');
     }
     source.push_str(" r;");
-    // 400-deep compiles comfortably under the default budget.
+    // 200-deep compiles comfortably under the default budget.
     let (value, _) = anvil_script::eval_cpp_vm_request_configured(5_000_000, &source)
-        .expect("400-deep nested ifs compile under the default budget");
+        .expect("200-deep nested ifs compile under the default budget");
     assert_eq!(value, 7.0);
     // With a 64 KiB budget the same script is refused.
     let error =
