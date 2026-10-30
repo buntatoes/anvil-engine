@@ -12,7 +12,7 @@
 # against the document and links the Cinder engine (`../anvil-browser/engines/cinder`) directly. It does not open a socket and does not link anvil-net.
 #
 # anvil-browser links these crates by path.
-# Dual-licensed under PolyForm Noncommercial 1.0.0 and Paid Commercial (Non-Compete):
+# Dual-licensed under noncommercial terms based on PolyForm Noncommercial 1.0.0 and Paid Commercial (Non-Compete):
 # LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial across anvil-browser, anvil-engine, and all sibling libraries.
 
 [workspace]

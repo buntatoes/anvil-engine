@@ -6,14 +6,14 @@
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="https://github.com/buntatoes/anvil-engine/actions/workflows/ci.yml"><img src="https://github.com/buntatoes/anvil-engine/actions/workflows/ci.yml/badge.svg" alt="CI: build, tests, clippy and rustfmt" /></a>
     <img src="https://img.shields.io/badge/external_crates-0_%28offline_verified%29-2ea44f?style=flat-square" alt="0 external crates (offline verified)" />
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="PolyForm Noncommercial 1.0.0 | Paid Commercial (Non-Compete)" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Noncommercial_%28based_on_PolyForm_1.0.0%29_%7C_Paid_Commercial_%28Non--Compete%29-blue?style=flat-square" alt="Noncommercial (based on PolyForm 1.0.0) | Paid Commercial (Non-Compete)" /></a>
     <img src="https://img.shields.io/badge/rust-2024-orange?style=flat-square" alt="Rust 2024" />
   </p>
 </div>
 
 Version 0.24.4 (`v.24.4`). Author: Buntato.
 
-This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is dual-licensed under the **PolyForm Noncommercial License 1.0.0** and a **Paid Commercial License with a Non-Compete Clause**. See [License](#license).
+This repository is part of the [Anvil Browser](https://github.com/buntatoes/anvil-browser) ecosystem and is dual-licensed under **noncommercial terms based on the PolyForm Noncommercial License 1.0.0** and a **Paid Commercial License with a Non-Compete Clause**. See [License](#license).
 
 There are no crates.io dependencies.
 
@@ -140,4 +140,4 @@ cargo test
 
 ## License
 
-Dual-licensed under the **PolyForm Noncommercial License 1.0.0** (free for personal, educational, academic, and noncommercial auditing/research use) and a **Paid Commercial License with a Non-Compete Clause** (required for any commercial, for-profit, or business use). Competing browser, rendering engine, JS VM, or codec use is prohibited without a signed commercial agreement from Buntato. See [LICENSE](./LICENSE).
+Dual-licensed under **noncommercial terms based on the PolyForm Noncommercial License 1.0.0** (free for personal, educational, academic, and noncommercial auditing/research use) and a **Paid Commercial License with a Non-Compete Clause** (required for any commercial, for-profit, or business use). Competing browser, rendering engine, JS VM, or codec use is prohibited without a signed commercial agreement from Buntato. See [LICENSE](./LICENSE).
