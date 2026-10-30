@@ -42,8 +42,8 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-cipher anvil-compress anvil-css anvil-gpu anvil-image anvil-js anvil-json anvil-ttf anvil-video; do
-            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
+          for repo in anvil-browser anvil-cipher anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf anvil-video; do
+            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
       - name: Install Rust
@@ -100,8 +100,8 @@ jobs:
       - name: Check out sibling repositories
         working-directory: .
         run: |
-          for repo in anvil-cipher anvil-compress anvil-css anvil-gpu anvil-image anvil-js anvil-json anvil-ttf anvil-video; do
-            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
+          for repo in anvil-browser anvil-cipher anvil-compress anvil-gpu anvil-image anvil-json anvil-ttf anvil-video; do
+            git clone --depth 1 -b "${{ github.ref_name }}" "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo" 2>/dev/null || git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git" "$repo"
           done
 
       - name: Install Rust 1.99.1
