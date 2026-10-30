@@ -34,6 +34,17 @@
 //! or direct interpreter hooks through the Rust interpreter.
 //! The caller owns the VM context. There is no process-global VM.
 
+#![allow(
+    clippy::chunks_exact_to_as_chunks,
+    clippy::clone_on_copy,
+    clippy::collapsible_if,
+    clippy::manual_clamp,
+    clippy::needless_question_mark,
+    clippy::question_mark,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 use std::sync::Arc;
 
 /// Direct linkage to the in-tree `Cinder` engine (`engines/cinder`).
