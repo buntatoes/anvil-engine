@@ -2570,6 +2570,7 @@ fn cascade_document(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn cascade_pseudo_elements(
     doc: &Document,
     sheet: &Stylesheet,
@@ -2844,6 +2845,7 @@ fn scope_proximity(
 /// each element is cascaded from it for change detection, and again from
 /// the animated `parent` when the two differ, so children inherit animated
 /// values without that counting as a change of their own.
+#[allow(clippy::too_many_arguments)]
 fn walk(
     doc: &Document,
     id: NodeId,
@@ -4110,20 +4112,20 @@ fn apply_declaration(
                         break;
                     }
                 }
-                match parsed_colors.as_slice() {
-                    &[all] => {
+                match *parsed_colors.as_slice() {
+                    [all] => {
                         style.border_color = all;
                         style.border_colors = [all; 4];
                     }
-                    &[v, h] => {
+                    [v, h] => {
                         style.border_color = v;
                         style.border_colors = [v, h, v, h];
                     }
-                    &[t, h, b] => {
+                    [t, h, b] => {
                         style.border_color = t;
                         style.border_colors = [t, h, b, h];
                     }
-                    &[t, r, b, l] => {
+                    [t, r, b, l] => {
                         style.border_color = t;
                         style.border_colors = [t, r, b, l];
                     }
@@ -5932,11 +5934,11 @@ fn apply_margin_shorthand(style: &mut ComputedStyle, value: &str, root_font_px: 
     else {
         return;
     };
-    let ((t, t_auto), (r, r_auto), (b, b_auto), (l, l_auto)) = match parts.as_slice() {
-        &[all] => (all, all, all, all),
-        &[v, h] => (v, h, v, h),
-        &[t, h, b] => (t, h, b, h),
-        &[t, r, b, l] => (t, r, b, l),
+    let ((t, t_auto), (r, r_auto), (b, b_auto), (l, l_auto)) = match *parts.as_slice() {
+        [all] => (all, all, all, all),
+        [v, h] => (v, h, v, h),
+        [t, h, b] => (t, h, b, h),
+        [t, r, b, l] => (t, r, b, l),
         _ => return,
     };
     style.margin = Edge {
@@ -6287,15 +6289,13 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     {
         is_radial = true;
         s
-    } else if let Some(s) = lower
-        .strip_prefix("conic-gradient(")
-        .or_else(|| lower.strip_prefix("repeating-conic-gradient("))
-        .and_then(|s| s.strip_suffix(')'))
-    {
+    } else {
+        let s = lower
+            .strip_prefix("conic-gradient(")
+            .or_else(|| lower.strip_prefix("repeating-conic-gradient("))
+            .and_then(|s| s.strip_suffix(')'))?;
         is_conic = true;
         s
-    } else {
-        return None;
     };
 
     let mut args = Vec::new();
