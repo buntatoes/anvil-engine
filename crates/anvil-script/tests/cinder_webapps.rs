@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-//! Integration tests for the self-hosted `anvil-js` compiler and Web/DOM runtime
-//! wired into `anvil-script` and running on `AnvilVM`.
+//! Integration tests for the self-hosted `cinder` compiler and Web/DOM runtime
+//! wired into `anvil-script` and running on `CinderVM`.
 
 use anvil_dom::parse_html;
 use anvil_script::{
-    ScriptRuntime, compile_es2022_with_anvil_js, eval_es2022_with_anvil_js,
-    eval_webapp_with_anvil_js, is_cpp_jit_kernel_active, self_hosted_bundle,
-    self_hosted_bundle_hash, self_hosted_runtime_bundle,
+    ScriptRuntime, compile_es2022_with_cinder, eval_es2022_with_cinder, eval_webapp_with_cinder,
+    is_cpp_jit_kernel_active, self_hosted_bundle, self_hosted_bundle_hash,
+    self_hosted_runtime_bundle,
 };
 
 #[test]
@@ -22,7 +22,7 @@ fn self_hosted_bundle_is_linked_into_anvil_script() {
 }
 
 #[test]
-fn self_hosted_es2022_lowering_and_execution_on_anvil_vm() {
+fn self_hosted_es2022_lowering_and_execution_on_cinder_vm() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -52,16 +52,16 @@ fn self_hosted_es2022_lowering_and_execution_on_anvil_vm() {
         console.log("result=" + cfg);
     "#;
 
-    let lowered = compile_es2022_with_anvil_js(source, false).expect("ES2022 source should lower");
+    let lowered = compile_es2022_with_cinder(source, false).expect("ES2022 source should lower");
     assert!(lowered.contains("class CounterBox"));
     assert!(lowered.contains("__priv_count"));
 
-    let run = eval_es2022_with_anvil_js(source).expect("lowered script should run on AnvilVM");
+    let run = eval_es2022_with_cinder(source).expect("lowered script should run on CinderVM");
     assert_eq!(run.output, vec!["result=133"]);
 }
 
 #[test]
-fn search_portal_webapp_loads_and_filters_on_anvil_vm() {
+fn search_portal_webapp_loads_and_filters_on_cinder_vm() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -100,16 +100,16 @@ fn search_portal_webapp_loads_and_filters_on_anvil_vm() {
             }
         }
         const ctrl = new SearchController(env);
-        ctrl.addEntry("Anvil Engine Reference", "https://anvil.example/engine", "Self-hosted JS runtime");
+        ctrl.addEntry("Anvil Forge Reference", "https://anvil.example/engine", "Self-hosted JS runtime");
         ctrl.addEntry("Weather Forecast", "https://anvil.example/weather", "Sunny skies");
-        ctrl.addEntry("Anvil CSS Selectors", "https://anvil.example/css", "Level 4 selector matcher");
+        ctrl.addEntry("Anvil Prism Selectors", "https://anvil.example/css", "Level 4 selector matcher");
         const count = ctrl.renderFromLocation();
         console.log("matched=" + count);
         console.log("href=" + env.window.location.href);
         console.log("cards=" + env.document.querySelectorAll(".result-card").length);
     "#;
 
-    let run = eval_webapp_with_anvil_js("https://search.example.com/search?q=anvil", app_script)
+    let run = eval_webapp_with_cinder("https://search.example.com/search?q=anvil", app_script)
         .expect("search webapp should execute cleanly");
     assert_eq!(
         run.output,
@@ -122,7 +122,7 @@ fn search_portal_webapp_loads_and_filters_on_anvil_vm() {
 }
 
 #[test]
-fn video_portal_webapp_custom_elements_shadow_dom_and_mse_on_anvil_vm() {
+fn video_portal_webapp_custom_elements_shadow_dom_and_mse_on_cinder_vm() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -163,7 +163,7 @@ fn video_portal_webapp_custom_elements_shadow_dom_and_mse_on_anvil_vm() {
         console.log("msState=" + ms.readyState + ",segments=" + sb.segments.length);
     "#;
 
-    let run = eval_webapp_with_anvil_js("https://video.example.com/watch?v=abc123", app_script)
+    let run = eval_webapp_with_cinder("https://video.example.com/watch?v=abc123", app_script)
         .expect("video portal webapp should execute cleanly");
     assert_eq!(
         run.output,
@@ -177,7 +177,7 @@ fn video_portal_webapp_custom_elements_shadow_dom_and_mse_on_anvil_vm() {
 }
 
 #[test]
-fn webmail_inbox_webapp_json_storage_and_abort_controller_on_anvil_vm() {
+fn webmail_inbox_webapp_json_storage_and_abort_controller_on_cinder_vm() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -226,7 +226,7 @@ fn webmail_inbox_webapp_json_storage_and_abort_controller_on_anvil_vm() {
         console.log("aborted=" + ac.signal.aborted + ":" + abortedCount);
     "#;
 
-    let run = eval_webapp_with_anvil_js("https://mail.example.com/mail/u/0/#inbox", app_script)
+    let run = eval_webapp_with_cinder("https://mail.example.com/mail/u/0/#inbox", app_script)
         .expect("webmail inbox webapp should execute cleanly");
     assert_eq!(
         run.output,
@@ -272,7 +272,7 @@ fn script_runtime_dom_integration_supports_custom_elements_mse_and_location() {
 }
 
 #[test]
-fn automatic_anvil_vm_dom_routing_seeds_hierarchy_and_applies_mutations() {
+fn automatic_cinder_vm_dom_routing_seeds_hierarchy_and_applies_mutations() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -333,7 +333,7 @@ fn automatic_anvil_vm_dom_routing_seeds_hierarchy_and_applies_mutations() {
 }
 
 #[test]
-fn interactive_anvil_vm_events_preserve_state_and_honor_prevent_default() {
+fn interactive_cinder_vm_events_preserve_state_and_honor_prevent_default() {
     if !is_cpp_jit_kernel_active() {
         return;
     }
@@ -447,7 +447,7 @@ fn mutation_intersection_and_resize_observers_deliver_microtask_callbacks() {
     let log_id = doc.get_element_by_id("log").unwrap();
     let text = doc.text_content(log_id);
     assert!(text.contains("io:true:watched"), "got: {text}");
-    assert!(text.contains("ro:100:watched"), "got: {text}");
+    assert!(text.contains("ro:1264:watched"), "got: {text}");
     assert!(
         text.contains("mo:2:attributes:watched"),
         "expected MutationObserver callback in: {text}"

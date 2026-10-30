@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 #![forbid(unsafe_code)]
-//! A small, safe-Rust file runner for the C++ AnvilVM engine.
+//! A small, safe-Rust file runner for the C++ CinderVM engine.
 //!
-//! Usage: `anvil-js-run <file.js>`
+//! Usage: `cinder-run <file.js>`
 //!
 //! It reads the file, runs it on the VM, prints each `console.log` line to
 //! stdout and, if the run is refused or stops, prints the reason to stderr.
@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use anvil_script::eval_cpp_vm_with_console_configured;
 
-const PROG: &str = "anvil-js-run";
+const PROG: &str = "cinder-run";
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os();

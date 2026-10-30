@@ -22,9 +22,7 @@ type Hbitmap = *mut c_void;
 /// Any GDI object selected into a DC.
 type HgdioBJ = *mut c_void;
 
-/// `FW_NORMAL`. Regular stroke weight, not bold.
-const FW_NORMAL: i32 = 400;
-/// `DEFAULT_CHARSET`. Let GDI pick the character set for Segoe UI.
+/// `DEFAULT_CHARSET`. Let GDI pick the character set for the selected face.
 const DEFAULT_CHARSET: u32 = 1;
 /// `OUT_DEFAULT_PRECIS`.
 const OUT_DEFAULT_PRECIS: u32 = 0;
@@ -132,13 +130,20 @@ unsafe extern "system" {
 /// The DIB is clamped to 4096 by 512. Coverage is the average of the B, G,
 /// and R bytes, multiplied by `color.a`. The line box is `font_size * 1.25`
 /// and the bitmap is centered in it.
-pub fn draw_system_text(
+/// Draw `text` with GDI using the requested font family (`0` = Sans-Serif `Segoe UI`,
+/// `1` = Serif `Georgia`, `2` = Monospace `Consolas`), stroke weight (`100..=900`),
+/// and italic style.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_system_text_styled(
     fb: &mut Framebuffer,
     x: f32,
     y: f32,
     text: &str,
     font_size: f32,
     color: Color,
+    family_idx: u8,
+    weight: u16,
+    italic: bool,
 ) -> bool {
     if text.is_empty()
         || font_size <= 0.0
@@ -153,7 +158,14 @@ pub fn draw_system_text(
         return true;
     }
     let height_px = (font_size * 0.90).round().max(8.0) as i32;
-    let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+    let face_name = match family_idx {
+        1 => "Georgia\0",
+        2 => "Consolas\0",
+        _ => "Segoe UI\0",
+    };
+    let face: Vec<u16> = face_name.encode_utf16().collect();
+    let gdi_weight = i32::from(weight.clamp(100, 900));
+    let gdi_italic = u32::from(italic);
 
     unsafe {
         let hdc = CreateCompatibleDC(null_mut());
@@ -165,8 +177,8 @@ pub fn draw_system_text(
             0,
             0,
             0,
-            FW_NORMAL,
-            0,
+            gdi_weight,
+            gdi_italic,
             0,
             0,
             DEFAULT_CHARSET,

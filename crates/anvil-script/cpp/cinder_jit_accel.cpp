@@ -3,12 +3,12 @@
 // C++20 Register Virtual Machine Execution Engine, Hot-Loop Accelerator, and Rust FFI Entry Points.
 // Author: Buntato
 //
-// Compiled alongside anvil_vm_heap.cpp, anvil_vm_ic.cpp, and anvil_vm_compiler.cpp
+// Compiled alongside cinder_vm_heap.cpp, cinder_vm_ic.cpp, and cinder_vm_compiler.cpp
 // by crates/anvil-script/build.rs when a C++20 compiler is available.
 
-#include "anvil_vm.hpp"
+#include "cinder_vm.hpp"
 
-namespace anvil_vm {
+namespace cinder_vm {
 
 namespace {
 
@@ -42,32 +42,32 @@ inline bool cstr_eq(const char* a, u32 alen, const char* b, u32 blen) noexcept {
     return true;
 }
 
-inline bool numeric_operand(AnvilValue v) noexcept {
+inline bool numeric_operand(CinderValue v) noexcept {
     return v.is_number() || v.is_bool() || v.is_null() || v.is_undefined();
 }
 
-inline u32 numeric_operands(AnvilOpcode op) noexcept {
+inline u32 numeric_operands(CinderOpcode op) noexcept {
     switch (op) {
-        case AnvilOpcode::Neg:
-        case AnvilOpcode::BitNot:
+        case CinderOpcode::Neg:
+        case CinderOpcode::BitNot:
             return 1u;
-        case AnvilOpcode::Sub:
-        case AnvilOpcode::Mul:
-        case AnvilOpcode::Div:
-        case AnvilOpcode::Mod:
-        case AnvilOpcode::BitAnd:
-        case AnvilOpcode::BitOr:
-        case AnvilOpcode::BitXor:
-        case AnvilOpcode::Shl:
-        case AnvilOpcode::Shr:
-        case AnvilOpcode::UShr:
+        case CinderOpcode::Sub:
+        case CinderOpcode::Mul:
+        case CinderOpcode::Div:
+        case CinderOpcode::Mod:
+        case CinderOpcode::BitAnd:
+        case CinderOpcode::BitOr:
+        case CinderOpcode::BitXor:
+        case CinderOpcode::Shl:
+        case CinderOpcode::Shr:
+        case CinderOpcode::UShr:
             return 2u;
         default:
             return 0u;
     }
 }
 
-inline bool truthy(const AnvilHeap& heap, AnvilValue v) noexcept {
+inline bool truthy(const CinderHeap& heap, CinderValue v) noexcept {
     if (v.is_string()) {
         u32 len = 0u;
         heap.get_string_ptr(v.payload(), &len);
@@ -204,7 +204,7 @@ inline u32 encode_unit_utf8(u16 u, char* out) noexcept {
     return 3u;
 }
 
-u32 utf16_slice_sym(AnvilHeap& heap, u32 sym, i32 start_idx, i32 end_idx) noexcept {
+u32 utf16_slice_sym(CinderHeap& heap, u32 sym, i32 start_idx, i32 end_idx) noexcept {
     if (start_idx >= end_idx) {
         return heap.intern_string("", 0u);
     }
@@ -291,9 +291,9 @@ u32 utf16_slice_sym(AnvilHeap& heap, u32 sym, i32 start_idx, i32 end_idx) noexce
     return res;
 }
 
-bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, bool& known) noexcept;
+bool values_loosely_equal(const CinderHeap& heap, CinderValue a, CinderValue b, bool& known) noexcept;
 
-bool values_strictly_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b) noexcept {
+bool values_strictly_equal(const CinderHeap& heap, CinderValue a, CinderValue b) noexcept {
     if (a.is_number() && b.is_number()) {
         return a.as_number() == b.as_number();
     }
@@ -306,7 +306,7 @@ bool values_strictly_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b) no
     return false;
 }
 
-bool same_value_zero(const AnvilHeap& heap, AnvilValue a, AnvilValue b) noexcept {
+bool same_value_zero(const CinderHeap& heap, CinderValue a, CinderValue b) noexcept {
     if (a.is_number() && b.is_number()) {
         const f64 na = a.as_number();
         const f64 nb = b.as_number();
@@ -318,7 +318,7 @@ bool same_value_zero(const AnvilHeap& heap, AnvilValue a, AnvilValue b) noexcept
     return values_strictly_equal(heap, a, b);
 }
 
-bool values_loosely_equal(const AnvilHeap& heap, AnvilValue a, AnvilValue b, bool& known) noexcept {
+bool values_loosely_equal(const CinderHeap& heap, CinderValue a, CinderValue b, bool& known) noexcept {
     known = true;
     if (a.is_number() && b.is_number()) {
         return a.as_number() == b.as_number();
@@ -346,12 +346,12 @@ inline u32 typed_array_shift(u8 bkind) noexcept {
     }
 }
 
-u8* get_arraybuffer_bytes(const AnvilHeap& heap, u32 buf_obj_id, u32* out_byte_len) noexcept {
+u8* get_arraybuffer_bytes(const CinderHeap& heap, u32 buf_obj_id, u32* out_byte_len) noexcept {
     if (buf_obj_id >= heap.object_count || !heap.objects()[buf_obj_id].active) {
         if (out_byte_len) *out_byte_len = 0u;
         return nullptr;
     }
-    const AnvilHeapObject& bobj = heap.objects()[buf_obj_id];
+    const CinderHeapObject& bobj = heap.objects()[buf_obj_id];
     if (static_cast<BuiltinObjectKind>(bobj.builtin_kind) != BuiltinObjectKind::ArrayBuffer ||
         bobj.aux_id >= heap.array_count || !heap.arrays()[bobj.aux_id].active) {
         if (out_byte_len) *out_byte_len = 0u;
@@ -362,56 +362,56 @@ u8* get_arraybuffer_bytes(const AnvilHeap& heap, u32 buf_obj_id, u32* out_byte_l
     if (storage_off == NO_SLOT) {
         return nullptr;
     }
-    return reinterpret_cast<u8*>(const_cast<AnvilValue*>(heap.array_elems(storage_off)));
+    return reinterpret_cast<u8*>(const_cast<CinderValue*>(heap.array_elems(storage_off)));
 }
 
-AnvilValue typed_array_get_elem(const AnvilHeap& heap, const AnvilHeapObject& obj, i32 idx) noexcept {
+CinderValue typed_array_get_elem(const CinderHeap& heap, const CinderHeapObject& obj, i32 idx) noexcept {
     const u32 shift = typed_array_shift(obj.builtin_kind);
     const u32 elem_len = obj.byte_length >> shift;
     if (idx < 0 || static_cast<u32>(idx) >= elem_len) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
     u32 buf_len = 0u;
     const u8* base = get_arraybuffer_bytes(heap, obj.aux_id, &buf_len);
     const u32 byte_pos = obj.byte_offset + (static_cast<u32>(idx) << shift);
     if (!base || byte_pos + (1u << shift) > buf_len) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
     const u8* ptr = base + byte_pos;
     switch (static_cast<BuiltinObjectKind>(obj.builtin_kind)) {
         case BuiltinObjectKind::Uint8Array:
-            return AnvilValue::make_smi(static_cast<i32>(ptr[0]));
+            return CinderValue::make_smi(static_cast<i32>(ptr[0]));
         case BuiltinObjectKind::Uint16Array: {
             const u16 v = static_cast<u16>(ptr[0]) | (static_cast<u16>(ptr[1]) << 8u);
-            return AnvilValue::make_smi(static_cast<i32>(v));
+            return CinderValue::make_smi(static_cast<i32>(v));
         }
         case BuiltinObjectKind::Int32Array: {
             const u32 u = static_cast<u32>(ptr[0]) |
                           (static_cast<u32>(ptr[1]) << 8u) |
                           (static_cast<u32>(ptr[2]) << 16u) |
                           (static_cast<u32>(ptr[3]) << 24u);
-            return AnvilValue::make_smi(static_cast<i32>(u));
+            return CinderValue::make_smi(static_cast<i32>(u));
         }
         case BuiltinObjectKind::Uint32Array: {
             const u32 u = static_cast<u32>(ptr[0]) |
                           (static_cast<u32>(ptr[1]) << 8u) |
                           (static_cast<u32>(ptr[2]) << 16u) |
                           (static_cast<u32>(ptr[3]) << 24u);
-            return AnvilValue::make_number(static_cast<f64>(u));
+            return CinderValue::make_number(static_cast<f64>(u));
         }
         case BuiltinObjectKind::Float64Array: {
             u64 bits = 0ULL;
             for (u32 k = 0u; k < 8u; ++k) {
                 bits |= (static_cast<u64>(ptr[k]) << (k * 8u));
             }
-            return AnvilValue::make_number(bits_to_f64(bits));
+            return CinderValue::make_number(bits_to_f64(bits));
         }
         default:
-            return AnvilValue::make_undefined();
+            return CinderValue::make_undefined();
     }
 }
 
-void typed_array_set_elem(AnvilHeap& heap, const AnvilHeapObject& obj, i32 idx, AnvilValue val) noexcept {
+void typed_array_set_elem(CinderHeap& heap, const CinderHeapObject& obj, i32 idx, CinderValue val) noexcept {
     const u32 shift = typed_array_shift(obj.builtin_kind);
     const u32 elem_len = obj.byte_length >> shift;
     if (idx < 0 || static_cast<u32>(idx) >= elem_len) {
@@ -458,28 +458,28 @@ void typed_array_set_elem(AnvilHeap& heap, const AnvilHeapObject& obj, i32 idx, 
 
 constexpr u64 TOMBSTONE_BITS = 0x7FFFFFFFFFFFFFFFULL;
 
-AnvilValue map_get(const AnvilHeap& heap, const AnvilHeapObject& obj, AnvilValue key) noexcept {
+CinderValue map_get(const CinderHeap& heap, const CinderHeapObject& obj, CinderValue key) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
-    const AnvilHeapArray& arr = heap.arrays()[arr_id];
-    const AnvilValue* elems = heap.array_elems(arr.storage_off);
+    const CinderHeapArray& arr = heap.arrays()[arr_id];
+    const CinderValue* elems = heap.array_elems(arr.storage_off);
     for (u32 i = 0u; i + 1u < arr.length; i += 2u) {
         if (elems[i].bits != TOMBSTONE_BITS && same_value_zero(heap, elems[i], key)) {
             return elems[i + 1u];
         }
     }
-    return AnvilValue::make_undefined();
+    return CinderValue::make_undefined();
 }
 
-bool map_has(const AnvilHeap& heap, const AnvilHeapObject& obj, AnvilValue key) noexcept {
+bool map_has(const CinderHeap& heap, const CinderHeapObject& obj, CinderValue key) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
         return false;
     }
-    const AnvilHeapArray& arr = heap.arrays()[arr_id];
-    const AnvilValue* elems = heap.array_elems(arr.storage_off);
+    const CinderHeapArray& arr = heap.arrays()[arr_id];
+    const CinderValue* elems = heap.array_elems(arr.storage_off);
     for (u32 i = 0u; i + 1u < arr.length; i += 2u) {
         if (elems[i].bits != TOMBSTONE_BITS && same_value_zero(heap, elems[i], key)) {
             return true;
@@ -488,17 +488,17 @@ bool map_has(const AnvilHeap& heap, const AnvilHeapObject& obj, AnvilValue key) 
     return false;
 }
 
-bool map_delete(AnvilHeap& heap, AnvilHeapObject& obj, AnvilValue key) noexcept {
+bool map_delete(CinderHeap& heap, CinderHeapObject& obj, CinderValue key) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
         return false;
     }
-    const AnvilHeapArray& arr = heap.arrays()[arr_id];
-    AnvilValue* elems = heap.array_elems(arr.storage_off);
+    const CinderHeapArray& arr = heap.arrays()[arr_id];
+    CinderValue* elems = heap.array_elems(arr.storage_off);
     for (u32 i = 0u; i + 1u < arr.length; i += 2u) {
         if (elems[i].bits != TOMBSTONE_BITS && same_value_zero(heap, elems[i], key)) {
-            elems[i] = AnvilValue(TOMBSTONE_BITS);
-            elems[i + 1u] = AnvilValue::make_undefined();
+            elems[i] = CinderValue(TOMBSTONE_BITS);
+            elems[i + 1u] = CinderValue::make_undefined();
             if (obj.byte_length > 0u) --obj.byte_length;
             return true;
         }
@@ -506,7 +506,7 @@ bool map_delete(AnvilHeap& heap, AnvilHeapObject& obj, AnvilValue key) noexcept 
     return false;
 }
 
-void map_clear(AnvilHeap& heap, AnvilHeapObject& obj) noexcept {
+void map_clear(CinderHeap& heap, CinderHeapObject& obj) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id < heap.array_count && heap.arrays()[arr_id].active) {
         heap.arrays()[arr_id].length = 0u;
@@ -514,13 +514,13 @@ void map_clear(AnvilHeap& heap, AnvilHeapObject& obj) noexcept {
     obj.byte_length = 0u;
 }
 
-bool map_set(AnvilHeap& heap, u32 obj_id, AnvilValue key, AnvilValue val) noexcept {
+bool map_set(CinderHeap& heap, u32 obj_id, CinderValue key, CinderValue val) noexcept {
     const u32 arr_id = heap.objects()[obj_id].aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
         return false;
     }
     const u32 len = heap.arrays()[arr_id].length;
-    AnvilValue* elems = heap.array_elems(heap.arrays()[arr_id].storage_off);
+    CinderValue* elems = heap.array_elems(heap.arrays()[arr_id].storage_off);
     for (u32 i = 0u; i + 1u < len; i += 2u) {
         if (elems[i].bits != TOMBSTONE_BITS && same_value_zero(heap, elems[i], key)) {
             elems[i + 1u] = val;
@@ -533,13 +533,13 @@ bool map_set(AnvilHeap& heap, u32 obj_id, AnvilValue key, AnvilValue val) noexce
     return true;
 }
 
-bool set_has(const AnvilHeap& heap, const AnvilHeapObject& obj, AnvilValue key) noexcept {
+bool set_has(const CinderHeap& heap, const CinderHeapObject& obj, CinderValue key) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
         return false;
     }
-    const AnvilHeapArray& arr = heap.arrays()[arr_id];
-    const AnvilValue* elems = heap.array_elems(arr.storage_off);
+    const CinderHeapArray& arr = heap.arrays()[arr_id];
+    const CinderValue* elems = heap.array_elems(arr.storage_off);
     for (u32 i = 0u; i < arr.length; ++i) {
         if (elems[i].bits != TOMBSTONE_BITS && same_value_zero(heap, elems[i], key)) {
             return true;
@@ -548,16 +548,16 @@ bool set_has(const AnvilHeap& heap, const AnvilHeapObject& obj, AnvilValue key) 
     return false;
 }
 
-bool set_delete(AnvilHeap& heap, AnvilHeapObject& obj, AnvilValue key) noexcept {
+bool set_delete(CinderHeap& heap, CinderHeapObject& obj, CinderValue key) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
         return false;
     }
-    const AnvilHeapArray& arr = heap.arrays()[arr_id];
-    AnvilValue* elems = heap.array_elems(arr.storage_off);
+    const CinderHeapArray& arr = heap.arrays()[arr_id];
+    CinderValue* elems = heap.array_elems(arr.storage_off);
     for (u32 i = 0u; i < arr.length; ++i) {
         if (elems[i].bits != TOMBSTONE_BITS && same_value_zero(heap, elems[i], key)) {
-            elems[i] = AnvilValue(TOMBSTONE_BITS);
+            elems[i] = CinderValue(TOMBSTONE_BITS);
             if (obj.byte_length > 0u) --obj.byte_length;
             return true;
         }
@@ -565,7 +565,7 @@ bool set_delete(AnvilHeap& heap, AnvilHeapObject& obj, AnvilValue key) noexcept 
     return false;
 }
 
-void set_clear(AnvilHeap& heap, AnvilHeapObject& obj) noexcept {
+void set_clear(CinderHeap& heap, CinderHeapObject& obj) noexcept {
     const u32 arr_id = obj.aux_id;
     if (arr_id < heap.array_count && heap.arrays()[arr_id].active) {
         heap.arrays()[arr_id].length = 0u;
@@ -573,7 +573,7 @@ void set_clear(AnvilHeap& heap, AnvilHeapObject& obj) noexcept {
     obj.byte_length = 0u;
 }
 
-bool set_add(AnvilHeap& heap, u32 obj_id, AnvilValue key) noexcept {
+bool set_add(CinderHeap& heap, u32 obj_id, CinderValue key) noexcept {
     const u32 arr_id = heap.objects()[obj_id].aux_id;
     if (arr_id >= heap.array_count || !heap.arrays()[arr_id].active) {
         return false;
@@ -630,7 +630,7 @@ f64 string_to_js_number(const char* ptr, u32 len) noexcept {
     return sign * val;
 }
 
-f64 coerce_to_number(const AnvilHeap& heap, AnvilValue v) noexcept {
+f64 coerce_to_number(const CinderHeap& heap, CinderValue v) noexcept {
     if (v.is_string()) {
         u32 len = 0u;
         const char* p = heap.get_string_ptr(v.payload(), &len);
@@ -647,7 +647,7 @@ constexpr u32 INIT_CONSTANT_TABLE = 64u;
 constexpr u32 INIT_FRAME_STACK = 8u;
 } // namespace
 
-bool AnvilVmContext::ensure_globals(u32 need) noexcept {
+bool CinderVmContext::ensure_globals(u32 need) noexcept {
     if (need <= globals_cap) {
         return true;
     }
@@ -656,12 +656,12 @@ bool AnvilVmContext::ensure_globals(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilGlobalBinding)), &over);
+    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(CinderGlobalBinding)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilGlobalBinding* dst = reinterpret_cast<AnvilGlobalBinding*>(heap.arena.at(new_off));
-    const AnvilGlobalBinding* src = globals();
+    CinderGlobalBinding* dst = reinterpret_cast<CinderGlobalBinding*>(heap.arena.at(new_off));
+    const CinderGlobalBinding* src = globals();
     for (u32 i = 0u; i < global_count; ++i) {
         dst[i] = src[i];
     }
@@ -670,12 +670,12 @@ bool AnvilVmContext::ensure_globals(u32 need) noexcept {
     globals_off = new_off;
     globals_cap = new_cap;
     if (old_cap != 0u) {
-        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilGlobalBinding)));
+        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderGlobalBinding)));
     }
     return true;
 }
 
-bool AnvilBytecodeProgram::ensure_constants(u32 need) noexcept {
+bool CinderBytecodeProgram::ensure_constants(u32 need) noexcept {
     if (need <= constants_cap) {
         return true;
     }
@@ -684,12 +684,12 @@ bool AnvilBytecodeProgram::ensure_constants(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilValue* dst = reinterpret_cast<AnvilValue*>(arena->at(new_off));
-    const AnvilValue* src = constants();
+    CinderValue* dst = reinterpret_cast<CinderValue*>(arena->at(new_off));
+    const CinderValue* src = constants();
     for (u32 i = 0u; i < const_len; ++i) {
         dst[i] = src[i];
     }
@@ -698,15 +698,15 @@ bool AnvilBytecodeProgram::ensure_constants(u32 need) noexcept {
     constants_off = new_off;
     constants_cap = new_cap;
     if (old_cap != 0u) {
-        arena->free(old_off, old_cap * static_cast<u32>(sizeof(AnvilValue)));
+        arena->free(old_off, old_cap * static_cast<u32>(sizeof(CinderValue)));
     }
     return true;
 }
 
-void AnvilVmContext::init() noexcept {
-    u8* arena_base = reinterpret_cast<u8*>(this) + sizeof(AnvilVmContext);
-    const u32 budget = heap_byte_budget != 0u ? heap_byte_budget : ANVIL_DEFAULT_HEAP_BUDGET;
-    heap.init(arena_base, ANVIL_ARENA_RESERVE_BYTES, budget);
+void CinderVmContext::init() noexcept {
+    u8* arena_base = reinterpret_cast<u8*>(this) + sizeof(CinderVmContext);
+    const u32 budget = heap_byte_budget != 0u ? heap_byte_budget : CINDER_DEFAULT_HEAP_BUDGET;
+    heap.init(arena_base, CINDER_ARENA_RESERVE_BYTES, budget);
     ic.init(&heap.arena);
     program.init(&heap.arena);
     registers_off = 0u;
@@ -725,7 +725,7 @@ void AnvilVmContext::init() noexcept {
     resume_pc = 0u;
     resume_reg_base = 0u;
     resume_closure = NO_SLOT;
-    resume_this = AnvilValue::make_undefined();
+    resume_this = CinderValue::make_undefined();
     pending_host_call = false;
     pending_host_fn = 0u;
     pending_arg_count = 0u;
@@ -746,7 +746,7 @@ void AnvilVmContext::init() noexcept {
     }
 }
 
-u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
+u16 CinderVmContext::resolve_global_slot(u32 name_sym) noexcept {
     for (u32 i = 0; i < global_count; ++i) {
         if (globals()[i].occupied && globals()[i].name_sym == name_sym) {
             return static_cast<u16>(i);
@@ -756,9 +756,9 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
         return NO_GLOBAL;
     }
     const u16 slot = static_cast<u16>(global_count++);
-    AnvilGlobalBinding& g = globals()[slot];
+    CinderGlobalBinding& g = globals()[slot];
     g.name_sym = name_sym;
-    g.value = AnvilValue::make_undefined();
+    g.value = CinderValue::make_undefined();
     g.occupied = true;
     g.exported = false;
     g.declared = false;
@@ -766,11 +766,11 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
     return slot;
 }
 
-void AnvilVmContext::reclaim_array_storage(u32 reg_top) noexcept {
+void CinderVmContext::reclaim_array_storage(u32 reg_top) noexcept {
     collect_garbage(reg_top);
 }
 
-bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
+bool CinderVmContext::store_ok(StoreResult stored) noexcept {
     switch (stored) {
         case StoreResult::TooManyProperties:
         case StoreResult::ShapesFull:
@@ -788,7 +788,7 @@ bool AnvilVmContext::store_ok(StoreResult stored) noexcept {
     return true;
 }
 
-bool AnvilVmContext::ensure_registers(u32 need) noexcept {
+bool CinderVmContext::ensure_registers(u32 need) noexcept {
     if (need <= registers_cap) {
         return true;
     }
@@ -797,29 +797,29 @@ bool AnvilVmContext::ensure_registers(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilValue* dst = reinterpret_cast<AnvilValue*>(heap.arena.at(new_off));
-    const AnvilValue* src = registers();
+    CinderValue* dst = reinterpret_cast<CinderValue*>(heap.arena.at(new_off));
+    const CinderValue* src = registers();
     for (u32 i = 0u; i < registers_cap; ++i) {
         dst[i] = src[i];
     }
     for (u32 i = registers_cap; i < new_cap; ++i) {
-        dst[i] = AnvilValue::make_undefined();
+        dst[i] = CinderValue::make_undefined();
     }
     const u32 old_off = registers_off;
     const u32 old_cap = registers_cap;
     registers_off = new_off;
     registers_cap = new_cap;
     if (old_cap != 0u) {
-        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilValue)));
+        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderValue)));
     }
     return true;
 }
 
-bool AnvilVmContext::ensure_frames(u32 need) noexcept {
+bool CinderVmContext::ensure_frames(u32 need) noexcept {
     if (need <= frames_cap) {
         return true;
     }
@@ -828,12 +828,12 @@ bool AnvilVmContext::ensure_frames(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilCallFrame)), &over);
+    const u32 new_off = heap.arena.alloc(new_cap * static_cast<u32>(sizeof(CinderCallFrame)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilCallFrame* dst = reinterpret_cast<AnvilCallFrame*>(heap.arena.at(new_off));
-    const AnvilCallFrame* src = frames();
+    CinderCallFrame* dst = reinterpret_cast<CinderCallFrame*>(heap.arena.at(new_off));
+    const CinderCallFrame* src = frames();
     for (u32 i = 0u; i < frame_count; ++i) {
         dst[i] = src[i];
     }
@@ -842,12 +842,12 @@ bool AnvilVmContext::ensure_frames(u32 need) noexcept {
     frames_off = new_off;
     frames_cap = new_cap;
     if (old_cap != 0u) {
-        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilCallFrame)));
+        heap.arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderCallFrame)));
     }
     return true;
 }
 
-void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
+void CinderVmContext::collect_garbage(u32 reg_top) noexcept {
     heap.clear_marks();
     const u32 top = reg_top < registers_cap ? reg_top : registers_cap;
     for (u32 i = 0; i < top; ++i) {
@@ -897,46 +897,46 @@ void AnvilVmContext::collect_garbage(u32 reg_top) noexcept {
     heap.sweep_unmarked();
 }
 
-AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
+CinderValue CinderVmContext::execute(u32 entry_pc) noexcept {
     if (yield_interval == 0u) {
         f64 native_out = 0.0;
-        if (anvil_jit_try_run(this, entry_pc, &native_out)) {
+        if (cinder_jit_try_run(this, entry_pc, &native_out)) {
             ++native_compilations;
-            return AnvilValue::make_number(native_out);
+            return CinderValue::make_number(native_out);
         }
     }
 
     frame_count = 0u;
     try_depth = 0u;
     const u32 top_regs = program.top_frame_regs != 0u ? program.top_frame_regs : 1u;
-    return run_loop(entry_pc, 0u, top_regs, NO_SLOT, AnvilValue::make_undefined());
+    return run_loop(entry_pc, 0u, top_regs, NO_SLOT, CinderValue::make_undefined());
 }
 
-AnvilValue AnvilVmContext::resume() noexcept {
+CinderValue CinderVmContext::resume() noexcept {
     paused = false;
     if (pending_host_call) {
         pending_host_call = false;
         const u32 dst = resume_reg_base + resume_host_dst;
         if (dst < registers_cap) {
-            registers()[dst] = AnvilValue::make_undefined();
+            registers()[dst] = CinderValue::make_undefined();
         }
     }
     return run_loop(resume_pc, resume_reg_base, resume_frame_regs, resume_closure, resume_this);
 }
 
-AnvilValue AnvilVmContext::run_loop(
+CinderValue CinderVmContext::run_loop(
     u32 pc,
     u32 reg_base,
     u32 frame_regs,
     u32 cur_closure_in,
-    AnvilValue cur_this_in,
+    CinderValue cur_this_in,
     u32 stop_frame_depth
 ) noexcept {
     const u32 step_limit_now = effective_step_limit();
     const u32 base_frame_depth = stop_frame_depth;
     u32 cur_frame_regs = frame_regs;
     u32 cur_closure = cur_closure_in;
-    AnvilValue cur_this = cur_this_in;
+    CinderValue cur_this = cur_this_in;
     u32 slice = 0u;
 
     auto sync_gc_roots = [&]() noexcept {
@@ -944,9 +944,9 @@ AnvilValue AnvilVmContext::run_loop(
         resume_this = cur_this;
     };
 
-    auto unwind_throw = [&](AnvilValue exc_val) noexcept -> bool {
+    auto unwind_throw = [&](CinderValue exc_val) noexcept -> bool {
         while (try_depth > 0u) {
-            AnvilTryHandler& h = try_stack[try_depth - 1u];
+            CinderTryHandler& h = try_stack[try_depth - 1u];
             if (h.frame_depth < base_frame_depth) {
                 break;
             }
@@ -1004,7 +1004,7 @@ AnvilValue AnvilVmContext::run_loop(
                 err_id = heap.alloc_error_object(kind, msg_sym);
             }
             if (err_id != NO_SLOT) {
-                return unwind_throw(AnvilValue::make_object(err_id));
+                return unwind_throw(CinderValue::make_object(err_id));
             }
         }
         fail(stop_code, msg);
@@ -1019,16 +1019,16 @@ AnvilValue AnvilVmContext::run_loop(
             resume_frame_regs = cur_frame_regs;
             resume_closure = cur_closure;
             resume_this = cur_this;
-            return AnvilValue::make_undefined();
+            return CinderValue::make_undefined();
         }
         ++slice;
         if (++steps_executed > step_limit_now) {
             fail_limit(VM_STOP_STEPS, "step", step_limit_now, "steps");
-            return AnvilValue::make_undefined();
+            return CinderValue::make_undefined();
         }
 
-        const AnvilInstruction inst = program.code()[pc++];
-        AnvilValue* R = &registers()[reg_base];
+        const CinderInstruction inst = program.code()[pc++];
+        CinderValue* R = &registers()[reg_base];
 
         const u32 operands = numeric_operands(inst.op);
         if (operands != 0u &&
@@ -1036,52 +1036,52 @@ AnvilValue AnvilVmContext::run_loop(
             if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                      "arithmetic or comparison on a string or object",
                                      VM_STOP_UNSUPPORTED)) {
-                return AnvilValue::make_undefined();
+                return CinderValue::make_undefined();
             }
             continue;
         }
 
         switch (inst.op) {
-            case AnvilOpcode::Nop:
+            case CinderOpcode::Nop:
                 break;
 
-            case AnvilOpcode::LoadConst: {
+            case CinderOpcode::LoadConst: {
                 const u32 idx = inst.imm32();
-                R[inst.a] = (idx < program.const_len) ? program.constants()[idx] : AnvilValue::make_null();
+                R[inst.a] = (idx < program.const_len) ? program.constants()[idx] : CinderValue::make_null();
                 break;
             }
 
-            case AnvilOpcode::LoadSmi:
-                R[inst.a] = AnvilValue::make_smi(inst.signed_imm16());
+            case CinderOpcode::LoadSmi:
+                R[inst.a] = CinderValue::make_smi(inst.signed_imm16());
                 break;
 
-            case AnvilOpcode::LoadNull:
-                R[inst.a] = AnvilValue::make_null();
+            case CinderOpcode::LoadNull:
+                R[inst.a] = CinderValue::make_null();
                 break;
 
-            case AnvilOpcode::LoadTrue:
-                R[inst.a] = AnvilValue::make_bool(true);
+            case CinderOpcode::LoadTrue:
+                R[inst.a] = CinderValue::make_bool(true);
                 break;
 
-            case AnvilOpcode::LoadFalse:
-                R[inst.a] = AnvilValue::make_bool(false);
+            case CinderOpcode::LoadFalse:
+                R[inst.a] = CinderValue::make_bool(false);
                 break;
 
-            case AnvilOpcode::LoadThis:
+            case CinderOpcode::LoadThis:
                 R[inst.a] = cur_this;
                 break;
 
-            case AnvilOpcode::Move:
+            case CinderOpcode::Move:
                 R[inst.a] = R[inst.b];
                 break;
 
-            case AnvilOpcode::Add: {
-                const AnvilValue lhs = R[inst.b];
-                const AnvilValue rhs = R[inst.c];
+            case CinderOpcode::Add: {
+                const CinderValue lhs = R[inst.b];
+                const CinderValue rhs = R[inst.c];
                 if (lhs.is_smi() && rhs.is_smi()) {
                     const i64 sum = static_cast<i64>(lhs.as_smi()) + static_cast<i64>(rhs.as_smi());
                     if (sum >= -1073741824LL && sum <= 1073741823LL) {
-                        R[inst.a] = AnvilValue::make_smi(static_cast<i32>(sum));
+                        R[inst.a] = CinderValue::make_smi(static_cast<i32>(sum));
                         break;
                     }
                 }
@@ -1103,174 +1103,174 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (sym == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     R = &registers()[reg_base];
-                    R[inst.a] = AnvilValue::make_string(sym);
+                    R[inst.a] = CinderValue::make_string(sym);
                     break;
                 }
                 if (!numeric_operand(lhs) || !numeric_operand(rhs)) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "arithmetic or comparison on a string or object",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
-                R[inst.a] = AnvilValue::make_number(lhs.as_number() + rhs.as_number());
+                R[inst.a] = CinderValue::make_number(lhs.as_number() + rhs.as_number());
                 break;
             }
 
-            case AnvilOpcode::Sub: {
-                const AnvilValue lhs = R[inst.b];
-                const AnvilValue rhs = R[inst.c];
+            case CinderOpcode::Sub: {
+                const CinderValue lhs = R[inst.b];
+                const CinderValue rhs = R[inst.c];
                 if (lhs.is_smi() && rhs.is_smi()) {
                     const i64 diff = static_cast<i64>(lhs.as_smi()) - static_cast<i64>(rhs.as_smi());
                     if (diff >= -1073741824LL && diff <= 1073741823LL) {
-                        R[inst.a] = AnvilValue::make_smi(static_cast<i32>(diff));
+                        R[inst.a] = CinderValue::make_smi(static_cast<i32>(diff));
                         break;
                     }
                 }
-                R[inst.a] = AnvilValue::make_number(lhs.as_number() - rhs.as_number());
+                R[inst.a] = CinderValue::make_number(lhs.as_number() - rhs.as_number());
                 break;
             }
 
-            case AnvilOpcode::Mul: {
-                const AnvilValue lhs = R[inst.b];
-                const AnvilValue rhs = R[inst.c];
+            case CinderOpcode::Mul: {
+                const CinderValue lhs = R[inst.b];
+                const CinderValue rhs = R[inst.c];
                 if (lhs.is_smi() && rhs.is_smi()) {
                     const i64 prod = static_cast<i64>(lhs.as_smi()) * static_cast<i64>(rhs.as_smi());
                     const bool negative_zero = prod == 0 && (lhs.as_smi() < 0 || rhs.as_smi() < 0);
                     if (!negative_zero && prod >= -1073741824LL && prod <= 1073741823LL) {
-                        R[inst.a] = AnvilValue::make_smi(static_cast<i32>(prod));
+                        R[inst.a] = CinderValue::make_smi(static_cast<i32>(prod));
                         break;
                     }
                 }
-                R[inst.a] = AnvilValue::make_number(lhs.as_number() * rhs.as_number());
+                R[inst.a] = CinderValue::make_number(lhs.as_number() * rhs.as_number());
                 break;
             }
 
-            case AnvilOpcode::Div:
-                R[inst.a] = AnvilValue::make_number(R[inst.b].as_number() / R[inst.c].as_number());
+            case CinderOpcode::Div:
+                R[inst.a] = CinderValue::make_number(R[inst.b].as_number() / R[inst.c].as_number());
                 break;
 
-            case AnvilOpcode::Mod:
-                R[inst.a] = AnvilValue::make_number(js_remainder(R[inst.b].as_number(), R[inst.c].as_number()));
+            case CinderOpcode::Mod:
+                R[inst.a] = CinderValue::make_number(js_remainder(R[inst.b].as_number(), R[inst.c].as_number()));
                 break;
 
-            case AnvilOpcode::Neg:
-                R[inst.a] = AnvilValue::make_number(-R[inst.b].as_number());
+            case CinderOpcode::Neg:
+                R[inst.a] = CinderValue::make_number(-R[inst.b].as_number());
                 break;
 
-            case AnvilOpcode::Not:
-                R[inst.a] = AnvilValue::make_bool(!truthy(heap, R[inst.b]));
+            case CinderOpcode::Not:
+                R[inst.a] = CinderValue::make_bool(!truthy(heap, R[inst.b]));
                 break;
 
-            case AnvilOpcode::BitNot:
-                R[inst.a] = AnvilValue::make_smi(~js_to_int32(R[inst.b].as_number()));
+            case CinderOpcode::BitNot:
+                R[inst.a] = CinderValue::make_smi(~js_to_int32(R[inst.b].as_number()));
                 break;
 
-            case AnvilOpcode::ToNum:
-                R[inst.a] = AnvilValue::make_number(coerce_to_number(heap, R[inst.b]));
+            case CinderOpcode::ToNum:
+                R[inst.a] = CinderValue::make_number(coerce_to_number(heap, R[inst.b]));
                 break;
 
-            case AnvilOpcode::BitAnd:
-                R[inst.a] = AnvilValue::make_smi(
+            case CinderOpcode::BitAnd:
+                R[inst.a] = CinderValue::make_smi(
                     js_to_int32(R[inst.b].as_number()) & js_to_int32(R[inst.c].as_number())
                 );
                 break;
 
-            case AnvilOpcode::BitOr:
-                R[inst.a] = AnvilValue::make_smi(
+            case CinderOpcode::BitOr:
+                R[inst.a] = CinderValue::make_smi(
                     js_to_int32(R[inst.b].as_number()) | js_to_int32(R[inst.c].as_number())
                 );
                 break;
 
-            case AnvilOpcode::BitXor:
-                R[inst.a] = AnvilValue::make_smi(
+            case CinderOpcode::BitXor:
+                R[inst.a] = CinderValue::make_smi(
                     js_to_int32(R[inst.b].as_number()) ^ js_to_int32(R[inst.c].as_number())
                 );
                 break;
 
-            case AnvilOpcode::Shl: {
+            case CinderOpcode::Shl: {
                 const i32 s = js_to_int32(R[inst.c].as_number()) & 31;
-                R[inst.a] = AnvilValue::make_smi(js_to_int32(R[inst.b].as_number()) << s);
+                R[inst.a] = CinderValue::make_smi(js_to_int32(R[inst.b].as_number()) << s);
                 break;
             }
 
-            case AnvilOpcode::Shr: {
+            case CinderOpcode::Shr: {
                 const i32 s = js_to_int32(R[inst.c].as_number()) & 31;
-                R[inst.a] = AnvilValue::make_smi(js_to_int32(R[inst.b].as_number()) >> s);
+                R[inst.a] = CinderValue::make_smi(js_to_int32(R[inst.b].as_number()) >> s);
                 break;
             }
 
-            case AnvilOpcode::UShr: {
+            case CinderOpcode::UShr: {
                 const u32 s = js_to_uint32(R[inst.c].as_number()) & 31u;
                 const u32 u = js_to_uint32(R[inst.b].as_number()) >> s;
-                R[inst.a] = AnvilValue::make_number(static_cast<f64>(u));
+                R[inst.a] = CinderValue::make_number(static_cast<f64>(u));
                 break;
             }
 
-            case AnvilOpcode::CmpEq:
-                R[inst.a] = AnvilValue::make_bool(values_strictly_equal(heap, R[inst.b], R[inst.c]));
+            case CinderOpcode::CmpEq:
+                R[inst.a] = CinderValue::make_bool(values_strictly_equal(heap, R[inst.b], R[inst.c]));
                 break;
 
-            case AnvilOpcode::CmpNe:
-                R[inst.a] = AnvilValue::make_bool(!values_strictly_equal(heap, R[inst.b], R[inst.c]));
+            case CinderOpcode::CmpNe:
+                R[inst.a] = CinderValue::make_bool(!values_strictly_equal(heap, R[inst.b], R[inst.c]));
                 break;
 
-            case AnvilOpcode::CmpLooseEq:
-            case AnvilOpcode::CmpLooseNe: {
+            case CinderOpcode::CmpLooseEq:
+            case CinderOpcode::CmpLooseNe: {
                 bool known = true;
                 const bool equal = values_loosely_equal(heap, R[inst.b], R[inst.c], known);
                 if (!known) {
                     fail(VM_STOP_UNSUPPORTED, "== between values of different types");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_bool(inst.op == AnvilOpcode::CmpLooseEq ? equal : !equal);
+                R[inst.a] = CinderValue::make_bool(inst.op == CinderOpcode::CmpLooseEq ? equal : !equal);
                 break;
             }
 
-            case AnvilOpcode::CmpLt:
-            case AnvilOpcode::CmpLe:
-            case AnvilOpcode::CmpGt:
-            case AnvilOpcode::CmpGe: {
-                const AnvilValue lhs = R[inst.b];
-                const AnvilValue rhs = R[inst.c];
+            case CinderOpcode::CmpLt:
+            case CinderOpcode::CmpLe:
+            case CinderOpcode::CmpGt:
+            case CinderOpcode::CmpGe: {
+                const CinderValue lhs = R[inst.b];
+                const CinderValue rhs = R[inst.c];
                 if (lhs.is_string() && rhs.is_string()) {
                     u32 la = 0u, lb = 0u;
                     const char* pa = heap.get_string_ptr(lhs.payload(), &la);
                     const char* pb = heap.get_string_ptr(rhs.payload(), &lb);
                     const i32 cmp = utf16_compare(pa, la, pb, lb);
                     bool res = false;
-                    if (inst.op == AnvilOpcode::CmpLt) res = (cmp < 0);
-                    else if (inst.op == AnvilOpcode::CmpLe) res = (cmp <= 0);
-                    else if (inst.op == AnvilOpcode::CmpGt) res = (cmp > 0);
+                    if (inst.op == CinderOpcode::CmpLt) res = (cmp < 0);
+                    else if (inst.op == CinderOpcode::CmpLe) res = (cmp <= 0);
+                    else if (inst.op == CinderOpcode::CmpGt) res = (cmp > 0);
                     else res = (cmp >= 0);
-                    R[inst.a] = AnvilValue::make_bool(res);
+                    R[inst.a] = CinderValue::make_bool(res);
                     break;
                 }
                 if (!numeric_operand(lhs) || !numeric_operand(rhs)) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "arithmetic or comparison on a string or object",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
                 const f64 na = lhs.as_number();
                 const f64 nb = rhs.as_number();
                 bool res = false;
-                if (inst.op == AnvilOpcode::CmpLt) res = (na < nb);
-                else if (inst.op == AnvilOpcode::CmpLe) res = (na <= nb);
-                else if (inst.op == AnvilOpcode::CmpGt) res = (na > nb);
+                if (inst.op == CinderOpcode::CmpLt) res = (na < nb);
+                else if (inst.op == CinderOpcode::CmpLe) res = (na <= nb);
+                else if (inst.op == CinderOpcode::CmpGt) res = (na > nb);
                 else res = (na >= nb);
-                R[inst.a] = AnvilValue::make_bool(res);
+                R[inst.a] = CinderValue::make_bool(res);
                 break;
             }
 
-            case AnvilOpcode::TypeOf: {
-                const AnvilValue v = R[inst.b];
+            case CinderOpcode::TypeOf: {
+                const CinderValue v = R[inst.b];
                 const char* ts = "undefined";
                 u32 tlen = 9u;
                 switch (v.tag()) {
@@ -1294,47 +1294,47 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (sym == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_string(sym);
+                R[inst.a] = CinderValue::make_string(sym);
                 break;
             }
 
-            case AnvilOpcode::InOp: {
-                const AnvilValue key_val = R[inst.b];
-                const AnvilValue target = R[inst.c];
+            case CinderOpcode::InOp: {
+                const CinderValue key_val = R[inst.b];
+                const CinderValue target = R[inst.c];
                 if (target.is_array()) {
                     const i32 idx = key_val.is_number() ? array_index(key_val.as_number()) : -1;
                     const u32 arr_id = target.payload();
                     const bool ok = (idx >= 0 && arr_id < heap.array_count &&
                                      heap.arrays()[arr_id].active &&
                                      static_cast<u32>(idx) < heap.arrays()[arr_id].length);
-                    R[inst.a] = AnvilValue::make_bool(ok);
+                    R[inst.a] = CinderValue::make_bool(ok);
                     break;
                 }
                 if (!target.is_object()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "in operator on non-object",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
                 sync_gc_roots();
                 const u32 prop_sym = heap.value_to_string_sym(key_val);
                 R = &registers()[reg_base];
-                R[inst.a] = AnvilValue::make_bool(heap.has_object_prop(target.payload(), prop_sym));
+                R[inst.a] = CinderValue::make_bool(heap.has_object_prop(target.payload(), prop_sym));
                 break;
             }
 
-            case AnvilOpcode::InstanceOf: {
-                const AnvilValue lhs = R[inst.b];
-                const AnvilValue rhs = R[inst.c];
+            case CinderOpcode::InstanceOf: {
+                const CinderValue lhs = R[inst.b];
+                const CinderValue rhs = R[inst.c];
                 if (!rhs.is_function()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "instanceof right-hand side is not callable",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -1386,34 +1386,34 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                     }
                 }
-                R[inst.a] = AnvilValue::make_bool(found);
+                R[inst.a] = CinderValue::make_bool(found);
                 break;
             }
 
-            case AnvilOpcode::DeleteProp: {
-                const AnvilValue recv = R[inst.b];
+            case CinderOpcode::DeleteProp: {
+                const CinderValue recv = R[inst.b];
                 const u32 prop_sym = inst.imm32();
                 if (recv.is_object()) {
                     heap.delete_object_prop(recv.payload(), prop_sym);
                 }
-                R[inst.a] = AnvilValue::make_bool(true);
+                R[inst.a] = CinderValue::make_bool(true);
                 break;
             }
 
-            case AnvilOpcode::DeleteElem: {
-                const AnvilValue recv = R[inst.b];
-                const AnvilValue key = R[inst.c];
+            case CinderOpcode::DeleteElem: {
+                const CinderValue recv = R[inst.b];
+                const CinderValue key = R[inst.c];
                 if (recv.is_object()) {
                     sync_gc_roots();
                     const u32 prop_sym = heap.value_to_string_sym(key);
                     R = &registers()[reg_base];
                     heap.delete_object_prop(recv.payload(), prop_sym);
                 }
-                R[inst.a] = AnvilValue::make_bool(true);
+                R[inst.a] = CinderValue::make_bool(true);
                 break;
             }
 
-            case AnvilOpcode::StringFromCharCode: {
+            case CinderOpcode::StringFromCharCode: {
                 const u32 code_unit = js_to_uint32(R[inst.b].as_number()) & 0xFFFFu;
                 char utf8_buf[3];
                 const u32 n = encode_unit_utf8(static_cast<u16>(code_unit), utf8_buf);
@@ -1426,35 +1426,35 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (sym == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_string(sym);
+                R[inst.a] = CinderValue::make_string(sym);
                 break;
             }
 
-            case AnvilOpcode::Jump:
+            case CinderOpcode::Jump:
                 pc = inst.imm32();
                 break;
 
-            case AnvilOpcode::JumpIfFalse:
+            case CinderOpcode::JumpIfFalse:
                 if (!truthy(heap, R[inst.a])) {
                     pc = inst.imm32();
                 }
                 break;
 
-            case AnvilOpcode::JumpIfTrue:
+            case CinderOpcode::JumpIfTrue:
                 if (truthy(heap, R[inst.a])) {
                     pc = inst.imm32();
                 }
                 break;
 
-            case AnvilOpcode::GetGlobal: {
+            case CinderOpcode::GetGlobal: {
                 const u32 slot = inst.imm32();
-                R[inst.a] = (slot < global_count) ? globals()[slot].value : AnvilValue::make_undefined();
+                R[inst.a] = (slot < global_count) ? globals()[slot].value : CinderValue::make_undefined();
                 break;
             }
 
-            case AnvilOpcode::SetGlobal: {
+            case CinderOpcode::SetGlobal: {
                 const u32 slot = inst.imm32();
                 if (slot < global_count) {
                     globals()[slot].value = R[inst.a];
@@ -1463,7 +1463,7 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::NewObject: {
+            case CinderOpcode::NewObject: {
                 sync_gc_roots();
                 u32 obj_id = heap.alloc_object(0u);
                 if (obj_id == NO_SLOT) {
@@ -1473,13 +1473,13 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (obj_id == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_object(obj_id);
+                R[inst.a] = CinderValue::make_object(obj_id);
                 break;
             }
 
-            case AnvilOpcode::NewArray: {
+            case CinderOpcode::NewArray: {
                 sync_gc_roots();
                 u32 arr_id = heap.alloc_array(inst.b);
                 if (arr_id == NO_SLOT) {
@@ -1489,21 +1489,21 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (arr_id == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_array(arr_id);
+                R[inst.a] = CinderValue::make_array(arr_id);
                 break;
             }
 
-            case AnvilOpcode::GetPropIC: {
+            case CinderOpcode::GetPropIC: {
                 const u32 site_id = inst.c;
                 const u32 prop_sym = (site_id < ic.site_count) ? ic.sites()[site_id].prop_sym : 0u;
-                const AnvilValue recv = R[inst.b];
+                const CinderValue recv = R[inst.b];
                 if (!recv.is_object() && !recv.is_array() && !recv.is_string() && !recv.is_function()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "property read on a value that is not an object or array",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -1512,7 +1512,7 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::SetPropIC: {
+            case CinderOpcode::SetPropIC: {
                 const u32 site_id = inst.c;
                 const u32 prop_sym = (site_id < ic.site_count) ? ic.sites()[site_id].prop_sym : 0u;
                 sync_gc_roots();
@@ -1523,14 +1523,14 @@ AnvilValue AnvilVmContext::run_loop(
                     stored = ic.store_property_ic(heap, site_id, R[inst.a], prop_sym, R[inst.b]);
                 }
                 if (!store_ok(stored)) {
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::GetElem: {
-                const AnvilValue recv = R[inst.b];
-                const AnvilValue key = R[inst.c];
+            case CinderOpcode::GetElem: {
+                const CinderValue recv = R[inst.b];
+                const CinderValue key = R[inst.c];
                 if (recv.is_array() && key.is_number()) {
                     R[inst.a] = heap.get_array_elem(recv.payload(), array_index(key.as_number()));
                     break;
@@ -1538,14 +1538,14 @@ AnvilValue AnvilVmContext::run_loop(
                 if (recv.is_string() && key.is_number()) {
                     const i32 idx = array_index(key.as_number());
                     if (idx < 0) {
-                        R[inst.a] = AnvilValue::make_undefined();
+                        R[inst.a] = CinderValue::make_undefined();
                         break;
                     }
                     u32 blen = 0u;
                     const char* ptr = heap.get_string_ptr(recv.payload(), &blen);
                     u16 unit = 0u;
                     if (!utf16_at(ptr, blen, static_cast<u32>(idx), &unit)) {
-                        R[inst.a] = AnvilValue::make_undefined();
+                        R[inst.a] = CinderValue::make_undefined();
                         break;
                     }
                     char ubuf[3];
@@ -1557,7 +1557,7 @@ AnvilValue AnvilVmContext::run_loop(
                         R = &registers()[reg_base];
                         csym = heap.intern_string(ubuf, un);
                     }
-                    R[inst.a] = (csym != NO_SLOT) ? AnvilValue::make_string(csym) : AnvilValue::make_undefined();
+                    R[inst.a] = (csym != NO_SLOT) ? CinderValue::make_string(csym) : CinderValue::make_undefined();
                     break;
                 }
                 if (recv.is_object()) {
@@ -1580,22 +1580,22 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                          "element read the VM does not run",
                                          VM_STOP_UNSUPPORTED)) {
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::SetElem: {
-                const AnvilValue recv = R[inst.a];
-                const AnvilValue key = R[inst.b];
-                const AnvilValue val = R[inst.c];
+            case CinderOpcode::SetElem: {
+                const CinderValue recv = R[inst.a];
+                const CinderValue key = R[inst.b];
+                const CinderValue val = R[inst.c];
                 if (recv.is_array()) {
                     const i32 idx = key.is_number() ? array_index(key.as_number()) : -1;
                     if (idx < 0) {
                         if (!raise_builtin_error(BuiltinCtorKind::RangeError,
                                                  "element write the VM does not run",
                                                  VM_STOP_UNSUPPORTED)) {
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         break;
                     }
@@ -1607,7 +1607,7 @@ AnvilValue AnvilVmContext::run_loop(
                         stored = heap.set_array_elem(recv.payload(), idx, val);
                     }
                     if (!store_ok(stored)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -1631,7 +1631,7 @@ AnvilValue AnvilVmContext::run_loop(
                             stored = heap.set_object_prop(obj_id, prop_sym, val, nullptr, nullptr);
                         }
                         if (!store_ok(stored)) {
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         break;
                     }
@@ -1639,18 +1639,18 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                          "element write the VM does not run",
                                          VM_STOP_UNSUPPORTED)) {
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::ArrayPush: {
-                const AnvilValue recv = R[inst.a];
+            case CinderOpcode::ArrayPush: {
+                const CinderValue recv = R[inst.a];
                 if (!recv.is_array()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "push on a value that is not an array",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -1662,25 +1662,25 @@ AnvilValue AnvilVmContext::run_loop(
                     stored = heap.push_array_elem(recv.payload(), R[inst.b]);
                 }
                 if (!store_ok(stored)) {
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::Call: {
+            case CinderOpcode::Call: {
                 const u32 fn_id = inst.b;
                 if (fn_id >= heap.function_count || !heap.functions()[fn_id].active) {
-                    R[inst.a] = AnvilValue::make_null();
+                    R[inst.a] = CinderValue::make_null();
                     break;
                 }
                 if (frame_count + 1u > effective_call_depth()) {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const CinderHeapFunction& fn = heap.functions()[fn_id];
                 if (static_cast<u32>(inst.c) + fn.arity > cur_frame_regs) {
                     fail(VM_STOP_UNSUPPORTED, "call arguments outside the caller's registers");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 u32 callee_regs = fn.local_count;
                 if (callee_regs < fn.arity) {
@@ -1693,23 +1693,23 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilValue* regs = registers();
+                CinderValue* regs = registers();
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = regs[reg_base + inst.c + a_idx];
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, inst.a, NO_SLOT, cur_this};
+                    CinderCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, inst.a, NO_SLOT, cur_this};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
                 cur_closure = NO_SLOT;
-                cur_this = AnvilValue::make_undefined();
+                cur_this = CinderValue::make_undefined();
                 pc = fn.code_start;
                 break;
             }
 
-            case AnvilOpcode::LoadFunc: {
+            case CinderOpcode::LoadFunc: {
                 const u32 fn_id = inst.imm32();
                 u32 cid = NO_SLOT;
                 if (fn_id < heap.function_count) {
@@ -1718,16 +1718,16 @@ AnvilValue AnvilVmContext::run_loop(
                         cid = heap.alloc_closure(fn_id, NO_SLOT, 0u, true);
                         if (cid == NO_SLOT) {
                             fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         heap.functions()[fn_id].canonical_closure = cid;
                     }
                 }
-                R[inst.a] = AnvilValue::make_function(cid);
+                R[inst.a] = CinderValue::make_function(cid);
                 break;
             }
 
-            case AnvilOpcode::HostCall: {
+            case CinderOpcode::HostCall: {
                 const u32 fn_id = inst.imm32();
                 const u32 base = inst.b;
                 const u32 argc = inst.c;
@@ -1746,16 +1746,16 @@ AnvilValue AnvilVmContext::run_loop(
                 resume_closure = cur_closure;
                 resume_this = cur_this;
                 resume_host_dst = inst.a;
-                return AnvilValue::make_undefined();
+                return CinderValue::make_undefined();
             }
 
-            case AnvilOpcode::CallValue: {
-                const AnvilValue callee = R[inst.b];
+            case CinderOpcode::CallValue: {
+                const CinderValue callee = R[inst.b];
                 if (!callee.is_function()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -1764,7 +1764,7 @@ AnvilValue AnvilVmContext::run_loop(
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -1773,19 +1773,19 @@ AnvilValue AnvilVmContext::run_loop(
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
                 if (frame_count + 1u > effective_call_depth()) {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const CinderHeapFunction& fn = heap.functions()[fn_id];
                 const u32 argc = inst.imm32();
                 if (static_cast<u32>(inst.c) + argc > cur_frame_regs) {
                     fail(VM_STOP_UNSUPPORTED, "call arguments outside the caller's registers");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 u32 callee_regs = fn.local_count;
                 if (callee_regs < fn.arity) {
@@ -1798,34 +1798,34 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilValue* regs = registers();
+                CinderValue* regs = registers();
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = (a_idx < argc)
                         ? regs[reg_base + inst.c + a_idx]
-                        : AnvilValue::make_undefined();
+                        : CinderValue::make_undefined();
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, inst.a, NO_SLOT, cur_this};
+                    CinderCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, inst.a, NO_SLOT, cur_this};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
                 cur_closure = cid;
-                cur_this = AnvilValue::make_undefined();
+                cur_this = CinderValue::make_undefined();
                 pc = fn.code_start;
                 break;
             }
 
-            case AnvilOpcode::CallMethod: {
+            case CinderOpcode::CallMethod: {
                 const u32 argc = inst.pad;
                 const u16 dst_reg = inst.a;
-                const AnvilValue recv = R[inst.b];
+                const CinderValue recv = R[inst.b];
                 const u32 call_base = inst.c;
                 const u32 prop_sym = inst.imm32();
                 u32 mlen = 0u;
                 const char* mname = heap.get_string_ptr(prop_sym, &mlen);
-                auto arg_at = [&](u32 idx) noexcept -> AnvilValue {
-                    if (idx >= argc) return AnvilValue::make_undefined();
+                auto arg_at = [&](u32 idx) noexcept -> CinderValue {
+                    if (idx >= argc) return CinderValue::make_undefined();
                     return registers()[reg_base + call_base + idx];
                 };
 
@@ -1833,7 +1833,7 @@ AnvilValue AnvilVmContext::run_loop(
                     const u32 arr_id = recv.payload();
                     if (cstr_eq(mname, mlen, "push", 4u)) {
                         for (u32 i = 0; i < argc; ++i) {
-                            const AnvilValue v = arg_at(i);
+                            const CinderValue v = arg_at(i);
                             sync_gc_roots();
                             StoreResult stored = heap.push_array_elem(arr_id, v);
                             if (stored == StoreResult::HeapFull) {
@@ -1842,16 +1842,16 @@ AnvilValue AnvilVmContext::run_loop(
                                 stored = heap.push_array_elem(arr_id, v);
                             }
                             if (!store_ok(stored)) {
-                                return AnvilValue::make_undefined();
+                                return CinderValue::make_undefined();
                             }
                         }
-                        R[dst_reg] = AnvilValue::make_smi(static_cast<i32>(heap.arrays()[arr_id].length));
+                        R[dst_reg] = CinderValue::make_smi(static_cast<i32>(heap.arrays()[arr_id].length));
                         break;
                     }
                     if (cstr_eq(mname, mlen, "pop", 3u)) {
-                        AnvilHeapArray& arr = heap.arrays()[arr_id];
+                        CinderHeapArray& arr = heap.arrays()[arr_id];
                         if (arr.length == 0u) {
-                            R[dst_reg] = AnvilValue::make_undefined();
+                            R[dst_reg] = CinderValue::make_undefined();
                         } else {
                             --arr.length;
                             R[dst_reg] = heap.array_elems(arr.storage_off)[arr.length];
@@ -1859,7 +1859,7 @@ AnvilValue AnvilVmContext::run_loop(
                         break;
                     }
                     if (cstr_eq(mname, mlen, "slice", 5u)) {
-                        const AnvilHeapArray& arr = heap.arrays()[arr_id];
+                        const CinderHeapArray& arr = heap.arrays()[arr_id];
                         const i32 len = static_cast<i32>(arr.length);
                         i32 start = 0;
                         i32 end = len;
@@ -1883,21 +1883,21 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                         if (out_id == NO_SLOT) {
                             fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         for (u32 i = 0; i < count; ++i) {
-                            const AnvilValue elem = heap.get_array_elem(arr_id, start + static_cast<i32>(i));
+                            const CinderValue elem = heap.get_array_elem(arr_id, start + static_cast<i32>(i));
                             heap.push_array_elem(out_id, elem);
                         }
                         R = &registers()[reg_base];
-                        R[dst_reg] = AnvilValue::make_array(out_id);
+                        R[dst_reg] = CinderValue::make_array(out_id);
                         break;
                     }
                     if (cstr_eq(mname, mlen, "toString", 8u)) {
                         sync_gc_roots();
                         const u32 sym = heap.value_to_string_sym(recv);
                         R = &registers()[reg_base];
-                        R[dst_reg] = AnvilValue::make_string(sym);
+                        R[dst_reg] = CinderValue::make_string(sym);
                         break;
                     }
                 }
@@ -1911,9 +1911,9 @@ AnvilValue AnvilVmContext::run_loop(
                             : 0;
                         u16 unit = 0u;
                         if (idx < 0 || !utf16_at(ptr, blen, static_cast<u32>(idx), &unit)) {
-                            R[dst_reg] = AnvilValue::make_number(bits_to_f64(0x7FF8000000000000ULL));
+                            R[dst_reg] = CinderValue::make_number(bits_to_f64(0x7FF8000000000000ULL));
                         } else {
-                            R[dst_reg] = AnvilValue::make_smi(static_cast<i32>(unit));
+                            R[dst_reg] = CinderValue::make_smi(static_cast<i32>(unit));
                         }
                         break;
                     }
@@ -1956,15 +1956,15 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                         if (sym == NO_SLOT) {
                             fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         R = &registers()[reg_base];
-                        R[dst_reg] = AnvilValue::make_string(sym);
+                        R[dst_reg] = CinderValue::make_string(sym);
                         break;
                     }
                     if (cstr_eq(mname, mlen, "indexOf", 7u)) {
                         if (argc == 0u || !arg_at(0u).is_string()) {
-                            R[dst_reg] = AnvilValue::make_smi(-1);
+                            R[dst_reg] = CinderValue::make_smi(-1);
                             break;
                         }
                         u32 nlen = 0u;
@@ -1976,7 +1976,7 @@ AnvilValue AnvilVmContext::run_loop(
                         const u32 n_ulen = utf16_len(nptr, nlen);
                         const u32 start_u = (from < 0) ? 0u : (static_cast<u32>(from) > h_ulen ? h_ulen : static_cast<u32>(from));
                         if (n_ulen == 0u) {
-                            R[dst_reg] = AnvilValue::make_smi(static_cast<i32>(start_u));
+                            R[dst_reg] = CinderValue::make_smi(static_cast<i32>(start_u));
                             break;
                         }
                         i32 found_idx = -1;
@@ -1998,7 +1998,7 @@ AnvilValue AnvilVmContext::run_loop(
                                 }
                             }
                         }
-                        R[dst_reg] = AnvilValue::make_smi(found_idx);
+                        R[dst_reg] = CinderValue::make_smi(found_idx);
                         break;
                     }
                     if (cstr_eq(mname, mlen, "toString", 8u)) {
@@ -2017,28 +2017,28 @@ AnvilValue AnvilVmContext::run_loop(
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "has", 3u)) {
-                                R[dst_reg] = AnvilValue::make_bool(map_has(heap, heap.objects()[obj_id], arg_at(0u)));
+                                R[dst_reg] = CinderValue::make_bool(map_has(heap, heap.objects()[obj_id], arg_at(0u)));
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "delete", 6u)) {
-                                R[dst_reg] = AnvilValue::make_bool(map_delete(heap, heap.objects()[obj_id], arg_at(0u)));
+                                R[dst_reg] = CinderValue::make_bool(map_delete(heap, heap.objects()[obj_id], arg_at(0u)));
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "clear", 5u)) {
                                 map_clear(heap, heap.objects()[obj_id]);
-                                R[dst_reg] = AnvilValue::make_undefined();
+                                R[dst_reg] = CinderValue::make_undefined();
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "set", 3u)) {
-                                const AnvilValue k = arg_at(0u);
-                                const AnvilValue v = arg_at(1u);
+                                const CinderValue k = arg_at(0u);
+                                const CinderValue v = arg_at(1u);
                                 sync_gc_roots();
                                 if (!map_set(heap, obj_id, k, v)) {
                                     reclaim_array_storage(reg_base + cur_frame_regs);
                                     R = &registers()[reg_base];
                                     if (!map_set(heap, obj_id, k, v)) {
                                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                                        return AnvilValue::make_undefined();
+                                        return CinderValue::make_undefined();
                                     }
                                 }
                                 R = &registers()[reg_base];
@@ -2046,70 +2046,70 @@ AnvilValue AnvilVmContext::run_loop(
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "forEach", 7u)) {
-                                const AnvilValue cb = arg_at(0u);
+                                const CinderValue cb = arg_at(0u);
                                 if (!cb.is_function()) {
                                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                                              "Map.forEach callback is not a function",
                                                              VM_STOP_NOT_FUNCTION)) {
-                                        return AnvilValue::make_undefined();
+                                        return CinderValue::make_undefined();
                                     }
                                     break;
                                 }
                                 const u32 cid = cb.payload();
                                 const u32 fn_id = heap.closures()[cid].fn_id;
-                                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                                const CinderHeapFunction& fn = heap.functions()[fn_id];
                                 u32 callee_regs = fn.local_count;
                                 if (callee_regs < fn.arity) callee_regs = fn.arity;
                                 if (callee_regs == 0u) callee_regs = 1u;
                                 const u32 arr_id = heap.objects()[obj_id].aux_id;
                                 const u32 len = heap.arrays()[arr_id].length;
                                 for (u32 idx = 0; idx + 1u < len; idx += 2u) {
-                                    const AnvilValue k = heap.get_array_elem(arr_id, static_cast<i32>(idx));
+                                    const CinderValue k = heap.get_array_elem(arr_id, static_cast<i32>(idx));
                                     if (k.bits == TOMBSTONE_BITS) continue;
-                                    const AnvilValue v = heap.get_array_elem(arr_id, static_cast<i32>(idx + 1u));
+                                    const CinderValue v = heap.get_array_elem(arr_id, static_cast<i32>(idx + 1u));
                                     const u32 next_base = reg_base + cur_frame_regs;
                                     if (!ensure_registers(next_base + callee_regs) ||
                                         !ensure_frames(frame_count + 1u)) {
                                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                                        return AnvilValue::make_undefined();
+                                        return CinderValue::make_undefined();
                                     }
                                     for (u32 r = 0; r < callee_regs; ++r) {
-                                        registers()[next_base + r] = AnvilValue::make_undefined();
+                                        registers()[next_base + r] = CinderValue::make_undefined();
                                     }
                                     if (fn.arity >= 1u) registers()[next_base + 0u] = v;
                                     if (fn.arity >= 2u) registers()[next_base + 1u] = k;
                                     if (fn.arity >= 3u) registers()[next_base + 2u] = recv;
-                                    run_loop(fn.code_start, next_base, callee_regs, cid, AnvilValue::make_undefined(), frame_count);
-                                    if (aborted) return AnvilValue::make_undefined();
+                                    run_loop(fn.code_start, next_base, callee_regs, cid, CinderValue::make_undefined(), frame_count);
+                                    if (aborted) return CinderValue::make_undefined();
                                     R = &registers()[reg_base];
                                 }
-                                R[dst_reg] = AnvilValue::make_undefined();
+                                R[dst_reg] = CinderValue::make_undefined();
                                 break;
                             }
                         }
                         if (bkind == BuiltinObjectKind::Set) {
                             if (cstr_eq(mname, mlen, "has", 3u)) {
-                                R[dst_reg] = AnvilValue::make_bool(set_has(heap, heap.objects()[obj_id], arg_at(0u)));
+                                R[dst_reg] = CinderValue::make_bool(set_has(heap, heap.objects()[obj_id], arg_at(0u)));
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "delete", 6u)) {
-                                R[dst_reg] = AnvilValue::make_bool(set_delete(heap, heap.objects()[obj_id], arg_at(0u)));
+                                R[dst_reg] = CinderValue::make_bool(set_delete(heap, heap.objects()[obj_id], arg_at(0u)));
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "clear", 5u)) {
                                 set_clear(heap, heap.objects()[obj_id]);
-                                R[dst_reg] = AnvilValue::make_undefined();
+                                R[dst_reg] = CinderValue::make_undefined();
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "add", 3u)) {
-                                const AnvilValue k = arg_at(0u);
+                                const CinderValue k = arg_at(0u);
                                 sync_gc_roots();
                                 if (!set_add(heap, obj_id, k)) {
                                     reclaim_array_storage(reg_base + cur_frame_regs);
                                     R = &registers()[reg_base];
                                     if (!set_add(heap, obj_id, k)) {
                                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                                        return AnvilValue::make_undefined();
+                                        return CinderValue::make_undefined();
                                     }
                                 }
                                 R = &registers()[reg_base];
@@ -2117,62 +2117,62 @@ AnvilValue AnvilVmContext::run_loop(
                                 break;
                             }
                             if (cstr_eq(mname, mlen, "forEach", 7u)) {
-                                const AnvilValue cb = arg_at(0u);
+                                const CinderValue cb = arg_at(0u);
                                 if (!cb.is_function()) {
                                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                                              "Set.forEach callback is not a function",
                                                              VM_STOP_NOT_FUNCTION)) {
-                                        return AnvilValue::make_undefined();
+                                        return CinderValue::make_undefined();
                                     }
                                     break;
                                 }
                                 const u32 cid = cb.payload();
                                 const u32 fn_id = heap.closures()[cid].fn_id;
-                                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                                const CinderHeapFunction& fn = heap.functions()[fn_id];
                                 u32 callee_regs = fn.local_count;
                                 if (callee_regs < fn.arity) callee_regs = fn.arity;
                                 if (callee_regs == 0u) callee_regs = 1u;
                                 const u32 arr_id = heap.objects()[obj_id].aux_id;
                                 const u32 len = heap.arrays()[arr_id].length;
                                 for (u32 idx = 0; idx < len; ++idx) {
-                                    const AnvilValue k = heap.get_array_elem(arr_id, static_cast<i32>(idx));
+                                    const CinderValue k = heap.get_array_elem(arr_id, static_cast<i32>(idx));
                                     if (k.bits == TOMBSTONE_BITS) continue;
                                     const u32 next_base = reg_base + cur_frame_regs;
                                     if (!ensure_registers(next_base + callee_regs) ||
                                         !ensure_frames(frame_count + 1u)) {
                                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                                        return AnvilValue::make_undefined();
+                                        return CinderValue::make_undefined();
                                     }
                                     for (u32 r = 0; r < callee_regs; ++r) {
-                                        registers()[next_base + r] = AnvilValue::make_undefined();
+                                        registers()[next_base + r] = CinderValue::make_undefined();
                                     }
                                     if (fn.arity >= 1u) registers()[next_base + 0u] = k;
                                     if (fn.arity >= 2u) registers()[next_base + 1u] = k;
                                     if (fn.arity >= 3u) registers()[next_base + 2u] = recv;
-                                    run_loop(fn.code_start, next_base, callee_regs, cid, AnvilValue::make_undefined(), frame_count);
-                                    if (aborted) return AnvilValue::make_undefined();
+                                    run_loop(fn.code_start, next_base, callee_regs, cid, CinderValue::make_undefined(), frame_count);
+                                    if (aborted) return CinderValue::make_undefined();
                                     R = &registers()[reg_base];
                                 }
-                                R[dst_reg] = AnvilValue::make_undefined();
+                                R[dst_reg] = CinderValue::make_undefined();
                                 break;
                             }
                         }
                     }
                 }
 
-                AnvilValue callee = ic.load_property_ic(heap, NO_SLOT, recv, prop_sym);
+                CinderValue callee = ic.load_property_ic(heap, NO_SLOT, recv, prop_sym);
                 if (!callee.is_function() && recv.is_object() && cstr_eq(mname, mlen, "toString", 8u)) {
                     sync_gc_roots();
                     const u32 sym = heap.value_to_string_sym(recv);
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_string(sym);
+                    R[dst_reg] = CinderValue::make_string(sym);
                     break;
                 }
                 if (!callee.is_function()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -2180,9 +2180,9 @@ AnvilValue AnvilVmContext::run_loop(
                 const u32 fn_id = heap.closures()[cid].fn_id;
                 if (frame_count + 1u > effective_call_depth()) {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const CinderHeapFunction& fn = heap.functions()[fn_id];
                 u32 callee_regs = fn.local_count;
                 if (callee_regs < fn.arity) callee_regs = fn.arity;
                 if (callee_regs == 0u) callee_regs = 1u;
@@ -2190,16 +2190,16 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilValue* regs = registers();
+                CinderValue* regs = registers();
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = (a_idx < argc)
                         ? regs[reg_base + call_base + a_idx]
-                        : AnvilValue::make_undefined();
+                        : CinderValue::make_undefined();
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, NO_SLOT, cur_this};
+                    CinderCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, NO_SLOT, cur_this};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
                 cur_closure = cid;
@@ -2208,16 +2208,16 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::NewInstance: {
+            case CinderOpcode::NewInstance: {
                 const u16 dst_reg = inst.a;
-                const AnvilValue callee = R[inst.b];
+                const CinderValue callee = R[inst.b];
                 const u32 call_base = inst.c;
                 const u32 argc = inst.imm32();
                 if (!callee.is_function()) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -2226,7 +2226,7 @@ AnvilValue AnvilVmContext::run_loop(
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -2250,19 +2250,19 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (inst_obj_id == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 if (proto_id != NO_SLOT) {
                     heap.objects()[inst_obj_id].proto_obj_id = proto_id;
                 }
-                const AnvilValue instance_val = AnvilValue::make_object(inst_obj_id);
+                const CinderValue instance_val = CinderValue::make_object(inst_obj_id);
 
                 const u32 fn_id = heap.closures()[cid].fn_id;
                 if (frame_count + 1u > effective_call_depth()) {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const CinderHeapFunction& fn = heap.functions()[fn_id];
                 u32 callee_regs = fn.local_count;
                 if (callee_regs < fn.arity) callee_regs = fn.arity;
                 if (callee_regs == 0u) callee_regs = 1u;
@@ -2270,16 +2270,16 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilValue* regs = registers();
+                CinderValue* regs = registers();
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = (a_idx < argc)
                         ? regs[reg_base + call_base + a_idx]
-                        : AnvilValue::make_undefined();
+                        : CinderValue::make_undefined();
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, inst_obj_id, cur_this};
+                    CinderCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, inst_obj_id, cur_this};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
                 cur_closure = cid;
@@ -2288,13 +2288,13 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::NewBuiltin: {
+            case CinderOpcode::NewBuiltin: {
                 const BuiltinCtorKind ckind = static_cast<BuiltinCtorKind>(inst.pad);
                 const u16 dst_reg = inst.a;
                 const u32 call_base = inst.b;
                 const u32 argc = inst.c;
-                auto arg_at = [&](u32 idx) noexcept -> AnvilValue {
-                    if (idx >= argc) return AnvilValue::make_undefined();
+                auto arg_at = [&](u32 idx) noexcept -> CinderValue {
+                    if (idx >= argc) return CinderValue::make_undefined();
                     return registers()[reg_base + call_base + idx];
                 };
                 if (ckind >= BuiltinCtorKind::Error && ckind <= BuiltinCtorKind::ReferenceError) {
@@ -2311,10 +2311,10 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (err_id == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_object(err_id);
+                    R[dst_reg] = CinderValue::make_object(err_id);
                     break;
                 }
                 if (ckind == BuiltinCtorKind::Map) {
@@ -2329,9 +2329,9 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (obj_id == NO_SLOT || arr_id == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
-                    AnvilHeapObject& obj = heap.objects()[obj_id];
+                    CinderHeapObject& obj = heap.objects()[obj_id];
                     obj.builtin_kind = static_cast<u8>(BuiltinObjectKind::Map);
                     obj.aux_id = arr_id;
                     obj.byte_offset = 0u;
@@ -2340,16 +2340,16 @@ AnvilValue AnvilVmContext::run_loop(
                         const u32 init_arr = arg_at(0u).payload();
                         const u32 init_len = heap.arrays()[init_arr].length;
                         for (u32 i = 0; i < init_len; ++i) {
-                            const AnvilValue pair = heap.get_array_elem(init_arr, static_cast<i32>(i));
+                            const CinderValue pair = heap.get_array_elem(init_arr, static_cast<i32>(i));
                             if (pair.is_array() && heap.arrays()[pair.payload()].length >= 2u) {
-                                const AnvilValue k = heap.get_array_elem(pair.payload(), 0);
-                                const AnvilValue v = heap.get_array_elem(pair.payload(), 1);
+                                const CinderValue k = heap.get_array_elem(pair.payload(), 0);
+                                const CinderValue v = heap.get_array_elem(pair.payload(), 1);
                                 map_set(heap, obj_id, k, v);
                             }
                         }
                     }
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_object(obj_id);
+                    R[dst_reg] = CinderValue::make_object(obj_id);
                     break;
                 }
                 if (ckind == BuiltinCtorKind::Set) {
@@ -2364,9 +2364,9 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (obj_id == NO_SLOT || arr_id == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
-                    AnvilHeapObject& obj = heap.objects()[obj_id];
+                    CinderHeapObject& obj = heap.objects()[obj_id];
                     obj.builtin_kind = static_cast<u8>(BuiltinObjectKind::Set);
                     obj.aux_id = arr_id;
                     obj.byte_offset = 0u;
@@ -2379,7 +2379,7 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                     }
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_object(obj_id);
+                    R[dst_reg] = CinderValue::make_object(obj_id);
                     break;
                 }
                 if (ckind == BuiltinCtorKind::ArrayBuffer) {
@@ -2390,7 +2390,7 @@ AnvilValue AnvilVmContext::run_loop(
                         if (!raise_builtin_error(BuiltinCtorKind::RangeError,
                                                  "Invalid ArrayBuffer length",
                                                  VM_STOP_UNSUPPORTED)) {
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         break;
                     }
@@ -2407,19 +2407,19 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (obj_id == NO_SLOT || arr_id == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
-                    AnvilValue* store = heap.array_elems(heap.arrays()[arr_id].storage_off);
+                    CinderValue* store = heap.array_elems(heap.arrays()[arr_id].storage_off);
                     for (u32 i = 0; i < (slots > 0u ? slots : 1u); ++i) {
-                        store[i] = AnvilValue(0ULL);
+                        store[i] = CinderValue(0ULL);
                     }
-                    AnvilHeapObject& obj = heap.objects()[obj_id];
+                    CinderHeapObject& obj = heap.objects()[obj_id];
                     obj.builtin_kind = static_cast<u8>(BuiltinObjectKind::ArrayBuffer);
                     obj.aux_id = arr_id;
                     obj.byte_offset = 0u;
                     obj.byte_length = blen;
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_object(obj_id);
+                    R[dst_reg] = CinderValue::make_object(obj_id);
                     break;
                 }
                 if (ckind >= BuiltinCtorKind::Uint8Array && ckind <= BuiltinCtorKind::Float64Array) {
@@ -2427,7 +2427,7 @@ AnvilValue AnvilVmContext::run_loop(
                                      (static_cast<u8>(ckind) - static_cast<u8>(BuiltinCtorKind::Uint8Array));
                     const u32 shift = typed_array_shift(tkind);
                     const u32 bpe = 1u << shift;
-                    const AnvilValue first = arg_at(0u);
+                    const CinderValue first = arg_at(0u);
                     sync_gc_roots();
                     if (first.is_object() &&
                         static_cast<BuiltinObjectKind>(heap.objects()[first.payload()].builtin_kind) == BuiltinObjectKind::ArrayBuffer) {
@@ -2447,15 +2447,15 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                         if (view_id == NO_SLOT) {
                             fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
-                        AnvilHeapObject& view = heap.objects()[view_id];
+                        CinderHeapObject& view = heap.objects()[view_id];
                         view.builtin_kind = tkind;
                         view.aux_id = buf_obj_id;
                         view.byte_offset = byte_off;
                         view.byte_length = view_bytes;
                         R = &registers()[reg_base];
-                        R[dst_reg] = AnvilValue::make_object(view_id);
+                        R[dst_reg] = CinderValue::make_object(view_id);
                         break;
                     }
                     u32 elem_len = 0u;
@@ -2483,18 +2483,18 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (buf_obj_id == NO_SLOT || byte_arr_id == NO_SLOT || view_id == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
-                    AnvilValue* store = heap.array_elems(heap.arrays()[byte_arr_id].storage_off);
+                    CinderValue* store = heap.array_elems(heap.arrays()[byte_arr_id].storage_off);
                     for (u32 i = 0; i < (slots > 0u ? slots : 1u); ++i) {
-                        store[i] = AnvilValue(0ULL);
+                        store[i] = CinderValue(0ULL);
                     }
-                    AnvilHeapObject& bobj = heap.objects()[buf_obj_id];
+                    CinderHeapObject& bobj = heap.objects()[buf_obj_id];
                     bobj.builtin_kind = static_cast<u8>(BuiltinObjectKind::ArrayBuffer);
                     bobj.aux_id = byte_arr_id;
                     bobj.byte_offset = 0u;
                     bobj.byte_length = blen;
-                    AnvilHeapObject& view = heap.objects()[view_id];
+                    CinderHeapObject& view = heap.objects()[view_id];
                     view.builtin_kind = tkind;
                     view.aux_id = buf_obj_id;
                     view.byte_offset = 0u;
@@ -2506,7 +2506,7 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                     }
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_object(view_id);
+                    R[dst_reg] = CinderValue::make_object(view_id);
                     break;
                 }
                 if (ckind == BuiltinCtorKind::Array) {
@@ -2522,11 +2522,11 @@ AnvilValue AnvilVmContext::run_loop(
                     }
                     if (arr_id == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     if (argc == 1u && arg_at(0u).is_number()) {
                         for (u32 i = 0; i < cap; ++i) {
-                            heap.push_array_elem(arr_id, AnvilValue::make_undefined());
+                            heap.push_array_elem(arr_id, CinderValue::make_undefined());
                         }
                     } else {
                         for (u32 i = 0; i < argc; ++i) {
@@ -2534,7 +2534,7 @@ AnvilValue AnvilVmContext::run_loop(
                         }
                     }
                     R = &registers()[reg_base];
-                    R[dst_reg] = AnvilValue::make_array(arr_id);
+                    R[dst_reg] = CinderValue::make_array(arr_id);
                     break;
                 }
                 sync_gc_roots();
@@ -2546,16 +2546,16 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (obj_id == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 R = &registers()[reg_base];
-                R[dst_reg] = AnvilValue::make_object(obj_id);
+                R[dst_reg] = CinderValue::make_object(obj_id);
                 break;
             }
 
-            case AnvilOpcode::SetupClass: {
-                const AnvilValue ctor_val = R[inst.a];
-                const AnvilValue super_val = R[inst.b];
+            case CinderOpcode::SetupClass: {
+                const CinderValue ctor_val = R[inst.a];
+                const CinderValue super_val = R[inst.b];
                 if (!ctor_val.is_function()) break;
                 const u32 cid = ctor_val.payload();
                 sync_gc_roots();
@@ -2584,10 +2584,10 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::DefineMethod: {
+            case CinderOpcode::DefineMethod: {
                 const bool is_static = inst.pad != 0u;
-                const AnvilValue ctor_val = R[inst.a];
-                const AnvilValue fn_val = R[inst.b];
+                const CinderValue ctor_val = R[inst.a];
+                const CinderValue fn_val = R[inst.b];
                 const u32 prop_sym = inst.imm32();
                 if (!ctor_val.is_function()) break;
                 const u32 cid = ctor_val.payload();
@@ -2634,7 +2634,7 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::CallSuperCtor: {
+            case CinderOpcode::CallSuperCtor: {
                 const u16 dst_reg = inst.a;
                 const u32 call_base = inst.b;
                 const u32 argc = inst.c;
@@ -2650,9 +2650,9 @@ AnvilValue AnvilVmContext::run_loop(
                 const u32 fn_id = heap.closures()[super_cid].fn_id;
                 if (frame_count + 1u > effective_call_depth()) {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const CinderHeapFunction& fn = heap.functions()[fn_id];
                 u32 callee_regs = fn.local_count;
                 if (callee_regs < fn.arity) callee_regs = fn.arity;
                 if (callee_regs == 0u) callee_regs = 1u;
@@ -2660,17 +2660,17 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilValue* regs = registers();
+                CinderValue* regs = registers();
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = (a_idx < argc)
                         ? regs[reg_base + call_base + a_idx]
-                        : AnvilValue::make_undefined();
+                        : CinderValue::make_undefined();
                 }
                 const u32 inst_obj_id = cur_this.is_object() ? cur_this.payload() : NO_SLOT;
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, inst_obj_id, cur_this};
+                    CinderCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, inst_obj_id, cur_this};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
                 cur_closure = super_cid;
@@ -2678,12 +2678,12 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::CallSuperMethod: {
+            case CinderOpcode::CallSuperMethod: {
                 const u32 argc = inst.pad;
                 const u16 dst_reg = inst.a;
                 const u32 call_base = inst.b;
                 const u32 prop_sym = inst.imm32();
-                AnvilValue callee = AnvilValue::make_undefined();
+                CinderValue callee = CinderValue::make_undefined();
                 u32 start_proto = NO_SLOT;
                 if (cur_closure != NO_SLOT && cur_closure < heap.closure_count) {
                     const u32 cur_fn_id = heap.closures()[cur_closure].fn_id;
@@ -2708,7 +2708,7 @@ AnvilValue AnvilVmContext::run_loop(
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "called value is not a function",
                                              VM_STOP_NOT_FUNCTION)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -2716,9 +2716,9 @@ AnvilValue AnvilVmContext::run_loop(
                 const u32 fn_id = heap.closures()[cid].fn_id;
                 if (frame_count + 1u > effective_call_depth()) {
                     fail_limit(VM_STOP_CALL_DEPTH, "call depth", effective_call_depth(), "nested calls");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                const AnvilHeapFunction& fn = heap.functions()[fn_id];
+                const CinderHeapFunction& fn = heap.functions()[fn_id];
                 u32 callee_regs = fn.local_count;
                 if (callee_regs < fn.arity) callee_regs = fn.arity;
                 if (callee_regs == 0u) callee_regs = 1u;
@@ -2726,16 +2726,16 @@ AnvilValue AnvilVmContext::run_loop(
                 if (!ensure_registers(next_base + callee_regs) ||
                     !ensure_frames(frame_count + 1u)) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilValue* regs = registers();
+                CinderValue* regs = registers();
                 for (u32 a_idx = 0u; a_idx < fn.arity; ++a_idx) {
                     regs[next_base + a_idx] = (a_idx < argc)
                         ? regs[reg_base + call_base + a_idx]
-                        : AnvilValue::make_undefined();
+                        : CinderValue::make_undefined();
                 }
                 frames()[frame_count++] =
-                    AnvilCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, NO_SLOT, cur_this};
+                    CinderCallFrame{fn_id, cur_closure, pc, reg_base, cur_frame_regs, dst_reg, NO_SLOT, cur_this};
                 reg_base = next_base;
                 cur_frame_regs = callee_regs;
                 cur_closure = cid;
@@ -2743,12 +2743,12 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::EnterTry: {
+            case CinderOpcode::EnterTry: {
                 if (try_depth >= MAX_TRY_DEPTH) {
                     fail(VM_STOP_UNSUPPORTED, "try nesting limit exceeded");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                AnvilTryHandler& h = try_stack[try_depth++];
+                CinderTryHandler& h = try_stack[try_depth++];
                 h.frame_depth = frame_count;
                 h.reg_base = reg_base;
                 h.cur_frame_regs = cur_frame_regs;
@@ -2758,19 +2758,19 @@ AnvilValue AnvilVmContext::run_loop(
                 h.finally_pc = 0u;
                 h.catch_reg = inst.a;
                 h.completion_kind = TryCompletionKind::Normal;
-                h.completion_val = AnvilValue::make_undefined();
+                h.completion_val = CinderValue::make_undefined();
                 h.completion_pc = 0u;
                 break;
             }
 
-            case AnvilOpcode::SetTryFinally: {
+            case CinderOpcode::SetTryFinally: {
                 if (try_depth > 0u) {
                     try_stack[try_depth - 1u].finally_pc = inst.imm32();
                 }
                 break;
             }
 
-            case AnvilOpcode::LeaveTry: {
+            case CinderOpcode::LeaveTry: {
                 if (try_depth > 0u) {
                     if (try_stack[try_depth - 1u].finally_pc == 0u) {
                         --try_depth;
@@ -2781,29 +2781,29 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::EndFinally: {
+            case CinderOpcode::EndFinally: {
                 if (try_depth > 0u && try_stack[try_depth - 1u].completion_kind != TryCompletionKind::Normal) {
-                    const AnvilTryHandler pending = try_stack[--try_depth];
+                    const CinderTryHandler pending = try_stack[--try_depth];
                     if (pending.completion_kind == TryCompletionKind::Throw) {
                         if (!unwind_throw(pending.completion_val)) {
-                            return AnvilValue::make_undefined();
+                            return CinderValue::make_undefined();
                         }
                         break;
                     }
                     if (pending.completion_kind == TryCompletionKind::Return) {
-                        const AnvilValue ret_val = pending.completion_val;
+                        const CinderValue ret_val = pending.completion_val;
                         if (frame_count <= base_frame_depth) {
                             return ret_val;
                         }
-                        const AnvilCallFrame caller = frames()[--frame_count];
+                        const CinderCallFrame caller = frames()[--frame_count];
                         reg_base = caller.reg_base;
                         cur_frame_regs = caller.caller_frame_regs;
                         cur_closure = caller.closure_id;
                         cur_this = caller.caller_this;
-                        AnvilValue out_val = ret_val;
+                        CinderValue out_val = ret_val;
                         if (caller.new_instance_obj != NO_SLOT &&
                             !ret_val.is_object() && !ret_val.is_array() && !ret_val.is_function()) {
-                            out_val = AnvilValue::make_object(caller.new_instance_obj);
+                            out_val = CinderValue::make_object(caller.new_instance_obj);
                         }
                         registers()[reg_base + caller.dst_reg] = out_val;
                         pc = caller.return_pc;
@@ -2815,16 +2815,16 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::Throw: {
-                const AnvilValue exc = R[inst.a];
+            case CinderOpcode::Throw: {
+                const CinderValue exc = R[inst.a];
                 if (!unwind_throw(exc)) {
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::IterLen: {
-                const AnvilValue iter = R[inst.b];
+            case CinderOpcode::IterLen: {
+                const CinderValue iter = R[inst.b];
                 u32 len = 0u;
                 if (iter.is_array()) {
                     len = heap.arrays()[iter.payload()].length;
@@ -2833,7 +2833,7 @@ AnvilValue AnvilVmContext::run_loop(
                     const char* ptr = heap.get_string_ptr(iter.payload(), &blen);
                     len = utf16_len(ptr, blen);
                 } else if (iter.is_object()) {
-                    const AnvilHeapObject& obj = heap.objects()[iter.payload()];
+                    const CinderHeapObject& obj = heap.objects()[iter.payload()];
                     const BuiltinObjectKind bkind = static_cast<BuiltinObjectKind>(obj.builtin_kind);
                     if (bkind == BuiltinObjectKind::Set) {
                         len = obj.byte_length;
@@ -2842,12 +2842,12 @@ AnvilValue AnvilVmContext::run_loop(
                         len = obj.byte_length >> typed_array_shift(obj.builtin_kind);
                     }
                 }
-                R[inst.a] = AnvilValue::make_smi(static_cast<i32>(len));
+                R[inst.a] = CinderValue::make_smi(static_cast<i32>(len));
                 break;
             }
 
-            case AnvilOpcode::IterGet: {
-                const AnvilValue iter = R[inst.b];
+            case CinderOpcode::IterGet: {
+                const CinderValue iter = R[inst.b];
                 const i32 idx = R[inst.c].is_number() ? js_to_int32(R[inst.c].as_number()) : 0;
                 if (iter.is_array()) {
                     R[inst.a] = heap.get_array_elem(iter.payload(), idx);
@@ -2858,7 +2858,7 @@ AnvilValue AnvilVmContext::run_loop(
                     const char* ptr = heap.get_string_ptr(iter.payload(), &blen);
                     u16 unit = 0u;
                     if (idx < 0 || !utf16_at(ptr, blen, static_cast<u32>(idx), &unit)) {
-                        R[inst.a] = AnvilValue::make_undefined();
+                        R[inst.a] = CinderValue::make_undefined();
                         break;
                     }
                     char ubuf[3];
@@ -2871,19 +2871,19 @@ AnvilValue AnvilVmContext::run_loop(
                         csym = heap.intern_string(ubuf, un);
                     }
                     R = &registers()[reg_base];
-                    R[inst.a] = (csym != NO_SLOT) ? AnvilValue::make_string(csym) : AnvilValue::make_undefined();
+                    R[inst.a] = (csym != NO_SLOT) ? CinderValue::make_string(csym) : CinderValue::make_undefined();
                     break;
                 }
                 if (iter.is_object()) {
-                    const AnvilHeapObject& obj = heap.objects()[iter.payload()];
+                    const CinderHeapObject& obj = heap.objects()[iter.payload()];
                     const BuiltinObjectKind bkind = static_cast<BuiltinObjectKind>(obj.builtin_kind);
                     if (bkind == BuiltinObjectKind::Set) {
                         const u32 arr_id = obj.aux_id;
                         const u32 alen = heap.arrays()[arr_id].length;
                         i32 live = 0;
-                        AnvilValue found = AnvilValue::make_undefined();
+                        CinderValue found = CinderValue::make_undefined();
                         for (u32 k = 0; k < alen; ++k) {
-                            const AnvilValue v = heap.get_array_elem(arr_id, static_cast<i32>(k));
+                            const CinderValue v = heap.get_array_elem(arr_id, static_cast<i32>(k));
                             if (v.bits == TOMBSTONE_BITS) continue;
                             if (live == idx) {
                                 found = v;
@@ -2900,16 +2900,16 @@ AnvilValue AnvilVmContext::run_loop(
                         break;
                     }
                 }
-                R[inst.a] = AnvilValue::make_undefined();
+                R[inst.a] = CinderValue::make_undefined();
                 break;
             }
 
-            case AnvilOpcode::CallMath: {
+            case CinderOpcode::CallMath: {
                 if (!numeric_operand(R[inst.c])) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "arithmetic or comparison on a string or object",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -2925,38 +2925,38 @@ AnvilValue AnvilVmContext::run_loop(
                     case 7u: out = js_sign(v); break;
                     default: break;
                 }
-                R[inst.a] = AnvilValue::make_number(out);
+                R[inst.a] = CinderValue::make_number(out);
                 break;
             }
 
-            case AnvilOpcode::CallMath2: {
+            case CinderOpcode::CallMath2: {
                 if (!numeric_operand(R[inst.b]) || !numeric_operand(R[inst.c])) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "arithmetic or comparison on a string or object",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
                 const f64 a = R[inst.b].as_number();
                 const f64 b = R[inst.c].as_number();
                 switch (inst.imm32()) {
-                    case 1u: R[inst.a] = AnvilValue::make_number(js_pow(a, b)); break;
-                    case 2u: R[inst.a] = AnvilValue::make_number(static_cast<f64>(js_imul(a, b))); break;
-                    case 3u: R[inst.a] = AnvilValue::make_number(js_min2(a, b)); break;
-                    case 4u: R[inst.a] = AnvilValue::make_number(js_max2(a, b)); break;
-                    default: R[inst.a] = AnvilValue::make_undefined(); break;
+                    case 1u: R[inst.a] = CinderValue::make_number(js_pow(a, b)); break;
+                    case 2u: R[inst.a] = CinderValue::make_number(static_cast<f64>(js_imul(a, b))); break;
+                    case 3u: R[inst.a] = CinderValue::make_number(js_min2(a, b)); break;
+                    case 4u: R[inst.a] = CinderValue::make_number(js_max2(a, b)); break;
+                    default: R[inst.a] = CinderValue::make_undefined(); break;
                 }
                 break;
             }
 
-            case AnvilOpcode::CallPred: {
-                const AnvilValue av = R[inst.c];
+            case CinderOpcode::CallPred: {
+                const CinderValue av = R[inst.c];
                 if ((inst.b == 4u || inst.b == 5u) && !numeric_operand(av)) {
                     if (!raise_builtin_error(BuiltinCtorKind::TypeError,
                                              "global isNaN/isFinite on a non-numeric value",
                                              VM_STOP_UNSUPPORTED)) {
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     break;
                 }
@@ -2971,11 +2971,11 @@ AnvilValue AnvilVmContext::run_loop(
                     case 6u: out = av.is_array(); break;
                     default: break;
                 }
-                R[inst.a] = AnvilValue::make_bool(out);
+                R[inst.a] = CinderValue::make_bool(out);
                 break;
             }
 
-            case AnvilOpcode::NewCell: {
+            case CinderOpcode::NewCell: {
                 sync_gc_roots();
                 u32 cell = heap.alloc_cell(R[inst.b]);
                 if (cell == NO_SLOT) {
@@ -2985,27 +2985,27 @@ AnvilValue AnvilVmContext::run_loop(
                 }
                 if (cell == NO_SLOT) {
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_array(cell);
+                R[inst.a] = CinderValue::make_array(cell);
                 break;
             }
 
-            case AnvilOpcode::CellGet: {
+            case CinderOpcode::CellGet: {
                 R[inst.a] = R[inst.b].is_array()
                     ? heap.get_array_elem(R[inst.b].payload(), 0)
-                    : AnvilValue::make_undefined();
+                    : CinderValue::make_undefined();
                 break;
             }
 
-            case AnvilOpcode::CellSet: {
+            case CinderOpcode::CellSet: {
                 if (R[inst.a].is_array()) {
                     heap.set_array_elem(R[inst.a].payload(), 0, R[inst.b]);
                 }
                 break;
             }
 
-            case AnvilOpcode::GetUpval: {
+            case CinderOpcode::GetUpval: {
                 const u32 idx = inst.b;
                 if (cur_closure < heap.closure_count &&
                     idx < heap.closures()[cur_closure].upval_count) {
@@ -3013,25 +3013,25 @@ AnvilValue AnvilVmContext::run_loop(
                         heap.closure_upvals(heap.closures()[cur_closure].upvals_off)[idx];
                     R[inst.a] = heap.get_array_elem(cell, 0);
                 } else {
-                    R[inst.a] = AnvilValue::make_undefined();
+                    R[inst.a] = CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::GetUpvalCell: {
+            case CinderOpcode::GetUpvalCell: {
                 const u32 idx = inst.b;
                 if (cur_closure < heap.closure_count &&
                     idx < heap.closures()[cur_closure].upval_count) {
                     const u32 cell =
                         heap.closure_upvals(heap.closures()[cur_closure].upvals_off)[idx];
-                    R[inst.a] = AnvilValue::make_array(cell);
+                    R[inst.a] = CinderValue::make_array(cell);
                 } else {
-                    R[inst.a] = AnvilValue::make_undefined();
+                    R[inst.a] = CinderValue::make_undefined();
                 }
                 break;
             }
 
-            case AnvilOpcode::SetUpval: {
+            case CinderOpcode::SetUpval: {
                 const u32 idx = inst.a;
                 if (cur_closure < heap.closure_count &&
                     idx < heap.closures()[cur_closure].upval_count) {
@@ -3042,7 +3042,7 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::MakeClosure: {
+            case CinderOpcode::MakeClosure: {
                 const u32 fn_id = inst.imm32();
                 const u32 base = inst.b;
                 const u32 n = inst.c;
@@ -3052,7 +3052,7 @@ AnvilValue AnvilVmContext::run_loop(
                     upvals_off = heap.arena.alloc(n * static_cast<u32>(sizeof(u32)), &over);
                     if (upvals_off == NO_SLOT) {
                         fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                        return AnvilValue::make_undefined();
+                        return CinderValue::make_undefined();
                     }
                     u32* up = heap.closure_upvals(upvals_off);
                     for (u32 i = 0u; i < n; ++i) {
@@ -3071,13 +3071,13 @@ AnvilValue AnvilVmContext::run_loop(
                         heap.arena.free(upvals_off, n * static_cast<u32>(sizeof(u32)));
                     }
                     fail_limit(VM_STOP_HEAP, "heap", heap.arena.budget, "bytes");
-                    return AnvilValue::make_undefined();
+                    return CinderValue::make_undefined();
                 }
-                R[inst.a] = AnvilValue::make_function(cid);
+                R[inst.a] = CinderValue::make_function(cid);
                 break;
             }
 
-            case AnvilOpcode::LoopHeader: {
+            case CinderOpcode::LoopHeader: {
                 const u32 lid = inst.a & 63u;
                 ++program.loop_trip_counts[lid];
                 if (program.loop_trip_counts[lid] == HOT_LOOP_THRESHOLD) {
@@ -3086,10 +3086,10 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::Return: {
-                const AnvilValue ret_val = R[inst.a];
+            case CinderOpcode::Return: {
+                const CinderValue ret_val = R[inst.a];
                 while (try_depth > 0u && try_stack[try_depth - 1u].frame_depth == frame_count) {
-                    AnvilTryHandler& h = try_stack[try_depth - 1u];
+                    CinderTryHandler& h = try_stack[try_depth - 1u];
                     if (h.finally_pc != 0u) {
                         const u32 target_pc = h.finally_pc;
                         h.finally_pc = 0u;
@@ -3105,16 +3105,16 @@ AnvilValue AnvilVmContext::run_loop(
                     return ret_val;
                 }
                 {
-                    const AnvilCallFrame caller = frames()[--frame_count];
+                    const CinderCallFrame caller = frames()[--frame_count];
                     reg_base = caller.reg_base;
                     cur_frame_regs = caller.caller_frame_regs;
                     cur_closure = caller.closure_id;
                     cur_this = caller.caller_this;
                     pc = caller.return_pc;
-                    AnvilValue out_val = ret_val;
+                    CinderValue out_val = ret_val;
                     if (caller.new_instance_obj != NO_SLOT &&
                         !ret_val.is_object() && !ret_val.is_array() && !ret_val.is_function()) {
-                        out_val = AnvilValue::make_object(caller.new_instance_obj);
+                        out_val = CinderValue::make_object(caller.new_instance_obj);
                     }
                     registers()[reg_base + caller.dst_reg] = out_val;
                 }
@@ -3122,21 +3122,21 @@ AnvilValue AnvilVmContext::run_loop(
                 break;
             }
 
-            case AnvilOpcode::Halt:
+            case CinderOpcode::Halt:
                 return R[inst.a];
 
-            case AnvilOpcode::HostSetText:
+            case CinderOpcode::HostSetText:
                 break;
         }
     }
     return registers()[0];
 }
 
-void AnvilVmContext::fill_telemetry(AnvilVmTelemetryC* out) const noexcept {
+void CinderVmContext::fill_telemetry(CinderVmTelemetryC* out) const noexcept {
     if (!out) {
         return;
     }
-    out->kernel_version = ANVIL_VM_KERNEL_VERSION;
+    out->kernel_version = CINDER_VM_KERNEL_VERSION;
     out->bytecode_ops_executed = steps_executed;
     out->heap_objects_live = heap.live_objects + heap.live_arrays;
     out->heap_bytes_allocated = heap.bytes_allocated;
@@ -3209,15 +3209,15 @@ struct ExportWriter {
 
 } // namespace
 
-void AnvilVmContext::fill_exports(AnvilVmTelemetryC* out) const noexcept {
+void CinderVmContext::fill_exports(CinderVmTelemetryC* out) const noexcept {
     ExportWriter w{out->exports, MAX_EXPORT_BYTES, 0u, false};
     const u32 count = global_count;
     for (u32 index = 0u; index < count && !w.full; ++index) {
-        const AnvilGlobalBinding& g = globals()[index];
+        const CinderGlobalBinding& g = globals()[index];
         if (!g.occupied || !g.exported) {
             continue;
         }
-        const AnvilValue v = g.value;
+        const CinderValue v = g.value;
         u8 kind = 6u;
         if (v.is_bool()) {
             kind = 2u;
@@ -3248,13 +3248,13 @@ void AnvilVmContext::fill_exports(AnvilVmTelemetryC* out) const noexcept {
     out->exports_len = w.full ? 0u : w.len;
 }
 
-void AnvilVmContext::fill_host_call(AnvilVmTelemetryC* out) const noexcept {
+void CinderVmContext::fill_host_call(CinderVmTelemetryC* out) const noexcept {
     ExportWriter w{out->exports, MAX_EXPORT_BYTES, 0u, false};
     w.put_u32(pending_host_fn);
     w.put_u32(pending_arg_count);
     w.put_u32(pending_host_overflow);
     for (u32 i = 0u; i < pending_arg_count && !w.full; ++i) {
-        const AnvilValue v = pending_args[i];
+        const CinderValue v = pending_args[i];
         u8 kind = 6u;
         if (v.is_bool()) {
             kind = 2u;
@@ -3276,7 +3276,7 @@ void AnvilVmContext::fill_host_call(AnvilVmTelemetryC* out) const noexcept {
             w.put_u32(text ? text_len : 0u);
             w.put_text(text, text_len);
         } else if (kind == 6u) {
-            const u32 sym = const_cast<AnvilHeap&>(heap).value_to_string_sym(v);
+            const u32 sym = const_cast<CinderHeap&>(heap).value_to_string_sym(v);
             if (sym != NO_SLOT) {
                 w.bytes[w.len - 1u] = 5u;
                 u32 text_len = 0u;
@@ -3290,15 +3290,15 @@ void AnvilVmContext::fill_host_call(AnvilVmTelemetryC* out) const noexcept {
     out->exports_len = w.len;
 }
 
-} // namespace anvil_vm
+} // namespace cinder_vm
 
 extern "C" {
 
-u32 anvil_cpp_jit_kernel_version() noexcept {
-    return anvil_vm::ANVIL_VM_KERNEL_VERSION;
+u32 cinder_cpp_jit_kernel_version() noexcept {
+    return cinder_vm::CINDER_VM_KERNEL_VERSION;
 }
 
-f64 anvil_cpp_jit_eval_binary(u32 opcode, f64 lhs, f64 rhs) noexcept {
+f64 cinder_cpp_jit_eval_binary(u32 opcode, f64 lhs, f64 rhs) noexcept {
     switch (opcode) {
         case 0u:
             return lhs + rhs;
@@ -3309,90 +3309,90 @@ f64 anvil_cpp_jit_eval_binary(u32 opcode, f64 lhs, f64 rhs) noexcept {
         case 3u:
             return rhs == 0.0 ? 0.0 : (lhs / rhs);
         case 4u: {
-            const anvil_vm::i64 r_int = anvil_vm::sat_i64(rhs);
+            const cinder_vm::i64 r_int = cinder_vm::sat_i64(rhs);
             if (r_int == 0) {
                 return 0.0;
             }
-            const anvil_vm::i64 l_int = anvil_vm::sat_i64(lhs);
+            const cinder_vm::i64 l_int = cinder_vm::sat_i64(lhs);
             if (r_int == -1) {
                 return 0.0;
             }
             return static_cast<f64>(l_int % r_int);
         }
         case 5u:
-            return static_cast<f64>(anvil_vm::sat_i32(lhs) & anvil_vm::sat_i32(rhs));
+            return static_cast<f64>(cinder_vm::sat_i32(lhs) & cinder_vm::sat_i32(rhs));
         case 6u:
-            return static_cast<f64>(anvil_vm::sat_i32(lhs) | anvil_vm::sat_i32(rhs));
+            return static_cast<f64>(cinder_vm::sat_i32(lhs) | cinder_vm::sat_i32(rhs));
         case 7u:
-            return static_cast<f64>(anvil_vm::sat_i32(lhs) ^ anvil_vm::sat_i32(rhs));
+            return static_cast<f64>(cinder_vm::sat_i32(lhs) ^ cinder_vm::sat_i32(rhs));
         case 8u:
-            return static_cast<f64>(static_cast<anvil_vm::i32>(static_cast<anvil_vm::u32>(anvil_vm::sat_i32(lhs)) << (anvil_vm::sat_i32(rhs) & 31)));
+            return static_cast<f64>(static_cast<cinder_vm::i32>(static_cast<cinder_vm::u32>(cinder_vm::sat_i32(lhs)) << (cinder_vm::sat_i32(rhs) & 31)));
         case 9u:
-            return static_cast<f64>(anvil_vm::sat_i32(lhs) >> (anvil_vm::sat_i32(rhs) & 31));
+            return static_cast<f64>(cinder_vm::sat_i32(lhs) >> (cinder_vm::sat_i32(rhs) & 31));
         default:
             return 0.0;
     }
 }
 
-anvil_vm::i64 anvil_cpp_jit_sum_range_i64(anvil_vm::i64 start, anvil_vm::i64 end_exclusive, anvil_vm::i64 step) noexcept {
+cinder_vm::i64 cinder_cpp_jit_sum_range_i64(cinder_vm::i64 start, cinder_vm::i64 end_exclusive, cinder_vm::i64 step) noexcept {
     if (step <= 0 || start >= end_exclusive) {
         return 0;
     }
-    const anvil_vm::i64 span = end_exclusive - start;
-    anvil_vm::i64 count = (span + step - 1) / step;
+    const cinder_vm::i64 span = end_exclusive - start;
+    cinder_vm::i64 count = (span + step - 1) / step;
     if (count > 100000) {
         count = 100000;
     }
-    const anvil_vm::i64 last = start + (count - 1) * step;
+    const cinder_vm::i64 last = start + (count - 1) * step;
     return count * (start + last) / 2;
 }
 
-extern "C" anvil_vm::u32 anvil_cpp_vm_context_bytes() {
-    return static_cast<anvil_vm::u32>(sizeof(anvil_vm::AnvilVmContext)) + anvil_vm::ANVIL_ARENA_RESERVE_BYTES;
+extern "C" cinder_vm::u32 cinder_cpp_vm_context_bytes() {
+    return static_cast<cinder_vm::u32>(sizeof(cinder_vm::CinderVmContext)) + cinder_vm::CINDER_ARENA_RESERVE_BYTES;
 }
 
-extern "C" anvil_vm::u32 anvil_cpp_vm_context_align() {
-    return static_cast<anvil_vm::u32>(alignof(anvil_vm::AnvilVmContext));
+extern "C" cinder_vm::u32 cinder_cpp_vm_context_align() {
+    return static_cast<cinder_vm::u32>(alignof(cinder_vm::CinderVmContext));
 }
 
 namespace {
-void (*g_text_host_fn)(void*, const char*, anvil_vm::u32, double) = nullptr;
+void (*g_text_host_fn)(void*, const char*, cinder_vm::u32, double) = nullptr;
 void* g_text_host = nullptr;
 }
 
-extern "C" void anvil_cpp_vm_set_text_host(
-    void (*fn)(void*, const char*, anvil_vm::u32, double),
+extern "C" void cinder_cpp_vm_set_text_host(
+    void (*fn)(void*, const char*, cinder_vm::u32, double),
     void* host
 ) noexcept {
     g_text_host_fn = fn;
     g_text_host = host;
 }
 
-static anvil_vm::u32 run_script_text(
-    anvil_vm::AnvilVmContext& ctx,
+static cinder_vm::u32 run_script_text(
+    cinder_vm::CinderVmContext& ctx,
     void* compiler_memory,
     const char* script,
-    anvil_vm::u32 script_len,
-    anvil_vm::AnvilVmTelemetryC* telemetry_out,
-    anvil_vm::f64* numeric_result_out
+    cinder_vm::u32 script_len,
+    cinder_vm::CinderVmTelemetryC* telemetry_out,
+    cinder_vm::f64* numeric_result_out
 ) noexcept {
     if (!compiler_memory || !script || script_len == 0u) {
-        ctx.fail(anvil_vm::VM_REFUSE_SYNTAX, "empty script");
+        ctx.fail(cinder_vm::VM_REFUSE_SYNTAX, "empty script");
         ctx.fill_telemetry(telemetry_out);
-        return anvil_vm::VM_RUN_REFUSED;
+        return cinder_vm::VM_RUN_REFUSED;
     }
     if (ctx.script_size_limit != 0u && script_len > ctx.script_size_limit) {
-        ctx.fail_limit(anvil_vm::VM_REFUSE_CODE_SIZE, "script size", ctx.script_size_limit, "bytes");
+        ctx.fail_limit(cinder_vm::VM_REFUSE_CODE_SIZE, "script size", ctx.script_size_limit, "bytes");
         ctx.fill_telemetry(telemetry_out);
-        return anvil_vm::VM_RUN_REFUSED;
+        return cinder_vm::VM_RUN_REFUSED;
     }
     ctx.host_set_text = g_text_host_fn;
     ctx.host = g_text_host;
-    if (!anvil_vm::compile_js_to_bytecode(ctx, compiler_memory, script, script_len)) {
+    if (!cinder_vm::compile_js_to_bytecode(ctx, compiler_memory, script, script_len)) {
         ctx.fill_telemetry(telemetry_out);
-        return anvil_vm::VM_RUN_REFUSED;
+        return cinder_vm::VM_RUN_REFUSED;
     }
-    const anvil_vm::AnvilValue res = ctx.execute(0u);
+    const cinder_vm::CinderValue res = ctx.execute(0u);
     if (telemetry_out) {
         ctx.fill_telemetry(telemetry_out);
     }
@@ -3400,41 +3400,41 @@ static anvil_vm::u32 run_script_text(
         *numeric_result_out = res.as_number();
     }
     if (ctx.paused) {
-        return anvil_vm::VM_RUN_HOST_CALL;
+        return cinder_vm::VM_RUN_HOST_CALL;
     }
-    return ctx.aborted ? anvil_vm::VM_RUN_STOPPED : anvil_vm::VM_RUN_OK;
+    return ctx.aborted ? cinder_vm::VM_RUN_STOPPED : cinder_vm::VM_RUN_OK;
 }
 
-static anvil_vm::u32 run_request(
-    anvil_vm::AnvilVmContext& ctx,
+static cinder_vm::u32 run_request(
+    cinder_vm::CinderVmContext& ctx,
     void* compiler_memory,
     const char* src,
-    anvil_vm::u32 len,
-    anvil_vm::AnvilVmTelemetryC* telemetry_out,
-    anvil_vm::f64* numeric_result_out
+    cinder_vm::u32 len,
+    cinder_vm::CinderVmTelemetryC* telemetry_out,
+    cinder_vm::f64* numeric_result_out
 ) noexcept {
-    if (len < anvil_vm::AVK_HEADER_BYTES) {
-        ctx.fail(anvil_vm::VM_REFUSE_SYNTAX, "request header too short");
+    if (len < cinder_vm::AVK_HEADER_BYTES) {
+        ctx.fail(cinder_vm::VM_REFUSE_SYNTAX, "request header too short");
         ctx.fill_telemetry(telemetry_out);
-        return anvil_vm::VM_RUN_REFUSED;
+        return cinder_vm::VM_RUN_REFUSED;
     }
-    const anvil_vm::u32 op = anvil_vm::read_u32_le(src + 4);
-    const anvil_vm::u32 out_cap = anvil_vm::read_u32_le(src + 12);
-    if (telemetry_out && out_cap < static_cast<anvil_vm::u32>(sizeof(anvil_vm::AnvilVmTelemetryC))) {
-        return anvil_vm::VM_RUN_BUFFER_SMALL;
+    const cinder_vm::u32 op = cinder_vm::read_u32_le(src + 4);
+    const cinder_vm::u32 out_cap = cinder_vm::read_u32_le(src + 12);
+    if (telemetry_out && out_cap < static_cast<cinder_vm::u32>(sizeof(cinder_vm::CinderVmTelemetryC))) {
+        return cinder_vm::VM_RUN_BUFFER_SMALL;
     }
-    const anvil_vm::u32 pos = anvil_vm::AVK_HEADER_BYTES;
-    if (op == anvil_vm::AVK_OP_RUN) {
+    const cinder_vm::u32 pos = cinder_vm::AVK_HEADER_BYTES;
+    if (op == cinder_vm::AVK_OP_RUN) {
         return run_script_text(
             ctx, compiler_memory, src + pos, len - pos, telemetry_out, numeric_result_out
         );
     }
-    if (op == anvil_vm::AVK_OP_CONFIGURE) {
+    if (op == cinder_vm::AVK_OP_CONFIGURE) {
         if (len >= pos + 16u) {
-            const anvil_vm::u32 step = anvil_vm::read_u32_le(src + pos);
-            const anvil_vm::u32 script_size = anvil_vm::read_u32_le(src + pos + 4u);
-            const anvil_vm::u32 heap = anvil_vm::read_u32_le(src + pos + 8u);
-            const anvil_vm::u32 depth = anvil_vm::read_u32_le(src + pos + 12u);
+            const cinder_vm::u32 step = cinder_vm::read_u32_le(src + pos);
+            const cinder_vm::u32 script_size = cinder_vm::read_u32_le(src + pos + 4u);
+            const cinder_vm::u32 heap = cinder_vm::read_u32_le(src + pos + 8u);
+            const cinder_vm::u32 depth = cinder_vm::read_u32_le(src + pos + 12u);
             if (step != 0u) {
                 ctx.step_limit = step;
             }
@@ -3448,25 +3448,25 @@ static anvil_vm::u32 run_request(
                 ctx.call_depth_limit = depth;
             }
             if (len >= pos + 20u) {
-                ctx.yield_interval = anvil_vm::read_u32_le(src + pos + 16u);
+                ctx.yield_interval = cinder_vm::read_u32_le(src + pos + 16u);
             }
             if (len >= pos + 24u) {
-                const anvil_vm::u32 parse_stack = anvil_vm::read_u32_le(src + pos + 20u);
+                const cinder_vm::u32 parse_stack = cinder_vm::read_u32_le(src + pos + 20u);
                 if (parse_stack != 0u) {
                     ctx.parse_stack_budget = parse_stack;
                 }
             }
         }
         ctx.fill_telemetry(telemetry_out);
-        return anvil_vm::VM_RUN_OK;
+        return cinder_vm::VM_RUN_OK;
     }
-    if (op == anvil_vm::AVK_OP_RESUME) {
+    if (op == cinder_vm::AVK_OP_RESUME) {
         if (!ctx.paused) {
-            ctx.fail(anvil_vm::VM_REFUSE_UNSUPPORTED, "resume without a paused run");
+            ctx.fail(cinder_vm::VM_REFUSE_UNSUPPORTED, "resume without a paused run");
             ctx.fill_telemetry(telemetry_out);
-            return anvil_vm::VM_RUN_REFUSED;
+            return cinder_vm::VM_RUN_REFUSED;
         }
-        const anvil_vm::AnvilValue res = ctx.resume();
+        const cinder_vm::CinderValue res = ctx.resume();
         if (telemetry_out) {
             ctx.fill_telemetry(telemetry_out);
         }
@@ -3474,34 +3474,34 @@ static anvil_vm::u32 run_request(
             *numeric_result_out = res.as_number();
         }
         if (ctx.paused) {
-            return anvil_vm::VM_RUN_HOST_CALL;
+            return cinder_vm::VM_RUN_HOST_CALL;
         }
-        return ctx.aborted ? anvil_vm::VM_RUN_STOPPED : anvil_vm::VM_RUN_OK;
+        return ctx.aborted ? cinder_vm::VM_RUN_STOPPED : cinder_vm::VM_RUN_OK;
     }
-    ctx.fail(anvil_vm::VM_REFUSE_UNSUPPORTED, "unsupported request op");
+    ctx.fail(cinder_vm::VM_REFUSE_UNSUPPORTED, "unsupported request op");
     ctx.fill_telemetry(telemetry_out);
-    return anvil_vm::VM_RUN_REFUSED;
+    return cinder_vm::VM_RUN_REFUSED;
 }
 
-anvil_vm::u32 anvil_cpp_vm_run_script(
+cinder_vm::u32 cinder_cpp_vm_run_script(
     void* context_memory,
     void* compiler_memory,
     const char* source_ptr,
-    anvil_vm::u32 source_len,
-    anvil_vm::AnvilVmTelemetryC* telemetry_out,
-    anvil_vm::f64* numeric_result_out
+    cinder_vm::u32 source_len,
+    cinder_vm::CinderVmTelemetryC* telemetry_out,
+    cinder_vm::f64* numeric_result_out
 ) noexcept {
     if (!context_memory) {
         return 0u;
     }
-    auto& ctx = *static_cast<anvil_vm::AnvilVmContext*>(context_memory);
-    const bool is_resume = anvil_vm::has_request_magic(source_ptr, source_len) &&
-                           source_len >= anvil_vm::AVK_HEADER_BYTES &&
-                           anvil_vm::read_u32_le(source_ptr + 4) == anvil_vm::AVK_OP_RESUME;
+    auto& ctx = *static_cast<cinder_vm::CinderVmContext*>(context_memory);
+    const bool is_resume = cinder_vm::has_request_magic(source_ptr, source_len) &&
+                           source_len >= cinder_vm::AVK_HEADER_BYTES &&
+                           cinder_vm::read_u32_le(source_ptr + 4) == cinder_vm::AVK_OP_RESUME;
     if (!is_resume) {
         ctx.init();
     }
-    if (anvil_vm::has_request_magic(source_ptr, source_len)) {
+    if (cinder_vm::has_request_magic(source_ptr, source_len)) {
         return run_request(
             ctx, compiler_memory, source_ptr, source_len, telemetry_out, numeric_result_out
         );
@@ -3511,38 +3511,38 @@ anvil_vm::u32 anvil_cpp_vm_run_script(
     );
 }
 
-extern "C" anvil_vm::u32 anvil_cpp_vm_global_count(void* context_memory) noexcept {
+extern "C" cinder_vm::u32 cinder_cpp_vm_global_count(void* context_memory) noexcept {
     if (!context_memory) {
         return 0u;
     }
-    const auto& ctx = *static_cast<const anvil_vm::AnvilVmContext*>(context_memory);
+    const auto& ctx = *static_cast<const cinder_vm::CinderVmContext*>(context_memory);
     return ctx.global_count;
 }
 
-extern "C" anvil_vm::u32 anvil_cpp_vm_copy_global(
+extern "C" cinder_vm::u32 cinder_cpp_vm_copy_global(
     void* context_memory,
-    anvil_vm::u32 index,
+    cinder_vm::u32 index,
     char* name_out,
-    anvil_vm::u32 name_cap,
-    anvil_vm::f64* value_out
+    cinder_vm::u32 name_cap,
+    cinder_vm::f64* value_out
 ) noexcept {
     if (!context_memory || !name_out || name_cap < 2u || !value_out) {
         return 0u;
     }
-    const auto& ctx = *static_cast<const anvil_vm::AnvilVmContext*>(context_memory);
+    const auto& ctx = *static_cast<const cinder_vm::CinderVmContext*>(context_memory);
     if (index >= ctx.global_count || !ctx.globals()[index].occupied) {
         return 0u;
     }
     if (!ctx.globals()[index].value.is_number()) {
         return 0u;
     }
-    anvil_vm::u32 len = 0u;
+    cinder_vm::u32 len = 0u;
     const char* text = ctx.heap.get_string_ptr(ctx.globals()[index].name_sym, &len);
     if (!text || len == 0u) {
         return 0u;
     }
-    const anvil_vm::u32 n = (len < name_cap - 1u) ? len : (name_cap - 1u);
-    for (anvil_vm::u32 i = 0u; i < n; ++i) {
+    const cinder_vm::u32 n = (len < name_cap - 1u) ? len : (name_cap - 1u);
+    for (cinder_vm::u32 i = 0u; i < n; ++i) {
         name_out[i] = text[i];
     }
     name_out[n] = '\0';
@@ -3550,49 +3550,49 @@ extern "C" anvil_vm::u32 anvil_cpp_vm_copy_global(
     return 1u;
 }
 
-anvil_vm::u32 anvil_cpp_vm_run_ic_benchmark(
+cinder_vm::u32 cinder_cpp_vm_run_ic_benchmark(
     void* context_memory,
-    anvil_vm::u32 iterations,
-    anvil_vm::AnvilVmTelemetryC* telemetry_out
+    cinder_vm::u32 iterations,
+    cinder_vm::CinderVmTelemetryC* telemetry_out
 ) noexcept {
     if (!context_memory) {
         return 0u;
     }
-    auto& g_vm_ctx = *static_cast<anvil_vm::AnvilVmContext*>(context_memory);
+    auto& g_vm_ctx = *static_cast<cinder_vm::CinderVmContext*>(context_memory);
     g_vm_ctx.init();
 
-    const anvil_vm::u32 sym_x = g_vm_ctx.heap.intern_string("x", 1u);
-    const anvil_vm::u32 sym_y = g_vm_ctx.heap.intern_string("y", 1u);
-    const anvil_vm::u32 sym_z = g_vm_ctx.heap.intern_string("z", 1u);
+    const cinder_vm::u32 sym_x = g_vm_ctx.heap.intern_string("x", 1u);
+    const cinder_vm::u32 sym_y = g_vm_ctx.heap.intern_string("y", 1u);
+    const cinder_vm::u32 sym_z = g_vm_ctx.heap.intern_string("z", 1u);
 
-    const anvil_vm::u32 site_set_x = g_vm_ctx.ic.allocate_site(sym_x);
-    const anvil_vm::u32 site_set_y = g_vm_ctx.ic.allocate_site(sym_y);
-    const anvil_vm::u32 site_get_x = g_vm_ctx.ic.allocate_site(sym_x);
-    const anvil_vm::u32 site_get_y = g_vm_ctx.ic.allocate_site(sym_y);
+    const cinder_vm::u32 site_set_x = g_vm_ctx.ic.allocate_site(sym_x);
+    const cinder_vm::u32 site_set_y = g_vm_ctx.ic.allocate_site(sym_y);
+    const cinder_vm::u32 site_get_x = g_vm_ctx.ic.allocate_site(sym_x);
+    const cinder_vm::u32 site_get_y = g_vm_ctx.ic.allocate_site(sym_y);
 
-    const anvil_vm::u32 capped = iterations > 4096u ? 4096u : (iterations == 0u ? 16u : iterations);
-    anvil_vm::i32 accum = 0;
+    const cinder_vm::u32 capped = iterations > 4096u ? 4096u : (iterations == 0u ? 16u : iterations);
+    cinder_vm::i32 accum = 0;
 
-    for (anvil_vm::u32 i = 0u; i < capped; ++i) {
+    for (cinder_vm::u32 i = 0u; i < capped; ++i) {
         if (i != 0u && (i & 255u) == 0u) {
             g_vm_ctx.heap.collect_garbage(nullptr, 0u);
         }
-        const anvil_vm::u32 obj_id = g_vm_ctx.heap.alloc_object(0u);
-        if (obj_id == anvil_vm::NO_SLOT) {
+        const cinder_vm::u32 obj_id = g_vm_ctx.heap.alloc_object(0u);
+        if (obj_id == cinder_vm::NO_SLOT) {
             break;
         }
-        const anvil_vm::AnvilValue obj = anvil_vm::AnvilValue::make_object(obj_id);
+        const cinder_vm::CinderValue obj = cinder_vm::CinderValue::make_object(obj_id);
 
-        g_vm_ctx.ic.store_property_ic(g_vm_ctx.heap, site_set_x, obj, sym_x, anvil_vm::AnvilValue::make_smi(static_cast<anvil_vm::i32>(i)));
-        g_vm_ctx.ic.store_property_ic(g_vm_ctx.heap, site_set_y, obj, sym_y, anvil_vm::AnvilValue::make_smi(2));
+        g_vm_ctx.ic.store_property_ic(g_vm_ctx.heap, site_set_x, obj, sym_x, cinder_vm::CinderValue::make_smi(static_cast<cinder_vm::i32>(i)));
+        g_vm_ctx.ic.store_property_ic(g_vm_ctx.heap, site_set_y, obj, sym_y, cinder_vm::CinderValue::make_smi(2));
         if ((i & 3u) == 0u) {
-            anvil_vm::u32 sh = 0u;
-            anvil_vm::i32 sl = -1;
-            g_vm_ctx.heap.set_object_prop(obj_id, sym_z, anvil_vm::AnvilValue::make_smi(1), &sh, &sl);
+            cinder_vm::u32 sh = 0u;
+            cinder_vm::i32 sl = -1;
+            g_vm_ctx.heap.set_object_prop(obj_id, sym_z, cinder_vm::CinderValue::make_smi(1), &sh, &sl);
         }
 
-        const anvil_vm::AnvilValue vx = g_vm_ctx.ic.load_property_ic(g_vm_ctx.heap, site_get_x, obj, sym_x);
-        const anvil_vm::AnvilValue vy = g_vm_ctx.ic.load_property_ic(g_vm_ctx.heap, site_get_y, obj, sym_y);
+        const cinder_vm::CinderValue vx = g_vm_ctx.ic.load_property_ic(g_vm_ctx.heap, site_get_x, obj, sym_x);
+        const cinder_vm::CinderValue vy = g_vm_ctx.ic.load_property_ic(g_vm_ctx.heap, site_get_y, obj, sym_y);
         accum += vx.as_smi() * vy.as_smi();
         g_vm_ctx.steps_executed += 4u;
     }
@@ -3600,31 +3600,31 @@ anvil_vm::u32 anvil_cpp_vm_run_ic_benchmark(
     if (telemetry_out) {
         g_vm_ctx.fill_telemetry(telemetry_out);
     }
-    return static_cast<anvil_vm::u32>(accum);
+    return static_cast<cinder_vm::u32>(accum);
 }
 
-anvil_vm::f64 anvil_cpp_vm_vector_reduce(anvil_vm::u32 op, const anvil_vm::f64* data_ptr, anvil_vm::u32 len) noexcept {
+cinder_vm::f64 cinder_cpp_vm_vector_reduce(cinder_vm::u32 op, const cinder_vm::f64* data_ptr, cinder_vm::u32 len) noexcept {
     if (!data_ptr || len == 0u) {
         return 0.0;
     }
     if (op == 0u) {
-        anvil_vm::f64 s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-        anvil_vm::u32 i = 0u;
+        cinder_vm::f64 s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+        cinder_vm::u32 i = 0u;
         for (; i + 3u < len; i += 4u) {
             s0 += data_ptr[i];
             s1 += data_ptr[i + 1u];
             s2 += data_ptr[i + 2u];
             s3 += data_ptr[i + 3u];
         }
-        anvil_vm::f64 total = (s0 + s1) + (s2 + s3);
+        cinder_vm::f64 total = (s0 + s1) + (s2 + s3);
         for (; i < len; ++i) {
             total += data_ptr[i];
         }
         return total;
     }
     if (op == 1u) {
-        anvil_vm::f64 best = data_ptr[0];
-        for (anvil_vm::u32 i = 1u; i < len; ++i) {
+        cinder_vm::f64 best = data_ptr[0];
+        for (cinder_vm::u32 i = 1u; i < len; ++i) {
             if (data_ptr[i] < best) {
                 best = data_ptr[i];
             }
@@ -3632,8 +3632,8 @@ anvil_vm::f64 anvil_cpp_vm_vector_reduce(anvil_vm::u32 op, const anvil_vm::f64* 
         return best;
     }
     if (op == 2u) {
-        anvil_vm::f64 best = data_ptr[0];
-        for (anvil_vm::u32 i = 1u; i < len; ++i) {
+        cinder_vm::f64 best = data_ptr[0];
+        for (cinder_vm::u32 i = 1u; i < len; ++i) {
             if (data_ptr[i] > best) {
                 best = data_ptr[i];
             }
@@ -3641,15 +3641,15 @@ anvil_vm::f64 anvil_cpp_vm_vector_reduce(anvil_vm::u32 op, const anvil_vm::f64* 
         return best;
     }
     if (op == 3u) {
-        anvil_vm::f64 s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-        anvil_vm::u32 i = 0u;
+        cinder_vm::f64 s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+        cinder_vm::u32 i = 0u;
         for (; i + 3u < len; i += 4u) {
             s0 += data_ptr[i] * data_ptr[i];
             s1 += data_ptr[i + 1u] * data_ptr[i + 1u];
             s2 += data_ptr[i + 2u] * data_ptr[i + 2u];
             s3 += data_ptr[i + 3u] * data_ptr[i + 3u];
         }
-        anvil_vm::f64 total = (s0 + s1) + (s2 + s3);
+        cinder_vm::f64 total = (s0 + s1) + (s2 + s3);
         for (; i < len; ++i) {
             total += data_ptr[i] * data_ptr[i];
         }

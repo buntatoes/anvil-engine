@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 # Copyright (c) 2026 Buntato
-# GitHub Linguist language classification for Anvil Engine
+# GitHub Linguist language classification for Forge
 
 *.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
 *.js linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false

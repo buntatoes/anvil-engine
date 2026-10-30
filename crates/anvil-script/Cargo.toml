@@ -1,5 +1,5 @@
 # Budgeted script interpreter. Mutates anvil-dom, parses JSON with anvil-json,
-# and links the Anvil-JS engine directly (`../anvil-browser/engines/anvil-js`).
+# and links the Cinder engine directly (`../anvil-browser/engines/cinder`).
 # fetch() is same-origin only and runs in the Rust interpreter.
 # A registered mock wins. Otherwise a host callback runs. This crate does not
 # open a socket and does not link anvil-net. The numeric VM does not perform fetch.
@@ -17,5 +17,7 @@ publish.workspace = true
 
 [dependencies]
 anvil-dom = { path = "../anvil-dom" }
+anvil-style = { path = "../anvil-style" }
+anvil-layout = { path = "../anvil-layout" }
 anvil-json.workspace = true
 anvil-video.workspace = true

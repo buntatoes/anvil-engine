@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// C++20 Hidden Classes (AnvilShape), String Interning Pool, and Mark-Sweep GC Heap.
+// C++20 Hidden Classes (CinderShape), String Interning Pool, and Mark-Sweep GC Heap.
 // Author: Buntato
 
-#include "anvil_vm.hpp"
+#include "cinder_vm.hpp"
 
-namespace anvil_vm {
+namespace cinder_vm {
 
 namespace {
 
@@ -219,7 +219,7 @@ constexpr u32 INIT_FUNCTION_TABLE = 16u;
 
 } // namespace
 
-bool AnvilHeap::ensure_string_bytes(u32 need) noexcept {
+bool CinderHeap::ensure_string_bytes(u32 need) noexcept {
     if (need <= str_pool_cap) {
         return true;
     }
@@ -247,7 +247,7 @@ bool AnvilHeap::ensure_string_bytes(u32 need) noexcept {
     return true;
 }
 
-bool AnvilHeap::ensure_string_table(u32 need) noexcept {
+bool CinderHeap::ensure_string_table(u32 need) noexcept {
     if (need <= strings_cap) {
         return true;
     }
@@ -256,13 +256,13 @@ bool AnvilHeap::ensure_string_table(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 bytes = new_cap * static_cast<u32>(sizeof(AnvilInternedString));
+    const u32 bytes = new_cap * static_cast<u32>(sizeof(CinderInternedString));
     const u32 new_off = arena.alloc(bytes, &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilInternedString* dst = reinterpret_cast<AnvilInternedString*>(arena.at(new_off));
-    const AnvilInternedString* src = strings();
+    CinderInternedString* dst = reinterpret_cast<CinderInternedString*>(arena.at(new_off));
+    const CinderInternedString* src = strings();
     for (u32 i = 0u; i < string_count; ++i) {
         dst[i] = src[i];
     }
@@ -271,12 +271,12 @@ bool AnvilHeap::ensure_string_table(u32 need) noexcept {
     strings_off = new_off;
     strings_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilInternedString)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderInternedString)));
     }
     return true;
 }
 
-void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
+void CinderHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
     arena.init(arena_base, reserve, budget);
     str_pool_off = 0u;
     str_pool_cap = 0u;
@@ -301,7 +301,7 @@ void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
     ensure_objects(INIT_OBJECT_TABLE);
     if (shapes_cap > 0u) {
         shape_count = 1u;
-        AnvilShape& root = shapes()[0];
+        CinderShape& root = shapes()[0];
         root.id = 0u;
         root.parent_shape = 0u;
         root.prop_count = 0u;
@@ -331,18 +331,18 @@ void AnvilHeap::init(u8* arena_base, u32 reserve, u32 budget) noexcept {
 
     live_objects = 0u;
     live_arrays = 0u;
-    bytes_allocated = sizeof(AnvilShape);
+    bytes_allocated = sizeof(CinderShape);
     gc_collections = 0u;
     shape_transitions_count = 0u;
 }
 
-u32 AnvilHeap::intern_string(const char* str, u32 len) noexcept {
+u32 CinderHeap::intern_string(const char* str, u32 len) noexcept {
     if (!str && len > 0u) {
         len = 0u;
     }
     const u64 h = fnv1a_hash_bytes(str, len);
     for (u32 i = 0; i < string_count; ++i) {
-        const AnvilInternedString& e = strings()[i];
+        const CinderInternedString& e = strings()[i];
         if (e.active && e.hash == h && e.length == len) {
             if (len == 0u || bytes_equal(&string_bytes()[e.offset], str, len)) {
                 return i;
@@ -362,17 +362,17 @@ u32 AnvilHeap::intern_string(const char* str, u32 len) noexcept {
         pool[off + i] = str[i];
     }
     string_bytes_used += len;
-    AnvilInternedString& e = strings()[sym];
+    CinderInternedString& e = strings()[sym];
     e.hash = h;
     e.offset = off;
     e.length = len;
     e.marked = true;
     e.active = true;
-    bytes_allocated += static_cast<u32>(sizeof(AnvilInternedString)) + len;
+    bytes_allocated += static_cast<u32>(sizeof(CinderInternedString)) + len;
     return sym;
 }
 
-u32 AnvilHeap::intern_concat(u32 sym_a, u32 sym_b) noexcept {
+u32 CinderHeap::intern_concat(u32 sym_a, u32 sym_b) noexcept {
     u32 len_a = 0u;
     u32 len_b = 0u;
     (void) get_string_ptr(sym_a, &len_a);
@@ -423,7 +423,7 @@ u32 AnvilHeap::intern_concat(u32 sym_a, u32 sym_b) noexcept {
     return intern_string(&pool[off], len_a + len_b);
 }
 
-const char* AnvilHeap::get_string_ptr(u32 sym, u32* len_out) const noexcept {
+const char* CinderHeap::get_string_ptr(u32 sym, u32* len_out) const noexcept {
     if (sym >= string_count || !strings()[sym].active) {
         if (len_out) {
             *len_out = 0u;
@@ -436,22 +436,22 @@ const char* AnvilHeap::get_string_ptr(u32 sym, u32* len_out) const noexcept {
     return &string_bytes()[strings()[sym].offset];
 }
 
-bool AnvilHeap::string_equals(u32 sym_a, u32 sym_b) const noexcept {
+bool CinderHeap::string_equals(u32 sym_a, u32 sym_b) const noexcept {
     if (sym_a == sym_b) {
         return true;
     }
     if (sym_a >= string_count || sym_b >= string_count) {
         return false;
     }
-    const AnvilInternedString& a = strings()[sym_a];
-    const AnvilInternedString& b = strings()[sym_b];
+    const CinderInternedString& a = strings()[sym_a];
+    const CinderInternedString& b = strings()[sym_b];
     if (a.hash != b.hash || a.length != b.length) {
         return false;
     }
     return bytes_equal(&string_bytes()[a.offset], &string_bytes()[b.offset], a.length);
 }
 
-bool AnvilHeap::ensure_shapes(u32 need) noexcept {
+bool CinderHeap::ensure_shapes(u32 need) noexcept {
     if (need <= shapes_cap) {
         return true;
     }
@@ -460,12 +460,12 @@ bool AnvilHeap::ensure_shapes(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilShape)), &over);
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderShape)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilShape* dst = reinterpret_cast<AnvilShape*>(arena.at(new_off));
-    const AnvilShape* src = shapes();
+    CinderShape* dst = reinterpret_cast<CinderShape*>(arena.at(new_off));
+    const CinderShape* src = shapes();
     for (u32 i = 0u; i < shape_count; ++i) {
         dst[i] = src[i];
     }
@@ -474,12 +474,12 @@ bool AnvilHeap::ensure_shapes(u32 need) noexcept {
     shapes_off = new_off;
     shapes_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilShape)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderShape)));
     }
     return true;
 }
 
-bool AnvilHeap::ensure_transitions(u32 need) noexcept {
+bool CinderHeap::ensure_transitions(u32 need) noexcept {
     if (need <= transitions_cap) {
         return true;
     }
@@ -488,12 +488,12 @@ bool AnvilHeap::ensure_transitions(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilShapeTransition)), &over);
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderShapeTransition)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilShapeTransition* dst = reinterpret_cast<AnvilShapeTransition*>(arena.at(new_off));
-    const AnvilShapeTransition* src = transitions();
+    CinderShapeTransition* dst = reinterpret_cast<CinderShapeTransition*>(arena.at(new_off));
+    const CinderShapeTransition* src = transitions();
     for (u32 i = 0u; i < transition_count; ++i) {
         dst[i] = src[i];
     }
@@ -502,12 +502,12 @@ bool AnvilHeap::ensure_transitions(u32 need) noexcept {
     transitions_off = new_off;
     transitions_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilShapeTransition)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderShapeTransition)));
     }
     return true;
 }
 
-bool AnvilHeap::ensure_functions(u32 need) noexcept {
+bool CinderHeap::ensure_functions(u32 need) noexcept {
     if (need <= functions_cap) {
         return true;
     }
@@ -516,12 +516,12 @@ bool AnvilHeap::ensure_functions(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilHeapFunction)), &over);
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderHeapFunction)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilHeapFunction* dst = reinterpret_cast<AnvilHeapFunction*>(arena.at(new_off));
-    const AnvilHeapFunction* src = functions();
+    CinderHeapFunction* dst = reinterpret_cast<CinderHeapFunction*>(arena.at(new_off));
+    const CinderHeapFunction* src = functions();
     for (u32 i = 0u; i < function_count; ++i) {
         dst[i] = src[i];
     }
@@ -530,12 +530,12 @@ bool AnvilHeap::ensure_functions(u32 need) noexcept {
     functions_off = new_off;
     functions_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapFunction)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapFunction)));
     }
     return true;
 }
 
-bool AnvilHeap::ensure_objects(u32 need) noexcept {
+bool CinderHeap::ensure_objects(u32 need) noexcept {
     if (need <= objects_cap) {
         return true;
     }
@@ -544,12 +544,12 @@ bool AnvilHeap::ensure_objects(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilHeapObject)), &over);
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderHeapObject)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilHeapObject* dst = reinterpret_cast<AnvilHeapObject*>(arena.at(new_off));
-    const AnvilHeapObject* src = objects();
+    CinderHeapObject* dst = reinterpret_cast<CinderHeapObject*>(arena.at(new_off));
+    const CinderHeapObject* src = objects();
     for (u32 i = 0u; i < object_count; ++i) {
         dst[i] = src[i];
     }
@@ -558,19 +558,19 @@ bool AnvilHeap::ensure_objects(u32 need) noexcept {
     objects_off = new_off;
     objects_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapObject)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapObject)));
     }
     return true;
 }
 
-i32 AnvilHeap::lookup_shape_slot(u32 shape_id, u32 prop_sym) const noexcept {
+i32 CinderHeap::lookup_shape_slot(u32 shape_id, u32 prop_sym) const noexcept {
     if (shape_id >= shape_count) {
         return -1;
     }
     return shapes()[shape_id].find_slot(prop_sym);
 }
 
-u32 AnvilHeap::transition_shape(u32 current_shape, u32 prop_sym) noexcept {
+u32 CinderHeap::transition_shape(u32 current_shape, u32 prop_sym) noexcept {
     if (current_shape >= shape_count) {
         return 0u;
     }
@@ -594,7 +594,7 @@ u32 AnvilHeap::transition_shape(u32 current_shape, u32 prop_sym) noexcept {
         return current_shape;
     }
     const u32 next_id = shape_count++;
-    AnvilShape& child = shapes()[next_id];
+    CinderShape& child = shapes()[next_id];
     child.id = next_id;
     child.parent_shape = current_shape;
     child.prop_count = parent_count + 1u;
@@ -604,20 +604,20 @@ u32 AnvilHeap::transition_shape(u32 current_shape, u32 prop_sym) noexcept {
     child.prop_syms[parent_count] = prop_sym;
 
     if (ensure_transitions(transition_count + 1u)) {
-        AnvilShapeTransition& t = transitions()[transition_count];
+        CinderShapeTransition& t = transitions()[transition_count];
         t.from_shape = current_shape;
         t.prop_sym = prop_sym;
         t.to_shape = next_id;
         ++transition_count;
     }
     ++shape_transitions_count;
-    bytes_allocated += static_cast<u32>(sizeof(AnvilShape));
+    bytes_allocated += static_cast<u32>(sizeof(CinderShape));
     return next_id;
 }
 
-u32 AnvilHeap::alloc_object(u32 initial_shape) noexcept {
+u32 CinderHeap::alloc_object(u32 initial_shape) noexcept {
     bool over = false;
-    const u32 slots_off = arena.alloc(INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(AnvilValue)), &over);
+    const u32 slots_off = arena.alloc(INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(CinderValue)), &over);
     if (slots_off == NO_SLOT) {
         return NO_SLOT;
     }
@@ -630,16 +630,16 @@ u32 AnvilHeap::alloc_object(u32 initial_shape) noexcept {
     }
     if (id == NO_SLOT) {
         if (!ensure_objects(object_count + 1u)) {
-            arena.free(slots_off, INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(AnvilValue)));
+            arena.free(slots_off, INIT_OBJECT_SLOTS * static_cast<u32>(sizeof(CinderValue)));
             return NO_SLOT;
         }
         id = object_count++;
     }
-    AnvilValue* slots = object_slots(slots_off);
+    CinderValue* slots = object_slots(slots_off);
     for (u32 s = 0; s < INIT_OBJECT_SLOTS; ++s) {
-        slots[s] = AnvilValue::make_undefined();
+        slots[s] = CinderValue::make_undefined();
     }
-    AnvilHeapObject& obj = objects()[id];
+    CinderHeapObject& obj = objects()[id];
     obj.active = true;
     obj.marked = false;
     obj.dict = false;
@@ -654,11 +654,11 @@ u32 AnvilHeap::alloc_object(u32 initial_shape) noexcept {
     obj.byte_offset = 0u;
     obj.byte_length = 0u;
     ++live_objects;
-    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapObject));
+    bytes_allocated += static_cast<u32>(sizeof(CinderHeapObject));
     return id;
 }
 
-u32 AnvilHeap::alloc_error_object(BuiltinCtorKind ctor_kind, u32 msg_sym) noexcept {
+u32 CinderHeap::alloc_error_object(BuiltinCtorKind ctor_kind, u32 msg_sym) noexcept {
     const u32 id = alloc_object(0u);
     if (id == NO_SLOT) {
         return NO_SLOT;
@@ -693,16 +693,16 @@ u32 AnvilHeap::alloc_error_object(BuiltinCtorKind ctor_kind, u32 msg_sym) noexce
     if (k_name == NO_SLOT || v_name == NO_SLOT || k_msg == NO_SLOT) {
         return NO_SLOT;
     }
-    if (set_object_prop(id, k_name, AnvilValue::make_string(v_name)) != StoreResult::Ok) {
+    if (set_object_prop(id, k_name, CinderValue::make_string(v_name)) != StoreResult::Ok) {
         return NO_SLOT;
     }
-    if (set_object_prop(id, k_msg, AnvilValue::make_string(msg_sym)) != StoreResult::Ok) {
+    if (set_object_prop(id, k_msg, CinderValue::make_string(msg_sym)) != StoreResult::Ok) {
         return NO_SLOT;
     }
     return id;
 }
 
-bool AnvilHeap::ensure_arrays(u32 need) noexcept {
+bool CinderHeap::ensure_arrays(u32 need) noexcept {
     if (need <= arrays_cap) {
         return true;
     }
@@ -711,13 +711,13 @@ bool AnvilHeap::ensure_arrays(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 bytes = new_cap * static_cast<u32>(sizeof(AnvilHeapArray));
+    const u32 bytes = new_cap * static_cast<u32>(sizeof(CinderHeapArray));
     const u32 new_off = arena.alloc(bytes, &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilHeapArray* dst = reinterpret_cast<AnvilHeapArray*>(arena.at(new_off));
-    const AnvilHeapArray* src = arrays();
+    CinderHeapArray* dst = reinterpret_cast<CinderHeapArray*>(arena.at(new_off));
+    const CinderHeapArray* src = arrays();
     for (u32 i = 0u; i < array_count; ++i) {
         dst[i] = src[i];
     }
@@ -726,15 +726,15 @@ bool AnvilHeap::ensure_arrays(u32 need) noexcept {
     arrays_off = new_off;
     arrays_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapArray)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapArray)));
     }
     return true;
 }
 
-u32 AnvilHeap::alloc_array(u32 initial_capacity) noexcept {
+u32 CinderHeap::alloc_array(u32 initial_capacity) noexcept {
     const u32 cap = initial_capacity < 4u ? 4u : (initial_capacity > 128u ? 128u : initial_capacity);
     bool over = false;
-    const u32 elems_off = arena.alloc(cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    const u32 elems_off = arena.alloc(cap * static_cast<u32>(sizeof(CinderValue)), &over);
     if (elems_off == NO_SLOT) {
         return NO_SLOT;
     }
@@ -747,27 +747,27 @@ u32 AnvilHeap::alloc_array(u32 initial_capacity) noexcept {
     }
     if (id == NO_SLOT) {
         if (!ensure_arrays(array_count + 1u)) {
-            arena.free(elems_off, cap * static_cast<u32>(sizeof(AnvilValue)));
+            arena.free(elems_off, cap * static_cast<u32>(sizeof(CinderValue)));
             return NO_SLOT;
         }
         id = array_count++;
     }
-    AnvilValue* store = array_elems(elems_off);
+    CinderValue* store = array_elems(elems_off);
     for (u32 k = 0; k < cap; ++k) {
-        store[k] = AnvilValue::make_undefined();
+        store[k] = CinderValue::make_undefined();
     }
-    AnvilHeapArray& arr = arrays()[id];
+    CinderHeapArray& arr = arrays()[id];
     arr.active = true;
     arr.marked = false;
     arr.length = 0u;
     arr.storage_off = elems_off;
     arr.capacity = cap;
     ++live_arrays;
-    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapArray)) + cap * static_cast<u32>(sizeof(AnvilValue));
+    bytes_allocated += static_cast<u32>(sizeof(CinderHeapArray)) + cap * static_cast<u32>(sizeof(CinderValue));
     return id;
 }
 
-u32 AnvilHeap::alloc_cell(AnvilValue v) noexcept {
+u32 CinderHeap::alloc_cell(CinderValue v) noexcept {
     const u32 id = alloc_array(1u);
     if (id == NO_SLOT) {
         return NO_SLOT;
@@ -777,7 +777,7 @@ u32 AnvilHeap::alloc_cell(AnvilValue v) noexcept {
     return id;
 }
 
-u32 AnvilHeap::alloc_function(
+u32 CinderHeap::alloc_function(
     u32 name_sym,
     u32 arity,
     u32 local_count,
@@ -788,7 +788,7 @@ u32 AnvilHeap::alloc_function(
         return NO_SLOT;
     }
     const u32 id = function_count++;
-    AnvilHeapFunction& f = functions()[id];
+    CinderHeapFunction& f = functions()[id];
     f.active = true;
     f.marked = true;
     f.name_sym = name_sym;
@@ -798,11 +798,11 @@ u32 AnvilHeap::alloc_function(
     f.code_len = code_len;
     f.canonical_closure = NO_SLOT;
     f.home_proto_id = NO_SLOT;
-    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapFunction));
+    bytes_allocated += static_cast<u32>(sizeof(CinderHeapFunction));
     return id;
 }
 
-bool AnvilHeap::ensure_closures(u32 need) noexcept {
+bool CinderHeap::ensure_closures(u32 need) noexcept {
     if (need <= closures_cap) {
         return true;
     }
@@ -811,12 +811,12 @@ bool AnvilHeap::ensure_closures(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilHeapClosure)), &over);
+    const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderHeapClosure)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilHeapClosure* dst = reinterpret_cast<AnvilHeapClosure*>(arena.at(new_off));
-    const AnvilHeapClosure* src = closures();
+    CinderHeapClosure* dst = reinterpret_cast<CinderHeapClosure*>(arena.at(new_off));
+    const CinderHeapClosure* src = closures();
     for (u32 i = 0u; i < closure_count; ++i) {
         dst[i] = src[i];
     }
@@ -825,12 +825,12 @@ bool AnvilHeap::ensure_closures(u32 need) noexcept {
     closures_off = new_off;
     closures_cap = new_cap;
     if (old_cap != 0u) {
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilHeapClosure)));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderHeapClosure)));
     }
     return true;
 }
 
-u32 AnvilHeap::alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pinned) noexcept {
+u32 CinderHeap::alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pinned) noexcept {
     u32 id = NO_SLOT;
     for (u32 i = 0u; i < closure_count; ++i) {
         if (!closures()[i].active) {
@@ -844,7 +844,7 @@ u32 AnvilHeap::alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pi
         }
         id = closure_count++;
     }
-    AnvilHeapClosure& c = closures()[id];
+    CinderHeapClosure& c = closures()[id];
     c.active = true;
     c.marked = false;
     c.pinned = pinned;
@@ -855,15 +855,15 @@ u32 AnvilHeap::alloc_closure(u32 fn_id, u32 upvals_off, u32 upval_count, bool pi
     c.static_obj_id = NO_SLOT;
     c.super_closure_id = NO_SLOT;
     ++live_closures;
-    bytes_allocated += static_cast<u32>(sizeof(AnvilHeapClosure));
+    bytes_allocated += static_cast<u32>(sizeof(CinderHeapClosure));
     return id;
 }
 
-static bool find_own_prop(const AnvilHeap& heap, const AnvilHeapObject& obj, u32 prop_sym,
-                          AnvilValue* out) noexcept {
+static bool find_own_prop(const CinderHeap& heap, const CinderHeapObject& obj, u32 prop_sym,
+                          CinderValue* out) noexcept {
     if (obj.dict) {
         const u32* keys = heap.object_keys(obj.dict_keys_off);
-        const AnvilValue* slots = heap.object_slots(obj.slots_off);
+        const CinderValue* slots = heap.object_slots(obj.slots_off);
         for (u32 i = 0; i < obj.prop_count; ++i) {
             if (keys[i] == prop_sym) {
                 *out = slots[i];
@@ -880,7 +880,7 @@ static bool find_own_prop(const AnvilHeap& heap, const AnvilHeapObject& obj, u32
     return false;
 }
 
-AnvilValue AnvilHeap::get_object_prop(
+CinderValue CinderHeap::get_object_prop(
     u32 obj_id,
     u32 prop_sym,
     u32* out_shape,
@@ -890,9 +890,9 @@ AnvilValue AnvilHeap::get_object_prop(
         if (out_slot) {
             *out_slot = -1;
         }
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
-    const AnvilHeapObject& obj = objects()[obj_id];
+    const CinderHeapObject& obj = objects()[obj_id];
     if (out_shape) {
         *out_shape = obj.shape_id;
     }
@@ -906,7 +906,7 @@ AnvilValue AnvilHeap::get_object_prop(
             *out_slot = slot;
         }
     }
-    AnvilValue found;
+    CinderValue found;
     if (find_own_prop(*this, obj, prop_sym, &found)) {
         return found;
     }
@@ -920,15 +920,15 @@ AnvilValue AnvilHeap::get_object_prop(
         proto = objects()[proto].proto_obj_id;
         ++hops;
     }
-    return AnvilValue::make_undefined();
+    return CinderValue::make_undefined();
 }
 
-bool AnvilHeap::has_object_prop(u32 obj_id, u32 prop_sym) const noexcept {
+bool CinderHeap::has_object_prop(u32 obj_id, u32 prop_sym) const noexcept {
     if (obj_id >= object_count || !objects()[obj_id].active) {
         return false;
     }
-    const AnvilHeapObject& obj = objects()[obj_id];
-    AnvilValue found;
+    const CinderHeapObject& obj = objects()[obj_id];
+    CinderValue found;
     if (find_own_prop(*this, obj, prop_sym, &found)) {
         return true;
     }
@@ -944,20 +944,20 @@ bool AnvilHeap::has_object_prop(u32 obj_id, u32 prop_sym) const noexcept {
     return false;
 }
 
-bool AnvilHeap::delete_object_prop(u32 obj_id, u32 prop_sym) noexcept {
+bool CinderHeap::delete_object_prop(u32 obj_id, u32 prop_sym) noexcept {
     if (obj_id >= object_count || !objects()[obj_id].active) {
         return true;
     }
-    AnvilValue dummy;
+    CinderValue dummy;
     if (!find_own_prop(*this, objects()[obj_id], prop_sym, &dummy)) {
         return true;
     }
     if (!objects()[obj_id].dict && !convert_object_to_dict(obj_id)) {
         return false;
     }
-    AnvilHeapObject& obj = objects()[obj_id];
+    CinderHeapObject& obj = objects()[obj_id];
     u32* keys = object_keys(obj.dict_keys_off);
-    AnvilValue* slots = object_slots(obj.slots_off);
+    CinderValue* slots = object_slots(obj.slots_off);
     for (u32 i = 0; i < obj.prop_count; ++i) {
         if (keys[i] == prop_sym) {
             for (u32 j = i; j + 1u < obj.prop_count; ++j) {
@@ -966,14 +966,14 @@ bool AnvilHeap::delete_object_prop(u32 obj_id, u32 prop_sym) noexcept {
             }
             --obj.prop_count;
             keys[obj.prop_count] = 0u;
-            slots[obj.prop_count] = AnvilValue::make_undefined();
+            slots[obj.prop_count] = CinderValue::make_undefined();
             break;
         }
     }
     return true;
 }
 
-u32 AnvilHeap::value_to_string_sym(AnvilValue val) noexcept {
+u32 CinderHeap::value_to_string_sym(CinderValue val) noexcept {
     switch (val.tag()) {
         case ValueTag::String:
             return val.payload();
@@ -1007,7 +1007,7 @@ u32 AnvilHeap::value_to_string_sym(AnvilValue val) noexcept {
                         return NO_SLOT;
                     }
                 }
-                const AnvilValue elem = get_array_elem(arr_id, static_cast<i32>(i));
+                const CinderValue elem = get_array_elem(arr_id, static_cast<i32>(i));
                 if (!elem.is_undefined() && !elem.is_null()) {
                     const u32 part = value_to_string_sym(elem);
                     if (part == NO_SLOT) {
@@ -1030,8 +1030,8 @@ u32 AnvilHeap::value_to_string_sym(AnvilValue val) noexcept {
                 if (k_name == NO_SLOT || k_msg == NO_SLOT) {
                     return NO_SLOT;
                 }
-                const AnvilValue nv = get_object_prop(obj_id, k_name);
-                const AnvilValue mv = get_object_prop(obj_id, k_msg);
+                const CinderValue nv = get_object_prop(obj_id, k_name);
+                const CinderValue mv = get_object_prop(obj_id, k_msg);
                 const u32 n_sym = nv.is_undefined() ? intern_string("Error", 5u) : value_to_string_sym(nv);
                 const u32 m_sym = mv.is_undefined() ? intern_string("", 0u) : value_to_string_sym(mv);
                 if (n_sym == NO_SLOT || m_sym == NO_SLOT) {
@@ -1057,7 +1057,7 @@ u32 AnvilHeap::value_to_string_sym(AnvilValue val) noexcept {
     return intern_string("", 0u);
 }
 
-bool AnvilHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
+bool CinderHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
     if (need <= objects()[obj_id].slots_cap) {
         return true;
     }
@@ -1067,7 +1067,7 @@ bool AnvilHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
     }
     const bool dict = objects()[obj_id].dict;
     bool over = false;
-    const u32 new_slots = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+    const u32 new_slots = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
     if (new_slots == NO_SLOT) {
         return false;
     }
@@ -1075,22 +1075,22 @@ bool AnvilHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
     if (dict) {
         new_keys = arena.alloc(new_cap * static_cast<u32>(sizeof(u32)), &over);
         if (new_keys == NO_SLOT) {
-            arena.free(new_slots, new_cap * static_cast<u32>(sizeof(AnvilValue)));
+            arena.free(new_slots, new_cap * static_cast<u32>(sizeof(CinderValue)));
             return false;
         }
     }
-    AnvilHeapObject& obj = objects()[obj_id];
+    CinderHeapObject& obj = objects()[obj_id];
     const u32 pc = obj.prop_count;
-    AnvilValue* sdst = object_slots(new_slots);
-    const AnvilValue* ssrc = object_slots(obj.slots_off);
+    CinderValue* sdst = object_slots(new_slots);
+    const CinderValue* ssrc = object_slots(obj.slots_off);
     for (u32 i = 0; i < new_cap; ++i) {
-        sdst[i] = (i < pc) ? ssrc[i] : AnvilValue::make_undefined();
+        sdst[i] = (i < pc) ? ssrc[i] : CinderValue::make_undefined();
     }
     const u32 old_slots = obj.slots_off;
     const u32 old_cap = obj.slots_cap;
     obj.slots_off = new_slots;
     obj.slots_cap = new_cap;
-    arena.free(old_slots, old_cap * static_cast<u32>(sizeof(AnvilValue)));
+    arena.free(old_slots, old_cap * static_cast<u32>(sizeof(CinderValue)));
     if (dict) {
         u32* kdst = object_keys(new_keys);
         const u32* ksrc = object_keys(obj.dict_keys_off);
@@ -1104,7 +1104,7 @@ bool AnvilHeap::ensure_object_slots(u32 obj_id, u32 need) noexcept {
     return true;
 }
 
-bool AnvilHeap::convert_object_to_dict(u32 obj_id) noexcept {
+bool CinderHeap::convert_object_to_dict(u32 obj_id) noexcept {
     if (objects()[obj_id].dict) {
         return true;
     }
@@ -1114,13 +1114,13 @@ bool AnvilHeap::convert_object_to_dict(u32 obj_id) noexcept {
     if (keys_off == NO_SLOT) {
         return false;
     }
-    AnvilHeapObject& obj = objects()[obj_id];
+    CinderHeapObject& obj = objects()[obj_id];
     u32* keys = object_keys(keys_off);
     for (u32 i = 0; i < cap; ++i) {
         keys[i] = 0u;
     }
     if (obj.shape_id < shape_count) {
-        const AnvilShape& sh = shapes()[obj.shape_id];
+        const CinderShape& sh = shapes()[obj.shape_id];
         const u32 n = sh.prop_count < obj.prop_count ? sh.prop_count : obj.prop_count;
         for (u32 i = 0; i < n; ++i) {
             keys[i] = sh.prop_syms[i];
@@ -1132,10 +1132,10 @@ bool AnvilHeap::convert_object_to_dict(u32 obj_id) noexcept {
     return true;
 }
 
-StoreResult AnvilHeap::set_object_prop(
+StoreResult CinderHeap::set_object_prop(
     u32 obj_id,
     u32 prop_sym,
-    AnvilValue val,
+    CinderValue val,
     u32* out_shape,
     i32* out_slot
 ) noexcept {
@@ -1154,7 +1154,7 @@ StoreResult AnvilHeap::set_object_prop(
         }
         const u32 pc = objects()[obj_id].prop_count;
         u32* keys = object_keys(objects()[obj_id].dict_keys_off);
-        AnvilValue* slots = object_slots(objects()[obj_id].slots_off);
+        CinderValue* slots = object_slots(objects()[obj_id].slots_off);
         for (u32 i = 0; i < pc; ++i) {
             if (keys[i] == prop_sym) {
                 slots[i] = val;
@@ -1164,7 +1164,7 @@ StoreResult AnvilHeap::set_object_prop(
         if (!ensure_object_slots(obj_id, pc + 1u)) {
             return StoreResult::HeapFull;
         }
-        AnvilHeapObject& obj = objects()[obj_id];
+        CinderHeapObject& obj = objects()[obj_id];
         object_keys(obj.dict_keys_off)[pc] = prop_sym;
         object_slots(obj.slots_off)[pc] = val;
         obj.prop_count = pc + 1u;
@@ -1209,7 +1209,7 @@ StoreResult AnvilHeap::set_object_prop(
         }
         return StoreResult::HeapFull;
     }
-    AnvilHeapObject& obj = objects()[obj_id];
+    CinderHeapObject& obj = objects()[obj_id];
     obj.shape_id = new_shape;
     obj.prop_count = shapes()[new_shape].prop_count;
     object_slots(obj.slots_off)[slot] = val;
@@ -1222,19 +1222,19 @@ StoreResult AnvilHeap::set_object_prop(
     return StoreResult::Ok;
 }
 
-AnvilValue AnvilHeap::get_array_elem(u32 arr_id, i32 index) const noexcept {
+CinderValue CinderHeap::get_array_elem(u32 arr_id, i32 index) const noexcept {
     if (arr_id >= array_count || !arrays()[arr_id].active || index < 0) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
-    const AnvilHeapArray& arr = arrays()[arr_id];
+    const CinderHeapArray& arr = arrays()[arr_id];
     const u32 u_idx = static_cast<u32>(index);
     if (u_idx >= arr.length || u_idx >= arr.capacity) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
     return array_elems(arr.storage_off)[u_idx];
 }
 
-StoreResult AnvilHeap::set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept {
+StoreResult CinderHeap::set_array_elem(u32 arr_id, i32 index, CinderValue val) noexcept {
     if (arr_id >= array_count || !arrays()[arr_id].active || index < 0) {
         return StoreResult::NotStored;
     }
@@ -1245,22 +1245,22 @@ StoreResult AnvilHeap::set_array_elem(u32 arr_id, i32 index, AnvilValue val) noe
         const u32 old_cap = arrays()[arr_id].capacity;
         const u32 new_cap = (u_idx + 1u) + ((u_idx + 1u) >> 1u) + 8u;
         bool over = false;
-        const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(AnvilValue)), &over);
+        const u32 new_off = arena.alloc(new_cap * static_cast<u32>(sizeof(CinderValue)), &over);
         if (new_off == NO_SLOT) {
             return StoreResult::HeapFull;
         }
-        AnvilValue* dst = array_elems(new_off);
-        const AnvilValue* src = array_elems(old_off);
+        CinderValue* dst = array_elems(new_off);
+        const CinderValue* src = array_elems(old_off);
         for (u32 k = 0; k < new_cap; ++k) {
-            dst[k] = (k < old_len) ? src[k] : AnvilValue::make_undefined();
+            dst[k] = (k < old_len) ? src[k] : CinderValue::make_undefined();
         }
-        AnvilHeapArray& arr = arrays()[arr_id];
+        CinderHeapArray& arr = arrays()[arr_id];
         arr.storage_off = new_off;
         arr.capacity = new_cap;
-        arena.free(old_off, old_cap * static_cast<u32>(sizeof(AnvilValue)));
-        bytes_allocated += new_cap * static_cast<u32>(sizeof(AnvilValue));
+        arena.free(old_off, old_cap * static_cast<u32>(sizeof(CinderValue)));
+        bytes_allocated += new_cap * static_cast<u32>(sizeof(CinderValue));
     }
-    AnvilHeapArray& arr = arrays()[arr_id];
+    CinderHeapArray& arr = arrays()[arr_id];
     array_elems(arr.storage_off)[u_idx] = val;
     if (u_idx >= arr.length) {
         arr.length = u_idx + 1u;
@@ -1268,7 +1268,7 @@ StoreResult AnvilHeap::set_array_elem(u32 arr_id, i32 index, AnvilValue val) noe
     return StoreResult::Ok;
 }
 
-StoreResult AnvilHeap::push_array_elem(u32 arr_id, AnvilValue val) noexcept {
+StoreResult CinderHeap::push_array_elem(u32 arr_id, CinderValue val) noexcept {
     if (arr_id >= array_count || !arrays()[arr_id].active) {
         return StoreResult::NotStored;
     }
@@ -1276,7 +1276,7 @@ StoreResult AnvilHeap::push_array_elem(u32 arr_id, AnvilValue val) noexcept {
     return set_array_elem(arr_id, idx, val);
 }
 
-void AnvilHeap::mark_value(AnvilValue v) noexcept {
+void CinderHeap::mark_value(CinderValue v) noexcept {
     switch (v.tag()) {
         case ValueTag::String: {
             const u32 sym = v.payload();
@@ -1299,7 +1299,7 @@ void AnvilHeap::mark_value(AnvilValue v) noexcept {
     }
 }
 
-void AnvilHeap::mark_object(u32 obj_id) noexcept {
+void CinderHeap::mark_object(u32 obj_id) noexcept {
     if (obj_id >= object_count || !objects()[obj_id].active || objects()[obj_id].marked) {
         return;
     }
@@ -1335,20 +1335,20 @@ void AnvilHeap::mark_object(u32 obj_id) noexcept {
     }
 }
 
-void AnvilHeap::mark_array(u32 arr_id) noexcept {
+void CinderHeap::mark_array(u32 arr_id) noexcept {
     if (arr_id >= array_count || !arrays()[arr_id].active || arrays()[arr_id].marked) {
         return;
     }
     arrays()[arr_id].marked = true;
     const u32 len = arrays()[arr_id].length;
     const u32 off = arrays()[arr_id].storage_off;
-    const AnvilValue* elems = array_elems(off);
+    const CinderValue* elems = array_elems(off);
     for (u32 i = 0; i < len; ++i) {
         mark_value(elems[i]);
     }
 }
 
-void AnvilHeap::mark_closure(u32 closure_id) noexcept {
+void CinderHeap::mark_closure(u32 closure_id) noexcept {
     if (closure_id >= closure_count || !closures()[closure_id].active ||
         closures()[closure_id].marked) {
         return;
@@ -1384,13 +1384,13 @@ void AnvilHeap::mark_closure(u32 closure_id) noexcept {
     }
 }
 
-u32 AnvilHeap::sweep_unmarked() noexcept {
+u32 CinderHeap::sweep_unmarked() noexcept {
     u32 reclaimed = 0u;
     for (u32 i = 0; i < object_count; ++i) {
-        AnvilHeapObject& obj = objects()[i];
+        CinderHeapObject& obj = objects()[i];
         if (obj.active) {
             if (!obj.marked) {
-                arena.free(obj.slots_off, obj.slots_cap * static_cast<u32>(sizeof(AnvilValue)));
+                arena.free(obj.slots_off, obj.slots_cap * static_cast<u32>(sizeof(CinderValue)));
                 if (obj.dict && obj.dict_keys_off != NO_SLOT) {
                     arena.free(obj.dict_keys_off, obj.slots_cap * static_cast<u32>(sizeof(u32)));
                 }
@@ -1408,8 +1408,8 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
                 if (live_objects > 0u) {
                     --live_objects;
                 }
-                if (bytes_allocated >= sizeof(AnvilHeapObject)) {
-                    bytes_allocated -= static_cast<u32>(sizeof(AnvilHeapObject));
+                if (bytes_allocated >= sizeof(CinderHeapObject)) {
+                    bytes_allocated -= static_cast<u32>(sizeof(CinderHeapObject));
                 }
                 ++reclaimed;
             } else {
@@ -1418,10 +1418,10 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
         }
     }
     for (u32 i = 0; i < array_count; ++i) {
-        AnvilHeapArray& arr = arrays()[i];
+        CinderHeapArray& arr = arrays()[i];
         if (arr.active) {
             if (!arr.marked) {
-                arena.free(arr.storage_off, arr.capacity * static_cast<u32>(sizeof(AnvilValue)));
+                arena.free(arr.storage_off, arr.capacity * static_cast<u32>(sizeof(CinderValue)));
                 arr.active = false;
                 arr.length = 0u;
                 arr.capacity = 0u;
@@ -1429,8 +1429,8 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
                 if (live_arrays > 0u) {
                     --live_arrays;
                 }
-                if (bytes_allocated >= sizeof(AnvilHeapArray)) {
-                    bytes_allocated -= static_cast<u32>(sizeof(AnvilHeapArray));
+                if (bytes_allocated >= sizeof(CinderHeapArray)) {
+                    bytes_allocated -= static_cast<u32>(sizeof(CinderHeapArray));
                 }
                 ++reclaimed;
             } else {
@@ -1439,7 +1439,7 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
         }
     }
     for (u32 i = 0; i < closure_count; ++i) {
-        AnvilHeapClosure& c = closures()[i];
+        CinderHeapClosure& c = closures()[i];
         if (c.active && !c.marked && !c.pinned) {
             if (c.upvals_off != NO_SLOT) {
                 arena.free(c.upvals_off, c.upval_count * static_cast<u32>(sizeof(u32)));
@@ -1453,8 +1453,8 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
             if (live_closures > 0u) {
                 --live_closures;
             }
-            if (bytes_allocated >= sizeof(AnvilHeapClosure)) {
-                bytes_allocated -= static_cast<u32>(sizeof(AnvilHeapClosure));
+            if (bytes_allocated >= sizeof(CinderHeapClosure)) {
+                bytes_allocated -= static_cast<u32>(sizeof(CinderHeapClosure));
             }
             ++reclaimed;
         } else {
@@ -1465,7 +1465,7 @@ u32 AnvilHeap::sweep_unmarked() noexcept {
     return reclaimed;
 }
 
-void AnvilHeap::clear_marks() noexcept {
+void CinderHeap::clear_marks() noexcept {
     for (u32 i = 0; i < object_count; ++i) {
         objects()[i].marked = false;
     }
@@ -1477,7 +1477,7 @@ void AnvilHeap::clear_marks() noexcept {
     }
 }
 
-u32 AnvilHeap::collect_garbage(const AnvilValue* roots, u32 root_count) noexcept {
+u32 CinderHeap::collect_garbage(const CinderValue* roots, u32 root_count) noexcept {
     clear_marks();
     if (roots) {
         for (u32 i = 0; i < root_count; ++i) {
@@ -1487,4 +1487,4 @@ u32 AnvilHeap::collect_garbage(const AnvilValue* roots, u32 root_count) noexcept
     return sweep_unmarked();
 }
 
-} // namespace anvil_vm
+} // namespace cinder_vm

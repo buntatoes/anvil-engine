@@ -3,8 +3,8 @@
 // Optional C++20 scanline and compositor library for anvil-raster.
 // Author: Buntato
 //
-// Compiles and links cpp/anvil_raster_accel.cpp and cpp/anvil_raster_compositor.cpp
-// when a C++20 compiler is available, emitting cfg(anvil_cpp_accel).
+// Compiles and links cpp/forge_raster_accel.cpp and cpp/forge_raster_compositor.cpp
+// when a C++20 compiler is available, emitting cfg(forge_cpp_accel).
 
 use std::env;
 use std::fs;
@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CPP_UNITS: &[(&str, &str)] = &[
-    ("cpp/anvil_raster_accel.cpp", "anvil_raster_accel"),
-    ("cpp/anvil_raster_compositor.cpp", "anvil_raster_compositor"),
+    ("cpp/forge_raster_accel.cpp", "forge_raster_accel"),
+    ("cpp/forge_raster_compositor.cpp", "forge_raster_compositor"),
 ];
 
 fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
@@ -59,14 +59,14 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=cpp/anvil_raster_accel.hpp");
+    println!("cargo:rerun-if-changed=cpp/forge_raster_accel.hpp");
     for (src, _) in CPP_UNITS {
         println!("cargo:rerun-if-changed={src}");
         if !Path::new(src).exists() {
             return;
         }
     }
-    println!("cargo:rustc-check-cfg=cfg(anvil_cpp_accel)");
+    println!("cargo:rustc-check-cfg=cfg(forge_cpp_accel)");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
@@ -96,7 +96,7 @@ fn main() {
                 obj_paths.push(obj_path);
             }
 
-            let lib_path = out_dir.join("anvil_raster_accel.lib");
+            let lib_path = out_dir.join("forge_raster_accel.lib");
             let mut lib_cmd = Command::new(&lib_exe);
             lib_cmd
                 .arg("/NOLOGO")
@@ -106,8 +106,8 @@ fn main() {
             }
             if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
-                println!("cargo:rustc-link-lib=static=anvil_raster_accel");
-                println!("cargo:rustc-cfg=anvil_cpp_accel");
+                println!("cargo:rustc-link-lib=static=forge_raster_accel");
+                println!("cargo:rustc-cfg=forge_cpp_accel");
             }
         }
     } else {
@@ -134,7 +134,7 @@ fn main() {
             obj_paths.push(obj_path);
         }
 
-        let lib_path = out_dir.join("libanvil_raster_accel.a");
+        let lib_path = out_dir.join("libforge_raster_accel.a");
         let mut ar_cmd = Command::new("ar");
         ar_cmd.arg("rcs").arg(lib_path.to_str().unwrap());
         for obj in &obj_paths {
@@ -142,8 +142,8 @@ fn main() {
         }
         if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
             println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=anvil_raster_accel");
-            println!("cargo:rustc-cfg=anvil_cpp_accel");
+            println!("cargo:rustc-link-lib=static=forge_raster_accel");
+            println!("cargo:rustc-cfg=forge_cpp_accel");
         }
     }
 }

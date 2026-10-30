@@ -26,6 +26,13 @@ mod html;
 
 pub use html::{MAX_ATTRS_PER_ELEMENT, MAX_DOM_DEPTH, MAX_DOM_NODES, parse_html};
 
+/// Official codename of the overall rendering, layout, and paint engine (`Forge`).
+pub const RENDERING_ENGINE_NAME: &str = "Forge";
+/// Official codename of the JavaScript bytecode VM and native JIT engine (`Cinder`).
+pub const JS_ENGINE_NAME: &str = "Cinder";
+/// Official codename of the CSS tokenizer, selector, and cascade engine (`Prism`).
+pub const CSS_ENGINE_NAME: &str = "Prism";
+
 /// One style sheet the document names, from [`Document::style_sheets`].
 ///
 /// `media` is the trimmed `media` attribute, or `None` when there is none.
@@ -266,6 +273,8 @@ pub struct Document {
     focused_node: Option<NodeId>,
     target_fragment: Option<String>,
     adopted_styles: Vec<String>,
+    scroll_offsets: std::collections::HashMap<NodeId, (u32, u32)>,
+    custom_validity: std::collections::HashMap<NodeId, String>,
 }
 
 impl Default for Document {
@@ -319,6 +328,8 @@ impl Document {
             focused_node: None,
             target_fragment: None,
             adopted_styles: Vec::new(),
+            scroll_offsets: std::collections::HashMap::new(),
+            custom_validity: std::collections::HashMap::new(),
         };
         let root = doc.alloc(NodeData::Document);
         let html = doc.alloc(NodeData::element("html"));
@@ -524,6 +535,9 @@ impl Document {
         ) {
             return None;
         }
+        if self.custom_validity.get(&id).is_some_and(|m| !m.is_empty()) {
+            return Some(false);
+        }
         let is_required = data
             .attr("required")
             .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
@@ -719,6 +733,48 @@ impl Document {
             .into_iter()
             .filter(|s| !s.trim().is_empty())
             .collect();
+    }
+
+    /// Scroll offset `(scrollLeft, scrollTop)` in CSS pixels for element `id`.
+    pub fn node_scroll_offset(&self, id: NodeId) -> (f32, f32) {
+        self.scroll_offsets
+            .get(&id)
+            .map(|&(xb, yb)| (f32::from_bits(xb), f32::from_bits(yb)))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Set scroll offset `(scrollLeft, scrollTop)` in CSS pixels for element `id`.
+    pub fn set_node_scroll_offset(&mut self, id: NodeId, x: f32, y: f32) {
+        if self.nodes.get(id.index()).is_none() {
+            return;
+        }
+        let cx = if x.is_finite() { x.max(0.0) } else { 0.0 };
+        let cy = if y.is_finite() { y.max(0.0) } else { 0.0 };
+        if cx == 0.0 && cy == 0.0 {
+            self.scroll_offsets.remove(&id);
+        } else {
+            self.scroll_offsets.insert(id, (cx.to_bits(), cy.to_bits()));
+        }
+    }
+
+    /// Custom constraint validation message set via `setCustomValidity(msg)` for `id`.
+    pub fn custom_validity(&self, id: NodeId) -> &str {
+        self.custom_validity
+            .get(&id)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Set or clear the custom constraint validation message (`setCustomValidity`) for `id`.
+    pub fn set_custom_validity(&mut self, id: NodeId, message: &str) {
+        if self.nodes.get(id.index()).is_none() {
+            return;
+        }
+        if message.is_empty() {
+            self.custom_validity.remove(&id);
+        } else {
+            self.custom_validity.insert(id, message.to_string());
+        }
     }
 
     /// Append one constructable stylesheet CSS text to `document.adoptedStyleSheets`.

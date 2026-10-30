@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-//! Checks of the `anvil-js-run` file runner: its stdout, its stderr, and the
+//! Checks of the `cinder-run` file runner: its stdout, its stderr, and the
 //! exit codes it returns. The success checks need the C++ VM, so they return
 //! early when it is not linked.
 
@@ -16,7 +16,7 @@ fn temp_file(tag: &str, source: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "anvil-js-run-{tag}-{}-{nanos}.js",
+        "cinder-run-{tag}-{}-{nanos}.js",
         std::process::id()
     ));
     std::fs::write(&path, source).unwrap();
@@ -25,10 +25,10 @@ fn temp_file(tag: &str, source: &str) -> PathBuf {
 
 /// Run the binary on `path` and return (stdout, stderr, exit code).
 fn run(path: &PathBuf) -> (String, String, i32) {
-    let output = Command::new(env!("CARGO_BIN_EXE_anvil-js-run"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cinder-run"))
         .arg(path)
         .output()
-        .expect("spawn anvil-js-run");
+        .expect("spawn cinder-run");
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -98,7 +98,7 @@ fn a_refused_script_is_reported_on_stderr_and_exits_nonzero() {
     let path = temp_file("refused", "with (x) {}\n");
     let (stdout, stderr, code) = run(&path);
     assert_eq!(stdout, "");
-    assert!(stderr.starts_with("anvil-js-run: "), "{stderr}");
+    assert!(stderr.starts_with("cinder-run: "), "{stderr}");
     assert!(stderr.contains("unsupported word 'with'"), "{stderr}");
     assert!(stderr.contains("code "), "{stderr}");
     assert_ne!(code, 0);
@@ -114,7 +114,7 @@ fn a_runtime_stop_is_reported_on_stderr_and_exits_nonzero() {
     let path = temp_file("stop", "let x = 5;\nx();\n");
     let (stdout, stderr, code) = run(&path);
     assert_eq!(stdout, "");
-    assert!(stderr.starts_with("anvil-js-run: "), "{stderr}");
+    assert!(stderr.starts_with("cinder-run: "), "{stderr}");
     assert!(stderr.contains("code "), "{stderr}");
     assert_ne!(code, 0);
     let _ = std::fs::remove_file(&path);
@@ -159,16 +159,16 @@ console.log(2);
     );
     let (stdout, stderr, code) = run(&path);
     assert_eq!(stdout, "1\n");
-    assert!(stderr.starts_with("anvil-js-run: "), "{stderr}");
+    assert!(stderr.starts_with("cinder-run: "), "{stderr}");
     assert_ne!(code, 0);
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn no_argument_is_a_usage_error() {
-    let output = Command::new(env!("CARGO_BIN_EXE_anvil-js-run"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cinder-run"))
         .output()
-        .expect("spawn anvil-js-run");
+        .expect("spawn cinder-run");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("usage"), "{stderr}");
@@ -176,10 +176,10 @@ fn no_argument_is_a_usage_error() {
 
 #[test]
 fn a_missing_file_is_reported_and_exits_nonzero() {
-    let output = Command::new(env!("CARGO_BIN_EXE_anvil-js-run"))
-        .arg("/no/such/anvil-js-run-file.js")
+    let output = Command::new(env!("CARGO_BIN_EXE_cinder-run"))
+        .arg("/no/such/cinder-run-file.js")
         .output()
-        .expect("spawn anvil-js-run");
+        .expect("spawn cinder-run");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot read"), "{stderr}");

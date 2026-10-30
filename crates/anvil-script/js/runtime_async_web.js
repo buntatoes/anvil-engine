@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// AnvilVM Built-in Async Microtask, URL Query, Storage & DOM Event Helper Prelude
+// CinderVM Built-in Async Microtask, URL Query, Storage & DOM Event Helper Prelude
 // Author: Buntato
 
 function anvilParseQueryParam(urlOrSearch, paramKey) {

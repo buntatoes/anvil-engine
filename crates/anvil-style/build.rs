@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// Builds and links the native C++20 Anvil-CSS engine static library (`anvil_css_engine`)
-// from `../../../anvil-browser/engines/anvil-css/cpp/` directly into `anvil-style`.
+// Builds and links the native C++20 Prism engine static library (`prism_css_engine`)
+// from `../../../anvil-browser/engines/prism/cpp/` directly into `anvil-style`.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CSS_CPP_DIR: &str = "../../../anvil-browser/engines/anvil-css/cpp";
-const CSS_CPP_SRC: &str = "../../../anvil-browser/engines/anvil-css/cpp/anvil_css_engine.cpp";
-const CSS_CPP_HDR: &str = "../../../anvil-browser/engines/anvil-css/cpp/anvil_css_engine.hpp";
+const CSS_CPP_DIR: &str = "../../../anvil-browser/engines/prism/cpp";
+const CSS_CPP_SRC: &str = "../../../anvil-browser/engines/prism/cpp/prism_css_engine.cpp";
+const CSS_CPP_HDR: &str = "../../../anvil-browser/engines/prism/cpp/prism_css_engine.hpp";
 
 fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
     let roots = [
@@ -56,7 +56,7 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
 fn main() {
     println!("cargo:rerun-if-changed={CSS_CPP_HDR}");
     println!("cargo:rerun-if-changed={CSS_CPP_SRC}");
-    println!("cargo:rustc-check-cfg=cfg(anvil_cpp_css)");
+    println!("cargo:rustc-check-cfg=cfg(prism_cpp_css)");
 
     if !Path::new(CSS_CPP_SRC).exists() {
         return;
@@ -67,7 +67,7 @@ fn main() {
     if cfg!(target_os = "windows") {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
-            let obj_path = out_dir.join("anvil_css_engine.obj");
+            let obj_path = out_dir.join("prism_css_engine.obj");
             let cl_ok = Command::new(&cl_exe)
                 .args([
                     "/nologo",
@@ -86,7 +86,7 @@ fn main() {
             if !cl_ok || !obj_path.exists() {
                 return;
             }
-            let lib_path = out_dir.join("anvil_css_engine.lib");
+            let lib_path = out_dir.join("prism_css_engine.lib");
             let lib_ok = Command::new(&lib_exe)
                 .arg("/NOLOGO")
                 .arg(format!("/OUT:{}", lib_path.display()))
@@ -95,12 +95,12 @@ fn main() {
                 .is_ok_and(|s| s.success());
             if lib_ok && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
-                println!("cargo:rustc-link-lib=static=anvil_css_engine");
-                println!("cargo:rustc-cfg=anvil_cpp_css");
+                println!("cargo:rustc-link-lib=static=prism_css_engine");
+                println!("cargo:rustc-cfg=prism_cpp_css");
             }
         }
     } else {
-        let obj_path = out_dir.join("anvil_css_engine.o");
+        let obj_path = out_dir.join("prism_css_engine.o");
         let gpp_ok = Command::new("g++")
             .args([
                 "-c",
@@ -118,7 +118,7 @@ fn main() {
         if !gpp_ok || !obj_path.exists() {
             return;
         }
-        let lib_path = out_dir.join("libanvil_css_engine.a");
+        let lib_path = out_dir.join("libprism_css_engine.a");
         let ar_ok = Command::new("ar")
             .args([
                 "rcs",
@@ -129,8 +129,8 @@ fn main() {
             .is_ok_and(|s| s.success());
         if ar_ok && lib_path.exists() {
             println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=anvil_css_engine");
-            println!("cargo:rustc-cfg=anvil_cpp_css");
+            println!("cargo:rustc-link-lib=static=prism_css_engine");
+            println!("cargo:rustc-cfg=prism_cpp_css");
         }
     }
 }

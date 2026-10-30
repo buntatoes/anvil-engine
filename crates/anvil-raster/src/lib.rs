@@ -13,7 +13,7 @@
 //! CPU, and software otherwise). Other rounded boxes and gradients, and
 //! anything the compositor turns down, are drawn as quads on
 //! `anvil_gpu::GpuDevice`. Plain rectangles, image blits, blurs, and the
-//! bottom-up BGRA copy use the C++20 helpers when `anvil_cpp_accel` is linked,
+//! bottom-up BGRA copy use the C++20 helpers when `forge_cpp_accel` is linked,
 //! and Rust loops otherwise. Images are `anvil-image` buffers. `draw_image`
 //! resizes with that crate's bilinear filter and samples the result. This
 //! crate does not call `anvil-video`. A video frame is drawn only after the
@@ -39,7 +39,7 @@
 #[cfg(windows)]
 mod font;
 
-#[cfg(not(anvil_cpp_accel))]
+#[cfg(not(forge_cpp_accel))]
 use anvil_gpu::{GpuColor, sample_linear_gradient, sdf_box_shadow_alpha, sdf_rounded_box};
 use anvil_image::Image;
 use anvil_paint::{DisplayItem, DisplayList, Layer, LayerEffect, Transform2D};
@@ -50,9 +50,9 @@ pub use anvil_ttf::{
     linear_u12_to_srgb, srgb_to_linear_u12,
 };
 
-// Scanline and compositor entry points from anvil_raster_accel.cpp and
-// anvil_raster_compositor.cpp. Present only when build.rs set anvil_cpp_accel.
-#[cfg(anvil_cpp_accel)]
+// Scanline and compositor entry points from forge_raster_accel.cpp and
+// forge_raster_compositor.cpp. Present only when build.rs set forge_cpp_accel.
+#[cfg(forge_cpp_accel)]
 unsafe extern "C" {
     // Must return 16 or is_cpp_raster_kernel_active reports the kernel as off.
     fn anvil_cpp_raster_kernel_version() -> u32;
@@ -225,36 +225,36 @@ unsafe extern "C" {
     );
 }
 
-/// `true` only when `anvil_raster_accel.cpp` is linked and its version symbol is 16.
+/// `true` only when `forge_raster_accel.cpp` is linked and its version symbol is 16.
 /// A build that skipped the compiler returns `false`.
 /// Tile dimension in pixels used by incremental dirty-tile tracking and parallel strip rasterization.
 pub const TILE_SIZE: u32 = 64;
 
 /// Active SIMD span width in bytes reported by the C++20 raster kernel (`16` for 128-bit SSE2 on x86_64).
 pub fn raster_simd_width_bytes() -> u32 {
-    #[cfg(anvil_cpp_accel)]
+    #[cfg(forge_cpp_accel)]
     {
         unsafe { anvil_cpp_simd_width_bytes() }
     }
-    #[cfg(not(anvil_cpp_accel))]
+    #[cfg(not(forge_cpp_accel))]
     {
         4
     }
 }
 
 pub fn is_cpp_raster_kernel_active() -> bool {
-    #[cfg(anvil_cpp_accel)]
+    #[cfg(forge_cpp_accel)]
     {
         unsafe { anvil_cpp_raster_kernel_version() == 16 }
     }
-    #[cfg(not(anvil_cpp_accel))]
+    #[cfg(not(forge_cpp_accel))]
     {
         false
     }
 }
 
 /// Convert a semi-planar `NV12` (`Y` plane + interleaved `UV` plane) surface into top-down `RGBA8`
-/// using BT.709 coefficients (accelerated via C++20 when `anvil_cpp_accel` is linked).
+/// using BT.709 coefficients (accelerated via C++20 when `forge_cpp_accel` is linked).
 pub fn convert_nv12_to_rgba_bt709(
     y_plane: &[u8],
     uv_plane: &[u8],
@@ -268,7 +268,7 @@ pub fn convert_nv12_to_rgba_bt709(
         return Vec::new();
     }
     let mut out = vec![0u8; pixel_count * 4];
-    #[cfg(anvil_cpp_accel)]
+    #[cfg(forge_cpp_accel)]
     unsafe {
         anvil_cpp_nv12_to_rgba_bt709(
             y_plane.as_ptr(),
@@ -279,7 +279,7 @@ pub fn convert_nv12_to_rgba_bt709(
         );
         out
     }
-    #[cfg(not(anvil_cpp_accel))]
+    #[cfg(not(forge_cpp_accel))]
     {
         for py in 0..(height as usize) {
             let uv_row = (py / 2) * uv_stride;
@@ -817,7 +817,7 @@ pub fn build_gpu_scene_batch(
                 let cy = (*y - dy) + *h * 0.5;
                 let dx = rad.cos() * (*w * 0.5);
                 let dy_vec = rad.sin() * (*h * 0.5);
-                batch.push_gradient(
+                batch.push_rounded_gradient(
                     anvil_gpu::GpuRect::new(*x, *y - dy, *w, *h),
                     anvil_gpu::GradientShape::Linear {
                         start_x: cx - dx,
@@ -825,6 +825,7 @@ pub fn build_gpu_scene_batch(
                         end_x: cx + dx,
                         end_y: cy + dy_vec,
                     },
+                    radius.max(0.0),
                     stops,
                 );
             }
@@ -1092,7 +1093,7 @@ impl Framebuffer {
     }
 
     /// Fill one clipped span on the CPU. Tests use this to compare with the C++ fill.
-    #[cfg(any(test, not(anvil_cpp_accel)))]
+    #[cfg(any(test, not(forge_cpp_accel)))]
     fn fill_span_cpu(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
         for py in y0..y1 {
             for px in x0..x1 {
@@ -1181,7 +1182,7 @@ impl Framebuffer {
         let Some((x0, y0, x1, y1)) = self.clipped_span(x, y, width, height) else {
             return;
         };
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             anvil_cpp_fill_rect_rgba(
                 self.pixels.as_mut_ptr(),
@@ -1197,7 +1198,7 @@ impl Framebuffer {
                 color.a,
             );
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         self.fill_span_cpu(x0, y0, x1, y1, color);
     }
 
@@ -1349,7 +1350,7 @@ impl Framebuffer {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             anvil_cpp_fill_rounded_rect_sdf(
                 self.pixels.as_mut_ptr(),
@@ -1375,7 +1376,7 @@ impl Framebuffer {
                 border_color.a,
             );
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             let half_w = width * 0.5;
             let half_h = height * 0.5;
@@ -1495,7 +1496,7 @@ impl Framebuffer {
         let cx = sx_rect + half_w;
         let cy = sy_rect + half_h;
 
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             anvil_cpp_fill_box_shadow_sdf(
                 self.pixels.as_mut_ptr(),
@@ -1517,7 +1518,7 @@ impl Framebuffer {
                 color.a,
             );
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         for py in y0..y1 {
             for px in x0..x1 {
                 let sample_x = px as f32 + 0.5;
@@ -1552,7 +1553,7 @@ impl Framebuffer {
         if width <= 0.0 || height <= 0.0 {
             return;
         }
-        if radius <= 0.0 && border_width <= 0.0 {
+        if border_width <= 0.0 && radius.is_finite() {
             let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
             let gx0 = (x.floor() as i32).max(cx0);
             let gy0 = (y.floor() as i32).max(cy0);
@@ -1608,8 +1609,10 @@ impl Framebuffer {
                     self.width,
                     self.height,
                     (self.width as usize) * 4,
-                ) && with_thread_compositor(|comp| comp.fill_gradient(&mut target, &desc))
-                    .is_ok()
+                ) && with_thread_compositor(|comp| {
+                    comp.fill_rounded_gradient(&mut target, &desc, radius.max(0.0))
+                })
+                .is_ok()
                 {
                     return;
                 }
@@ -1649,7 +1652,7 @@ impl Framebuffer {
             return;
         }
 
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             anvil_cpp_fill_linear_gradient_sdf(
                 self.pixels.as_mut_ptr(),
@@ -1680,7 +1683,7 @@ impl Framebuffer {
                 border_color.a,
             );
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             let half_w = width * 0.5;
             let half_h = height * 0.5;
@@ -1748,7 +1751,7 @@ impl Framebuffer {
         let gx0 = (x.floor() as i32) + bmp.bearing_x;
         let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
 
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
             anvil_cpp_blend_glyph_coverage(
@@ -1771,7 +1774,7 @@ impl Framebuffer {
             );
             Some(bmp.advance_px)
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             for py in 0..bmp.height {
                 for px in 0..bmp.width {
@@ -1804,7 +1807,7 @@ impl Framebuffer {
         let gx0 = (x.round() as i32) + bmp.bearing_x;
         let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
 
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
             anvil_cpp_blend_subpixel_lcd(
@@ -1827,7 +1830,7 @@ impl Framebuffer {
             );
             Some(bmp.advance_px)
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
             for py in 0..bmp.height {
@@ -1881,7 +1884,7 @@ impl Framebuffer {
             return;
         }
         let mut scratch = vec![0u8; rw * rh * 4];
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             anvil_cpp_box_blur_rgba(
                 self.pixels.as_mut_ptr(),
@@ -1895,7 +1898,7 @@ impl Framebuffer {
                 radius,
             );
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             let rad = radius.min(64) as isize;
             let kernel = (2 * rad + 1) as u32;
@@ -1965,7 +1968,7 @@ impl Framebuffer {
         let base_x = x.round() as i32;
         let base_y = y.round() as i32;
 
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
             anvil_cpp_blit_rgba_clipped(
@@ -1984,7 +1987,7 @@ impl Framebuffer {
                 border_radius,
             );
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             let half_w = (dst_w as f32) * 0.5;
             let half_h = (dst_h as f32) * 0.5;
@@ -2026,15 +2029,35 @@ impl Framebuffer {
 
     /// Draw a run of text. Non-positive size or zero alpha returns immediately.
     pub fn draw_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
+        self.draw_text_styled(x, y, text, font_size, color, 0, 400, false);
+    }
+
+    /// Draw a run of text with explicit family slot (`0` = Sans, `1` = Serif, `2` = Monospace),
+    /// stroke weight (`100..=900`), and italic flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_styled(
+        &mut self,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+        color: Color,
+        family_idx: u8,
+        weight: u16,
+        italic: bool,
+    ) {
         if font_size <= 0.0 || color.a == 0 {
             return;
         }
         #[cfg(windows)]
-        if font::draw_system_text(self, x, y, text, font_size, color) {
+        if font::draw_system_text_styled(
+            self, x, y, text, font_size, color, family_idx, weight, italic,
+        ) {
             return;
         }
         #[cfg(target_os = "linux")]
         if let Some(sys_font) = linux_system_ttf_font() {
+            let _ = (family_idx, weight, italic);
             self.draw_ttf_text(x, y, text, font_size, color, sys_font);
             return;
         }
@@ -2136,7 +2159,7 @@ impl Framebuffer {
     /// Convert top-down RGBA scanlines into bottom-up BGRA scanlines for GDI.
     pub fn to_bgra_bottom_up(&self) -> Vec<u8> {
         let mut out = vec![0_u8; self.pixels.len()];
-        #[cfg(anvil_cpp_accel)]
+        #[cfg(forge_cpp_accel)]
         unsafe {
             anvil_cpp_rgba_to_bgra_bottom_up(
                 self.pixels.as_ptr(),
@@ -2146,7 +2169,7 @@ impl Framebuffer {
             );
             out
         }
-        #[cfg(not(anvil_cpp_accel))]
+        #[cfg(not(forge_cpp_accel))]
         {
             let stride = (self.width as usize) * 4;
             for row in 0..(self.height as usize) {
@@ -2519,7 +2542,7 @@ fn try_push_span_batch_item(
             angle_deg,
             start_color,
             end_color,
-            ..
+            border_color,
         } => {
             let rx = px(*x);
             let ry = py(*y);
@@ -2530,61 +2553,110 @@ fn try_push_span_batch_item(
             if rw <= 0.0 || rh <= 0.0 {
                 return true;
             }
-            if r <= 0.0 && bw <= 0.0 && is_finite_rect_span(rx, ry, rw, rh) && angle_deg.is_finite()
+            if !is_finite_rect_span(rx, ry, rw, rh)
+                || !r.is_finite()
+                || !bw.is_finite()
+                || !angle_deg.is_finite()
             {
-                let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
-                let gx0 = (rx.floor() as i32).max(cx0);
-                let gy0 = (ry.floor() as i32).max(cy0);
-                let gx1 = ((rx + rw).ceil() as i32).min(cx1);
-                let gy1 = ((ry + rh).ceil() as i32).min(cy1);
-                if gx0 < gx1 && gy0 < gy1 {
-                    let rad = angle_deg.to_radians();
-                    let dx = rad.sin();
-                    let dy_vec = -rad.cos();
-                    let half_w = rw * 0.5;
-                    let half_h = rh * 0.5;
-                    let max_proj = (half_w * dx.abs() + half_h * dy_vec.abs()).max(0.001);
-                    let cx = rx + half_w;
-                    let cy = ry + half_h;
-                    let stops = vec![
-                        anvil_gpu::GpuGradientStop::new(
-                            0.0,
-                            anvil_gpu::GpuColor::rgba(
-                                start_color.r,
-                                start_color.g,
-                                start_color.b,
-                                start_color.a,
-                            ),
-                        ),
-                        anvil_gpu::GpuGradientStop::new(
-                            1.0,
-                            anvil_gpu::GpuColor::rgba(
-                                end_color.r,
-                                end_color.g,
-                                end_color.b,
-                                end_color.a,
-                            ),
-                        ),
-                    ];
-                    batch.push_clip(anvil_gpu::GpuRect::new(
-                        cx0 as f32,
-                        cy0 as f32,
-                        (cx1 - cx0) as f32,
-                        (cy1 - cy0) as f32,
-                    ));
-                    batch.push_gradient(
-                        anvil_gpu::GpuRect::new(rx, ry, rw, rh),
-                        anvil_gpu::GradientShape::Linear {
-                            start_x: cx - dx * max_proj,
-                            start_y: cy - dy_vec * max_proj,
-                            end_x: cx + dx * max_proj,
-                            end_y: cy + dy_vec * max_proj,
-                        },
-                        stops,
-                    );
-                    batch.pop_clip();
-                    return true;
-                }
+                return false;
+            }
+            let (cx0, cy0, cx1, cy1) = fb.active_clip_bounds();
+            let gx0 = (rx.floor() as i32).max(cx0);
+            let gy0 = (ry.floor() as i32).max(cy0);
+            let gx1 = ((rx + rw).ceil() as i32).min(cx1);
+            let gy1 = ((ry + rh).ceil() as i32).min(cy1);
+            if gx0 >= gx1 || gy0 >= gy1 {
+                return true;
+            }
+            let rad = angle_deg.to_radians();
+            let dx = rad.sin();
+            let dy_vec = -rad.cos();
+            let stops = vec![
+                anvil_gpu::GpuGradientStop::new(
+                    0.0,
+                    anvil_gpu::GpuColor::rgba(
+                        start_color.r,
+                        start_color.g,
+                        start_color.b,
+                        start_color.a,
+                    ),
+                ),
+                anvil_gpu::GpuGradientStop::new(
+                    1.0,
+                    anvil_gpu::GpuColor::rgba(end_color.r, end_color.g, end_color.b, end_color.a),
+                ),
+            ];
+            let clip_rect = anvil_gpu::GpuRect::new(
+                cx0 as f32,
+                cy0 as f32,
+                (cx1 - cx0) as f32,
+                (cy1 - cy0) as f32,
+            );
+            if bw <= 0.0 {
+                let half_w = rw * 0.5;
+                let half_h = rh * 0.5;
+                let max_proj = (half_w * dx.abs() + half_h * dy_vec.abs()).max(0.001);
+                let cx = rx + half_w;
+                let cy = ry + half_h;
+                batch.push_clip(clip_rect);
+                batch.push_rounded_gradient(
+                    anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    anvil_gpu::GradientShape::Linear {
+                        start_x: cx - dx * max_proj,
+                        start_y: cy - dy_vec * max_proj,
+                        end_x: cx + dx * max_proj,
+                        end_y: cy + dy_vec * max_proj,
+                    },
+                    r.max(0.0),
+                    stops,
+                );
+                batch.pop_clip();
+                return true;
+            }
+            if bw > 0.0
+                && border_color.a == 255
+                && start_color.a == 255
+                && end_color.a == 255
+                && rw > bw * 2.0
+                && rh > bw * 2.0
+            {
+                let irx = rx + bw;
+                let iry = ry + bw;
+                let irw = rw - bw * 2.0;
+                let irh = rh - bw * 2.0;
+                let half_w = irw * 0.5;
+                let half_h = irh * 0.5;
+                let max_proj = (half_w * dx.abs() + half_h * dy_vec.abs()).max(0.001);
+                let cx = irx + half_w;
+                let cy = iry + half_h;
+                batch.push_clip(clip_rect);
+                batch.push_box_shadow(anvil_gpu::ShadowDesc {
+                    rect: anvil_gpu::GpuRect::new(rx, ry, rw, rh),
+                    corner_radius: r.max(0.0),
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    blur_radius: 0.0,
+                    spread: 0.0,
+                    color: anvil_gpu::GpuColor::rgba(
+                        border_color.r,
+                        border_color.g,
+                        border_color.b,
+                        border_color.a,
+                    ),
+                    clip: Some(clip_rect),
+                });
+                batch.push_rounded_gradient(
+                    anvil_gpu::GpuRect::new(irx, iry, irw, irh),
+                    anvil_gpu::GradientShape::Linear {
+                        start_x: cx - dx * max_proj,
+                        start_y: cy - dy_vec * max_proj,
+                        end_x: cx + dx * max_proj,
+                        end_y: cy + dy_vec * max_proj,
+                    },
+                    (r - bw).max(0.0),
+                    stops,
+                );
+                batch.pop_clip();
                 return true;
             }
             false

@@ -3,15 +3,15 @@
 // CPU scanline helpers for the anvil-raster framebuffer.
 // Author: Buntato
 //
-// Compiled alongside anvil_raster_compositor.cpp by crates/anvil-raster/build.rs
-// when a C++20 compiler is on PATH, setting cfg(anvil_cpp_accel).
+// Compiled alongside forge_raster_compositor.cpp by crates/anvil-raster/build.rs
+// when a C++20 compiler is on PATH, setting cfg(forge_cpp_accel).
 
-#include "anvil_raster_accel.hpp"
+#include "forge_raster_accel.hpp"
 #if !defined(_MSC_VER) && defined(__SSE2__)
 #include <emmintrin.h>
 #endif
 
-using namespace anvil_raster_cpp;
+using namespace forge_raster_cpp;
 
 extern "C" {
 

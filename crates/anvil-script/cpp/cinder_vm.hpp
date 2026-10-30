@@ -4,17 +4,17 @@
 // Author: Buntato
 //
 // Freestanding C++20 header used by:
-//   - anvil_vm_heap.cpp     (String interning, AnvilShape transition trees, Mark-Sweep GC)
-//   - anvil_vm_ic.cpp       (4-way Polymorphic Inline Cache & DOM selector IC table)
-//   - anvil_vm_compiler.cpp (C++20 Lexer, Recursive-Descent/Pratt Parser, Register Bytecode Compiler)
-//   - anvil_jit_accel.cpp   (Register VM dispatch loop, hot-loop OSR kernels, extern "C" ABI)
+//   - cinder_vm_heap.cpp     (String interning, CinderShape transition trees, Mark-Sweep GC)
+//   - cinder_vm_ic.cpp       (4-way Polymorphic Inline Cache & DOM selector IC table)
+//   - cinder_vm_compiler.cpp (C++20 Lexer, Recursive-Descent/Pratt Parser, Register Bytecode Compiler)
+//   - cinder_jit_accel.cpp   (Register VM dispatch loop, hot-loop OSR kernels, extern "C" ABI)
 //
 // Designed to compile cleanly with zero external runtime dependencies under both:
 //   - Windows MSVC: cl.exe /c /O2 /fp:precise /std:c++20 /Zl
 //   - Linux GCC/Clang: g++ -c -O3 -std=c++20 -fno-exceptions -fno-rtti
 
-#ifndef ANVIL_VM_HPP
-#define ANVIL_VM_HPP
+#ifndef CINDER_VM_HPP
+#define CINDER_VM_HPP
 
 using u8  = unsigned char;
 using u16 = unsigned short;
@@ -24,7 +24,7 @@ using i32 = int;
 using i64 = long long;
 using f64 = double;
 
-namespace anvil_vm {
+namespace cinder_vm {
 
 using ::u8;
 using ::u16;
@@ -38,18 +38,18 @@ using ::f64;
 // 1. Deterministic Engine Limits & Budgets
 // ============================================================================
 
-constexpr u32 ANVIL_VM_KERNEL_VERSION    = 18u;
+constexpr u32 CINDER_VM_KERNEL_VERSION    = 18u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
 constexpr u32 MAX_REGISTERS_PER_FRAME   = 65535u;
 constexpr u32 INIT_REGISTERS_PER_FRAME  = 64u;
 constexpr u32 MAX_CALL_ARGS             = 256u;
-constexpr u32 ANVIL_ARENA_RESERVE_BYTES = 64u * 1024u * 1024u;
-constexpr u32 ANVIL_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
-constexpr u32 ANVIL_DEFAULT_CALL_DEPTH  = 10000u;
-constexpr u32 ANVIL_DEFAULT_PARSE_STACK_BUDGET = 1024u * 1024u;
+constexpr u32 CINDER_ARENA_RESERVE_BYTES = 64u * 1024u * 1024u;
+constexpr u32 CINDER_DEFAULT_HEAP_BUDGET = 64u * 1024u * 1024u;
+constexpr u32 CINDER_DEFAULT_CALL_DEPTH  = 10000u;
+constexpr u32 CINDER_DEFAULT_PARSE_STACK_BUDGET = 1024u * 1024u;
 constexpr u32 DICT_THRESHOLD            = 64u;
 constexpr u32 MAX_BYTECODE_INSTRUCTIONS = 8192u;
-constexpr u32 ANVIL_MAX_PROGRAM_INSTRUCTIONS = 16777215u;
+constexpr u32 CINDER_MAX_PROGRAM_INSTRUCTIONS = 16777215u;
 constexpr u32 INIT_CODE_BUFFER = 256u;
 constexpr u32 MAX_DOM_IC_ENTRIES        = 1280u;
 constexpr u32 HOT_LOOP_THRESHOLD        = 16u;
@@ -61,7 +61,7 @@ constexpr u32 NO_SLOT = 0xFFFFFFFFu;
 constexpr u32 DICT_SHAPE = 0xFFFFFFFEu;
 constexpr u16 NO_GLOBAL = 0xFFFFu;
 
-// Built-in object kinds stored in AnvilHeapObject::builtin_kind.
+// Built-in object kinds stored in CinderHeapObject::builtin_kind.
 enum class BuiltinObjectKind : u8 {
     Plain       = 0u,
     Map         = 1u,
@@ -134,7 +134,7 @@ constexpr u32 MAX_EXPORT_BYTES = 4096u;
 constexpr u32 MAX_HOST_ARGS = 32u;
 
 // The first reason a run stopped or a script was refused, as plain text.
-struct AnvilVmError {
+struct CinderVmError {
     u32 code;
     u32 len;
     char text[MAX_ERROR_TEXT];
@@ -193,7 +193,7 @@ enum class StoreResult : u32 {
 };
 
 // ============================================================================
-// 2. 64-Bit NaN-Boxed Value Representation (AnvilValue)
+// 2. 64-Bit NaN-Boxed Value Representation (CinderValue)
 // ============================================================================
 
 enum class ValueTag : u32 {
@@ -480,34 +480,34 @@ inline i32 sat_i32(f64 v) noexcept {
     return static_cast<i32>(v);
 }
 
-struct AnvilValue {
+struct CinderValue {
     u64 bits;
 
-    constexpr AnvilValue() noexcept : bits(NANBOX_BASE_MASK | (4ULL << 48)) {}
-    constexpr explicit AnvilValue(u64 raw) noexcept : bits(raw) {}
+    constexpr CinderValue() noexcept : bits(NANBOX_BASE_MASK | (4ULL << 48)) {}
+    constexpr explicit CinderValue(u64 raw) noexcept : bits(raw) {}
 
-    static constexpr AnvilValue make_undefined() noexcept {
-        return AnvilValue(NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Undefined) << 48));
+    static constexpr CinderValue make_undefined() noexcept {
+        return CinderValue(NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Undefined) << 48));
     }
 
-    static constexpr AnvilValue make_null() noexcept {
-        return AnvilValue(NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Null) << 48));
+    static constexpr CinderValue make_null() noexcept {
+        return CinderValue(NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Null) << 48));
     }
 
-    static constexpr AnvilValue make_bool(bool b) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_bool(bool b) noexcept {
+        return CinderValue(
             NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Bool) << 48) | (b ? 1ULL : 0ULL)
         );
     }
 
-    static constexpr AnvilValue make_smi(i32 v) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_smi(i32 v) noexcept {
+        return CinderValue(
             NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Smi) << 48) |
             static_cast<u64>(static_cast<u32>(v))
         );
     }
 
-    static AnvilValue make_number(f64 n) noexcept {
+    static CinderValue make_number(f64 n) noexcept {
         if (n >= -1073741824.0 && n <= 1073741823.0 && (n != 0.0 || (f64_to_bits(n) >> 63) == 0u)) {
             const i32 as_int = static_cast<i32>(n);
             if (static_cast<f64>(as_int) == n) {
@@ -515,37 +515,37 @@ struct AnvilValue {
             }
         }
         if (js_is_nan(n)) {
-            return AnvilValue(NANBOX_BASE_MASK);
+            return CinderValue(NANBOX_BASE_MASK);
         }
-        return AnvilValue(f64_to_bits(n));
+        return CinderValue(f64_to_bits(n));
     }
 
-    static constexpr AnvilValue make_string(u32 sym_id) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_string(u32 sym_id) noexcept {
+        return CinderValue(
             NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::String) << 48) | static_cast<u64>(sym_id)
         );
     }
 
-    static constexpr AnvilValue make_object(u32 obj_id) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_object(u32 obj_id) noexcept {
+        return CinderValue(
             NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Object) << 48) | static_cast<u64>(obj_id)
         );
     }
 
-    static constexpr AnvilValue make_array(u32 arr_id) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_array(u32 arr_id) noexcept {
+        return CinderValue(
             NANBOX_BASE_MASK | (static_cast<u64>(ValueTag::Array) << 48) | static_cast<u64>(arr_id)
         );
     }
 
-    static constexpr AnvilValue make_function(u32 fn_id) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_function(u32 fn_id) noexcept {
+        return CinderValue(
             NANBOX_EST_TAG(ValueTag::Function, fn_id)
         );
     }
 
-    static constexpr AnvilValue make_dom_node(u32 node_id) noexcept {
-        return AnvilValue(
+    static constexpr CinderValue make_dom_node(u32 node_id) noexcept {
+        return CinderValue(
             NANBOX_EST_TAG(ValueTag::DomNode, node_id)
         );
     }
@@ -635,12 +635,12 @@ struct AnvilValue {
 };
 
 // ============================================================================
-// 3. Hidden Classes (AnvilShape) & Managed Mark-Sweep Heap (AnvilHeap)
+// 3. Hidden Classes (CinderShape) & Managed Mark-Sweep Heap (CinderHeap)
 // ============================================================================
 
 constexpr u32 ARENA_SIZE_CLASSES = 32u;
 
-struct AnvilArena {
+struct CinderArena {
     u8* base;
     u32 used;      // bump frontier
     u32 reserve;   // total bytes the arena may ever use
@@ -716,7 +716,7 @@ struct AnvilArena {
     const u8* at(u32 off) const noexcept { return base + off; }
 };
 
-struct AnvilInternedString {
+struct CinderInternedString {
     u64 hash;
     u32 offset;
     u32 length;
@@ -724,13 +724,13 @@ struct AnvilInternedString {
     bool active;
 };
 
-struct AnvilShapeTransition {
+struct CinderShapeTransition {
     u32 from_shape;
     u32 prop_sym;
     u32 to_shape;
 };
 
-struct AnvilShape {
+struct CinderShape {
     u32 id;
     u32 parent_shape;
     u32 prop_count;
@@ -746,7 +746,7 @@ struct AnvilShape {
     }
 };
 
-struct AnvilHeapObject {
+struct CinderHeapObject {
     bool active;
     bool marked;
     bool dict;            // dictionary mode: own key map, no shared shape
@@ -754,7 +754,7 @@ struct AnvilHeapObject {
     u32 shape_id;         // a shape id, or DICT_SHAPE when dict
     u32 proto_obj_id;
     u32 prop_count;       // live properties, kept in both modes
-    u32 slots_off;        // arena block: AnvilValue[slots_cap]
+    u32 slots_off;        // arena block: CinderValue[slots_cap]
     u32 slots_cap;
     u32 dict_keys_off;    // arena block: u32[slots_cap] of keys (dict only), else NO_SLOT
     u32 aux_id;           // Map/Set backing array id, ArrayBuffer arena offset, or TypedArray buffer obj_id
@@ -762,15 +762,15 @@ struct AnvilHeapObject {
     u32 byte_length;      // ArrayBuffer or TypedArray byte length
 };
 
-struct AnvilHeapArray {
+struct CinderHeapArray {
     bool active;
     bool marked;
     u32 length;
-    u32 storage_off; // arena block holding AnvilValue[capacity], or NO_SLOT
+    u32 storage_off; // arena block holding CinderValue[capacity], or NO_SLOT
     u32 capacity;
 };
 
-struct AnvilHeapFunction {
+struct CinderHeapFunction {
     bool active;
     bool marked;
     u32 name_sym;
@@ -782,7 +782,7 @@ struct AnvilHeapFunction {
     u32 home_proto_id;    // prototype object where this method lives (for super.m), or NO_SLOT
 };
 
-struct AnvilHeapClosure {
+struct CinderHeapClosure {
     bool active;
     bool marked;
     bool pinned;        // a canonical closure, never collected
@@ -794,8 +794,8 @@ struct AnvilHeapClosure {
     u32 super_closure_id; // superclass constructor closure id, or NO_SLOT
 };
 
-struct AnvilHeap {
-    AnvilArena arena;
+struct CinderHeap {
+    CinderArena arena;
 
     u32 str_pool_off;
     u32 str_pool_cap;
@@ -808,11 +808,11 @@ struct AnvilHeap {
     const char* string_bytes() const noexcept {
         return reinterpret_cast<const char*>(arena.at(str_pool_off));
     }
-    AnvilInternedString* strings() noexcept {
-        return reinterpret_cast<AnvilInternedString*>(arena.at(strings_off));
+    CinderInternedString* strings() noexcept {
+        return reinterpret_cast<CinderInternedString*>(arena.at(strings_off));
     }
-    const AnvilInternedString* strings() const noexcept {
-        return reinterpret_cast<const AnvilInternedString*>(arena.at(strings_off));
+    const CinderInternedString* strings() const noexcept {
+        return reinterpret_cast<const CinderInternedString*>(arena.at(strings_off));
     }
     bool ensure_string_bytes(u32 need) noexcept;
     bool ensure_string_table(u32 need) noexcept;
@@ -824,15 +824,15 @@ struct AnvilHeap {
     u32 transitions_cap;
     u32 transition_count;
 
-    AnvilShape* shapes() noexcept { return reinterpret_cast<AnvilShape*>(arena.at(shapes_off)); }
-    const AnvilShape* shapes() const noexcept {
-        return reinterpret_cast<const AnvilShape*>(arena.at(shapes_off));
+    CinderShape* shapes() noexcept { return reinterpret_cast<CinderShape*>(arena.at(shapes_off)); }
+    const CinderShape* shapes() const noexcept {
+        return reinterpret_cast<const CinderShape*>(arena.at(shapes_off));
     }
-    AnvilShapeTransition* transitions() noexcept {
-        return reinterpret_cast<AnvilShapeTransition*>(arena.at(transitions_off));
+    CinderShapeTransition* transitions() noexcept {
+        return reinterpret_cast<CinderShapeTransition*>(arena.at(transitions_off));
     }
-    const AnvilShapeTransition* transitions() const noexcept {
-        return reinterpret_cast<const AnvilShapeTransition*>(arena.at(transitions_off));
+    const CinderShapeTransition* transitions() const noexcept {
+        return reinterpret_cast<const CinderShapeTransition*>(arena.at(transitions_off));
     }
     bool ensure_shapes(u32 need) noexcept;
     bool ensure_transitions(u32 need) noexcept;
@@ -840,17 +840,17 @@ struct AnvilHeap {
     u32 objects_off;
     u32 objects_cap;
     u32 object_count;
-    AnvilHeapObject* objects() noexcept {
-        return reinterpret_cast<AnvilHeapObject*>(arena.at(objects_off));
+    CinderHeapObject* objects() noexcept {
+        return reinterpret_cast<CinderHeapObject*>(arena.at(objects_off));
     }
-    const AnvilHeapObject* objects() const noexcept {
-        return reinterpret_cast<const AnvilHeapObject*>(arena.at(objects_off));
+    const CinderHeapObject* objects() const noexcept {
+        return reinterpret_cast<const CinderHeapObject*>(arena.at(objects_off));
     }
-    AnvilValue* object_slots(u32 off) noexcept {
-        return reinterpret_cast<AnvilValue*>(arena.at(off));
+    CinderValue* object_slots(u32 off) noexcept {
+        return reinterpret_cast<CinderValue*>(arena.at(off));
     }
-    const AnvilValue* object_slots(u32 off) const noexcept {
-        return reinterpret_cast<const AnvilValue*>(arena.at(off));
+    const CinderValue* object_slots(u32 off) const noexcept {
+        return reinterpret_cast<const CinderValue*>(arena.at(off));
     }
     u32* object_keys(u32 off) noexcept { return reinterpret_cast<u32*>(arena.at(off)); }
     const u32* object_keys(u32 off) const noexcept {
@@ -863,11 +863,11 @@ struct AnvilHeap {
     u32 functions_off;
     u32 functions_cap;
     u32 function_count;
-    AnvilHeapFunction* functions() noexcept {
-        return reinterpret_cast<AnvilHeapFunction*>(arena.at(functions_off));
+    CinderHeapFunction* functions() noexcept {
+        return reinterpret_cast<CinderHeapFunction*>(arena.at(functions_off));
     }
-    const AnvilHeapFunction* functions() const noexcept {
-        return reinterpret_cast<const AnvilHeapFunction*>(arena.at(functions_off));
+    const CinderHeapFunction* functions() const noexcept {
+        return reinterpret_cast<const CinderHeapFunction*>(arena.at(functions_off));
     }
     bool ensure_functions(u32 need) noexcept;
 
@@ -875,11 +875,11 @@ struct AnvilHeap {
     u32 closures_cap;
     u32 closure_count;
     u32 live_closures;
-    AnvilHeapClosure* closures() noexcept {
-        return reinterpret_cast<AnvilHeapClosure*>(arena.at(closures_off));
+    CinderHeapClosure* closures() noexcept {
+        return reinterpret_cast<CinderHeapClosure*>(arena.at(closures_off));
     }
-    const AnvilHeapClosure* closures() const noexcept {
-        return reinterpret_cast<const AnvilHeapClosure*>(arena.at(closures_off));
+    const CinderHeapClosure* closures() const noexcept {
+        return reinterpret_cast<const CinderHeapClosure*>(arena.at(closures_off));
     }
     u32* closure_upvals(u32 off) noexcept { return reinterpret_cast<u32*>(arena.at(off)); }
     const u32* closure_upvals(u32 off) const noexcept {
@@ -892,17 +892,17 @@ struct AnvilHeap {
     u32 arrays_cap;
     u32 array_count;
 
-    AnvilHeapArray* arrays() noexcept {
-        return reinterpret_cast<AnvilHeapArray*>(arena.at(arrays_off));
+    CinderHeapArray* arrays() noexcept {
+        return reinterpret_cast<CinderHeapArray*>(arena.at(arrays_off));
     }
-    const AnvilHeapArray* arrays() const noexcept {
-        return reinterpret_cast<const AnvilHeapArray*>(arena.at(arrays_off));
+    const CinderHeapArray* arrays() const noexcept {
+        return reinterpret_cast<const CinderHeapArray*>(arena.at(arrays_off));
     }
-    AnvilValue* array_elems(u32 off) noexcept {
-        return reinterpret_cast<AnvilValue*>(arena.at(off));
+    CinderValue* array_elems(u32 off) noexcept {
+        return reinterpret_cast<CinderValue*>(arena.at(off));
     }
-    const AnvilValue* array_elems(u32 off) const noexcept {
-        return reinterpret_cast<const AnvilValue*>(arena.at(off));
+    const CinderValue* array_elems(u32 off) const noexcept {
+        return reinterpret_cast<const CinderValue*>(arena.at(off));
     }
     bool ensure_arrays(u32 need) noexcept;
 
@@ -930,28 +930,28 @@ struct AnvilHeap {
 
     u32 alloc_object(u32 initial_shape = 0u) noexcept;
     u32 alloc_array(u32 initial_capacity = 8u) noexcept;
-    u32 alloc_cell(AnvilValue v) noexcept;
+    u32 alloc_cell(CinderValue v) noexcept;
     u32 alloc_function(u32 name_sym, u32 arity, u32 local_count, u32 code_start, u32 code_len) noexcept;
     u32 alloc_error_object(BuiltinCtorKind kind, u32 msg_sym) noexcept;
 
-    AnvilValue get_object_prop(u32 obj_id, u32 prop_sym, u32* out_shape = nullptr, i32* out_slot = nullptr) const noexcept;
-    StoreResult set_object_prop(u32 obj_id, u32 prop_sym, AnvilValue val, u32* out_shape = nullptr, i32* out_slot = nullptr) noexcept;
+    CinderValue get_object_prop(u32 obj_id, u32 prop_sym, u32* out_shape = nullptr, i32* out_slot = nullptr) const noexcept;
+    StoreResult set_object_prop(u32 obj_id, u32 prop_sym, CinderValue val, u32* out_shape = nullptr, i32* out_slot = nullptr) noexcept;
     bool has_object_prop(u32 obj_id, u32 prop_sym) const noexcept;
     bool delete_object_prop(u32 obj_id, u32 prop_sym) noexcept;
 
-    AnvilValue get_array_elem(u32 arr_id, i32 index) const noexcept;
-    StoreResult set_array_elem(u32 arr_id, i32 index, AnvilValue val) noexcept;
-    StoreResult push_array_elem(u32 arr_id, AnvilValue val) noexcept;
+    CinderValue get_array_elem(u32 arr_id, i32 index) const noexcept;
+    StoreResult set_array_elem(u32 arr_id, i32 index, CinderValue val) noexcept;
+    StoreResult push_array_elem(u32 arr_id, CinderValue val) noexcept;
     u32 intern_concat(u32 sym_a, u32 sym_b) noexcept;
-    u32 value_to_string_sym(AnvilValue v) noexcept;
+    u32 value_to_string_sym(CinderValue v) noexcept;
 
-    void mark_value(AnvilValue v) noexcept;
+    void mark_value(CinderValue v) noexcept;
     void mark_object(u32 obj_id) noexcept;
     void mark_array(u32 arr_id) noexcept;
     void mark_closure(u32 closure_id) noexcept;
     void clear_marks() noexcept;
     u32 sweep_unmarked() noexcept;
-    u32 collect_garbage(const AnvilValue* roots, u32 root_count) noexcept;
+    u32 collect_garbage(const CinderValue* roots, u32 root_count) noexcept;
 };
 
 // ============================================================================
@@ -965,33 +965,33 @@ enum class IcState : u8 {
     Megamorphic   = 3u,
 };
 
-struct AnvilIcStub {
+struct CinderIcStub {
     u32 shape_id;
     i32 slot_offset;
 };
 
-struct AnvilIcSite {
+struct CinderIcSite {
     IcState state;
     u8 count;
     u32 prop_sym;
-    AnvilIcStub stubs[4];
+    CinderIcStub stubs[4];
 };
 
-struct AnvilDomIcEntry {
+struct CinderDomIcEntry {
     u64 selector_hash;
     u32 node_id;
     u32 hit_count;
     bool occupied;
 };
 
-struct AnvilIcTable {
-    AnvilArena* arena;
+struct CinderIcTable {
+    CinderArena* arena;
     u32 sites_off;
     u32 sites_cap;
     u32 site_count;
-    AnvilIcSite* sites() noexcept { return reinterpret_cast<AnvilIcSite*>(arena->at(sites_off)); }
-    const AnvilIcSite* sites() const noexcept {
-        return reinterpret_cast<const AnvilIcSite*>(arena->at(sites_off));
+    CinderIcSite* sites() noexcept { return reinterpret_cast<CinderIcSite*>(arena->at(sites_off)); }
+    const CinderIcSite* sites() const noexcept {
+        return reinterpret_cast<const CinderIcSite*>(arena->at(sites_off));
     }
     bool ensure_sites(u32 need) noexcept;
     u32 ic_hits;
@@ -999,14 +999,14 @@ struct AnvilIcTable {
     u32 polymorphic_upgrades;
     u32 megamorphic_fallbacks;
 
-    AnvilDomIcEntry dom_entries[MAX_DOM_IC_ENTRIES];
+    CinderDomIcEntry dom_entries[MAX_DOM_IC_ENTRIES];
     u32 dom_ic_hits;
     u32 dom_ic_misses;
 
-    void init(AnvilArena* a) noexcept;
+    void init(CinderArena* a) noexcept;
     u32 allocate_site(u32 prop_sym) noexcept;
-    AnvilValue load_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym) noexcept;
-    StoreResult store_property_ic(AnvilHeap& heap, u32 site_id, AnvilValue receiver, u32 prop_sym, AnvilValue val) noexcept;
+    CinderValue load_property_ic(CinderHeap& heap, u32 site_id, CinderValue receiver, u32 prop_sym) noexcept;
+    StoreResult store_property_ic(CinderHeap& heap, u32 site_id, CinderValue receiver, u32 prop_sym, CinderValue val) noexcept;
 
     i32 lookup_dom_selector(const char* selector, u32 len) noexcept;
     void record_dom_selector(const char* selector, u32 len, u32 node_id) noexcept;
@@ -1014,10 +1014,10 @@ struct AnvilIcTable {
 };
 
 // ============================================================================
-// 5. Register-Based Bytecode ISA (AnvilOpcode & AnvilInstruction)
+// 5. Register-Based Bytecode ISA (CinderOpcode & CinderInstruction)
 // ============================================================================
 
-enum class AnvilOpcode : u8 {
+enum class CinderOpcode : u8 {
     Nop          = 0u,
     LoadConst    = 1u,   // R[a] = Const[imm32]
     LoadSmi      = 2u,   // R[a] = Smi(imm16 as i16)
@@ -1101,20 +1101,20 @@ enum class AnvilOpcode : u8 {
     ToNum        = 80u,  // R[a] = +R[b]
 };
 
-struct AnvilInstruction {
-    AnvilOpcode op;
+struct CinderInstruction {
+    CinderOpcode op;
     u8 pad;
     u16 a;
     u16 b;
     u16 c;
     u32 imm;
 
-    static constexpr AnvilInstruction make_abc(AnvilOpcode op, u16 a, u16 b, u16 c) noexcept {
-        return AnvilInstruction{op, 0u, a, b, c, 0u};
+    static constexpr CinderInstruction make_abc(CinderOpcode op, u16 a, u16 b, u16 c) noexcept {
+        return CinderInstruction{op, 0u, a, b, c, 0u};
     }
 
-    static constexpr AnvilInstruction make_abx(AnvilOpcode op, u16 a, u32 imm) noexcept {
-        return AnvilInstruction{op, 0u, a, 0u, 0u, imm};
+    static constexpr CinderInstruction make_abx(CinderOpcode op, u16 a, u32 imm) noexcept {
+        return CinderInstruction{op, 0u, a, 0u, 0u, imm};
     }
 
     constexpr u32 imm32() const noexcept {
@@ -1134,16 +1134,16 @@ struct AnvilInstruction {
     }
 };
 
-struct AnvilGlobalBinding {
+struct CinderGlobalBinding {
     u32 name_sym;
-    AnvilValue value;
+    CinderValue value;
     bool occupied;
     bool exported;
     bool declared;
     u32 decl_depth;
 };
 
-struct AnvilCallFrame {
+struct CinderCallFrame {
     u32 fn_id;
     u32 closure_id;
     u32 return_pc;
@@ -1151,7 +1151,7 @@ struct AnvilCallFrame {
     u32 caller_frame_regs;
     u16 dst_reg;
     u32 new_instance_obj; // NO_SLOT for normal calls; object id for `new Ctor(...)`
-    AnvilValue caller_this;
+    CinderValue caller_this;
 };
 
 // Completion state for an active try/catch/finally handler.
@@ -1161,26 +1161,26 @@ enum class TryCompletionKind : u8 {
     Return = 2u,
 };
 
-struct AnvilTryHandler {
+struct CinderTryHandler {
     u32 frame_depth;
     u32 reg_base;
     u32 cur_frame_regs;
     u32 cur_closure;
-    AnvilValue cur_this;
+    CinderValue cur_this;
     u32 catch_pc;
     u32 finally_pc;
     u16 catch_reg;
     TryCompletionKind completion_kind;
-    AnvilValue completion_val;
+    CinderValue completion_val;
     u32 completion_pc;
 };
 
-struct AnvilBytecodeProgram {
+struct CinderBytecodeProgram {
     u32 code_off;
     u32 code_cap;
     u32 code_len;
     u32 top_frame_regs;
-    AnvilArena* arena;
+    CinderArena* arena;
     u32 constants_off;
     u32 constants_cap;
     u32 const_len;
@@ -1188,19 +1188,19 @@ struct AnvilBytecodeProgram {
     bool compile_ok;
     u32 overflow;
 
-    AnvilValue* constants() noexcept {
-        return reinterpret_cast<AnvilValue*>(arena->at(constants_off));
+    CinderValue* constants() noexcept {
+        return reinterpret_cast<CinderValue*>(arena->at(constants_off));
     }
-    const AnvilValue* constants() const noexcept {
-        return reinterpret_cast<const AnvilValue*>(arena->at(constants_off));
+    const CinderValue* constants() const noexcept {
+        return reinterpret_cast<const CinderValue*>(arena->at(constants_off));
     }
     bool ensure_constants(u32 need) noexcept;
 
-    AnvilInstruction* code() noexcept {
-        return reinterpret_cast<AnvilInstruction*>(arena->at(code_off));
+    CinderInstruction* code() noexcept {
+        return reinterpret_cast<CinderInstruction*>(arena->at(code_off));
     }
-    const AnvilInstruction* code() const noexcept {
-        return reinterpret_cast<const AnvilInstruction*>(arena->at(code_off));
+    const CinderInstruction* code() const noexcept {
+        return reinterpret_cast<const CinderInstruction*>(arena->at(code_off));
     }
     bool ensure_code(u32 need) noexcept {
         if (need <= code_cap) {
@@ -1211,12 +1211,12 @@ struct AnvilBytecodeProgram {
             new_cap *= 2u;
         }
         bool over = false;
-        const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(AnvilInstruction)), &over);
+        const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(CinderInstruction)), &over);
         if (new_off == NO_SLOT) {
             return false;
         }
-        AnvilInstruction* dst = reinterpret_cast<AnvilInstruction*>(arena->at(new_off));
-        const AnvilInstruction* old = code();
+        CinderInstruction* dst = reinterpret_cast<CinderInstruction*>(arena->at(new_off));
+        const CinderInstruction* old = code();
         for (u32 i = 0u; i < code_len; ++i) {
             dst[i] = old[i];
         }
@@ -1225,12 +1225,12 @@ struct AnvilBytecodeProgram {
         code_off = new_off;
         code_cap = new_cap;
         if (old_cap != 0u) {
-            arena->free(old_off, old_cap * static_cast<u32>(sizeof(AnvilInstruction)));
+            arena->free(old_off, old_cap * static_cast<u32>(sizeof(CinderInstruction)));
         }
         return true;
     }
 
-    void init(AnvilArena* a) noexcept {
+    void init(CinderArena* a) noexcept {
         arena = a;
         code_off = 0u;
         code_cap = 0u;
@@ -1246,8 +1246,8 @@ struct AnvilBytecodeProgram {
         overflow = VM_OK;
     }
 
-    u32 emit(AnvilInstruction inst) noexcept {
-        if (code_len >= ANVIL_MAX_PROGRAM_INSTRUCTIONS || !ensure_code(code_len + 1u)) {
+    u32 emit(CinderInstruction inst) noexcept {
+        if (code_len >= CINDER_MAX_PROGRAM_INSTRUCTIONS || !ensure_code(code_len + 1u)) {
             if (compile_ok) {
                 overflow = VM_REFUSE_CODE_SIZE;
             }
@@ -1259,7 +1259,7 @@ struct AnvilBytecodeProgram {
         return idx;
     }
 
-    u32 add_constant(AnvilValue val) noexcept {
+    u32 add_constant(CinderValue val) noexcept {
         for (u32 i = 0; i < const_len; ++i) {
             if (constants()[i].bits == val.bits) {
                 return i;
@@ -1282,7 +1282,7 @@ struct AnvilBytecodeProgram {
 // 6. Complete C++20 Virtual Machine Instance & Telemetry Struct
 // ============================================================================
 
-struct AnvilVmTelemetryC {
+struct CinderVmTelemetryC {
     u32 kernel_version;
     u32 bytecode_ops_executed;
     u32 heap_objects_live;
@@ -1302,51 +1302,51 @@ struct AnvilVmTelemetryC {
     u8 exports[MAX_EXPORT_BYTES];
 };
 
-static_assert(sizeof(AnvilVmTelemetryC) == 11u * 4u + 8u + MAX_ERROR_TEXT + 8u + MAX_EXPORT_BYTES,
+static_assert(sizeof(CinderVmTelemetryC) == 11u * 4u + 8u + MAX_ERROR_TEXT + 8u + MAX_EXPORT_BYTES,
               "telemetry layout");
 
-struct AnvilVmContext {
-    AnvilHeap heap;
-    AnvilIcTable ic;
-    AnvilBytecodeProgram program;
+struct CinderVmContext {
+    CinderHeap heap;
+    CinderIcTable ic;
+    CinderBytecodeProgram program;
     u32 registers_off;
     u32 registers_cap;
-    AnvilValue* registers() noexcept {
-        return reinterpret_cast<AnvilValue*>(heap.arena.at(registers_off));
+    CinderValue* registers() noexcept {
+        return reinterpret_cast<CinderValue*>(heap.arena.at(registers_off));
     }
-    const AnvilValue* registers() const noexcept {
-        return reinterpret_cast<const AnvilValue*>(heap.arena.at(registers_off));
+    const CinderValue* registers() const noexcept {
+        return reinterpret_cast<const CinderValue*>(heap.arena.at(registers_off));
     }
     bool ensure_registers(u32 need) noexcept;
     u32 globals_off;
     u32 globals_cap;
     u32 global_count;
-    AnvilGlobalBinding* globals() noexcept {
-        return reinterpret_cast<AnvilGlobalBinding*>(heap.arena.at(globals_off));
+    CinderGlobalBinding* globals() noexcept {
+        return reinterpret_cast<CinderGlobalBinding*>(heap.arena.at(globals_off));
     }
-    const AnvilGlobalBinding* globals() const noexcept {
-        return reinterpret_cast<const AnvilGlobalBinding*>(heap.arena.at(globals_off));
+    const CinderGlobalBinding* globals() const noexcept {
+        return reinterpret_cast<const CinderGlobalBinding*>(heap.arena.at(globals_off));
     }
     bool ensure_globals(u32 need) noexcept;
     u32 frames_off;
     u32 frames_cap;
     u32 frame_count;
-    AnvilCallFrame* frames() noexcept {
-        return reinterpret_cast<AnvilCallFrame*>(heap.arena.at(frames_off));
+    CinderCallFrame* frames() noexcept {
+        return reinterpret_cast<CinderCallFrame*>(heap.arena.at(frames_off));
     }
-    const AnvilCallFrame* frames() const noexcept {
-        return reinterpret_cast<const AnvilCallFrame*>(heap.arena.at(frames_off));
+    const CinderCallFrame* frames() const noexcept {
+        return reinterpret_cast<const CinderCallFrame*>(heap.arena.at(frames_off));
     }
     bool ensure_frames(u32 need) noexcept;
 
-    AnvilTryHandler try_stack[MAX_TRY_DEPTH];
+    CinderTryHandler try_stack[MAX_TRY_DEPTH];
     u32 try_depth;
 
     u32 steps_executed;
     u32 hot_loops_accelerated;
     u32 native_compilations;
     bool aborted;
-    AnvilVmError error;
+    CinderVmError error;
     char host_ids[8][64];
     u32 host_id_lens[8];
     u32 host_id_count;
@@ -1363,13 +1363,13 @@ struct AnvilVmContext {
     u32 resume_reg_base;
     u32 resume_frame_regs;
     u32 resume_closure;
-    AnvilValue resume_this;
+    CinderValue resume_this;
     bool pending_host_call;
     u32 pending_host_fn;
     u32 pending_arg_count;
     u32 pending_host_overflow;
     u16 resume_host_dst;
-    AnvilValue pending_args[MAX_HOST_ARGS];
+    CinderValue pending_args[MAX_HOST_ARGS];
 
     u32 parse_stack_budget;
 
@@ -1378,11 +1378,11 @@ struct AnvilVmContext {
     }
 
     u32 effective_call_depth() const noexcept {
-        return call_depth_limit != 0u ? call_depth_limit : ANVIL_DEFAULT_CALL_DEPTH;
+        return call_depth_limit != 0u ? call_depth_limit : CINDER_DEFAULT_CALL_DEPTH;
     }
 
     u32 effective_parse_stack_budget() const noexcept {
-        return parse_stack_budget != 0u ? parse_stack_budget : ANVIL_DEFAULT_PARSE_STACK_BUDGET;
+        return parse_stack_budget != 0u ? parse_stack_budget : CINDER_DEFAULT_PARSE_STACK_BUDGET;
     }
 
     void init() noexcept;
@@ -1420,16 +1420,16 @@ struct AnvilVmContext {
     void collect_garbage(u32 reg_top) noexcept;
     void reclaim_array_storage(u32 reg_top) noexcept;
     bool store_ok(StoreResult stored) noexcept;
-    AnvilValue execute(u32 entry_pc = 0u) noexcept;
-    AnvilValue resume() noexcept;
-    AnvilValue run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in, AnvilValue cur_this_in = AnvilValue::make_undefined(), u32 stop_frame_depth = 0u) noexcept;
-    void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
-    void fill_exports(AnvilVmTelemetryC* out) const noexcept;
-    void fill_host_call(AnvilVmTelemetryC* out) const noexcept;
+    CinderValue execute(u32 entry_pc = 0u) noexcept;
+    CinderValue resume() noexcept;
+    CinderValue run_loop(u32 pc, u32 reg_base, u32 frame_regs, u32 cur_closure_in, CinderValue cur_this_in = CinderValue::make_undefined(), u32 stop_frame_depth = 0u) noexcept;
+    void fill_telemetry(CinderVmTelemetryC* out) const noexcept;
+    void fill_exports(CinderVmTelemetryC* out) const noexcept;
+    void fill_host_call(CinderVmTelemetryC* out) const noexcept;
 };
 
-bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexcept;
-bool compile_js_to_bytecode(AnvilVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept;
+bool cinder_jit_try_run(CinderVmContext* ctx, u32 entry_pc, f64* out_number) noexcept;
+bool compile_js_to_bytecode(CinderVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept;
 
 // Exact IEEE-754 decimal/radix number literal parser used by the compiler and number formatter.
 f64 parse_f64_slice(const char* s, u32 len) noexcept;
@@ -1443,6 +1443,6 @@ inline u64 fnv1a_hash_bytes(const char* data, u32 len) noexcept {
     return h;
 }
 
-} // namespace anvil_vm
+} // namespace cinder_vm
 
-#endif // ANVIL_VM_HPP
+#endif // CINDER_VM_HPP

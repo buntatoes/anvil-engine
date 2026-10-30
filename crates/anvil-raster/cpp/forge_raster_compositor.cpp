@@ -3,9 +3,9 @@
 // C++20 SDF Box-Shadow, Linear-Gradient, Clipped RGBA Blitter, Glyph Coverage, and NV12 Kernels.
 // Author: Buntato
 
-#include "anvil_raster_accel.hpp"
+#include "forge_raster_accel.hpp"
 
-using namespace anvil_raster_cpp;
+using namespace forge_raster_cpp;
 
 extern "C" {
 

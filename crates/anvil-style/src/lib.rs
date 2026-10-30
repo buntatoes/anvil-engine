@@ -57,9 +57,9 @@
 use anvil_dom::{Document, NodeData, NodeId};
 use std::collections::HashMap;
 
-/// Direct linkage to the in-tree `Anvil-CSS` engine (`engines/anvil-css`).
-#[path = "../../../../anvil-browser/engines/anvil-css/src/lib.rs"]
-pub mod anvil_css;
+/// Direct linkage to the in-tree `Prism` engine (`engines/prism`).
+#[path = "../../../../anvil-browser/engines/prism/src/lib.rs"]
+pub mod prism;
 
 mod animation;
 mod selectors;
@@ -91,6 +91,61 @@ pub struct Stylesheet {
     pub layers: Vec<String>,
     /// Custom properties registered with `@property`.
     pub properties: Vec<RegisteredProperty>,
+    /// `@font-face` rules declared in the stylesheet.
+    pub font_faces: Vec<FontFaceRule>,
+}
+
+/// An `@font-face` rule parsed from CSS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFaceRule {
+    pub family: String,
+    pub src_url: String,
+    pub weight: u16,
+    pub italic: bool,
+}
+
+/// Resolved `font-family` stack slot. Inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FontFamily {
+    /// Proportional sans-serif (`sans-serif`, `system-ui`, `ui-sans-serif`). Initial value.
+    #[default]
+    SansSerif,
+    /// Proportional serif (`serif`, `ui-serif`, `georgia`, `times`).
+    Serif,
+    /// Fixed-width monospace (`monospace`, `ui-monospace`, `consolas`, `courier`).
+    Monospace,
+    /// Custom `@font-face` family hash.
+    Custom(u16),
+}
+
+/// `text-transform` case conversion. Inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextTransform {
+    /// Leave character case unchanged. Initial value.
+    #[default]
+    None,
+    /// Convert all characters to uppercase (`uppercase`).
+    Uppercase,
+    /// Convert all characters to lowercase (`lowercase`).
+    Lowercase,
+    /// Capitalize the first letter of each word (`capitalize`).
+    Capitalize,
+}
+
+/// `object-fit` sizing mode for replaced elements (`<img>`, `<video>`, `<canvas>`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectFit {
+    /// Stretch to fill the content box (`fill`). Initial value.
+    #[default]
+    Fill,
+    /// Scale to fit inside the content box preserving aspect ratio (`contain`).
+    Contain,
+    /// Scale to cover the content box preserving aspect ratio (`cover`).
+    Cover,
+    /// Do not scale the replaced content (`none`).
+    None,
+    /// Like `none` or `contain`, whichever produces a smaller concrete object size (`scale-down`).
+    ScaleDown,
 }
 
 impl Stylesheet {
@@ -114,6 +169,7 @@ impl Stylesheet {
             self.rules.push(rule);
         }
         self.keyframes.extend(later.keyframes);
+        self.font_faces.extend(later.font_faces);
         for prop in later.properties {
             if let Some(existing) = self.properties.iter_mut().find(|p| p.name == prop.name) {
                 *existing = prop;
@@ -661,17 +717,15 @@ impl Color {
         }
         let lower = value.to_ascii_lowercase();
         if let Some(inner) = lower.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-            return parse_rgb(inner, false).or_else(|| {
-                anvil_css::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a })
-            });
+            return parse_rgb(inner, false)
+                .or_else(|| prism::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a }));
         }
         if let Some(inner) = lower
             .strip_prefix("rgba(")
             .and_then(|s| s.strip_suffix(')'))
         {
-            return parse_rgb(inner, true).or_else(|| {
-                anvil_css::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a })
-            });
+            return parse_rgb(inner, true)
+                .or_else(|| prism::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a }));
         }
         Some(match lower.as_str() {
             "black" => Self::BLACK,
@@ -729,7 +783,7 @@ impl Color {
                 b: 0,
                 a: 0,
             },
-            _ => return anvil_css::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a }),
+            _ => return prism::parse_css_rgba8(value).map(|[r, g, b, a]| Self { r, g, b, a }),
         })
     }
 
@@ -1378,6 +1432,24 @@ pub struct ComputedStyle {
     pub transitions: Transitions,
     /// `animation` and its longhands. Not inherited.
     pub animations: Animations,
+    pub font_family: FontFamily,
+    pub text_transform: TextTransform,
+    pub line_through: bool,
+    pub letter_spacing: f32,
+    pub word_spacing: f32,
+    pub scrollable_overflow: bool,
+    pub object_fit: ObjectFit,
+    pub border_colors: [Color; 4],
+    pub outline_width: f32,
+    pub outline_color: Color,
+    pub outline_offset: f32,
+    pub backdrop_blur: f32,
+    pub filter_blur: f32,
+    pub filter_brightness: f32,
+    pub filter_contrast: f32,
+    pub filter_grayscale: f32,
+    pub filter_invert: f32,
+    pub filter_sepia: f32,
 }
 
 impl ComputedStyle {
@@ -1466,6 +1538,24 @@ impl ComputedStyle {
             opacity: 1.0,
             transitions: Transitions::INITIAL,
             animations: Animations::INITIAL,
+            font_family: FontFamily::SansSerif,
+            text_transform: TextTransform::None,
+            line_through: false,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
+            scrollable_overflow: false,
+            object_fit: ObjectFit::Fill,
+            border_colors: [Color::BLACK; 4],
+            outline_width: 0.0,
+            outline_color: Color::BLACK,
+            outline_offset: 0.0,
+            backdrop_blur: 0.0,
+            filter_blur: 0.0,
+            filter_brightness: 1.0,
+            filter_contrast: 1.0,
+            filter_grayscale: 0.0,
+            filter_invert: 0.0,
+            filter_sepia: 0.0,
         }
     }
 
@@ -1505,6 +1595,13 @@ impl ComputedStyle {
             underline: self.underline,
             word_break_any: self.word_break_any,
             border_color: self.color,
+            border_colors: [self.color; 4],
+            outline_color: self.color,
+            font_family: self.font_family,
+            text_transform: self.text_transform,
+            line_through: self.line_through,
+            letter_spacing: self.letter_spacing,
+            word_spacing: self.word_spacing,
             ..Self::initial()
         }
     }
@@ -1824,9 +1921,9 @@ fn parse_css_rules_scoped(
             .strip_prefix("@supports")
             .or_else(|| selector_src.strip_prefix("@SUPPORTS"))
         {
-            let opts = anvil_css::Options::default();
-            if let Ok(cvs) = anvil_css::parse_component_values(cond.trim(), &opts)
-                && anvil_css::media::parse_supports_condition(&cvs, &opts.limits)
+            let opts = prism::Options::default();
+            if let Ok(cvs) = prism::parse_component_values(cond.trim(), &opts)
+                && prism::media::parse_supports_condition(&cvs, &opts.limits)
                     .is_ok_and(|c| c.evaluate())
             {
                 parse_css_rules_scoped(
@@ -1928,6 +2025,60 @@ fn parse_css_rules_scoped(
                 active_layer.clone(),
                 sheet,
             );
+            continue;
+        }
+        if selector_src.eq_ignore_ascii_case("@font-face") {
+            let decls = parse_declarations(body_src);
+            let mut family = None;
+            let mut src_url = String::new();
+            let mut weight = 400u16;
+            let mut italic = false;
+            for d in decls {
+                match d.name.as_str() {
+                    "font-family" => {
+                        let f = d.value.trim().trim_matches(['"', '\'']).trim();
+                        if !f.is_empty() {
+                            family = Some(f.to_string());
+                        }
+                    }
+                    "src" => {
+                        let lower = d.value.to_ascii_lowercase();
+                        if let Some(u_idx) = lower.find("url(") {
+                            let after = &d.value[u_idx + 4..];
+                            if let Some(close_idx) = after.find(')') {
+                                src_url = after[..close_idx]
+                                    .trim()
+                                    .trim_matches(['"', '\''])
+                                    .trim()
+                                    .to_string();
+                            }
+                        } else {
+                            src_url = d.value.trim().to_string();
+                        }
+                    }
+                    "font-weight" => {
+                        let lw = d.value.trim().to_ascii_lowercase();
+                        if lw == "bold" {
+                            weight = 700;
+                        } else if let Ok(w) = lw.parse::<u16>() {
+                            weight = w.clamp(1, 1000);
+                        }
+                    }
+                    "font-style" => {
+                        let ls = d.value.trim().to_ascii_lowercase();
+                        italic = matches!(ls.as_str(), "italic" | "oblique");
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(fam) = family {
+                sheet.font_faces.push(FontFaceRule {
+                    family: fam,
+                    src_url,
+                    weight,
+                    italic,
+                });
+            }
             continue;
         }
         if selector_src.starts_with('@') {
@@ -3073,7 +3224,10 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
             dst.bottom = src.bottom;
         }
         "z-index" => dst.z_index = src.z_index,
-        "overflow" | "overflow-x" | "overflow-y" => dst.overflow = src.overflow,
+        "overflow" | "overflow-x" | "overflow-y" => {
+            dst.overflow = src.overflow;
+            dst.scrollable_overflow = src.scrollable_overflow;
+        }
         "visibility" => dst.visibility = src.visibility,
         "box-sizing" => dst.box_sizing = src.box_sizing,
         "color" => dst.color = src.color,
@@ -3088,7 +3242,32 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "line-height" => dst.line_height = src.line_height,
         "text-align" => dst.text_align = src.text_align,
         "white-space" => dst.white_space = src.white_space,
-        "text-decoration" | "text-decoration-line" => dst.underline = src.underline,
+        "text-decoration" | "text-decoration-line" => {
+            dst.underline = src.underline;
+            dst.line_through = src.line_through;
+        }
+        "font-family" => dst.font_family = src.font_family,
+        "text-transform" => dst.text_transform = src.text_transform,
+        "letter-spacing" => dst.letter_spacing = src.letter_spacing,
+        "word-spacing" => dst.word_spacing = src.word_spacing,
+        "object-fit" => dst.object_fit = src.object_fit,
+        "outline" => {
+            dst.outline_width = src.outline_width;
+            dst.outline_color = src.outline_color;
+            dst.outline_offset = src.outline_offset;
+        }
+        "outline-width" => dst.outline_width = src.outline_width,
+        "outline-color" => dst.outline_color = src.outline_color,
+        "outline-offset" => dst.outline_offset = src.outline_offset,
+        "backdrop-filter" => dst.backdrop_blur = src.backdrop_blur,
+        "filter" => {
+            dst.filter_blur = src.filter_blur;
+            dst.filter_brightness = src.filter_brightness;
+            dst.filter_contrast = src.filter_contrast;
+            dst.filter_grayscale = src.filter_grayscale;
+            dst.filter_invert = src.filter_invert;
+            dst.filter_sepia = src.filter_sepia;
+        }
         "text-overflow" => dst.text_overflow_ellipsis = src.text_overflow_ellipsis,
         "overflow-wrap" | "word-wrap" | "word-break" => dst.word_break_any = src.word_break_any,
         "margin" => {
@@ -3144,7 +3323,14 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
             dst.border_color = src.border_color;
         }
         "border-width" => dst.border = src.border,
-        "border-color" => dst.border_color = src.border_color,
+        "border-color" => {
+            dst.border_color = src.border_color;
+            dst.border_colors = src.border_colors;
+        }
+        "border-top-color" => dst.border_colors[0] = src.border_colors[0],
+        "border-right-color" => dst.border_colors[1] = src.border_colors[1],
+        "border-bottom-color" => dst.border_colors[2] = src.border_colors[2],
+        "border-left-color" => dst.border_colors[3] = src.border_colors[3],
         "border-top" | "border-block-start" => dst.border.top = src.border.top,
         "border-right" | "border-inline-end" => dst.border.right = src.border.right,
         "border-bottom" | "border-block-end" => dst.border.bottom = src.border.bottom,
@@ -3485,6 +3671,13 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
             a: 255,
         };
     }
+    if matches!(tag, "code" | "pre" | "kbd" | "samp" | "tt") {
+        style.font_family = FontFamily::Monospace;
+    }
+    if matches!(tag, "s" | "del" | "strike") {
+        style.line_through = true;
+    }
+    style.border_colors = [style.border_color; 4];
     style.font_size = match tag {
         "h1" => 32.0,
         "h2" => 24.0,
@@ -3714,10 +3907,97 @@ fn apply_declaration(
             for tok in split_css_tokens(value) {
                 if tok.eq_ignore_ascii_case("underline") {
                     style.underline = true;
+                } else if tok.eq_ignore_ascii_case("line-through") {
+                    style.line_through = true;
                 } else if tok.eq_ignore_ascii_case("none") {
                     style.underline = false;
+                    style.line_through = false;
                 }
             }
+        }
+        "font-family" => {
+            if let Some(fam) = parse_font_family(value) {
+                style.font_family = fam;
+            }
+        }
+        "text-transform" => {
+            style.text_transform = match value.to_ascii_lowercase().as_str() {
+                "none" => TextTransform::None,
+                "uppercase" => TextTransform::Uppercase,
+                "lowercase" => TextTransform::Lowercase,
+                "capitalize" => TextTransform::Capitalize,
+                _ => return,
+            };
+        }
+        "letter-spacing" => {
+            if value.eq_ignore_ascii_case("normal") {
+                style.letter_spacing = 0.0;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.letter_spacing = px.clamp(-64.0, 256.0);
+            }
+        }
+        "word-spacing" => {
+            if value.eq_ignore_ascii_case("normal") {
+                style.word_spacing = 0.0;
+            } else if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.word_spacing = px.clamp(-64.0, 256.0);
+            }
+        }
+        "object-fit" => {
+            style.object_fit = match value.to_ascii_lowercase().as_str() {
+                "fill" => ObjectFit::Fill,
+                "contain" => ObjectFit::Contain,
+                "cover" => ObjectFit::Cover,
+                "none" => ObjectFit::None,
+                "scale-down" => ObjectFit::ScaleDown,
+                _ => return,
+            };
+        }
+        "outline" => {
+            if value.eq_ignore_ascii_case("none") || value == "0" {
+                style.outline_width = 0.0;
+            } else if let Some((w, c)) = parse_border_side(value) {
+                style.outline_width = w;
+                if let Some(color) = c {
+                    style.outline_color = color;
+                }
+            }
+        }
+        "outline-width" => {
+            if let Some(w) = parse_border_width_token(value) {
+                style.outline_width = w;
+            }
+        }
+        "outline-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.outline_color = style.color;
+            } else if let Some(c) = Color::parse(value) {
+                style.outline_color = c;
+            }
+        }
+        "outline-offset" => {
+            if let Some(px) = parse_box_px(value, style.font_size, root_font_px) {
+                style.outline_offset = px.clamp(-128.0, 128.0);
+            }
+        }
+        p if p == "backdrop-filter" || p.ends_with("-backdrop-filter") => {
+            if value.eq_ignore_ascii_case("none") {
+                style.backdrop_blur = 0.0;
+            } else {
+                for tok in split_css_tokens(value) {
+                    let lower = tok.to_ascii_lowercase();
+                    if let Some(inner) = lower
+                        .strip_prefix("blur(")
+                        .and_then(|s| s.strip_suffix(')'))
+                        && let Some(px) = parse_box_px(inner.trim(), style.font_size, root_font_px)
+                    {
+                        style.backdrop_blur = px.clamp(0.0, 64.0);
+                    }
+                }
+            }
+        }
+        "filter" => {
+            apply_filter_declaration(style, value, root_font_px);
         }
         "text-overflow" => {
             if value.eq_ignore_ascii_case("ellipsis") {
@@ -3811,8 +4091,72 @@ fn apply_declaration(
         "border-color" => {
             if value.eq_ignore_ascii_case("currentcolor") {
                 style.border_color = style.color;
+                style.border_colors = [style.color; 4];
             } else if let Some(color) = Color::parse(value) {
                 style.border_color = color;
+                style.border_colors = [color; 4];
+            } else {
+                let mut parsed_colors = Vec::new();
+                for tok in split_css_tokens(value) {
+                    let c = if tok.eq_ignore_ascii_case("currentcolor") {
+                        Some(style.color)
+                    } else {
+                        Color::parse(tok)
+                    };
+                    if let Some(col) = c {
+                        parsed_colors.push(col);
+                    } else {
+                        parsed_colors.clear();
+                        break;
+                    }
+                }
+                match parsed_colors.as_slice() {
+                    &[all] => {
+                        style.border_color = all;
+                        style.border_colors = [all; 4];
+                    }
+                    &[v, h] => {
+                        style.border_color = v;
+                        style.border_colors = [v, h, v, h];
+                    }
+                    &[t, h, b] => {
+                        style.border_color = t;
+                        style.border_colors = [t, h, b, h];
+                    }
+                    &[t, r, b, l] => {
+                        style.border_color = t;
+                        style.border_colors = [t, r, b, l];
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "border-top-color" | "border-block-start-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.border_colors[0] = style.color;
+            } else if let Some(c) = Color::parse(value) {
+                style.border_colors[0] = c;
+            }
+        }
+        "border-right-color" | "border-inline-end-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.border_colors[1] = style.color;
+            } else if let Some(c) = Color::parse(value) {
+                style.border_colors[1] = c;
+            }
+        }
+        "border-bottom-color" | "border-block-end-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.border_colors[2] = style.color;
+            } else if let Some(c) = Color::parse(value) {
+                style.border_colors[2] = c;
+            }
+        }
+        "border-left-color" | "border-inline-start-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.border_colors[3] = style.color;
+            } else if let Some(c) = Color::parse(value) {
+                style.border_colors[3] = c;
             }
         }
         "border-top" => {
@@ -3822,6 +4166,7 @@ fn apply_declaration(
                 style.border.top = w;
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[0] = color;
                 }
             }
         }
@@ -3832,6 +4177,7 @@ fn apply_declaration(
                 style.border.right = w;
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[1] = color;
                 }
             }
         }
@@ -3842,6 +4188,7 @@ fn apply_declaration(
                 style.border.bottom = w;
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[2] = color;
                 }
             }
         }
@@ -3852,6 +4199,7 @@ fn apply_declaration(
                 style.border.left = w;
                 if let Some(color) = c {
                     style.border_color = color;
+                    style.border_colors[3] = color;
                 }
             }
         }
@@ -4282,11 +4630,13 @@ fn apply_declaration(
         }
         "overflow" | "overflow-x" | "overflow-y" => {
             let first = split_css_tokens(value).first().copied().unwrap_or(value);
-            style.overflow = match first.to_ascii_lowercase().as_str() {
+            let lower_ov = first.to_ascii_lowercase();
+            style.overflow = match lower_ov.as_str() {
                 "hidden" | "scroll" | "auto" | "clip" => Overflow::Hidden,
                 "visible" => Overflow::Visible,
                 _ => return,
             };
+            style.scrollable_overflow = matches!(lower_ov.as_str(), "scroll" | "auto");
         }
         "flex" => {
             apply_flex_shorthand(style, value);
@@ -5046,6 +5396,163 @@ fn apply_border_shorthand(style: &mut ComputedStyle, value: &str) {
         style.border = Edge::all(width);
         if let Some(color) = color {
             style.border_color = color;
+            style.border_colors = [color; 4];
+        }
+    }
+}
+
+fn parse_font_family(value: &str) -> Option<FontFamily> {
+    for raw in value.split(',') {
+        let name = raw
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim()
+            .to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "monospace"
+                | "ui-monospace"
+                | "consolas"
+                | "courier"
+                | "courier new"
+                | "cascadia mono"
+                | "cascadia code"
+                | "fira code"
+                | "jetbrains mono"
+                | "menlo"
+                | "monaco"
+                | "source code pro"
+        ) || name.contains("mono")
+        {
+            return Some(FontFamily::Monospace);
+        }
+        if matches!(
+            name.as_str(),
+            "serif"
+                | "ui-serif"
+                | "georgia"
+                | "times"
+                | "times new roman"
+                | "cambria"
+                | "palatino"
+                | "garamond"
+        ) {
+            return Some(FontFamily::Serif);
+        }
+        if matches!(
+            name.as_str(),
+            "sans-serif"
+                | "system-ui"
+                | "ui-sans-serif"
+                | "-apple-system"
+                | "blinkmacsystemfont"
+                | "segoe ui"
+                | "arial"
+                | "helvetica"
+                | "inter"
+                | "roboto"
+                | "verdana"
+                | "tahoma"
+        ) {
+            return Some(FontFamily::SansSerif);
+        }
+    }
+    let first = value
+        .split(',')
+        .next()?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim();
+    if first.is_empty() {
+        return None;
+    }
+    let mut h = 0x811c_9dc5u32;
+    for b in first.to_ascii_lowercase().bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    Some(FontFamily::Custom((h as u16).max(1)))
+}
+
+fn apply_filter_declaration(style: &mut ComputedStyle, value: &str, root_font_px: f32) {
+    if value.eq_ignore_ascii_case("none") {
+        style.filter_blur = 0.0;
+        style.filter_brightness = 1.0;
+        style.filter_contrast = 1.0;
+        style.filter_grayscale = 0.0;
+        style.filter_invert = 0.0;
+        style.filter_sepia = 0.0;
+        return;
+    }
+    let parse_amount = |arg: &str| -> Option<f32> {
+        let trimmed = arg.trim();
+        if let Some(pct) = trimmed.strip_suffix('%') {
+            pct.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(|v| (v / 100.0).max(0.0))
+        } else {
+            trimmed
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(|v| v.max(0.0))
+        }
+    };
+    for tok in split_css_tokens(value) {
+        let lower = tok.to_ascii_lowercase();
+        if let Some(inner) = lower
+            .strip_prefix("blur(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(px) = parse_box_px(inner.trim(), style.font_size, root_font_px) {
+                style.filter_blur = px.clamp(0.0, 64.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("brightness(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(v) = parse_amount(inner) {
+                style.filter_brightness = v.clamp(0.0, 8.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("contrast(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(v) = parse_amount(inner) {
+                style.filter_contrast = v.clamp(0.0, 8.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("grayscale(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(v) = parse_amount(inner) {
+                style.filter_grayscale = v.clamp(0.0, 1.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("invert(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(v) = parse_amount(inner) {
+                style.filter_invert = v.clamp(0.0, 1.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("sepia(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if let Some(v) = parse_amount(inner) {
+                style.filter_sepia = v.clamp(0.0, 1.0);
+            }
+        } else if let Some(inner) = lower
+            .strip_prefix("opacity(")
+            .and_then(|s| s.strip_suffix(')'))
+            && let Some(v) = parse_amount(inner)
+        {
+            style.opacity = (style.opacity * v.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         }
     }
 }
@@ -5147,7 +5654,7 @@ fn parse_length(value: &str) -> Option<Size> {
         && let Some(open) = value.find('(')
     {
         let fn_name = value[..open].trim();
-        if anvil_css::values::is_math_function(fn_name) {
+        if prism::values::is_math_function(fn_name) {
             return parse_css_math_size(value);
         }
     }
@@ -5186,14 +5693,14 @@ fn parse_length(value: &str) -> Option<Size> {
 }
 
 fn parse_css_math_size(value: &str) -> Option<Size> {
-    use anvil_css::values::{CalcLeaf, CalcNode, CalcType, LengthUnit};
-    let opts = anvil_css::Options::default();
-    let cvs = anvil_css::parse_component_values(value, &opts).ok()?;
+    use prism::values::{CalcLeaf, CalcNode, CalcType, LengthUnit};
+    let opts = prism::Options::default();
+    let cvs = prism::parse_component_values(value, &opts).ok()?;
     let non_ws: Vec<_> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
     let [cv] = non_ws.as_slice() else {
         return None;
     };
-    let calc = anvil_css::values::parse_math(cv, &opts.limits).ok()?;
+    let calc = prism::values::parse_math(cv, &opts.limits).ok()?;
     let leaf_to_size = |leaf: CalcLeaf| -> Option<Size> {
         match leaf {
             CalcLeaf::Length(len) => {
@@ -5220,7 +5727,7 @@ fn parse_css_math_size(value: &str) -> Option<Size> {
                     | LengthUnit::Lvmax
                     | LengthUnit::Dvmax => Size::Vmax(v),
                     LengthUnit::Ch | LengthUnit::Rch => Size::Ch(v),
-                    _ => Size::Px(len.to_px(&anvil_css::ResolveContext::default()) as f32),
+                    _ => Size::Px(len.to_px(&prism::ResolveContext::default()) as f32),
                 })
             }
             CalcLeaf::Percentage(p) => {
@@ -5270,7 +5777,7 @@ fn parse_css_math_size(value: &str) -> Option<Size> {
         }
     }
     if matches!(calc.ty, CalcType::Length | CalcType::LengthPercentage) {
-        let resolved = calc.resolve(&anvil_css::ResolveContext::default()) as f32;
+        let resolved = calc.resolve(&prism::ResolveContext::default()) as f32;
         if resolved.is_finite() {
             return Some(Size::Px(resolved));
         }
@@ -5377,7 +5884,7 @@ fn parse_box_px(value: &str, em_px: f32, rem_px: f32) -> Option<f32> {
         } => px + (960.0 * percent / 100.0) + em * em_px + rem * rem_px,
         _ => return None,
     };
-    raw.is_finite().then(|| raw.clamp(-1.0e6, 1.0e6))
+    raw.is_finite().then_some(raw)
 }
 
 fn parse_box_edge(value: &str, em_px: f32, rem_px: f32) -> Option<Edge> {
@@ -5766,6 +6273,7 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
     let mut is_radial = false;
+    let mut is_conic = false;
     let inner = if let Some(s) = lower
         .strip_prefix("linear-gradient(")
         .or_else(|| lower.strip_prefix("repeating-linear-gradient("))
@@ -5778,6 +6286,13 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
         .and_then(|s| s.strip_suffix(')'))
     {
         is_radial = true;
+        s
+    } else if let Some(s) = lower
+        .strip_prefix("conic-gradient(")
+        .or_else(|| lower.strip_prefix("repeating-conic-gradient("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        is_conic = true;
         s
     } else {
         return None;
@@ -5818,6 +6333,21 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
                 || first.starts_with("farthest-")
                 || first.starts_with("at "))
         {
+            color_start_idx = 1;
+        }
+    } else if is_conic {
+        angle_deg = 0.0;
+        if parse_stop_color(first).is_none()
+            && (first.starts_with("from ") || first.starts_with("at "))
+        {
+            if let Some(after_from) = first.strip_prefix("from ") {
+                let deg_tok = after_from.split_whitespace().next().unwrap_or("");
+                if let Some(deg_str) = deg_tok.strip_suffix("deg")
+                    && let Ok(deg) = deg_str.trim().parse::<f32>()
+                {
+                    angle_deg = deg;
+                }
+            }
             color_start_idx = 1;
         }
     } else if let Some(deg_str) = first.strip_suffix("deg") {
@@ -7366,29 +7896,115 @@ mod tests {
 
     #[test]
     fn parses_builtin_ua_stylesheets_and_executes_cpp_css_engine_kernels() {
-        let sheets = anvil_css::builtin_user_agent_stylesheets();
+        let sheets = prism::builtin_user_agent_stylesheets();
         assert_eq!(sheets.len(), 4);
         for css_src in sheets {
-            let parsed = anvil_css::parse_stylesheet(css_src, &anvil_css::Options::default())
+            let parsed = prism::parse_stylesheet(css_src, &prism::Options::default())
                 .expect("built-in UA stylesheet should parse within limits");
             assert!(!parsed.rules.is_empty());
             let cascade_sheet = parse_css(css_src);
             assert!(!cascade_sheet.rules.is_empty());
         }
 
-        assert_eq!(anvil_css::classify_pseudo_element_fast(".badge::before"), 1);
-        assert_eq!(anvil_css::classify_pseudo_element_fast(".badge::after"), 2);
-        assert_eq!(anvil_css::classify_pseudo_element_fast(".badge:hover"), 0);
+        assert_eq!(prism::classify_pseudo_element_fast(".badge::before"), 1);
+        assert_eq!(prism::classify_pseudo_element_fast(".badge::after"), 2);
+        assert_eq!(prism::classify_pseudo_element_fast(".badge:hover"), 0);
         assert_eq!(
-            anvil_css::resolve_length_px_fast(2.0, 2, 14.0, 16.0, 1280.0, 720.0, 400.0),
+            prism::resolve_length_px_fast(2.0, 2, 14.0, 16.0, 1280.0, 720.0, 400.0),
             32.0
         );
-        assert_eq!(anvil_css::eval_clamp_fast(12.0, 40.0, 24.0), 24.0);
-        let center_px = anvil_css::sample_radial_gradient_fast(0.5, 0.5, 0xFF00_00FF, 0x0000_FFFF);
+        assert_eq!(prism::eval_clamp_fast(12.0, 40.0, 24.0), 24.0);
+        let center_px = prism::sample_radial_gradient_fast(0.5, 0.5, 0xFF00_00FF, 0x0000_FFFF);
         assert_eq!(center_px, 0xFF00_00FF);
         assert_eq!(
-            anvil_css::pack_specificity_fast(1, 2, 3),
+            prism::pack_specificity_fast(1, 2, 3),
             (1 << 20) | (2 << 10) | 3
         );
+    }
+
+    #[test]
+    fn parses_font_face_typography_overflow_scroll_object_fit_outline_and_filters() {
+        let doc = parse_html(
+            "<div id=\"card\">
+               <code id=\"code_el\">const x = 1;</code>
+               <del id=\"del_el\">obsolete</del>
+               <img id=\"hero_img\" src=\"hero.png\" />
+             </div>",
+        );
+        let sheet = parse_css(
+            "@font-face {
+               font-family: \"InterVariable\";
+               src: url(\"fonts/inter.woff2\") format(\"woff2\");
+               font-weight: 700;
+               font-style: italic;
+             }
+             #card {
+               font-family: Georgia, serif;
+               text-transform: uppercase;
+               letter-spacing: 2px;
+               word-spacing: 4px;
+               overflow: auto;
+               border: 2px solid #112233;
+               border-top-color: #ff0000;
+               border-bottom-color: #00ff00;
+               outline: 3px solid #336699;
+               outline-offset: 4px;
+               background-image: conic-gradient(from 45deg, #102030, #405060);
+               backdrop-filter: blur(8px);
+               filter: blur(2px) brightness(120%) contrast(1.5) grayscale(50%);
+             }
+             #hero_img {
+               object-fit: cover;
+             }",
+        );
+        assert_eq!(sheet.font_faces.len(), 1);
+        assert_eq!(sheet.font_faces[0].family, "InterVariable");
+        assert_eq!(sheet.font_faces[0].src_url, "fonts/inter.woff2");
+        assert_eq!(sheet.font_faces[0].weight, 700);
+        assert!(sheet.font_faces[0].italic);
+
+        let styles = compute_styles(&doc, &sheet);
+        let card = styles.get(doc.get_element_by_id("card").unwrap());
+        let code_el = styles.get(doc.get_element_by_id("code_el").unwrap());
+        let del_el = styles.get(doc.get_element_by_id("del_el").unwrap());
+        let hero_img = styles.get(doc.get_element_by_id("hero_img").unwrap());
+
+        assert_eq!(card.font_family, FontFamily::Serif);
+        assert_eq!(card.text_transform, TextTransform::Uppercase);
+        assert_eq!(card.letter_spacing, 2.0);
+        assert_eq!(card.word_spacing, 4.0);
+        assert_eq!(card.overflow, Overflow::Hidden);
+        assert!(card.scrollable_overflow);
+        assert_eq!(
+            card.border_colors[0],
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
+        assert_eq!(
+            card.border_colors[2],
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            }
+        );
+        assert_eq!(card.outline_width, 3.0);
+        assert_eq!(card.outline_offset, 4.0);
+        assert!(card.background_gradient.is_some());
+        assert_eq!(card.backdrop_blur, 8.0);
+        assert_eq!(card.filter_blur, 2.0);
+        assert!((card.filter_brightness - 1.2).abs() < 1e-4);
+        assert!((card.filter_contrast - 1.5).abs() < 1e-4);
+        assert!((card.filter_grayscale - 0.5).abs() < 1e-4);
+
+        assert_eq!(code_el.font_family, FontFamily::Monospace);
+        assert_eq!(code_el.text_transform, TextTransform::Uppercase);
+        assert!(del_el.line_through);
+        assert_eq!(hero_img.object_fit, ObjectFit::Cover);
     }
 }

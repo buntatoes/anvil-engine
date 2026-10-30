@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
 //! Live DOM, `Storage`, `Location`, `Event`, and `console` host implementation
-//! ([`AnvilJsDomHost`]) for the `anvil-js` bytecode virtual machine ([`anvil_js::vm::Vm`]).
+//! ([`CinderDomHost`]) for the `cinder` bytecode virtual machine ([`cinder::vm::Vm`]).
 
 use std::any::Any;
 use std::collections::VecDeque;
 
-use crate::anvil_js;
+use crate::cinder;
 use anvil_dom::{Document, NodeData, NodeId, parse_html};
-use anvil_js::gc::roots::Persistent;
-use anvil_js::value::object::{HostData, ObjectClass};
-use anvil_js::value::{ObjectRef, Value as JsValue};
-use anvil_js::vm::{Host, Job, NativeCx, NativeFn, RunError, Vm};
+use cinder::gc::roots::Persistent;
+use cinder::value::object::{HostData, ObjectClass};
+use cinder::value::{ObjectRef, Value as JsValue};
+use cinder::vm::{Host, Job, NativeCx, NativeFn, RunError, Vm};
 
 use crate::{
     camel_to_kebab, kebab_to_camel, read_inline_style, remove_inline_style_prop,
@@ -25,9 +25,9 @@ const TAG_STYLE: u64 = 0x3000_0000_0000_0000;
 const TAG_DATASET: u64 = 0x4000_0000_0000_0000;
 
 /// Live DOM, `localStorage`, `sessionStorage`, `location`, event listener, and
-/// microtask host for [`anvil_js::vm::Vm`].
+/// microtask host for [`cinder::vm::Vm`].
 #[derive(Debug)]
-pub struct AnvilJsDomHost {
+pub struct CinderDomHost {
     /// Live HTML document mutated directly by JavaScript DOM operations.
     pub doc: Document,
     /// FIFO microtask queue for `Promise` reactions and `queueMicrotask`.
@@ -70,16 +70,20 @@ pub struct AnvilJsDomHost {
     pub mutation_observers: Vec<(Persistent, NodeId)>,
     /// Registered mock responses for `fetch(url)`: `(url, status, body)`.
     pub fetch_mocks: Vec<(String, u16, String)>,
+    /// Active layout viewport width in CSS pixels (`window.innerWidth`).
+    pub viewport_width: f32,
+    /// Active layout viewport height in CSS pixels (`window.innerHeight`).
+    pub viewport_height: f32,
 }
 
-impl Default for AnvilJsDomHost {
+impl Default for CinderDomHost {
     fn default() -> Self {
         Self::new(Document::new(), "https://localhost/")
     }
 }
 
-impl AnvilJsDomHost {
-    /// Create a new [`AnvilJsDomHost`] owning `doc` and `location_href`.
+impl CinderDomHost {
+    /// Create a new [`CinderDomHost`] owning `doc` and `location_href`.
     pub fn new(doc: Document, location_href: &str) -> Self {
         Self {
             doc,
@@ -107,7 +111,42 @@ impl AnvilJsDomHost {
             canvas_paths: std::collections::HashMap::new(),
             mutation_observers: Vec::new(),
             fetch_mocks: Vec::new(),
+            viewport_width: 1280.0,
+            viewport_height: 800.0,
         }
+    }
+
+    /// Collect document `<style>` rules and `adoptedStyleSheets` and cascade styles.
+    pub fn compute_styles(&self) -> anvil_style::StyleMap {
+        let mut css_src = String::new();
+        for sid in self.doc.query_selector_all("style") {
+            let txt = self.doc.text_content(sid);
+            if !txt.trim().is_empty() {
+                css_src.push_str(&txt);
+                css_src.push('\n');
+            }
+        }
+        for sheet_css in self.doc.adopted_style_sheets() {
+            if !sheet_css.trim().is_empty() {
+                css_src.push_str(sheet_css);
+                css_src.push('\n');
+            }
+        }
+        let sheet = anvil_style::parse_css(&css_src);
+        anvil_style::compute_styles_for_viewport(
+            &self.doc,
+            &sheet,
+            self.viewport_width,
+            self.viewport_height,
+        )
+    }
+
+    /// Resolve styles and compute layout for `self.doc`, returning the [`anvil_layout::LayoutBox`]
+    /// for `nid` if it participates in layout.
+    pub fn compute_node_box(&self, nid: NodeId) -> Option<anvil_layout::LayoutBox> {
+        let styles = self.compute_styles();
+        let layout = anvil_layout::layout_document(&self.doc, &styles, self.viewport_width);
+        layout.find_node_box(nid).cloned()
     }
 
     /// Install all Web/DOM globals (`window`, `document`, `Element.prototype`,
@@ -155,6 +194,14 @@ impl AnvilJsDomHost {
             ("focus", el_focus),
             ("blur", el_blur),
             ("scrollIntoView", el_noop),
+            ("scrollTo", el_scroll_to),
+            ("scrollBy", el_scroll_by),
+            ("show", el_dialog_show),
+            ("showModal", el_dialog_show_modal),
+            ("close", el_dialog_close),
+            ("checkValidity", el_check_validity),
+            ("reportValidity", el_report_validity),
+            ("setCustomValidity", el_set_custom_validity),
         ] {
             vm.define_method(el_proto, name, func)?;
         }
@@ -223,6 +270,31 @@ impl AnvilJsDomHost {
             ("classList", Some(el_get_class_list), None),
             ("style", Some(el_get_style), None),
             ("dataset", Some(el_get_dataset), None),
+            ("offsetWidth", Some(el_get_offset_width), None),
+            ("offsetHeight", Some(el_get_offset_height), None),
+            ("clientWidth", Some(el_get_client_width), None),
+            ("clientHeight", Some(el_get_client_height), None),
+            ("scrollWidth", Some(el_get_scroll_width), None),
+            ("scrollHeight", Some(el_get_scroll_height), None),
+            (
+                "scrollTop",
+                Some(el_get_scroll_top),
+                Some(el_set_scroll_top),
+            ),
+            (
+                "scrollLeft",
+                Some(el_get_scroll_left),
+                Some(el_set_scroll_left),
+            ),
+            ("open", Some(el_get_dialog_open), Some(el_set_dialog_open)),
+            (
+                "returnValue",
+                Some(el_get_dialog_return_value),
+                Some(el_set_dialog_return_value),
+            ),
+            ("validity", Some(el_get_validity), None),
+            ("validationMessage", Some(el_get_validation_message), None),
+            ("willValidate", Some(el_get_will_validate), None),
         ] {
             vm.define_accessor(el_proto, prop, getter, setter)?;
         }
@@ -478,9 +550,9 @@ impl AnvilJsDomHost {
     }
 
     fn install_web_api_classes(&mut self, vm: &mut Vm) -> Result<(), RunError> {
-        let bootstrap = anvil_js::DOM_WEB_BOOTSTRAP_JS;
+        let bootstrap = cinder::DOM_WEB_BOOTSTRAP_JS;
         let limits = vm.limits().clone();
-        let code = anvil_js::compile_script(bootstrap, &limits)
+        let code = cinder::compile_script(bootstrap, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
         let id = vm.load(code)?;
         vm.run(self, id)?;
@@ -548,14 +620,14 @@ impl AnvilJsDomHost {
             "(function(prop) {{ return function(val) {{ this.setProperty(prop, val); }}; }})({:?})",
             css_name
         );
-        let mut dummy_host = anvil_js::vm::BasicHost::default();
+        let mut dummy_host = cinder::vm::BasicHost::default();
         let limits = vm.limits().clone();
-        let get_code = anvil_js::compile_script(&getter_src, &limits)
+        let get_code = cinder::compile_script(&getter_src, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
         let get_id = vm.load(get_code)?;
         let get_fn = vm.run(&mut dummy_host, get_id)?;
 
-        let set_code = anvil_js::compile_script(&setter_src, &limits)
+        let set_code = cinder::compile_script(&setter_src, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
         let set_id = vm.load(set_code)?;
         let set_fn = vm.run(&mut dummy_host, set_id)?;
@@ -568,12 +640,12 @@ impl AnvilJsDomHost {
             .define_own(
                 st_proto,
                 key,
-                anvil_js::value::object::Property {
-                    attrs: anvil_js::value::shape::Attrs(
-                        anvil_js::value::shape::Attrs::ENUMERABLE
-                            | anvil_js::value::shape::Attrs::CONFIGURABLE,
+                cinder::value::object::Property {
+                    attrs: cinder::value::shape::Attrs(
+                        cinder::value::shape::Attrs::ENUMERABLE
+                            | cinder::value::shape::Attrs::CONFIGURABLE,
                     ),
-                    slot: anvil_js::value::object::Slot::Accessor {
+                    slot: cinder::value::object::Slot::Accessor {
                         get: get_fn,
                         set: set_fn,
                     },
@@ -597,14 +669,14 @@ impl AnvilJsDomHost {
             "(function(k) {{ return function(v) {{ this.set(k, v); }}; }})({:?})",
             key_name
         );
-        let mut dummy_host = anvil_js::vm::BasicHost::default();
+        let mut dummy_host = cinder::vm::BasicHost::default();
         let limits = vm.limits().clone();
-        let get_code = anvil_js::compile_script(&getter_src, &limits)
+        let get_code = cinder::compile_script(&getter_src, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
         let get_id = vm.load(get_code)?;
         let get_fn = vm.run(&mut dummy_host, get_id)?;
 
-        let set_code = anvil_js::compile_script(&setter_src, &limits)
+        let set_code = cinder::compile_script(&setter_src, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
         let set_id = vm.load(set_code)?;
         let set_fn = vm.run(&mut dummy_host, set_id)?;
@@ -617,12 +689,12 @@ impl AnvilJsDomHost {
             .define_own(
                 ds_proto,
                 key,
-                anvil_js::value::object::Property {
-                    attrs: anvil_js::value::shape::Attrs(
-                        anvil_js::value::shape::Attrs::ENUMERABLE
-                            | anvil_js::value::shape::Attrs::CONFIGURABLE,
+                cinder::value::object::Property {
+                    attrs: cinder::value::shape::Attrs(
+                        cinder::value::shape::Attrs::ENUMERABLE
+                            | cinder::value::shape::Attrs::CONFIGURABLE,
                     ),
-                    slot: anvil_js::value::object::Slot::Accessor {
+                    slot: cinder::value::object::Slot::Accessor {
                         get: get_fn,
                         set: set_fn,
                     },
@@ -772,7 +844,7 @@ impl AnvilJsDomHost {
     }
 }
 
-impl Host for AnvilJsDomHost {
+impl Host for CinderDomHost {
     fn enqueue_job(&mut self, job: Job) {
         self.jobs.push_back(job);
     }
@@ -823,7 +895,7 @@ fn wrap_node(cx: &mut NativeCx<'_>, nid: NodeId) -> Result<JsValue, RunError> {
     if let Some(existing) = cx.heap().wrapper(data) {
         return Ok(JsValue::object(existing));
     }
-    let proto = cx.host_as::<AnvilJsDomHost>().and_then(|h| h.element_proto);
+    let proto = cx.host_as::<CinderDomHost>().and_then(|h| h.element_proto);
     let obj = cx.vm().new_host_object(proto, data)?;
     cx.heap().set_wrapper(data, obj);
     Ok(JsValue::object(obj))
@@ -848,10 +920,10 @@ fn wrap_node_list(cx: &mut NativeCx<'_>, ids: Vec<NodeId>) -> Result<JsValue, Ru
 
 fn unwrap_node(cx: &mut NativeCx<'_>, val: JsValue) -> Option<NodeId> {
     let obj = val.as_object()?;
-    if let Some(doc_obj) = cx.host_as::<AnvilJsDomHost>().and_then(|h| h.document_obj)
+    if let Some(doc_obj) = cx.host_as::<CinderDomHost>().and_then(|h| h.document_obj)
         && obj == doc_obj
     {
-        return cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.root());
+        return cx.host_as::<CinderDomHost>().map(|h| h.doc.root());
     }
     let class = cx.heap().object(obj).ok()?.class.clone();
     match class {
@@ -882,7 +954,7 @@ fn ev_get_default_prevented(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let prevented = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.event_default_prevented);
     Ok(JsValue::boolean(prevented))
 }
@@ -892,7 +964,7 @@ fn ev_prevent_default(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.event_default_prevented = true;
     }
     Ok(JsValue::UNDEFINED)
@@ -903,7 +975,7 @@ fn ev_stop_propagation(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.event_propagation_stopped = true;
     }
     Ok(JsValue::UNDEFINED)
@@ -918,7 +990,7 @@ fn doc_get_element_by_id(
 ) -> Result<JsValue, RunError> {
     let id_str = arg_str(cx, args, 0)?;
     let found = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get_element_by_id(&id_str));
     wrap_optional_node(cx, found)
 }
@@ -930,7 +1002,7 @@ fn doc_query_selector(
 ) -> Result<JsValue, RunError> {
     let sel = arg_str(cx, args, 0)?;
     let found = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.query_selector(&sel));
     wrap_optional_node(cx, found)
 }
@@ -942,7 +1014,7 @@ fn doc_query_selector_all(
 ) -> Result<JsValue, RunError> {
     let sel = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.query_selector_all(&sel))
         .unwrap_or_default();
     wrap_node_list(cx, ids)
@@ -959,7 +1031,7 @@ fn doc_create_element(
     } else {
         tag.trim()
     };
-    let Some(h) = cx.host_as::<AnvilJsDomHost>() else {
+    let Some(h) = cx.host_as::<CinderDomHost>() else {
         return Ok(JsValue::NULL);
     };
     let nid = h.doc.create_element(tag, Vec::new());
@@ -972,7 +1044,7 @@ fn doc_create_text_node(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let text = arg_str(cx, args, 0)?;
-    let Some(h) = cx.host_as::<AnvilJsDomHost>() else {
+    let Some(h) = cx.host_as::<CinderDomHost>() else {
         return Ok(JsValue::NULL);
     };
     let nid = h.doc.create_text(&text);
@@ -984,7 +1056,7 @@ fn doc_create_document_fragment(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    let Some(h) = cx.host_as::<AnvilJsDomHost>() else {
+    let Some(h) = cx.host_as::<CinderDomHost>() else {
         return Ok(JsValue::NULL);
     };
     let nid = h.doc.create_element("anvil-fragment", Vec::new());
@@ -998,7 +1070,7 @@ fn doc_get_elements_by_tag_name(
 ) -> Result<JsValue, RunError> {
     let tag = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.get_elements_by_tag_name(h.doc.root(), &tag))
         .unwrap_or_default();
     wrap_node_list(cx, ids)
@@ -1011,7 +1083,7 @@ fn doc_get_elements_by_class_name(
 ) -> Result<JsValue, RunError> {
     let cls = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.get_elements_by_class_name(h.doc.root(), &cls))
         .unwrap_or_default();
     wrap_node_list(cx, ids)
@@ -1024,7 +1096,7 @@ fn doc_get_elements_by_name(
 ) -> Result<JsValue, RunError> {
     let name = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.get_elements_by_name(&name))
         .unwrap_or_default();
     wrap_node_list(cx, ids)
@@ -1050,7 +1122,7 @@ fn doc_add_event_listener(
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         let root = h.doc.root();
         h.listeners.push((root, ev_type, pers));
     }
@@ -1066,7 +1138,7 @@ fn doc_remove_event_listener(
     let Some(cb) = args.get(1).copied().filter(|v| v.is_object()) else {
         return Ok(JsValue::UNDEFINED);
     };
-    let root = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.root());
+    let root = cx.host_as::<CinderDomHost>().map(|h| h.doc.root());
     if let Some(root_id) = root {
         remove_listener_for_node(cx, root_id, &ev_type, cb);
     }
@@ -1078,7 +1150,7 @@ fn doc_dispatch_event(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    let root = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.root());
+    let root = cx.host_as::<CinderDomHost>().map(|h| h.doc.root());
     let Some(root_id) = root else {
         return Ok(JsValue::TRUE);
     };
@@ -1093,7 +1165,7 @@ fn doc_adopt_node(
     let Some(nid) = args.first().copied().and_then(|v| unwrap_node(cx, v)) else {
         return Ok(JsValue::NULL);
     };
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.remove_node(nid);
     }
     wrap_node(cx, nid)
@@ -1112,7 +1184,7 @@ fn doc_import_node(
         .copied()
         .is_none_or(|v| v.is_undefined() || v.as_bool() == Some(true));
     let cloned = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.clone_node(nid, deep));
     wrap_optional_node(cx, cloned)
 }
@@ -1124,7 +1196,7 @@ fn doc_parse_html_fragment(
 ) -> Result<JsValue, RunError> {
     let markup = arg_str(cx, args, 0)?;
     let parsed = parse_html(&markup);
-    let Some(h) = cx.host_as::<AnvilJsDomHost>() else {
+    let Some(h) = cx.host_as::<CinderDomHost>() else {
         return Ok(JsValue::NULL);
     };
     let doc_root = h.doc.create_element("document", Vec::new());
@@ -1159,7 +1231,7 @@ fn doc_add_adopted_sheet(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let css = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.add_adopted_style_sheet(css);
     }
     Ok(JsValue::UNDEFINED)
@@ -1171,7 +1243,7 @@ fn doc_set_adopted_sheets(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let joined = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         if joined.trim().is_empty() {
             h.doc.set_adopted_style_sheets(Vec::new());
         } else {
@@ -1187,7 +1259,7 @@ fn doc_get_active_element(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let active = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.focused_node().or_else(|| Some(h.doc.body())));
     wrap_optional_node(cx, active)
 }
@@ -1198,7 +1270,7 @@ fn doc_get_title(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let title = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.title())
         .unwrap_or_default();
     cx.vm().string(&title)
@@ -1210,7 +1282,7 @@ fn doc_set_title(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let title = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_title(&title);
     }
     Ok(JsValue::UNDEFINED)
@@ -1221,7 +1293,7 @@ fn doc_get_body(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    let body = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.body());
+    let body = cx.host_as::<CinderDomHost>().map(|h| h.doc.body());
     wrap_optional_node(cx, body)
 }
 
@@ -1230,7 +1302,7 @@ fn doc_get_head(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    let head = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.head());
+    let head = cx.host_as::<CinderDomHost>().map(|h| h.doc.head());
     wrap_optional_node(cx, head)
 }
 
@@ -1239,7 +1311,7 @@ fn doc_get_document_element(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    let html = cx.host_as::<AnvilJsDomHost>().map(|h| h.doc.html());
+    let html = cx.host_as::<CinderDomHost>().map(|h| h.doc.html());
     wrap_optional_node(cx, html)
 }
 
@@ -1257,7 +1329,7 @@ fn doc_get_url(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let url = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.location_href.clone())
         .unwrap_or_default();
     cx.vm().string(&url)
@@ -1275,7 +1347,7 @@ fn el_get_attribute(
     };
     let name = arg_str(cx, args, 0)?;
     let val = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).data().attr(&name).map(str::to_string));
     match val {
         Some(s) => cx.vm().string(&s),
@@ -1293,7 +1365,7 @@ fn el_set_attribute(
     };
     let name = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_attribute(nid, &name, &val);
     }
     notify_mutation(cx, nid, "attributes", Some(&name))?;
@@ -1309,7 +1381,7 @@ fn el_remove_attribute(
         return Ok(JsValue::UNDEFINED);
     };
     let name = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.remove_attribute(nid, &name);
     }
     notify_mutation(cx, nid, "attributes", Some(&name))?;
@@ -1326,7 +1398,7 @@ fn el_has_attribute(
     };
     let name = arg_str(cx, args, 0)?;
     let has = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.doc.get(nid).data().attr(&name).is_some());
     Ok(JsValue::boolean(has))
 }
@@ -1343,7 +1415,7 @@ fn el_append_child(
     let Some(child_id) = unwrap_node(cx, child_val) else {
         return Ok(child_val);
     };
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         if h.doc.get(child_id).data().tag() == Some("anvil-fragment") {
             let kids: Vec<NodeId> = h.doc.children(child_id).to_vec();
             for k in kids {
@@ -1367,7 +1439,7 @@ fn el_remove_child(
     };
     let child_val = args.first().copied().unwrap_or(JsValue::NULL);
     if let Some(child_id) = unwrap_node(cx, child_val)
-        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(h) = cx.host_as::<CinderDomHost>()
     {
         let _ = h.doc.remove_child(parent_id, child_id);
     }
@@ -1388,7 +1460,7 @@ fn el_insert_before(
         return Ok(new_val);
     };
     let ref_id = args.get(1).copied().and_then(|v| unwrap_node(cx, v));
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         let _ = h.doc.insert_before(parent_id, new_id, ref_id);
     }
     notify_mutation(cx, parent_id, "childList", None)?;
@@ -1406,7 +1478,7 @@ fn el_replace_child(
     let new_val = args.first().copied().unwrap_or(JsValue::NULL);
     let old_val = args.get(1).copied().unwrap_or(JsValue::NULL);
     if let (Some(new_id), Some(old_id)) = (unwrap_node(cx, new_val), unwrap_node(cx, old_val))
-        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(h) = cx.host_as::<CinderDomHost>()
     {
         let _ = h.doc.replace_child(parent_id, new_id, old_id);
     }
@@ -1427,7 +1499,7 @@ fn el_clone_node(
         .copied()
         .is_some_and(|v| v.as_bool() == Some(true));
     let cloned = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.clone_node(nid, deep));
     wrap_optional_node(cx, cloned)
 }
@@ -1437,9 +1509,9 @@ fn el_remove(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<
         return Ok(JsValue::UNDEFINED);
     };
     let parent = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).parent());
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.remove_node(nid);
     }
     if let Some(p) = parent {
@@ -1457,7 +1529,7 @@ fn el_query_selector(
         return Ok(JsValue::NULL);
     };
     let sel = arg_str(cx, args, 0)?;
-    let found = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+    let found = cx.host_as::<CinderDomHost>().and_then(|h| {
         if nid == h.doc.root() {
             h.doc.query_selector(&sel)
         } else {
@@ -1477,7 +1549,7 @@ fn el_query_selector_all(
     };
     let sel = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| {
             if nid == h.doc.root() {
                 h.doc.query_selector_all(&sel)
@@ -1496,7 +1568,7 @@ fn el_get_element_by_id(
 ) -> Result<JsValue, RunError> {
     let id_str = arg_str(cx, args, 0)?;
     let nid = unwrap_node(cx, this);
-    let found = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+    let found = cx.host_as::<CinderDomHost>().and_then(|h| {
         if let Some(sub_root) = nid
             && sub_root != h.doc.root()
         {
@@ -1520,7 +1592,7 @@ fn el_get_elements_by_tag_name(
     };
     let tag = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.get_elements_by_tag_name(nid, &tag))
         .unwrap_or_default();
     wrap_node_list(cx, ids)
@@ -1536,7 +1608,7 @@ fn el_get_elements_by_class_name(
     };
     let cls = arg_str(cx, args, 0)?;
     let ids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.get_elements_by_class_name(nid, &cls))
         .unwrap_or_default();
     wrap_node_list(cx, ids)
@@ -1552,7 +1624,7 @@ fn el_insert_adjacent_html(
     };
     let pos = arg_str(cx, args, 0)?;
     let html = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.insert_adjacent_html(nid, &pos, &html);
     }
     Ok(JsValue::UNDEFINED)
@@ -1568,7 +1640,7 @@ fn el_insert_adjacent_text(
     };
     let pos = arg_str(cx, args, 0)?;
     let text = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.insert_adjacent_text(nid, &pos, &text);
     }
     Ok(JsValue::UNDEFINED)
@@ -1587,7 +1659,7 @@ fn el_insert_adjacent_element(
         return Ok(JsValue::NULL);
     };
     let inserted = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.insert_adjacent_element(nid, &pos, new_el));
     wrap_optional_node(cx, inserted)
 }
@@ -1598,7 +1670,7 @@ fn el_matches(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<
     };
     let sel = arg_str(cx, args, 0)?;
     let matched = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.doc.matches_selector(nid, &sel));
     Ok(JsValue::boolean(matched))
 }
@@ -1609,7 +1681,7 @@ fn el_closest(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<
     };
     let sel = arg_str(cx, args, 0)?;
     let found = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.closest(nid, &sel));
     wrap_optional_node(cx, found)
 }
@@ -1626,7 +1698,7 @@ fn el_contains(
         return Ok(JsValue::FALSE);
     };
     let contains = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.doc.contains_node(nid, other_id));
     Ok(JsValue::boolean(contains))
 }
@@ -1640,7 +1712,7 @@ fn el_attach_shadow(
         return Ok(JsValue::NULL);
     };
     let sr = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.attach_shadow(nid, true));
     wrap_optional_node(cx, sr)
 }
@@ -1661,7 +1733,7 @@ fn el_add_event_listener(
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.listeners.push((nid, ev_type, pers));
     }
     Ok(JsValue::UNDEFINED)
@@ -1684,7 +1756,7 @@ fn el_remove_event_listener(
 }
 
 fn remove_listener_for_node(cx: &mut NativeCx<'_>, nid: NodeId, ev_type: &str, cb: JsValue) {
-    let Some(listeners) = cx.host_as::<AnvilJsDomHost>().map(|h| h.listeners.clone()) else {
+    let Some(listeners) = cx.host_as::<CinderDomHost>().map(|h| h.listeners.clone()) else {
         return;
     };
     let mut kept = Vec::with_capacity(listeners.len());
@@ -1699,7 +1771,7 @@ fn remove_listener_for_node(cx: &mut NativeCx<'_>, nid: NodeId, ev_type: &str, c
             kept.push((lnid, lev, lpers));
         }
     }
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.listeners = kept;
     }
 }
@@ -1755,7 +1827,7 @@ fn dispatch_js_event_on_node(
     cx.vm().define_data(ev_obj, "target", target_val)?;
 
     let mut chain = vec![target];
-    if bubbles && let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if bubbles && let Some(h) = cx.host_as::<CinderDomHost>() {
         let mut cur = h.doc.get(target).parent();
         while let Some(p) = cur {
             chain.push(p);
@@ -1773,7 +1845,7 @@ fn dispatch_js_event_on_node(
             break;
         }
         let matching: Vec<Persistent> = cx
-            .host_as::<AnvilJsDomHost>()
+            .host_as::<CinderDomHost>()
             .map(|h| {
                 h.listeners
                     .iter()
@@ -1811,7 +1883,7 @@ fn dispatch_js_event_on_node(
 
 fn el_focus(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
     if let Some(nid) = unwrap_node(cx, this)
-        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(h) = cx.host_as::<CinderDomHost>()
     {
         h.doc.set_focused_node(Some(nid));
     }
@@ -1820,7 +1892,7 @@ fn el_focus(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<J
 
 fn el_blur(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<JsValue, RunError> {
     if let Some(nid) = unwrap_node(cx, this)
-        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(h) = cx.host_as::<CinderDomHost>()
         && h.doc.focused_node() == Some(nid)
     {
         h.doc.set_focused_node(None);
@@ -1830,19 +1902,71 @@ fn el_blur(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<Js
 
 fn el_get_bounding_client_rect(
     cx: &mut NativeCx<'_>,
-    _this: JsValue,
+    this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
+    let (x, y, w, h) = if let Some(nid) = unwrap_node(cx, this)
+        && let Some(host) = cx.host_as::<CinderDomHost>()
+    {
+        if let Some(b) = host.compute_node_box(nid) {
+            (
+                b.rect.x as f64,
+                b.rect.y as f64,
+                b.rect.width as f64,
+                b.rect.height as f64,
+            )
+        } else {
+            let styles = host.compute_styles();
+            let cs = styles.get(nid);
+            let inline = host
+                .doc
+                .get(nid)
+                .data()
+                .attr("style")
+                .map(str::to_string)
+                .unwrap_or_default();
+            let parse_px = |prop: &str| -> Option<f64> {
+                let s = read_inline_style(&host.doc, nid, prop);
+                if s.is_empty() {
+                    None
+                } else {
+                    s.trim().trim_end_matches("px").trim().parse::<f64>().ok()
+                }
+            };
+            let size_px = |sz: anvil_style::Size| -> Option<f64> {
+                match sz {
+                    anvil_style::Size::Px(v) => Some(v as f64),
+                    _ => None,
+                }
+            };
+            if cs.display == anvil_style::Display::None && inline.is_empty() {
+                (0.0, 0.0, 0.0, 0.0)
+            } else {
+                (
+                    parse_px("left").or_else(|| size_px(cs.left)).unwrap_or(0.0),
+                    parse_px("top").or_else(|| size_px(cs.top)).unwrap_or(0.0),
+                    parse_px("width")
+                        .or_else(|| size_px(cs.width))
+                        .unwrap_or(100.0),
+                    parse_px("height")
+                        .or_else(|| size_px(cs.height))
+                        .unwrap_or(24.0),
+                )
+            }
+        }
+    } else {
+        (0.0, 0.0, 100.0, 24.0)
+    };
     let rect = cx.vm().new_plain_object()?;
     for (k, v) in [
-        ("x", 0.0),
-        ("y", 0.0),
-        ("top", 0.0),
-        ("left", 0.0),
-        ("width", 100.0),
-        ("height", 24.0),
-        ("right", 100.0),
-        ("bottom", 24.0),
+        ("x", x),
+        ("y", y),
+        ("top", y),
+        ("left", x),
+        ("width", w),
+        ("height", h),
+        ("right", x + w),
+        ("bottom", y + h),
     ] {
         cx.vm().define_data(rect, k, JsValue::number(v))?;
     }
@@ -1940,7 +2064,7 @@ fn canvas_fill_rect(
         .unwrap_or(0.0)
         .max(0.0) as u32;
     let rgba = canvas_style_color(cx, this, "fillStyle");
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         host.doc.canvas_fill_rect(nid, x, y, w, h, rgba);
     }
     Ok(JsValue::UNDEFINED)
@@ -1967,7 +2091,7 @@ fn canvas_stroke_rect(
         .unwrap_or(0.0)
         .max(0.0) as u32;
     let rgba = canvas_style_color(cx, this, "strokeStyle");
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         host.doc.canvas_stroke_rect(nid, x, y, w, h, 1, rgba);
     }
     Ok(JsValue::UNDEFINED)
@@ -1993,7 +2117,7 @@ fn canvas_clear_rect(
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
         .max(0.0) as u32;
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         host.doc.canvas_clear_rect(nid, x, y, w, h);
     }
     Ok(JsValue::UNDEFINED)
@@ -2011,7 +2135,7 @@ fn canvas_fill_text(
     let x = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let y = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let rgba = canvas_style_color(cx, this, "fillStyle");
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         host.doc.canvas_draw_text_bitmap(nid, &text, x, y, rgba);
     }
     Ok(JsValue::UNDEFINED)
@@ -2023,7 +2147,7 @@ fn canvas_begin_path(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     if let Some(nid) = unwrap_node(cx, this)
-        && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(h) = cx.host_as::<CinderDomHost>()
     {
         h.canvas_paths.insert(nid, Vec::new());
     }
@@ -2040,7 +2164,7 @@ fn canvas_move_to(
     };
     let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.canvas_paths.entry(nid).or_default().push((x, y));
     }
     Ok(JsValue::UNDEFINED)
@@ -2066,7 +2190,7 @@ fn canvas_rect(
     let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let w = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
     let h = args.get(3).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         let pts = host.canvas_paths.entry(nid).or_default();
         pts.push((x, y));
         pts.push((x + w, y));
@@ -2093,7 +2217,7 @@ fn canvas_arc(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<
         .get(4)
         .and_then(|v| v.as_number())
         .unwrap_or(std::f64::consts::TAU);
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         let pts = host.canvas_paths.entry(nid).or_default();
         let steps = 16usize;
         for i in 0..=steps {
@@ -2112,7 +2236,7 @@ fn canvas_close_path(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     if let Some(nid) = unwrap_node(cx, this)
-        && let Some(host) = cx.host_as::<AnvilJsDomHost>()
+        && let Some(host) = cx.host_as::<CinderDomHost>()
         && let Some(pts) = host.canvas_paths.get_mut(&nid)
         && let Some(&first) = pts.first()
     {
@@ -2140,7 +2264,7 @@ fn canvas_stroke(
     } else {
         1
     };
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>()
+    if let Some(host) = cx.host_as::<CinderDomHost>()
         && let Some(pts) = host.canvas_paths.get(&nid).cloned()
     {
         for win in pts.windows(2) {
@@ -2160,7 +2284,7 @@ fn canvas_fill(
         return Ok(JsValue::UNDEFINED);
     };
     let rgba = canvas_style_color(cx, this, "fillStyle");
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>()
+    if let Some(host) = cx.host_as::<CinderDomHost>()
         && let Some(pts) = host.canvas_paths.get(&nid).cloned()
         && !pts.is_empty()
     {
@@ -2241,7 +2365,7 @@ fn canvas_get_image_data(
         .unwrap_or(1.0)
         .clamp(1.0, 256.0) as u32;
     let mut bytes = Vec::with_capacity((sw as usize) * (sh as usize) * 4);
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         let surf = host.doc.ensure_canvas_surface(nid);
         for ry in 0..(sh as i32) {
             for rx in 0..(sw as i32) {
@@ -2339,7 +2463,7 @@ fn canvas_put_image_data(
             }
         }
         if !rgba.is_empty()
-            && let Some(host) = cx.host_as::<AnvilJsDomHost>()
+            && let Some(host) = cx.host_as::<CinderDomHost>()
         {
             host.doc.canvas_put_image_data(nid, dx, dy, sw, sh, &rgba);
         }
@@ -2368,7 +2492,7 @@ fn window_set_timeout(
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
-    let id = if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    let id = if let Some(h) = cx.host_as::<CinderDomHost>() {
         let id = h.next_timer_id;
         h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
         let due = h.clock_ms + delay;
@@ -2397,7 +2521,7 @@ fn window_set_interval(
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
-    let id = if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    let id = if let Some(h) = cx.host_as::<CinderDomHost>() {
         let id = h.next_timer_id;
         h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
         let due = h.clock_ms + interval;
@@ -2421,7 +2545,7 @@ fn window_request_animation_frame(
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
-    let id = if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    let id = if let Some(h) = cx.host_as::<CinderDomHost>() {
         let id = h.next_timer_id;
         h.next_timer_id = h.next_timer_id.wrapping_add(1).max(1);
         let due = h.clock_ms + 16.0;
@@ -2442,7 +2566,7 @@ fn window_clear_timer(
         return Ok(JsValue::UNDEFINED);
     };
     let target_id = id_num as u32;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.timers.retain(|(id, _, _, _, _)| *id != target_id);
     }
     Ok(JsValue::UNDEFINED)
@@ -2463,7 +2587,7 @@ fn window_register_mutation_observer(
         .heap()
         .persist(cb)
         .map_err(|e| RunError::internal(format!("{e:?}")))?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.mutation_observers.push((pers, nid));
     }
     Ok(JsValue::UNDEFINED)
@@ -2478,7 +2602,7 @@ fn window_unregister_mutation_observer(
         return Ok(JsValue::UNDEFINED);
     };
     let Some(existing) = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.mutation_observers.clone())
     else {
         return Ok(JsValue::UNDEFINED);
@@ -2489,7 +2613,7 @@ fn window_unregister_mutation_observer(
             kept.push((pers, nid));
         }
     }
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.mutation_observers = kept;
     }
     Ok(JsValue::UNDEFINED)
@@ -2502,7 +2626,7 @@ fn notify_mutation(
     attr_name: Option<&str>,
 ) -> Result<(), RunError> {
     let matching: Vec<Persistent> = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| {
             h.mutation_observers
                 .iter()
@@ -2540,7 +2664,7 @@ fn el_get_id(cx: &mut NativeCx<'_>, this: JsValue, _args: &[JsValue]) -> Result<
         return cx.vm().string("");
     };
     let id = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).data().id().map(str::to_string))
         .unwrap_or_default();
     cx.vm().string(&id)
@@ -2551,7 +2675,7 @@ fn el_set_id(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
         return Ok(JsValue::UNDEFINED);
     };
     let val = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_attribute(nid, "id", &val);
     }
     notify_mutation(cx, nid, "attributes", Some("id"))?;
@@ -2567,7 +2691,7 @@ fn el_get_class_name(
         return cx.vm().string("");
     };
     let cls = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).data().attr("class").map(str::to_string))
         .unwrap_or_default();
     cx.vm().string(&cls)
@@ -2582,7 +2706,7 @@ fn el_set_class_name(
         return Ok(JsValue::UNDEFINED);
     };
     let val = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_attribute(nid, "class", &val);
     }
     notify_mutation(cx, nid, "attributes", Some("class"))?;
@@ -2598,7 +2722,7 @@ fn el_get_text_content(
         return cx.vm().string("");
     };
     let text = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.text_content(nid))
         .unwrap_or_default();
     cx.vm().string(&text)
@@ -2613,7 +2737,7 @@ fn el_set_text_content(
         return Ok(JsValue::UNDEFINED);
     };
     let text = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_text_content(nid, &text);
     }
     notify_mutation(cx, nid, "childList", None)?;
@@ -2645,7 +2769,7 @@ fn el_get_inner_html(
         return cx.vm().string("");
     };
     let html = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.inner_html(nid))
         .unwrap_or_default();
     cx.vm().string(&html)
@@ -2660,7 +2784,7 @@ fn el_set_inner_html(
         return Ok(JsValue::UNDEFINED);
     };
     let html = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_inner_html(nid, &html);
     }
     notify_mutation(cx, nid, "childList", None)?;
@@ -2684,7 +2808,7 @@ fn el_get_outer_html(
         return cx.vm().string("");
     };
     let html = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.outer_html(nid))
         .unwrap_or_default();
     cx.vm().string(&html)
@@ -2699,7 +2823,7 @@ fn el_get_value(
         return cx.vm().string("");
     };
     let val = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.input_value(nid))
         .unwrap_or_default();
     cx.vm().string(&val)
@@ -2714,7 +2838,7 @@ fn el_set_value(
         return Ok(JsValue::UNDEFINED);
     };
     let val = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_input_value(nid, &val);
     }
     Ok(JsValue::UNDEFINED)
@@ -2737,7 +2861,7 @@ fn el_get_checked(
         return Ok(JsValue::FALSE);
     };
     let checked = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.doc.is_checked(nid));
     Ok(JsValue::boolean(checked))
 }
@@ -2754,7 +2878,7 @@ fn el_set_checked(
         .first()
         .copied()
         .is_some_and(|v| v.as_bool() == Some(true) || v.as_number().is_some_and(|n| n != 0.0));
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_checked(nid, checked);
     }
     Ok(JsValue::UNDEFINED)
@@ -2769,7 +2893,7 @@ fn el_get_tag_name(
         return cx.vm().string("");
     };
     let tag = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).data().tag().map(str::to_ascii_uppercase))
         .unwrap_or_default();
     cx.vm().string(&tag)
@@ -2784,7 +2908,7 @@ fn el_get_parent_element(
         return Ok(JsValue::NULL);
     };
     let parent = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.parent_element(nid));
     wrap_optional_node(cx, parent)
 }
@@ -2798,7 +2922,7 @@ fn el_get_first_element_child(
         return Ok(JsValue::NULL);
     };
     let first = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.first_element_child(nid));
     wrap_optional_node(cx, first)
 }
@@ -2812,7 +2936,7 @@ fn el_get_last_element_child(
         return Ok(JsValue::NULL);
     };
     let last = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.last_element_child(nid));
     wrap_optional_node(cx, last)
 }
@@ -2826,7 +2950,7 @@ fn el_get_first_child(
         return Ok(JsValue::NULL);
     };
     let first = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.first_child(nid));
     wrap_optional_node(cx, first)
 }
@@ -2840,7 +2964,7 @@ fn el_get_last_child(
         return Ok(JsValue::NULL);
     };
     let last = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.last_child(nid));
     wrap_optional_node(cx, last)
 }
@@ -2854,7 +2978,7 @@ fn el_get_next_element_sibling(
         return Ok(JsValue::NULL);
     };
     let next = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.next_element_sibling(nid));
     wrap_optional_node(cx, next)
 }
@@ -2868,7 +2992,7 @@ fn el_get_previous_element_sibling(
         return Ok(JsValue::NULL);
     };
     let prev = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.previous_element_sibling(nid));
     wrap_optional_node(cx, prev)
 }
@@ -2882,7 +3006,7 @@ fn el_get_children(
         return cx.vm().new_array_from(&[]);
     };
     let kids = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.element_children(nid))
         .unwrap_or_default();
     wrap_node_list(cx, kids)
@@ -2897,7 +3021,7 @@ fn el_get_child_element_count(
         return Ok(JsValue::number(0.0));
     };
     let count = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.element_children(nid).len())
         .unwrap_or(0);
     Ok(JsValue::number(count as f64))
@@ -2912,7 +3036,7 @@ fn el_get_shadow_root(
         return Ok(JsValue::NULL);
     };
     let sr = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.shadow_root(nid));
     wrap_optional_node(cx, sr)
 }
@@ -2930,7 +3054,7 @@ fn el_get_class_list(
         return Ok(JsValue::object(existing));
     }
     let proto = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.class_list_proto);
     let obj = cx.vm().new_host_object(proto, data)?;
     cx.heap().set_wrapper(data, obj);
@@ -2949,7 +3073,7 @@ fn el_get_style(
     if let Some(existing) = cx.heap().wrapper(data) {
         return Ok(JsValue::object(existing));
     }
-    let proto = cx.host_as::<AnvilJsDomHost>().and_then(|h| h.style_proto);
+    let proto = cx.host_as::<CinderDomHost>().and_then(|h| h.style_proto);
     let obj = cx.vm().new_host_object(proto, data)?;
     cx.heap().set_wrapper(data, obj);
     Ok(JsValue::object(obj))
@@ -2967,7 +3091,7 @@ fn el_get_dataset(
     if let Some(existing) = cx.heap().wrapper(data) {
         return Ok(JsValue::object(existing));
     }
-    let proto = cx.host_as::<AnvilJsDomHost>().and_then(|h| h.dataset_proto);
+    let proto = cx.host_as::<CinderDomHost>().and_then(|h| h.dataset_proto);
     let obj = cx.vm().new_host_object(proto, data)?;
     cx.heap().set_wrapper(data, obj);
     Ok(JsValue::object(obj))
@@ -2981,7 +3105,7 @@ fn cl_add(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<JsVa
     };
     for i in 0..args.len() {
         let token = arg_str(cx, args, i)?;
-        if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        if let Some(h) = cx.host_as::<CinderDomHost>() {
             h.doc.add_class(nid, token.trim());
         }
     }
@@ -2994,7 +3118,7 @@ fn cl_remove(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
     };
     for i in 0..args.len() {
         let token = arg_str(cx, args, i)?;
-        if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        if let Some(h) = cx.host_as::<CinderDomHost>() {
             h.doc.remove_class(nid, token.trim());
         }
     }
@@ -3010,7 +3134,7 @@ fn cl_toggle(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
         && !force.is_undefined()
     {
         let on = force.as_bool() == Some(true) || force.as_number().is_some_and(|n| n != 0.0);
-        if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+        if let Some(h) = cx.host_as::<CinderDomHost>() {
             if on {
                 h.doc.add_class(nid, token.trim());
             } else {
@@ -3019,7 +3143,7 @@ fn cl_toggle(cx: &mut NativeCx<'_>, this: JsValue, args: &[JsValue]) -> Result<J
         }
         on
     } else {
-        cx.host_as::<AnvilJsDomHost>()
+        cx.host_as::<CinderDomHost>()
             .is_some_and(|h| h.doc.toggle_class(nid, token.trim()))
     };
     Ok(JsValue::boolean(present))
@@ -3035,7 +3159,7 @@ fn cl_contains(
     };
     let token = arg_str(cx, args, 0)?;
     let has = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.doc.get(nid).data().has_class(token.trim()));
     Ok(JsValue::boolean(has))
 }
@@ -3061,7 +3185,7 @@ fn style_set_property(
     let raw_prop = arg_str(cx, args, 0)?;
     let css_prop = camel_to_kebab(raw_prop.trim());
     let val = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         if val.trim().is_empty() {
             remove_inline_style_prop(&mut h.doc, nid, &css_prop);
         } else {
@@ -3082,7 +3206,7 @@ fn style_get_property_value(
     let raw_prop = arg_str(cx, args, 0)?;
     let css_prop = camel_to_kebab(raw_prop.trim());
     let val = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| read_inline_style(&h.doc, nid, &css_prop))
         .unwrap_or_default();
     cx.vm().string(&val)
@@ -3099,7 +3223,7 @@ fn style_remove_property(
     let raw_prop = arg_str(cx, args, 0)?;
     let css_prop = camel_to_kebab(raw_prop.trim());
     let prev = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| {
             let old = read_inline_style(&h.doc, nid, &css_prop);
             remove_inline_style_prop(&mut h.doc, nid, &css_prop);
@@ -3118,7 +3242,7 @@ fn style_get_css_text(
         return cx.vm().string("");
     };
     let css = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).data().attr("style").map(str::to_string))
         .unwrap_or_default();
     cx.vm().string(&css)
@@ -3133,7 +3257,7 @@ fn style_set_css_text(
         return Ok(JsValue::UNDEFINED);
     };
     let css = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_attribute(nid, "style", &css);
     }
     Ok(JsValue::UNDEFINED)
@@ -3152,7 +3276,7 @@ fn dataset_get(
     let key = arg_str(cx, args, 0)?;
     let attr_name = format!("data-{}", camel_to_kebab(key.trim()));
     let val = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).data().attr(&attr_name).map(str::to_string));
     match val {
         Some(s) => cx.vm().string(&s),
@@ -3171,7 +3295,7 @@ fn dataset_set(
     let key = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
     let attr_name = format!("data-{}", camel_to_kebab(key.trim()));
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.set_attribute(nid, &attr_name, &val);
     }
     Ok(JsValue::UNDEFINED)
@@ -3185,7 +3309,7 @@ fn local_storage_get_item(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let key = arg_str(cx, args, 0)?;
-    let val = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+    let val = cx.host_as::<CinderDomHost>().and_then(|h| {
         h.local_storage
             .iter()
             .find(|(k, _)| k == &key)
@@ -3204,7 +3328,7 @@ fn local_storage_set_item(
 ) -> Result<JsValue, RunError> {
     let key = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         if let Some((_, existing)) = h.local_storage.iter_mut().find(|(k, _)| k == &key) {
             *existing = val;
         } else {
@@ -3220,7 +3344,7 @@ fn local_storage_remove_item(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let key = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.local_storage.retain(|(k, _)| k != &key);
     }
     Ok(JsValue::UNDEFINED)
@@ -3231,7 +3355,7 @@ fn local_storage_clear(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.local_storage.clear();
     }
     Ok(JsValue::UNDEFINED)
@@ -3244,7 +3368,7 @@ fn local_storage_key(
 ) -> Result<JsValue, RunError> {
     let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
     let key = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.local_storage.get(idx).map(|(k, _)| k.clone()));
     match key {
         Some(s) => cx.vm().string(&s),
@@ -3258,7 +3382,7 @@ fn local_storage_length(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let len = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.local_storage.len())
         .unwrap_or(0);
     Ok(JsValue::number(len as f64))
@@ -3270,7 +3394,7 @@ fn session_storage_get_item(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let key = arg_str(cx, args, 0)?;
-    let val = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+    let val = cx.host_as::<CinderDomHost>().and_then(|h| {
         h.session_storage
             .iter()
             .find(|(k, _)| k == &key)
@@ -3289,7 +3413,7 @@ fn session_storage_set_item(
 ) -> Result<JsValue, RunError> {
     let key = arg_str(cx, args, 0)?;
     let val = arg_str(cx, args, 1)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         if let Some((_, existing)) = h.session_storage.iter_mut().find(|(k, _)| k == &key) {
             *existing = val;
         } else {
@@ -3305,7 +3429,7 @@ fn session_storage_remove_item(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let key = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.session_storage.retain(|(k, _)| k != &key);
     }
     Ok(JsValue::UNDEFINED)
@@ -3316,7 +3440,7 @@ fn session_storage_clear(
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.session_storage.clear();
     }
     Ok(JsValue::UNDEFINED)
@@ -3329,7 +3453,7 @@ fn session_storage_key(
 ) -> Result<JsValue, RunError> {
     let idx = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
     let key = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.session_storage.get(idx).map(|(k, _)| k.clone()));
     match key {
         Some(s) => cx.vm().string(&s),
@@ -3343,7 +3467,7 @@ fn session_storage_length(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let len = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.session_storage.len())
         .unwrap_or(0);
     Ok(JsValue::number(len as f64))
@@ -3357,7 +3481,7 @@ fn loc_get_href(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let href = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.location_href.clone())
         .unwrap_or_default();
     cx.vm().string(&href)
@@ -3369,7 +3493,7 @@ fn loc_set_href(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let next = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         let resolved = crate::resolve_script_fetch_url(&h.location_href, &next);
         h.location_href = resolved.clone();
         h.pending_navigation = Some(resolved);
@@ -3387,7 +3511,7 @@ fn loc_get_origin(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let href = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.location_href.clone())
         .unwrap_or_default();
     let origin = if let Some((scheme, host, port)) = crate::extract_origin_tuple(&href) {
@@ -3408,7 +3532,7 @@ fn loc_get_pathname(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let href = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.location_href.clone())
         .unwrap_or_default();
     let after_scheme = href
@@ -3426,7 +3550,7 @@ fn loc_get_search(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let href = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.location_href.clone())
         .unwrap_or_default();
     let before_hash = href.split('#').next().unwrap_or("");
@@ -3443,7 +3567,7 @@ fn loc_get_hash(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let href = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.location_href.clone())
         .unwrap_or_default();
     let hash = href
@@ -3461,7 +3585,7 @@ fn hist_push_state(
     if args.len() >= 3 && !args[2].is_nullish() {
         let next = arg_str(cx, args, 2)?;
         if !next.trim().is_empty()
-            && let Some(h) = cx.host_as::<AnvilJsDomHost>()
+            && let Some(h) = cx.host_as::<CinderDomHost>()
         {
             h.location_href = crate::resolve_script_fetch_url(&h.location_href, &next);
         }
@@ -3475,7 +3599,7 @@ fn custom_elements_define(
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let name = arg_str(cx, args, 0)?;
-    if let Some(h) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
         h.doc.define_custom_element(&name);
     }
     Ok(JsValue::UNDEFINED)
@@ -3488,7 +3612,7 @@ fn custom_elements_get(
 ) -> Result<JsValue, RunError> {
     let name = arg_str(cx, args, 0)?;
     let defined = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .is_some_and(|h| h.doc.is_custom_element_defined(&name));
     if defined {
         cx.vm().string(&name)
@@ -3510,17 +3634,185 @@ fn window_match_media(
     Ok(JsValue::object(mql))
 }
 
+fn format_css_color(c: anvil_style::Color) -> String {
+    if c.a == 255 {
+        format!("rgb({}, {}, {})", c.r, c.g, c.b)
+    } else if c.a == 0 {
+        "rgba(0, 0, 0, 0)".to_string()
+    } else {
+        let alpha = (c.a as f32 / 255.0 * 100.0).round() / 100.0;
+        format!("rgba({}, {}, {}, {alpha})", c.r, c.g, c.b)
+    }
+}
+
+fn format_css_px(px: f32) -> String {
+    if px.fract().abs() < 1e-4 {
+        format!("{}px", px.round() as i64)
+    } else {
+        format!("{px:.2}px")
+    }
+}
+
 fn window_get_computed_style(
     cx: &mut NativeCx<'_>,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let obj = cx.vm().new_plain_object()?;
+    let pseudo_raw = if args.len() >= 2 && !args[1].is_nullish() {
+        arg_str(cx, args, 1).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let pseudo_norm = pseudo_raw.trim().to_ascii_lowercase();
     if let Some(nid) = args.first().copied().and_then(|v| unwrap_node(cx, v)) {
-        let inline = cx
-            .host_as::<AnvilJsDomHost>()
-            .and_then(|h| h.doc.get(nid).data().attr("style").map(str::to_string))
-            .unwrap_or_default();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut inline = String::new();
+        if let Some(h) = cx.host_as::<CinderDomHost>() {
+            inline = h
+                .doc
+                .get(nid)
+                .data()
+                .attr("style")
+                .map(str::to_string)
+                .unwrap_or_default();
+            let styles = h.compute_styles();
+            let layout = anvil_layout::layout_document(&h.doc, &styles, h.viewport_width);
+            let box_rect = layout.find_node_box(nid).map(|b| b.rect);
+            let (cs, pseudo_content) = match pseudo_norm.as_str() {
+                "::before" | ":before" => {
+                    if let Some((txt, ps)) = styles.before_style(nid) {
+                        (ps.clone(), Some(format!("\"{txt}\"")))
+                    } else {
+                        (styles.get(nid).clone(), Some("none".to_string()))
+                    }
+                }
+                "::after" | ":after" => {
+                    if let Some((txt, ps)) = styles.after_style(nid) {
+                        (ps.clone(), Some(format!("\"{txt}\"")))
+                    } else {
+                        (styles.get(nid).clone(), Some("none".to_string()))
+                    }
+                }
+                _ => (styles.get(nid).clone(), None),
+            };
+            let display_str = match cs.display {
+                anvil_style::Display::Block => "block",
+                anvil_style::Display::Inline => "inline",
+                anvil_style::Display::Flex => "flex",
+                anvil_style::Display::Grid => "grid",
+                anvil_style::Display::None => "none",
+            };
+            let position_str = match cs.position {
+                anvil_style::Position::Static => "static",
+                anvil_style::Position::Relative => "relative",
+                anvil_style::Position::Absolute => "absolute",
+                anvil_style::Position::Fixed => "fixed",
+                anvil_style::Position::Sticky => "sticky",
+            };
+            let visibility_str = match cs.visibility {
+                anvil_style::Visibility::Visible => "visible",
+                anvil_style::Visibility::Hidden => "hidden",
+                anvil_style::Visibility::Collapse => "collapse",
+            };
+            let overflow_str = if cs.scrollable_overflow {
+                "auto"
+            } else {
+                match cs.overflow {
+                    anvil_style::Overflow::Visible => "visible",
+                    anvil_style::Overflow::Hidden => "hidden",
+                }
+            };
+            let font_family_str = match cs.font_family {
+                anvil_style::FontFamily::SansSerif => "sans-serif",
+                anvil_style::FontFamily::Serif => "serif",
+                anvil_style::FontFamily::Monospace => "monospace",
+                anvil_style::FontFamily::Custom(_) => "custom",
+            };
+            let text_transform_str = match cs.text_transform {
+                anvil_style::TextTransform::None => "none",
+                anvil_style::TextTransform::Uppercase => "uppercase",
+                anvil_style::TextTransform::Lowercase => "lowercase",
+                anvil_style::TextTransform::Capitalize => "capitalize",
+            };
+            let object_fit_str = match cs.object_fit {
+                anvil_style::ObjectFit::Fill => "fill",
+                anvil_style::ObjectFit::Contain => "contain",
+                anvil_style::ObjectFit::Cover => "cover",
+                anvil_style::ObjectFit::None => "none",
+                anvil_style::ObjectFit::ScaleDown => "scale-down",
+            };
+            let width_px = box_rect.map(|r| r.width).unwrap_or(match cs.width {
+                anvil_style::Size::Px(v) => v,
+                _ => 0.0,
+            });
+            let height_px = box_rect.map(|r| r.height).unwrap_or(match cs.height {
+                anvil_style::Size::Px(v) => v,
+                _ => 0.0,
+            });
+            pairs.push(("display".to_string(), display_str.to_string()));
+            pairs.push(("position".to_string(), position_str.to_string()));
+            pairs.push(("visibility".to_string(), visibility_str.to_string()));
+            pairs.push(("overflow".to_string(), overflow_str.to_string()));
+            pairs.push(("color".to_string(), format_css_color(cs.color)));
+            pairs.push((
+                "background-color".to_string(),
+                cs.background
+                    .map(format_css_color)
+                    .unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
+            ));
+            pairs.push(("width".to_string(), format_css_px(width_px)));
+            pairs.push(("height".to_string(), format_css_px(height_px)));
+            pairs.push(("font-size".to_string(), format_css_px(cs.font_size)));
+            pairs.push(("font-weight".to_string(), cs.font_weight.to_string()));
+            pairs.push((
+                "font-style".to_string(),
+                if cs.italic { "italic" } else { "normal" }.to_string(),
+            ));
+            pairs.push(("font-family".to_string(), font_family_str.to_string()));
+            pairs.push(("text-transform".to_string(), text_transform_str.to_string()));
+            pairs.push((
+                "letter-spacing".to_string(),
+                format_css_px(cs.letter_spacing),
+            ));
+            pairs.push(("word-spacing".to_string(), format_css_px(cs.word_spacing)));
+            pairs.push(("opacity".to_string(), cs.opacity.to_string()));
+            pairs.push(("z-index".to_string(), cs.z_index.to_string()));
+            pairs.push(("object-fit".to_string(), object_fit_str.to_string()));
+            pairs.push(("margin-top".to_string(), format_css_px(cs.margin.top)));
+            pairs.push(("margin-right".to_string(), format_css_px(cs.margin.right)));
+            pairs.push(("margin-bottom".to_string(), format_css_px(cs.margin.bottom)));
+            pairs.push(("margin-left".to_string(), format_css_px(cs.margin.left)));
+            pairs.push(("padding-top".to_string(), format_css_px(cs.padding.top)));
+            pairs.push(("padding-right".to_string(), format_css_px(cs.padding.right)));
+            pairs.push((
+                "padding-bottom".to_string(),
+                format_css_px(cs.padding.bottom),
+            ));
+            pairs.push(("padding-left".to_string(), format_css_px(cs.padding.left)));
+            pairs.push(("border-top-width".to_string(), format_css_px(cs.border.top)));
+            pairs.push((
+                "border-right-width".to_string(),
+                format_css_px(cs.border.right),
+            ));
+            pairs.push((
+                "border-bottom-width".to_string(),
+                format_css_px(cs.border.bottom),
+            ));
+            pairs.push((
+                "border-left-width".to_string(),
+                format_css_px(cs.border.left),
+            ));
+            if let Some(cnt) = pseudo_content {
+                pairs.push(("content".to_string(), cnt));
+            }
+        }
+        for (k, v) in pairs {
+            let vs = cx.vm().string(&v)?;
+            cx.vm().define_data(obj, &k, vs)?;
+            let camel = kebab_to_camel(&k);
+            cx.vm().define_data(obj, &camel, vs)?;
+        }
         for part in inline.split(';') {
             if let Some((k, v)) = part.split_once(':') {
                 let k_clean = k.trim().to_ascii_lowercase();
@@ -3569,7 +3861,7 @@ fn el_get_attribute_names(
         return cx.vm().new_array_from(&[]);
     };
     let names: Vec<String> = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| {
             if let NodeData::Element { attrs, .. } = h.doc.get(nid).data() {
                 Some(attrs.iter().map(|(k, _)| k.clone()).collect())
@@ -3596,7 +3888,7 @@ fn el_has_attributes(
         return Ok(JsValue::FALSE);
     };
     let has = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| {
             if let NodeData::Element { attrs, .. } = h.doc.get(nid).data() {
                 Some(!attrs.is_empty())
@@ -3617,7 +3909,7 @@ fn el_get_node_name(
         return cx.vm().string("");
     };
     let name = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| match h.doc.get(nid).data() {
             NodeData::Document => "#document".to_string(),
             NodeData::Element { tag, .. } => tag.to_ascii_uppercase(),
@@ -3636,7 +3928,7 @@ fn el_get_node_type(
         return Ok(JsValue::number(1.0));
     };
     let nt = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| match h.doc.get(nid).data() {
             NodeData::Element { .. } => 1.0,
             NodeData::Text(_) => 3.0,
@@ -3655,7 +3947,7 @@ fn el_get_node_value(
         return Ok(JsValue::NULL);
     };
     let val = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| match h.doc.get(nid).data() {
             NodeData::Text(t) => Some(t.clone()),
             _ => None,
@@ -3675,7 +3967,7 @@ fn el_set_node_value(
         return Ok(JsValue::UNDEFINED);
     };
     let text = arg_str(cx, args, 0)?;
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         if let NodeData::Text(_) = host.doc.get(nid).data() {
             host.doc.set_text_content(nid, &text);
         }
@@ -3692,7 +3984,7 @@ fn el_get_parent_node(
         return Ok(JsValue::NULL);
     };
     let parent = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .and_then(|h| h.doc.get(nid).parent());
     match parent {
         Some(pid) => wrap_node(cx, pid),
@@ -3724,7 +4016,7 @@ fn el_get_is_connected(
         return Ok(JsValue::FALSE);
     };
     let connected = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| {
             let root = h.doc.root();
             let mut cur = Some(nid);
@@ -3749,7 +4041,7 @@ fn el_get_child_nodes(
         return wrap_node_list(cx, Vec::new());
     };
     let kids: Vec<NodeId> = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.children(nid).to_vec())
         .unwrap_or_default();
     wrap_node_list(cx, kids)
@@ -3763,7 +4055,7 @@ fn el_get_next_sibling(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::NULL);
     };
-    let next = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+    let next = cx.host_as::<CinderDomHost>().and_then(|h| {
         let pid = h.doc.get(nid).parent()?;
         let siblings = h.doc.children(pid);
         let pos = siblings.iter().position(|&c| c == nid)?;
@@ -3783,7 +4075,7 @@ fn el_get_previous_sibling(
     let Some(nid) = unwrap_node(cx, this) else {
         return Ok(JsValue::NULL);
     };
-    let prev = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+    let prev = cx.host_as::<CinderDomHost>().and_then(|h| {
         let pid = h.doc.get(nid).parent()?;
         let siblings = h.doc.children(pid);
         let pos = siblings.iter().position(|&c| c == nid)?;
@@ -3821,7 +4113,7 @@ fn doc_get_child_nodes(
     _args: &[JsValue],
 ) -> Result<JsValue, RunError> {
     let kids: Vec<NodeId> = cx
-        .host_as::<AnvilJsDomHost>()
+        .host_as::<CinderDomHost>()
         .map(|h| h.doc.children(h.doc.root()).to_vec())
         .unwrap_or_default();
     wrap_node_list(cx, kids)
@@ -3842,7 +4134,7 @@ fn window_native_fetch(
 ) -> Result<JsValue, RunError> {
     let url = arg_str(cx, args, 0)?;
     let (status, body) =
-        if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+        if let Some(host) = cx.host_as::<CinderDomHost>() {
             if let Some((_, st, mock_body)) = host.fetch_mocks.iter().find(|(k, _, _)| {
                 k == &url || url.ends_with(k.as_str()) || k.ends_with(url.as_str())
             }) {
@@ -3944,7 +4236,7 @@ fn canvas_fill_linear_gradient(
     } else {
         (y + h as i32) as f32
     };
-    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+    if let Some(host) = cx.host_as::<CinderDomHost>() {
         host.doc.canvas_fill_linear_gradient(
             nid,
             x,
@@ -4051,4 +4343,670 @@ fn sha256_digest(data: &[u8]) -> [u8; 32] {
 fn _keep_dom_imports_used(d: &Document) -> bool {
     let _ = parse_html;
     matches!(d.get(d.root()).data(), NodeData::Document)
+}
+
+// ---- Pillar 2.3 & Pillar 4: Live Geometry, Scroll, <dialog>, & Form Validation ----
+
+fn el_get_offset_width(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let w = unwrap_node(cx, this)
+        .and_then(|nid| cx.host_as::<CinderDomHost>()?.compute_node_box(nid))
+        .map(|b| b.rect.width.round() as f64)
+        .unwrap_or(0.0);
+    Ok(JsValue::number(w))
+}
+
+fn el_get_offset_height(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let h = unwrap_node(cx, this)
+        .and_then(|nid| cx.host_as::<CinderDomHost>()?.compute_node_box(nid))
+        .map(|b| b.rect.height.round() as f64)
+        .unwrap_or(0.0);
+    Ok(JsValue::number(h))
+}
+
+fn el_get_client_width(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let w = unwrap_node(cx, this)
+        .and_then(|nid| cx.host_as::<CinderDomHost>()?.compute_node_box(nid))
+        .map(|b| {
+            (b.rect.width - b.border.left - b.border.right)
+                .max(0.0)
+                .round() as f64
+        })
+        .unwrap_or(0.0);
+    Ok(JsValue::number(w))
+}
+
+fn el_get_client_height(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let h = unwrap_node(cx, this)
+        .and_then(|nid| cx.host_as::<CinderDomHost>()?.compute_node_box(nid))
+        .map(|b| {
+            (b.rect.height - b.border.top - b.border.bottom)
+                .max(0.0)
+                .round() as f64
+        })
+        .unwrap_or(0.0);
+    Ok(JsValue::number(h))
+}
+
+fn el_get_scroll_width(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let w = unwrap_node(cx, this)
+        .and_then(|nid| cx.host_as::<CinderDomHost>()?.compute_node_box(nid))
+        .map(|b| {
+            let cw = (b.rect.width - b.border.left - b.border.right).max(0.0);
+            b.scroll_size.0.max(cw).round() as f64
+        })
+        .unwrap_or(0.0);
+    Ok(JsValue::number(w))
+}
+
+fn el_get_scroll_height(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let h = unwrap_node(cx, this)
+        .and_then(|nid| cx.host_as::<CinderDomHost>()?.compute_node_box(nid))
+        .map(|b| {
+            let ch = (b.rect.height - b.border.top - b.border.bottom).max(0.0);
+            b.scroll_size.1.max(ch).round() as f64
+        })
+        .unwrap_or(0.0);
+    Ok(JsValue::number(h))
+}
+
+fn el_get_scroll_top(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let sy = unwrap_node(cx, this)
+        .and_then(|nid| Some(cx.host_as::<CinderDomHost>()?.doc.node_scroll_offset(nid).1 as f64))
+        .unwrap_or(0.0);
+    Ok(JsValue::number(sy))
+}
+
+fn el_set_scroll_top(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let next_y = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as f32;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (sx, _) = h.doc.node_scroll_offset(nid);
+        h.doc.set_node_scroll_offset(nid, sx, next_y);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_scroll_left(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let sx = unwrap_node(cx, this)
+        .and_then(|nid| Some(cx.host_as::<CinderDomHost>()?.doc.node_scroll_offset(nid).0 as f64))
+        .unwrap_or(0.0);
+    Ok(JsValue::number(sx))
+}
+
+fn el_set_scroll_left(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let next_x = args
+        .first()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as f32;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (_, sy) = h.doc.node_scroll_offset(nid);
+        h.doc.set_node_scroll_offset(nid, next_x, sy);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn extract_scroll_coords(cx: &mut NativeCx<'_>, args: &[JsValue]) -> (Option<f32>, Option<f32>) {
+    if let Some(first) = args.first().copied() {
+        if let Some(obj) = first.as_object() {
+            let mut left = None;
+            let mut top = None;
+            if let Ok(k_left) = cx.heap().key_from_str("left")
+                && let Ok(Some(p)) = cx.heap().get_own(obj, k_left)
+                && let Some(v) = p.slot.data().and_then(|v| v.as_number())
+            {
+                left = Some(v as f32);
+            }
+            if let Ok(k_top) = cx.heap().key_from_str("top")
+                && let Ok(Some(p)) = cx.heap().get_own(obj, k_top)
+                && let Some(v) = p.slot.data().and_then(|v| v.as_number())
+            {
+                top = Some(v as f32);
+            }
+            return (left, top);
+        }
+        let x = first.as_number().map(|v| v as f32);
+        let y = args.get(1).and_then(|v| v.as_number()).map(|v| v as f32);
+        return (x, y);
+    }
+    (None, None)
+}
+
+fn el_scroll_to(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let (nx, ny) = extract_scroll_coords(cx, args);
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (cx_off, cy_off) = h.doc.node_scroll_offset(nid);
+        h.doc.set_node_scroll_offset(
+            nid,
+            nx.unwrap_or(cx_off).max(0.0),
+            ny.unwrap_or(cy_off).max(0.0),
+        );
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_scroll_by(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let (dx, dy) = extract_scroll_coords(cx, args);
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        let (cx_off, cy_off) = h.doc.node_scroll_offset(nid);
+        h.doc.set_node_scroll_offset(
+            nid,
+            (cx_off + dx.unwrap_or(0.0)).max(0.0),
+            (cy_off + dy.unwrap_or(0.0)).max(0.0),
+        );
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_dialog_open(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let open = unwrap_node(cx, this)
+        .and_then(|nid| {
+            let h = cx.host_as::<CinderDomHost>()?;
+            Some(
+                h.doc
+                    .get(nid)
+                    .data()
+                    .attr("open")
+                    .is_some_and(|v| !v.eq_ignore_ascii_case("false")),
+            )
+        })
+        .unwrap_or(false);
+    Ok(JsValue::boolean(open))
+}
+
+fn el_set_dialog_open(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let open = args.first().copied().is_some_and(|v| {
+        v.as_bool() == Some(true)
+            || v.as_number().is_some_and(|n| n != 0.0 && !n.is_nan())
+            || v.is_object()
+            || (v.is_string() && cx.to_display_string(v).is_ok_and(|s| !s.is_empty()))
+    });
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        if open {
+            h.doc.set_attribute(nid, "open", "");
+        } else {
+            h.doc.remove_attribute(nid, "open");
+            h.doc.remove_attribute(nid, "data-modal");
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_dialog_return_value(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let rv = unwrap_node(cx, this)
+        .and_then(|nid| {
+            cx.host_as::<CinderDomHost>()?
+                .doc
+                .get(nid)
+                .data()
+                .attr("data-return-value")
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    cx.vm().string(&rv)
+}
+
+fn el_set_dialog_return_value(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let rv = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc.set_attribute(nid, "data-return-value", &rv);
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_dialog_show(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(h) = cx.host_as::<CinderDomHost>()
+    {
+        h.doc.set_attribute(nid, "open", "");
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_dialog_show_modal(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    if let Some(nid) = unwrap_node(cx, this)
+        && let Some(h) = cx.host_as::<CinderDomHost>()
+    {
+        h.doc.set_attribute(nid, "open", "");
+        h.doc.set_attribute(nid, "data-modal", "true");
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_dialog_close(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let ret_val = if let Some(first) = args.first().copied()
+        && !first.is_undefined()
+    {
+        Some(cx.to_display_string(first)?)
+    } else {
+        None
+    };
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc.remove_attribute(nid, "open");
+        h.doc.remove_attribute(nid, "data-modal");
+        if let Some(rv) = ret_val {
+            h.doc.set_attribute(nid, "data-return-value", &rv);
+        }
+    }
+    let ev = cx.vm().new_plain_object()?;
+    let close_str = cx.vm().string("close")?;
+    cx.vm().define_data(ev, "type", close_str)?;
+    cx.vm().define_data(ev, "bubbles", JsValue::FALSE)?;
+    cx.vm().define_data(ev, "cancelable", JsValue::FALSE)?;
+    let _ = el_dispatch_event(cx, this, &[JsValue::object(ev)]);
+    Ok(JsValue::UNDEFINED)
+}
+
+struct ValidityBreakdown {
+    valid: bool,
+    value_missing: bool,
+    type_mismatch: bool,
+    pattern_mismatch: bool,
+    too_long: bool,
+    too_short: bool,
+    range_underflow: bool,
+    range_overflow: bool,
+    custom_error: bool,
+    message: String,
+}
+
+fn evaluate_node_validity(doc: &Document, nid: NodeId) -> ValidityBreakdown {
+    let mut out = ValidityBreakdown {
+        valid: true,
+        value_missing: false,
+        type_mismatch: false,
+        pattern_mismatch: false,
+        too_long: false,
+        too_short: false,
+        range_underflow: false,
+        range_overflow: false,
+        custom_error: false,
+        message: String::new(),
+    };
+    let custom = doc.custom_validity(nid);
+    if !custom.is_empty() {
+        out.valid = false;
+        out.custom_error = true;
+        out.message = custom.to_string();
+    }
+    let data = doc.get(nid).data();
+    let Some(tag) = data.tag() else {
+        return out;
+    };
+    if tag == "form" || tag == "fieldset" {
+        if doc.is_control_valid(nid) == Some(false) {
+            out.valid = false;
+            if out.message.is_empty() {
+                out.message = "Form contains invalid controls.".to_string();
+            }
+        }
+        return out;
+    }
+    if !matches!(tag, "input" | "textarea" | "select") {
+        return out;
+    }
+    if data
+        .attr("disabled")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+        || data
+            .attr("readonly")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+    {
+        return out;
+    }
+    let input_type = if tag == "input" {
+        data.attr("type")
+            .unwrap_or("text")
+            .trim()
+            .to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    let is_required = data
+        .attr("required")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+    if matches!(input_type.as_str(), "checkbox" | "radio") {
+        if is_required && !doc.is_checked(nid) {
+            out.valid = false;
+            out.value_missing = true;
+            if out.message.is_empty() {
+                out.message = "Please check this box if you want to proceed.".to_string();
+            }
+        }
+        return out;
+    }
+    let val = doc.input_value(nid);
+    if is_required && val.trim().is_empty() {
+        out.valid = false;
+        out.value_missing = true;
+        if out.message.is_empty() {
+            out.message = "Please fill out this field.".to_string();
+        }
+        return out;
+    }
+    if val.is_empty() {
+        return out;
+    }
+    let char_len = val.chars().count();
+    if let Some(min_len) = data
+        .attr("minlength")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        && char_len < min_len
+    {
+        out.valid = false;
+        out.too_short = true;
+        if out.message.is_empty() {
+            out.message = format!("Please lengthen this text to {min_len} characters or more.");
+        }
+    }
+    if let Some(max_len) = data
+        .attr("maxlength")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        && char_len > max_len
+    {
+        out.valid = false;
+        out.too_long = true;
+        if out.message.is_empty() {
+            out.message = format!("Please shorten this text to {max_len} characters or fewer.");
+        }
+    }
+    match input_type.as_str() {
+        "email" => {
+            let trimmed = val.trim();
+            let valid_email = trimmed.split_once('@').is_some_and(|(l, d)| {
+                !l.is_empty()
+                    && !d.is_empty()
+                    && !d.contains('@')
+                    && !trimmed.chars().any(char::is_whitespace)
+            });
+            if !valid_email {
+                out.valid = false;
+                out.type_mismatch = true;
+                if out.message.is_empty() {
+                    out.message = "Please enter an email address.".to_string();
+                }
+            }
+        }
+        "url" => {
+            let trimmed = val.trim();
+            let valid_url = trimmed.split_once("://").is_some_and(|(s, r)| {
+                !s.is_empty()
+                    && !r.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                    && !trimmed.chars().any(char::is_whitespace)
+            });
+            if !valid_url {
+                out.valid = false;
+                out.type_mismatch = true;
+                if out.message.is_empty() {
+                    out.message = "Please enter a URL.".to_string();
+                }
+            }
+        }
+        "number" | "range" => {
+            if let Ok(num) = val.trim().parse::<f64>() {
+                if let Some(min_v) = data.attr("min").and_then(|s| s.trim().parse::<f64>().ok())
+                    && num < min_v
+                {
+                    out.valid = false;
+                    out.range_underflow = true;
+                    if out.message.is_empty() {
+                        out.message = format!("Value must be greater than or equal to {min_v}.");
+                    }
+                }
+                if let Some(max_v) = data.attr("max").and_then(|s| s.trim().parse::<f64>().ok())
+                    && num > max_v
+                {
+                    out.valid = false;
+                    out.range_overflow = true;
+                    if out.message.is_empty() {
+                        out.message = format!("Value must be less than or equal to {max_v}.");
+                    }
+                }
+            } else {
+                out.valid = false;
+                out.type_mismatch = true;
+                if out.message.is_empty() {
+                    out.message = "Please enter a number.".to_string();
+                }
+            }
+        }
+        _ => {}
+    }
+    if out.valid && doc.is_control_valid(nid) == Some(false) {
+        out.valid = false;
+        out.pattern_mismatch = true;
+        if out.message.is_empty() {
+            out.message = "Please match the requested format.".to_string();
+        }
+    }
+    out
+}
+
+fn el_get_validity(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let bd = unwrap_node(cx, this)
+        .and_then(|nid| {
+            Some(evaluate_node_validity(
+                &cx.host_as::<CinderDomHost>()?.doc,
+                nid,
+            ))
+        })
+        .unwrap_or(ValidityBreakdown {
+            valid: true,
+            value_missing: false,
+            type_mismatch: false,
+            pattern_mismatch: false,
+            too_long: false,
+            too_short: false,
+            range_underflow: false,
+            range_overflow: false,
+            custom_error: false,
+            message: String::new(),
+        });
+    let obj = cx.vm().new_plain_object()?;
+    for (k, v) in [
+        ("valid", bd.valid),
+        ("valueMissing", bd.value_missing),
+        ("typeMismatch", bd.type_mismatch),
+        ("patternMismatch", bd.pattern_mismatch),
+        ("tooLong", bd.too_long),
+        ("tooShort", bd.too_short),
+        ("rangeUnderflow", bd.range_underflow),
+        ("rangeOverflow", bd.range_overflow),
+        ("stepMismatch", false),
+        ("badInput", false),
+        ("customError", bd.custom_error),
+    ] {
+        cx.vm().define_data(obj, k, JsValue::boolean(v))?;
+    }
+    Ok(JsValue::object(obj))
+}
+
+fn el_get_validation_message(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let msg = unwrap_node(cx, this)
+        .and_then(|nid| {
+            Some(evaluate_node_validity(&cx.host_as::<CinderDomHost>()?.doc, nid).message)
+        })
+        .unwrap_or_default();
+    cx.vm().string(&msg)
+}
+
+fn el_get_will_validate(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let will = unwrap_node(cx, this)
+        .and_then(|nid| {
+            let h = cx.host_as::<CinderDomHost>()?;
+            let data = h.doc.get(nid).data();
+            let tag = data.tag()?;
+            if !matches!(tag, "input" | "textarea" | "select") {
+                return Some(false);
+            }
+            let disabled = data
+                .attr("disabled")
+                .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+            let readonly = data
+                .attr("readonly")
+                .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+            Some(!disabled && !readonly)
+        })
+        .unwrap_or(false);
+    Ok(JsValue::boolean(will))
+}
+
+fn el_check_validity(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::TRUE);
+    };
+    let valid = cx
+        .host_as::<CinderDomHost>()
+        .map(|h| evaluate_node_validity(&h.doc, nid).valid)
+        .unwrap_or(true);
+    if !valid {
+        let ev = cx.vm().new_plain_object()?;
+        let inv_str = cx.vm().string("invalid")?;
+        cx.vm().define_data(ev, "type", inv_str)?;
+        cx.vm().define_data(ev, "bubbles", JsValue::FALSE)?;
+        cx.vm().define_data(ev, "cancelable", JsValue::TRUE)?;
+        let _ = el_dispatch_event(cx, this, &[JsValue::object(ev)]);
+    }
+    Ok(JsValue::boolean(valid))
+}
+
+fn el_report_validity(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    el_check_validity(cx, this, args)
+}
+
+fn el_set_custom_validity(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let msg = arg_str(cx, args, 0)?;
+    if let Some(h) = cx.host_as::<CinderDomHost>() {
+        h.doc.set_custom_validity(nid, &msg);
+    }
+    Ok(JsValue::UNDEFINED)
 }

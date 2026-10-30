@@ -3,9 +3,9 @@
 // C++20 4-Way Polymorphic Inline Cache (IC) Engine & DOM Selector IC Table.
 // Author: Buntato
 
-#include "anvil_vm.hpp"
+#include "cinder_vm.hpp"
 
-namespace anvil_vm {
+namespace cinder_vm {
 
 namespace {
 constexpr u32 INIT_IC_SITE_TABLE = 16u;
@@ -49,7 +49,7 @@ inline u32 utf16_unit_length(const char* s, u32 byte_len) noexcept {
 
 } // namespace
 
-bool AnvilIcTable::ensure_sites(u32 need) noexcept {
+bool CinderIcTable::ensure_sites(u32 need) noexcept {
     if (need <= sites_cap) {
         return true;
     }
@@ -58,12 +58,12 @@ bool AnvilIcTable::ensure_sites(u32 need) noexcept {
         new_cap *= 2u;
     }
     bool over = false;
-    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(AnvilIcSite)), &over);
+    const u32 new_off = arena->alloc(new_cap * static_cast<u32>(sizeof(CinderIcSite)), &over);
     if (new_off == NO_SLOT) {
         return false;
     }
-    AnvilIcSite* dst = reinterpret_cast<AnvilIcSite*>(arena->at(new_off));
-    const AnvilIcSite* src = sites();
+    CinderIcSite* dst = reinterpret_cast<CinderIcSite*>(arena->at(new_off));
+    const CinderIcSite* src = sites();
     for (u32 i = 0u; i < site_count; ++i) {
         dst[i] = src[i];
     }
@@ -72,12 +72,12 @@ bool AnvilIcTable::ensure_sites(u32 need) noexcept {
     sites_off = new_off;
     sites_cap = new_cap;
     if (old_cap != 0u) {
-        arena->free(old_off, old_cap * static_cast<u32>(sizeof(AnvilIcSite)));
+        arena->free(old_off, old_cap * static_cast<u32>(sizeof(CinderIcSite)));
     }
     return true;
 }
 
-void AnvilIcTable::init(AnvilArena* a) noexcept {
+void CinderIcTable::init(CinderArena* a) noexcept {
     arena = a;
     sites_off = 0u;
     sites_cap = 0u;
@@ -98,12 +98,12 @@ void AnvilIcTable::init(AnvilArena* a) noexcept {
     }
 }
 
-u32 AnvilIcTable::allocate_site(u32 prop_sym) noexcept {
+u32 CinderIcTable::allocate_site(u32 prop_sym) noexcept {
     if (!ensure_sites(site_count + 1u)) {
         return NO_SLOT;
     }
     const u32 id = site_count++;
-    AnvilIcSite& st = sites()[id];
+    CinderIcSite& st = sites()[id];
     st.state = IcState::Uninitialized;
     st.count = 0u;
     st.prop_sym = prop_sym;
@@ -114,10 +114,10 @@ u32 AnvilIcTable::allocate_site(u32 prop_sym) noexcept {
     return id;
 }
 
-AnvilValue AnvilIcTable::load_property_ic(
-    AnvilHeap& heap,
+CinderValue CinderIcTable::load_property_ic(
+    CinderHeap& heap,
     u32 site_id,
-    AnvilValue receiver,
+    CinderValue receiver,
     u32 prop_sym
 ) noexcept {
     // Array `.length` fast-path check.
@@ -128,10 +128,10 @@ AnvilValue AnvilIcTable::load_property_ic(
             const char* name = heap.get_string_ptr(prop_sym, &str_len);
             if (prop_is(name, str_len, "length", 6u)) {
                 ++ic_hits;
-                return AnvilValue::make_smi(static_cast<i32>(heap.arrays()[arr_id].length));
+                return CinderValue::make_smi(static_cast<i32>(heap.arrays()[arr_id].length));
             }
         }
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
 
     // String `.length` (in UTF-16 code units).
@@ -142,9 +142,9 @@ AnvilValue AnvilIcTable::load_property_ic(
             u32 s_bytes = 0u;
             const char* s_ptr = heap.get_string_ptr(receiver.payload(), &s_bytes);
             ++ic_hits;
-            return AnvilValue::make_smi(static_cast<i32>(utf16_unit_length(s_ptr, s_bytes)));
+            return CinderValue::make_smi(static_cast<i32>(utf16_unit_length(s_ptr, s_bytes)));
         }
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
 
     // Function / Class static properties and `.prototype` / `.name` / `.length`.
@@ -155,7 +155,7 @@ AnvilValue AnvilIcTable::load_property_ic(
             const char* name = heap.get_string_ptr(prop_sym, &str_len);
             if (prop_is(name, str_len, "prototype", 9u) &&
                 heap.closures()[cid].proto_obj_id != NO_SLOT) {
-                return AnvilValue::make_object(heap.closures()[cid].proto_obj_id);
+                return CinderValue::make_object(heap.closures()[cid].proto_obj_id);
             }
             u32 cur_cid = cid;
             u32 hops = 0u;
@@ -172,25 +172,25 @@ AnvilValue AnvilIcTable::load_property_ic(
             const u32 fn_id = heap.closures()[cid].fn_id;
             if (fn_id < heap.function_count && heap.functions()[fn_id].active) {
                 if (prop_is(name, str_len, "length", 6u)) {
-                    return AnvilValue::make_smi(static_cast<i32>(heap.functions()[fn_id].arity));
+                    return CinderValue::make_smi(static_cast<i32>(heap.functions()[fn_id].arity));
                 }
                 if (prop_is(name, str_len, "name", 4u)) {
-                    return AnvilValue::make_string(heap.functions()[fn_id].name_sym);
+                    return CinderValue::make_string(heap.functions()[fn_id].name_sym);
                 }
             }
         }
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
 
     if (!receiver.is_object()) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
     const u32 obj_id = receiver.payload();
     if (obj_id >= heap.object_count || !heap.objects()[obj_id].active) {
-        return AnvilValue::make_undefined();
+        return CinderValue::make_undefined();
     }
 
-    const AnvilHeapObject& obj = heap.objects()[obj_id];
+    const CinderHeapObject& obj = heap.objects()[obj_id];
 
     // Builtin object virtual properties (`size`, `byteLength`, `byteOffset`, `buffer`, `length`).
     if (obj.builtin_kind != static_cast<u8>(BuiltinObjectKind::Plain) &&
@@ -200,21 +200,21 @@ AnvilValue AnvilIcTable::load_property_ic(
         const auto bkind = static_cast<BuiltinObjectKind>(obj.builtin_kind);
         if ((bkind == BuiltinObjectKind::Map || bkind == BuiltinObjectKind::Set) &&
             prop_is(name, str_len, "size", 4u)) {
-            return AnvilValue::make_smi(static_cast<i32>(obj.byte_length));
+            return CinderValue::make_smi(static_cast<i32>(obj.byte_length));
         }
         if (bkind == BuiltinObjectKind::ArrayBuffer &&
             prop_is(name, str_len, "byteLength", 10u)) {
-            return AnvilValue::make_number(static_cast<f64>(obj.byte_length));
+            return CinderValue::make_number(static_cast<f64>(obj.byte_length));
         }
         if (bkind >= BuiltinObjectKind::Uint8Array && bkind <= BuiltinObjectKind::Float64Array) {
             if (prop_is(name, str_len, "byteLength", 10u)) {
-                return AnvilValue::make_number(static_cast<f64>(obj.byte_length));
+                return CinderValue::make_number(static_cast<f64>(obj.byte_length));
             }
             if (prop_is(name, str_len, "byteOffset", 10u)) {
-                return AnvilValue::make_number(static_cast<f64>(obj.byte_offset));
+                return CinderValue::make_number(static_cast<f64>(obj.byte_offset));
             }
             if (prop_is(name, str_len, "buffer", 6u)) {
-                return AnvilValue::make_object(obj.aux_id);
+                return CinderValue::make_object(obj.aux_id);
             }
             if (prop_is(name, str_len, "length", 6u)) {
                 u32 shift = 0u;
@@ -226,7 +226,7 @@ AnvilValue AnvilIcTable::load_property_ic(
                 } else if (bkind == BuiltinObjectKind::Float64Array) {
                     shift = 3u;
                 }
-                return AnvilValue::make_number(static_cast<f64>(obj.byte_length >> shift));
+                return CinderValue::make_number(static_cast<f64>(obj.byte_length >> shift));
             }
         }
     }
@@ -234,7 +234,7 @@ AnvilValue AnvilIcTable::load_property_ic(
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
-        AnvilIcSite& site = sites()[site_id];
+        CinderIcSite& site = sites()[site_id];
         if (site.state == IcState::Monomorphic) {
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
@@ -250,14 +250,14 @@ AnvilValue AnvilIcTable::load_property_ic(
         }
     }
 
-    // Inline Cache miss: consult hidden class (`AnvilShape`) and update stub table.
+    // Inline Cache miss: consult hidden class (`CinderShape`) and update stub table.
     ++ic_misses;
     u32 resolved_shape = 0u;
     i32 resolved_slot = -1;
-    const AnvilValue val = heap.get_object_prop(obj_id, prop_sym, &resolved_shape, &resolved_slot);
+    const CinderValue val = heap.get_object_prop(obj_id, prop_sym, &resolved_shape, &resolved_slot);
 
     if (site_id < site_count && resolved_slot >= 0) {
-        AnvilIcSite& site = sites()[site_id];
+        CinderIcSite& site = sites()[site_id];
         if (site.state == IcState::Uninitialized) {
             site.state = IcState::Monomorphic;
             site.count = 1u;
@@ -285,12 +285,12 @@ AnvilValue AnvilIcTable::load_property_ic(
     return val;
 }
 
-StoreResult AnvilIcTable::store_property_ic(
-    AnvilHeap& heap,
+StoreResult CinderIcTable::store_property_ic(
+    CinderHeap& heap,
     u32 site_id,
-    AnvilValue receiver,
+    CinderValue receiver,
     u32 prop_sym,
-    AnvilValue val
+    CinderValue val
 ) noexcept {
     if (receiver.is_function()) {
         const u32 cid = receiver.payload();
@@ -316,11 +316,11 @@ StoreResult AnvilIcTable::store_property_ic(
         return StoreResult::NotStored;
     }
 
-    AnvilHeapObject& obj = heap.objects()[obj_id];
+    CinderHeapObject& obj = heap.objects()[obj_id];
     const u32 shape_id = obj.shape_id;
 
     if (site_id < site_count) {
-        AnvilIcSite& site = sites()[site_id];
+        CinderIcSite& site = sites()[site_id];
         if (site.state == IcState::Monomorphic) {
             if (site.stubs[0].shape_id == shape_id && site.stubs[0].slot_offset >= 0) {
                 ++ic_hits;
@@ -343,7 +343,7 @@ StoreResult AnvilIcTable::store_property_ic(
     i32 slot = -1;
     const StoreResult stored = heap.set_object_prop(obj_id, prop_sym, val, &new_shape, &slot);
     if (stored == StoreResult::Ok && site_id < site_count && slot >= 0) {
-        AnvilIcSite& site = sites()[site_id];
+        CinderIcSite& site = sites()[site_id];
         if (site.state == IcState::Uninitialized) {
             site.state = IcState::Monomorphic;
             site.count = 1u;
@@ -371,7 +371,7 @@ StoreResult AnvilIcTable::store_property_ic(
     return stored;
 }
 
-i32 AnvilIcTable::lookup_dom_selector(const char* selector, u32 len) noexcept {
+i32 CinderIcTable::lookup_dom_selector(const char* selector, u32 len) noexcept {
     if (!selector || len == 0u) {
         return -1;
     }
@@ -393,7 +393,7 @@ i32 AnvilIcTable::lookup_dom_selector(const char* selector, u32 len) noexcept {
     return -1;
 }
 
-void AnvilIcTable::record_dom_selector(const char* selector, u32 len, u32 node_id) noexcept {
+void CinderIcTable::record_dom_selector(const char* selector, u32 len, u32 node_id) noexcept {
     if (!selector || len == 0u) {
         return;
     }
@@ -415,10 +415,10 @@ void AnvilIcTable::record_dom_selector(const char* selector, u32 len, u32 node_i
     dom_entries[start].occupied = true;
 }
 
-void AnvilIcTable::invalidate_dom_cache() noexcept {
+void CinderIcTable::invalidate_dom_cache() noexcept {
     for (u32 i = 0; i < MAX_DOM_IC_ENTRIES; ++i) {
         dom_entries[i].occupied = false;
     }
 }
 
-} // namespace anvil_vm
+} // namespace cinder_vm

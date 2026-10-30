@@ -3,9 +3,9 @@
 // C++20 Lexer, Recursive-Descent / Pratt Expression Parser, and Register Bytecode Compiler.
 // Author: Buntato
 
-#include "anvil_vm.hpp"
+#include "cinder_vm.hpp"
 
-namespace anvil_vm {
+namespace cinder_vm {
 
 namespace {
 
@@ -112,7 +112,7 @@ struct Token {
     f64 num_val;
 };
 
-constexpr u32 ANVIL_COMPILER_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
+constexpr u32 CINDER_COMPILER_ARENA_RESERVE_BYTES = 256u * 1024u * 1024u;
 constexpr u32 INIT_TOKEN_BUFFER = 1024u;
 
 inline bool is_space(char c) noexcept {
@@ -175,7 +175,7 @@ inline bool is_unsupported_word(const char* s, u32 len) noexcept {
     return false;
 }
 
-// Exact IEEE-754 number parser using 24-bit limbs (port of anvil-js numeric.js).
+// Exact IEEE-754 number parser using 24-bit limbs (port of cinder numeric.js).
 struct BigLimbs {
     u32 d[128];
     u32 len;
@@ -522,8 +522,8 @@ u32 encode_utf8_cp(u32 cp, char* out) noexcept {
     return 4u;
 }
 
-struct AnvilLexer {
-    AnvilArena* arena;
+struct CinderLexer {
+    CinderArena* arena;
     u32 tokens_off;
     u32 tokens_cap;
     u32 count;
@@ -1276,15 +1276,15 @@ struct VarRef {
     u32 sym;
 };
 
-constexpr u32 ANVIL_MAX_UPVALUES = 64u;
+constexpr u32 CINDER_MAX_UPVALUES = 64u;
 
 struct FnScope {
     FnScope* parent;
     u32 local_floor;
     u32 upval_count;
-    bool upval_is_local[ANVIL_MAX_UPVALUES];
-    u16 upval_index[ANVIL_MAX_UPVALUES];
-    u32 upval_sym[ANVIL_MAX_UPVALUES];
+    bool upval_is_local[CINDER_MAX_UPVALUES];
+    u16 upval_index[CINDER_MAX_UPVALUES];
+    u32 upval_sym[CINDER_MAX_UPVALUES];
 };
 
 inline bool is_assign_token(TokenKind k) noexcept {
@@ -1307,35 +1307,35 @@ inline bool is_assign_token(TokenKind k) noexcept {
     }
 }
 
-inline AnvilOpcode assign_token_opcode(TokenKind k) noexcept {
+inline CinderOpcode assign_token_opcode(TokenKind k) noexcept {
     switch (k) {
-        case TokenKind::PlusEq:    return AnvilOpcode::Add;
-        case TokenKind::MinusEq:   return AnvilOpcode::Sub;
-        case TokenKind::StarEq:    return AnvilOpcode::Mul;
-        case TokenKind::SlashEq:   return AnvilOpcode::Div;
-        case TokenKind::PercentEq: return AnvilOpcode::Mod;
-        case TokenKind::ShlEq:     return AnvilOpcode::Shl;
-        case TokenKind::ShrEq:     return AnvilOpcode::Shr;
-        case TokenKind::UShrEq:    return AnvilOpcode::UShr;
-        case TokenKind::AmpEq:     return AnvilOpcode::BitAnd;
-        case TokenKind::CaretEq:   return AnvilOpcode::BitXor;
-        case TokenKind::PipeEq:    return AnvilOpcode::BitOr;
-        default:                   return AnvilOpcode::Nop;
+        case TokenKind::PlusEq:    return CinderOpcode::Add;
+        case TokenKind::MinusEq:   return CinderOpcode::Sub;
+        case TokenKind::StarEq:    return CinderOpcode::Mul;
+        case TokenKind::SlashEq:   return CinderOpcode::Div;
+        case TokenKind::PercentEq: return CinderOpcode::Mod;
+        case TokenKind::ShlEq:     return CinderOpcode::Shl;
+        case TokenKind::ShrEq:     return CinderOpcode::Shr;
+        case TokenKind::UShrEq:    return CinderOpcode::UShr;
+        case TokenKind::AmpEq:     return CinderOpcode::BitAnd;
+        case TokenKind::CaretEq:   return CinderOpcode::BitXor;
+        case TokenKind::PipeEq:    return CinderOpcode::BitOr;
+        default:                   return CinderOpcode::Nop;
     }
 }
 
-struct AnvilCompiler {
-    AnvilVmContext* ctx;
+struct CinderCompiler {
+    CinderVmContext* ctx;
     const char* src;
-    AnvilArena arena;
-    AnvilLexer lexer;
+    CinderArena arena;
+    CinderLexer lexer;
     u32 cursor;
     u32 locals_off;
     u32 locals_cap;
     u32 local_count;
     u32 local_floor;
     bool fn_uses_cells;
-    static constexpr u32 MAX_UPVALUES = ANVIL_MAX_UPVALUES;
+    static constexpr u32 MAX_UPVALUES = CINDER_MAX_UPVALUES;
     FnScope root_fn;
     FnScope* cur_fn;
     u16 next_reg;
@@ -1353,8 +1353,8 @@ struct AnvilCompiler {
     u32 stack_budget;
 
     struct BlockScope {
-        AnvilCompiler& c;
-        explicit BlockScope(AnvilCompiler& comp) noexcept : c(comp) {
+        CinderCompiler& c;
+        explicit BlockScope(CinderCompiler& comp) noexcept : c(comp) {
             ++c.block_depth;
         }
         ~BlockScope() {
@@ -1456,8 +1456,8 @@ struct AnvilCompiler {
         ctx->host_ids[slot][id_tok.length] = '\0';
         ctx->host_id_lens[slot] = id_tok.length;
         const u16 rhs = compile_assignment();
-        ctx->program.emit(AnvilInstruction::make_abx(
-            AnvilOpcode::HostSetText,
+        ctx->program.emit(CinderInstruction::make_abx(
+            CinderOpcode::HostSetText,
             rhs,
             static_cast<u16>(slot)
         ));
@@ -1524,13 +1524,13 @@ struct AnvilCompiler {
         const u32 break_pc = ctx->program.code_len;
         for (u32 i = 0u; i < jumps.break_count && i < MAX_LOOP_JUMPS; ++i) {
             if (jumps.breaks[i] < ctx->program.code_len) {
-                ctx->program.code()[jumps.breaks[i]] = AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, break_pc);
+                ctx->program.code()[jumps.breaks[i]] = CinderInstruction::make_abx(CinderOpcode::Jump, 0u, break_pc);
             }
         }
         for (u32 i = 0u; i < jumps.continue_count && i < MAX_LOOP_JUMPS; ++i) {
             if (jumps.continues[i] < ctx->program.code_len) {
                 ctx->program.code()[jumps.continues[i]] =
-                    AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, continue_pc);
+                    CinderInstruction::make_abx(CinderOpcode::Jump, 0u, continue_pc);
             }
         }
     }
@@ -1570,7 +1570,7 @@ struct AnvilCompiler {
             reject_limit(VM_REFUSE_LOOPS, is_break ? "break" : "continue", MAX_LOOP_JUMPS, "jumps per loop");
             return;
         }
-        const u32 pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+        const u32 pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
         (is_break ? jumps.breaks : jumps.continues)[count] = pc;
         ++count;
         match(TokenKind::Semicolon);
@@ -1801,20 +1801,20 @@ struct AnvilCompiler {
                 return vr.reg;
             case VarKind::Cell: {
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CellGet, dst, vr.reg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CellGet, dst, vr.reg, 0u));
                 return dst;
             }
             case VarKind::Upval: {
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::GetUpval, dst, static_cast<u16>(vr.idx), 0u));
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::GetUpval, dst, static_cast<u16>(vr.idx), 0u));
                 return dst;
             }
             case VarKind::Global:
             default: {
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abx(
-                    AnvilOpcode::GetGlobal, dst, global_slot(vr.sym)));
+                ctx->program.emit(CinderInstruction::make_abx(
+                    CinderOpcode::GetGlobal, dst, global_slot(vr.sym)));
                 return dst;
             }
         }
@@ -1824,15 +1824,15 @@ struct AnvilCompiler {
         switch (vr.kind) {
             case VarKind::Local:
                 if (vr.reg != src_reg) {
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, vr.reg, src_reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, vr.reg, src_reg, 0u));
                 }
                 break;
             case VarKind::Cell:
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CellSet, vr.reg, src_reg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CellSet, vr.reg, src_reg, 0u));
                 break;
             case VarKind::Upval:
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::SetUpval, static_cast<u16>(vr.idx), src_reg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::SetUpval, static_cast<u16>(vr.idx), src_reg, 0u));
                 break;
             case VarKind::Global:
             default:
@@ -1840,17 +1840,17 @@ struct AnvilCompiler {
                     reject_here(VM_REFUSE_UNSUPPORTED, "cannot reassign a declared function");
                     break;
                 }
-                ctx->program.emit(AnvilInstruction::make_abx(
-                    AnvilOpcode::SetGlobal, src_reg, global_slot(vr.sym)));
+                ctx->program.emit(CinderInstruction::make_abx(
+                    CinderOpcode::SetGlobal, src_reg, global_slot(vr.sym)));
                 break;
         }
     }
 
     void init_local(u16 reg, bool is_cell, u16 value_reg) noexcept {
         if (is_cell) {
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, reg, value_reg, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::NewCell, reg, value_reg, 0u));
         } else if (reg != value_reg) {
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, reg, value_reg, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, reg, value_reg, 0u));
         }
     }
 
@@ -1915,8 +1915,8 @@ struct AnvilCompiler {
     }
 
     void emit_load_undefined(u16 dst) noexcept {
-        const u32 cidx = ctx->program.add_constant(AnvilValue::make_undefined());
-        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+        const u32 cidx = ctx->program.add_constant(CinderValue::make_undefined());
+        ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, dst, cidx));
     }
 
     void emit_load_number(u16 dst, f64 n) noexcept {
@@ -1924,16 +1924,16 @@ struct AnvilCompiler {
         if (!neg_zero && n >= -32768.0 && n <= 32767.0) {
             const i32 as_int = static_cast<i32>(n);
             if (static_cast<f64>(as_int) == n) {
-                ctx->program.emit(AnvilInstruction::make_abx(
-                    AnvilOpcode::LoadSmi,
+                ctx->program.emit(CinderInstruction::make_abx(
+                    CinderOpcode::LoadSmi,
                     dst,
                     static_cast<u16>(static_cast<short>(as_int))
                 ));
                 return;
             }
         }
-        const u32 cidx = ctx->program.add_constant(AnvilValue::make_number(n));
-        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+        const u32 cidx = ctx->program.add_constant(CinderValue::make_number(n));
+        ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, dst, cidx));
     }
 
     bool is_arrow_ahead() const noexcept {
@@ -2024,7 +2024,7 @@ struct AnvilCompiler {
 
         fn_uses_cells = body_has_nested_function();
 
-        const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+        const u32 jskip_pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
         const u32 fn_start_pc = ctx->program.code_len;
         if (fn_id < ctx->heap.function_count) {
             ctx->heap.functions()[fn_id].code_start = fn_start_pc;
@@ -2035,18 +2035,18 @@ struct AnvilCompiler {
             for (u32 i = local_floor; i < local_count; ++i) {
                 locals()[i].is_cell = true;
                 const u16 preg = locals()[i].reg;
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, preg, preg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::NewCell, preg, preg, 0u));
             }
         }
 
         if (is_arrow && peek().kind != TokenKind::LBrace) {
             const u16 r = compile_assignment();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, r, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Return, r, 0u, 0u));
         } else {
             compile_statement();
             const u16 ft = alloc_reg();
             emit_load_undefined(ft);
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, ft, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Return, ft, 0u, 0u));
         }
 
         if (fn_id < ctx->heap.function_count) {
@@ -2054,7 +2054,7 @@ struct AnvilCompiler {
             ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
         }
         ctx->program.code()[jskip_pc] =
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, ctx->program.code_len);
 
         const u32 n_up = fs.upval_count;
         bool captured_is_local[MAX_UPVALUES];
@@ -2078,18 +2078,18 @@ struct AnvilCompiler {
 
         const u16 dst = alloc_reg();
         if (n_up == 0u) {
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_id));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadFunc, dst, fn_id));
         } else {
             const u16 base = next_reg;
             for (u32 i = 0u; i < n_up; ++i) {
                 const u16 slot = alloc_reg();
                 if (captured_is_local[i]) {
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot, captured_index[i], 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot, captured_index[i], 0u));
                 } else {
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetUpvalCell, slot, captured_index[i], 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetUpvalCell, slot, captured_index[i], 0u));
                 }
             }
-            ctx->program.emit(AnvilInstruction{AnvilOpcode::MakeClosure, 0u, dst, base,
+            ctx->program.emit(CinderInstruction{CinderOpcode::MakeClosure, 0u, dst, base,
                                                static_cast<u16>(n_up), fn_id});
         }
         return dst;
@@ -2150,34 +2150,34 @@ struct AnvilCompiler {
             reject_limit(VM_REFUSE_HEAP, "heap", ctx->heap.arena.budget, "bytes");
             return alloc_reg();
         }
-        const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+        const u32 jskip_pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
         const u32 fn_start_pc = ctx->program.code_len;
         if (fn_id < ctx->heap.function_count) {
             ctx->heap.functions()[fn_id].code_start = fn_start_pc;
         }
         if (has_extends) {
             // Parameters 0..7 are in registers 0..7; CallSuperCtor forwards them.
-            ctx->program.emit(AnvilInstruction{AnvilOpcode::CallSuperCtor, 0u, 8u, 0u, 8u, 0u});
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadConst, 9u,
-                static_cast<u16>(ctx->program.add_constant(AnvilValue::make_undefined())), 0u));
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, 9u, 0u, 0u));
+            ctx->program.emit(CinderInstruction{CinderOpcode::CallSuperCtor, 0u, 8u, 0u, 8u, 0u});
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadConst, 9u,
+                static_cast<u16>(ctx->program.add_constant(CinderValue::make_undefined())), 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Return, 9u, 0u, 0u));
             if (fn_id < ctx->heap.function_count) {
                 ctx->heap.functions()[fn_id].local_count = 10u;
                 ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
             }
         } else {
-            const u32 cidx = ctx->program.add_constant(AnvilValue::make_undefined());
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, 0u, cidx));
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, 0u, 0u, 0u));
+            const u32 cidx = ctx->program.add_constant(CinderValue::make_undefined());
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, 0u, cidx));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Return, 0u, 0u, 0u));
             if (fn_id < ctx->heap.function_count) {
                 ctx->heap.functions()[fn_id].local_count = 1u;
                 ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
             }
         }
         ctx->program.code()[jskip_pc] =
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, ctx->program.code_len);
         const u16 dst = alloc_reg();
-        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_id));
+        ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadFunc, dst, fn_id));
         return dst;
     }
 
@@ -2189,7 +2189,7 @@ struct AnvilCompiler {
             super_reg = compile_unary();
         } else {
             super_reg = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, super_reg, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadNull, super_reg, 0u, 0u));
         }
 
         expect(TokenKind::LBrace);
@@ -2240,10 +2240,10 @@ struct AnvilCompiler {
             ctor_reg = synthesize_default_ctor(class_name_sym, has_extends);
         }
 
-        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetupClass, ctor_reg, super_reg, 0u));
+        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::SetupClass, ctor_reg, super_reg, 0u));
         for (u32 i = 0u; i < method_count; ++i) {
-            ctx->program.emit(AnvilInstruction{
-                AnvilOpcode::DefineMethod,
+            ctx->program.emit(CinderInstruction{
+                CinderOpcode::DefineMethod,
                 methods[i].is_static ? 1u : 0u,
                 ctor_reg,
                 methods[i].fn_reg,
@@ -2281,12 +2281,12 @@ struct AnvilCompiler {
                 for (u32 i = 0u; i < argc && !had_error; ++i) {
                     const u16 slot_r = alloc_reg();
                     if (arg_regs[i] != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction{
-                    AnvilOpcode::NewBuiltin, bkind, dst, call_base, static_cast<u16>(argc), 0u
+                ctx->program.emit(CinderInstruction{
+                    CinderOpcode::NewBuiltin, bkind, dst, call_base, static_cast<u16>(argc), 0u
                 });
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
             }
@@ -2302,7 +2302,7 @@ struct AnvilCompiler {
                 const u32 fn_as_val = find_function(sym);
                 if (fn_as_val != NO_SLOT) {
                     callee_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, callee_reg, fn_as_val));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadFunc, callee_reg, fn_as_val));
                 } else {
                     bool found_global = false;
                     for (u32 gi = 0u; gi < ctx->global_count; ++gi) {
@@ -2333,14 +2333,14 @@ struct AnvilCompiler {
                 const u32 prop_sym = token_sym(prop_tok);
                 const u32 ic_site = new_site(prop_sym);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::GetPropIC, dst, callee_reg, static_cast<u16>(ic_site)));
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::GetPropIC, dst, callee_reg, static_cast<u16>(ic_site)));
                 callee_reg = dst;
             } else if (match(TokenKind::LBracket)) {
                 const u16 idx_reg = compile_expr();
                 expect(TokenKind::RBracket);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, dst, callee_reg, idx_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetElem, dst, callee_reg, idx_reg));
                 callee_reg = dst;
             }
         }
@@ -2366,12 +2366,12 @@ struct AnvilCompiler {
         for (u32 i = 0u; i < argc && !had_error; ++i) {
             const u16 slot_r = alloc_reg();
             if (arg_regs[i] != slot_r) {
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
             }
         }
         const u16 dst = alloc_reg();
-        ctx->program.emit(AnvilInstruction{
-            AnvilOpcode::NewInstance, 0u, dst, callee_reg, call_base, argc
+        ctx->program.emit(CinderInstruction{
+            CinderOpcode::NewInstance, 0u, dst, callee_reg, call_base, argc
         });
         return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
     }
@@ -2387,25 +2387,25 @@ struct AnvilCompiler {
         if (t.kind == TokenKind::KwTrue) {
             advance();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadTrue, dst, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadTrue, dst, 0u, 0u));
             return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
         }
         if (t.kind == TokenKind::KwFalse) {
             advance();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadFalse, dst, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadFalse, dst, 0u, 0u));
             return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
         }
         if (t.kind == TokenKind::KwNull) {
             advance();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, dst, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadNull, dst, 0u, 0u));
             return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
         }
         if (t.kind == TokenKind::KwThis) {
             advance();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadThis, dst, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadThis, dst, 0u, 0u));
             return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
         }
         if (t.kind == TokenKind::KwNew) {
@@ -2434,12 +2434,12 @@ struct AnvilCompiler {
                 for (u32 i = 0u; i < argc && !had_error; ++i) {
                     const u16 slot_r = alloc_reg();
                     if (arg_regs[i] != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction{
-                    AnvilOpcode::CallSuperCtor, 0u, dst, call_base, static_cast<u16>(argc), 0u
+                ctx->program.emit(CinderInstruction{
+                    CinderOpcode::CallSuperCtor, 0u, dst, call_base, static_cast<u16>(argc), 0u
                 });
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
             }
@@ -2470,12 +2470,12 @@ struct AnvilCompiler {
                 for (u32 i = 0u; i < argc && !had_error; ++i) {
                     const u16 slot_r = alloc_reg();
                     if (arg_regs[i] != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction{
-                    AnvilOpcode::CallSuperMethod,
+                ctx->program.emit(CinderInstruction{
+                    CinderOpcode::CallSuperMethod,
                     static_cast<u8>(argc < 255u ? argc : 255u),
                     dst,
                     call_base,
@@ -2491,30 +2491,30 @@ struct AnvilCompiler {
             advance();
             const u32 sym = token_sym(t);
             const u16 dst = alloc_reg();
-            const u32 cidx = ctx->program.add_constant(AnvilValue::make_string(sym));
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+            const u32 cidx = ctx->program.add_constant(CinderValue::make_string(sym));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, dst, cidx));
             return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, 0u}, false);
         }
         if (t.kind == TokenKind::TemplateHead) {
             const Token head_tok = advance();
             const u32 head_sym = token_sym(head_tok);
             u16 acc_reg = alloc_reg();
-            const u32 cidx = ctx->program.add_constant(AnvilValue::make_string(head_sym));
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, acc_reg, cidx));
+            const u32 cidx = ctx->program.add_constant(CinderValue::make_string(head_sym));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, acc_reg, cidx));
             while (!had_error && peek().kind != TokenKind::Eof) {
                 const u16 expr_reg = compile_expr();
                 const u16 next_acc = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Add, next_acc, acc_reg, expr_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Add, next_acc, acc_reg, expr_reg));
                 acc_reg = next_acc;
                 if (peek().kind == TokenKind::TemplateMiddle) {
                     const Token mid_tok = advance();
                     if (mid_tok.length > 0u) {
                         const u32 mid_sym = token_sym(mid_tok);
                         const u16 mid_reg = alloc_reg();
-                        const u32 mcidx = ctx->program.add_constant(AnvilValue::make_string(mid_sym));
-                        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, mid_reg, mcidx));
+                        const u32 mcidx = ctx->program.add_constant(CinderValue::make_string(mid_sym));
+                        ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, mid_reg, mcidx));
                         const u16 joined = alloc_reg();
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Add, joined, acc_reg, mid_reg));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Add, joined, acc_reg, mid_reg));
                         acc_reg = joined;
                     }
                 } else if (peek().kind == TokenKind::TemplateTail) {
@@ -2522,10 +2522,10 @@ struct AnvilCompiler {
                     if (tail_tok.length > 0u) {
                         const u32 tail_sym = token_sym(tail_tok);
                         const u16 tail_reg = alloc_reg();
-                        const u32 tcidx = ctx->program.add_constant(AnvilValue::make_string(tail_sym));
-                        ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, tail_reg, tcidx));
+                        const u32 tcidx = ctx->program.add_constant(CinderValue::make_string(tail_sym));
+                        ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, tail_reg, tcidx));
                         const u16 joined = alloc_reg();
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Add, joined, acc_reg, tail_reg));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Add, joined, acc_reg, tail_reg));
                         acc_reg = joined;
                     }
                     break;
@@ -2567,7 +2567,7 @@ struct AnvilCompiler {
             advance();
             const u16 obj_reg = alloc_reg();
             const u16 obj_mark = next_reg;
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewObject, obj_reg, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::NewObject, obj_reg, 0u, 0u));
             while (peek().kind != TokenKind::RBrace && peek().kind != TokenKind::Eof && !had_error) {
                 const Token key_tok = advance();
                 if (!is_property_name_token(key_tok.kind) && key_tok.kind != TokenKind::String) {
@@ -2588,8 +2588,8 @@ struct AnvilCompiler {
                     break;
                 }
                 const u32 ic_site = new_site(prop_sym);
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::SetPropIC,
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::SetPropIC,
                     obj_reg,
                     val_reg,
                     static_cast<u16>(ic_site)
@@ -2608,10 +2608,10 @@ struct AnvilCompiler {
             advance();
             const u16 arr_reg = alloc_reg();
             const u16 arr_mark = next_reg;
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewArray, arr_reg, 8u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::NewArray, arr_reg, 8u, 0u));
             while (peek().kind != TokenKind::RBracket && peek().kind != TokenKind::Eof && !had_error) {
                 const u16 elem_reg = compile_assignment();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ArrayPush, arr_reg, elem_reg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ArrayPush, arr_reg, elem_reg, 0u));
                 if (next_reg > arr_mark) {
                     next_reg = arr_mark;
                 }
@@ -2658,11 +2658,11 @@ struct AnvilCompiler {
                 for (u32 i = 0u; i < argc && !had_error; ++i) {
                     const u16 slot_r = alloc_reg();
                     if (i < argc && arg_regs[i] != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction{AnvilOpcode::HostCall, 0u, dst, call_base,
+                ctx->program.emit(CinderInstruction{CinderOpcode::HostCall, 0u, dst, call_base,
                                                    static_cast<u16>(argc), 0u});
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
             }
@@ -2678,7 +2678,7 @@ struct AnvilCompiler {
                 const u16 arg_reg = compile_assignment();
                 expect(TokenKind::RParen);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallPred, dst, pred_op, arg_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CallPred, dst, pred_op, arg_reg));
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
             }
 
@@ -2695,20 +2695,20 @@ struct AnvilCompiler {
                     advance();
                     const u16 dst = alloc_reg();
                     const u32 empty_sym = intern_name("", 0u);
-                    const u32 cidx = ctx->program.add_constant(AnvilValue::make_string(empty_sym));
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+                    const u32 cidx = ctx->program.add_constant(CinderValue::make_string(empty_sym));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, dst, cidx));
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
                 const u16 first_arg = compile_assignment();
                 u16 acc = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::StringFromCharCode, acc, first_arg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::StringFromCharCode, acc, first_arg, 0u));
                 while (match(TokenKind::Comma)) {
                     if (peek().kind == TokenKind::RParen) break;
                     const u16 next_arg = compile_assignment();
                     const u16 part = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::StringFromCharCode, part, next_arg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::StringFromCharCode, part, next_arg, 0u));
                     const u16 joined = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Add, joined, acc, part));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Add, joined, acc, part));
                     acc = joined;
                 }
                 expect(TokenKind::RParen);
@@ -2727,7 +2727,7 @@ struct AnvilCompiler {
                 const u16 arg_reg = compile_assignment();
                 expect(TokenKind::RParen);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallPred, dst, 6u, arg_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CallPred, dst, 6u, arg_reg));
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
             }
 
@@ -2771,7 +2771,7 @@ struct AnvilCompiler {
                     const u16 arg_reg = compile_assignment();
                     expect(TokenKind::RParen);
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallMath, dst, math_op, arg_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CallMath, dst, math_op, arg_reg));
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
 
@@ -2785,7 +2785,7 @@ struct AnvilCompiler {
                     const u16 b_reg = compile_assignment();
                     expect(TokenKind::RParen);
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction{AnvilOpcode::CallMath2, 0u, dst, a_reg, b_reg, op2});
+                    ctx->program.emit(CinderInstruction{CinderOpcode::CallMath2, 0u, dst, a_reg, b_reg, op2});
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
 
@@ -2808,7 +2808,7 @@ struct AnvilCompiler {
                         }
                         const u16 nxt = compile_assignment();
                         const u16 res = alloc_reg();
-                        ctx->program.emit(AnvilInstruction{AnvilOpcode::CallMath2, 0u, res, acc, nxt, mm});
+                        ctx->program.emit(CinderInstruction{CinderOpcode::CallMath2, 0u, res, acc, nxt, mm});
                         acc = res;
                     }
                     expect(TokenKind::RParen);
@@ -2839,7 +2839,7 @@ struct AnvilCompiler {
                 const u16 arg_reg = compile_assignment();
                 expect(TokenKind::RParen);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CallPred, dst, pred_op, arg_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CallPred, dst, pred_op, arg_reg));
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
             }
 
@@ -2862,12 +2862,12 @@ struct AnvilCompiler {
                     for (u32 i = 0u; i < argc && !had_error; ++i) {
                         const u16 slot_r = alloc_reg();
                         if (arg_regs[i] != slot_r) {
-                            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                         }
                     }
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction{
-                        AnvilOpcode::NewBuiltin, bkind, dst, call_base, static_cast<u16>(argc), 0u
+                    ctx->program.emit(CinderInstruction{
+                        CinderOpcode::NewBuiltin, bkind, dst, call_base, static_cast<u16>(argc), 0u
                     });
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
@@ -2879,36 +2879,36 @@ struct AnvilCompiler {
                     } else {
                         const u16 arg = compile_assignment();
                         expect(TokenKind::RParen);
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, dst, arg, 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, dst, arg, 0u));
                     }
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
                 if (match_kw(&src[id_tok.offset], id_tok.length, "String", 6)) {
                     expect(TokenKind::LParen);
                     const u32 empty_sym = intern_name("", 0u);
-                    const u32 cidx = ctx->program.add_constant(AnvilValue::make_string(empty_sym));
+                    const u32 cidx = ctx->program.add_constant(CinderValue::make_string(empty_sym));
                     const u16 empty_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, empty_reg, cidx));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, empty_reg, cidx));
                     if (match(TokenKind::RParen)) {
                         return compile_postfix(empty_reg, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                     }
                     const u16 arg = compile_assignment();
                     expect(TokenKind::RParen);
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Add, dst, empty_reg, arg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Add, dst, empty_reg, arg));
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
                 if (match_kw(&src[id_tok.offset], id_tok.length, "Boolean", 7)) {
                     expect(TokenKind::LParen);
                     const u16 dst = alloc_reg();
                     if (match(TokenKind::RParen)) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadFalse, dst, 0u, 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadFalse, dst, 0u, 0u));
                     } else {
                         const u16 arg = compile_assignment();
                         expect(TokenKind::RParen);
                         const u16 tmp = alloc_reg();
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Not, tmp, arg, 0u));
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Not, dst, tmp, 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Not, tmp, arg, 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Not, dst, tmp, 0u));
                     }
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
@@ -2943,15 +2943,15 @@ struct AnvilCompiler {
                         const u16 slot_r = alloc_reg();
                         if (i < argc) {
                             if (arg_regs[i] != slot_r) {
-                                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                             }
                         } else {
                             emit_load_undefined(slot_r);
                         }
                     }
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::Call, dst, static_cast<u16>(target_fn), call_base));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::Call, dst, static_cast<u16>(target_fn), call_base));
                     return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
                 }
 
@@ -2966,8 +2966,8 @@ struct AnvilCompiler {
                         if (ctx->globals()[gi].occupied && ctx->globals()[gi].name_sym == sym &&
                             ctx->globals()[gi].declared) {
                             callee_reg = alloc_reg();
-                            ctx->program.emit(AnvilInstruction::make_abx(
-                                AnvilOpcode::GetGlobal, callee_reg, static_cast<u16>(gi)));
+                            ctx->program.emit(CinderInstruction::make_abx(
+                                CinderOpcode::GetGlobal, callee_reg, static_cast<u16>(gi)));
                             have_callee = true;
                             break;
                         }
@@ -2983,12 +2983,12 @@ struct AnvilCompiler {
                 for (u32 i = 0u; i < argc && !had_error; ++i) {
                     const u16 slot_r = alloc_reg();
                     if (arg_regs[i] != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction{
-                    AnvilOpcode::CallValue, 0u, dst, callee_reg, call_base, argc});
+                ctx->program.emit(CinderInstruction{
+                    CinderOpcode::CallValue, 0u, dst, callee_reg, call_base, argc});
                 return compile_postfix(dst, VarRef{VarKind::Global, 0u, 0u, sym}, false);
             }
 
@@ -3013,8 +3013,8 @@ struct AnvilCompiler {
                 if (bkind != 0u && !is_shadowed_name(sym) && !is_assign_token(peek().kind)) {
                     const u16 dst = alloc_reg();
                     const u32 cidx = ctx->program.add_constant(
-                        AnvilValue::make_function(0xFFFFFF00u | static_cast<u32>(bkind)));
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+                        CinderValue::make_function(0xFFFFFF00u | static_cast<u32>(bkind)));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, dst, cidx));
                     return compile_postfix(dst, vr, false);
                 }
                 const u32 fn_as_value = find_function(sym);
@@ -3024,7 +3024,7 @@ struct AnvilCompiler {
                         return alloc_reg();
                     }
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadFunc, dst, fn_as_value));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadFunc, dst, fn_as_value));
                     return compile_postfix(dst, vr, false);
                 }
             }
@@ -3039,7 +3039,7 @@ struct AnvilCompiler {
                 const u16 cur_reg = load_var(vr);
                 const u16 rhs = compile_assignment();
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(assign_token_opcode(ak), dst, cur_reg, rhs));
+                ctx->program.emit(CinderInstruction::make_abc(assign_token_opcode(ak), dst, cur_reg, rhs));
                 store_var(vr, dst);
                 return dst;
             }
@@ -3049,7 +3049,7 @@ struct AnvilCompiler {
 
         reject_syntax();
         const u16 fallback = alloc_reg();
-        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, fallback, 0u, 0u));
+        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadNull, fallback, 0u, 0u));
         return fallback;
     }
 
@@ -3085,12 +3085,12 @@ struct AnvilCompiler {
                     for (u32 i = 0u; i < argc && !had_error; ++i) {
                         const u16 slot_r = alloc_reg();
                         if (arg_regs[i] != slot_r) {
-                            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                         }
                     }
                     const u16 dst = alloc_reg();
-                    ctx->program.emit(AnvilInstruction{
-                        AnvilOpcode::CallMethod,
+                    ctx->program.emit(CinderInstruction{
+                        CinderOpcode::CallMethod,
                         static_cast<u8>(argc < 255u ? argc : 255u),
                         dst,
                         cur,
@@ -3103,8 +3103,8 @@ struct AnvilCompiler {
                 if (match(TokenKind::Assign)) {
                     const u16 rhs = compile_assignment();
                     const u32 ic_site = new_site(prop_sym);
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::SetPropIC,
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::SetPropIC,
                         cur,
                         rhs,
                         static_cast<u16>(ic_site)
@@ -3116,14 +3116,14 @@ struct AnvilCompiler {
                     const TokenKind ak = advance().kind;
                     const u32 get_site = new_site(prop_sym);
                     const u16 lhs_val = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::GetPropIC, lhs_val, cur, static_cast<u16>(get_site)));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::GetPropIC, lhs_val, cur, static_cast<u16>(get_site)));
                     const u16 rhs = compile_assignment();
                     const u16 res = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(assign_token_opcode(ak), res, lhs_val, rhs));
+                    ctx->program.emit(CinderInstruction::make_abc(assign_token_opcode(ak), res, lhs_val, rhs));
                     const u32 set_site = new_site(prop_sym);
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::SetPropIC, cur, res, static_cast<u16>(set_site)));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::SetPropIC, cur, res, static_cast<u16>(set_site)));
                     cur = res;
                     continue;
                 }
@@ -3131,25 +3131,25 @@ struct AnvilCompiler {
                     const bool is_inc = advance().kind == TokenKind::PlusPlus;
                     const u32 get_site = new_site(prop_sym);
                     const u16 raw_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::GetPropIC, raw_reg, cur, static_cast<u16>(get_site)));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::GetPropIC, raw_reg, cur, static_cast<u16>(get_site)));
                     const u16 old_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, old_reg, raw_reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, old_reg, raw_reg, 0u));
                     const u16 one_reg = alloc_reg();
                     emit_load_number(one_reg, 1.0);
                     const u16 new_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub, new_reg, old_reg, one_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        is_inc ? CinderOpcode::Add : CinderOpcode::Sub, new_reg, old_reg, one_reg));
                     const u32 set_site = new_site(prop_sym);
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::SetPropIC, cur, new_reg, static_cast<u16>(set_site)));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::SetPropIC, cur, new_reg, static_cast<u16>(set_site)));
                     cur = old_reg;
                     continue;
                 }
                 const u32 ic_site = new_site(prop_sym);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::GetPropIC,
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::GetPropIC,
                     dst,
                     cur,
                     static_cast<u16>(ic_site)
@@ -3163,38 +3163,38 @@ struct AnvilCompiler {
                 expect(TokenKind::RBracket);
                 if (match(TokenKind::Assign)) {
                     const u16 rhs = compile_assignment();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetElem, cur, idx_reg, rhs));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::SetElem, cur, idx_reg, rhs));
                     cur = rhs;
                     continue;
                 }
                 if (is_assign_token(peek().kind)) {
                     const TokenKind ak = advance().kind;
                     const u16 lhs_val = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, lhs_val, cur, idx_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetElem, lhs_val, cur, idx_reg));
                     const u16 rhs = compile_assignment();
                     const u16 res = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(assign_token_opcode(ak), res, lhs_val, rhs));
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetElem, cur, idx_reg, res));
+                    ctx->program.emit(CinderInstruction::make_abc(assign_token_opcode(ak), res, lhs_val, rhs));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::SetElem, cur, idx_reg, res));
                     cur = res;
                     continue;
                 }
                 if (peek().kind == TokenKind::PlusPlus || peek().kind == TokenKind::MinusMinus) {
                     const bool is_inc = advance().kind == TokenKind::PlusPlus;
                     const u16 raw_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, raw_reg, cur, idx_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetElem, raw_reg, cur, idx_reg));
                     const u16 old_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, old_reg, raw_reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, old_reg, raw_reg, 0u));
                     const u16 one_reg = alloc_reg();
                     emit_load_number(one_reg, 1.0);
                     const u16 new_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub, new_reg, old_reg, one_reg));
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetElem, cur, idx_reg, new_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        is_inc ? CinderOpcode::Add : CinderOpcode::Sub, new_reg, old_reg, one_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::SetElem, cur, idx_reg, new_reg));
                     cur = old_reg;
                     continue;
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, dst, cur, idx_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetElem, dst, cur, idx_reg));
                 cur = dst;
                 continue;
             }
@@ -3219,12 +3219,12 @@ struct AnvilCompiler {
                 for (u32 i = 0u; i < argc && !had_error; ++i) {
                     const u16 slot_r = alloc_reg();
                     if (arg_regs[i] != slot_r) {
-                        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, slot_r, arg_regs[i], 0u));
+                        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, slot_r, arg_regs[i], 0u));
                     }
                 }
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction{
-                    AnvilOpcode::CallValue, 0u, dst, cur, call_base, argc});
+                ctx->program.emit(CinderInstruction{
+                    CinderOpcode::CallValue, 0u, dst, cur, call_base, argc});
                 cur = dst;
                 continue;
             }
@@ -3235,12 +3235,12 @@ struct AnvilCompiler {
                 }
                 const bool is_inc = advance().kind == TokenKind::PlusPlus;
                 const u16 old_reg = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, old_reg, cur, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, old_reg, cur, 0u));
                 const u16 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub,
+                ctx->program.emit(CinderInstruction::make_abc(
+                    is_inc ? CinderOpcode::Add : CinderOpcode::Sub,
                     dst,
                     old_reg,
                     one_reg
@@ -3265,7 +3265,7 @@ struct AnvilCompiler {
         if (peek().kind == TokenKind::KwThis) {
             advance();
             cur = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadThis, cur, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadThis, cur, 0u, 0u));
         } else {
             const Token id_tok = advance();
             const u32 sym = token_sym(id_tok);
@@ -3287,43 +3287,43 @@ struct AnvilCompiler {
                 if (peek().kind != TokenKind::Dot && peek().kind != TokenKind::LBracket) {
                     const u32 get_site = new_site(prop_sym);
                     const u16 raw_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::GetPropIC, raw_reg, cur, static_cast<u16>(get_site)));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::GetPropIC, raw_reg, cur, static_cast<u16>(get_site)));
                     const u16 num_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, num_reg, raw_reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, num_reg, raw_reg, 0u));
                     const u16 one_reg = alloc_reg();
                     emit_load_number(one_reg, 1.0);
                     const u16 new_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub, new_reg, num_reg, one_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        is_inc ? CinderOpcode::Add : CinderOpcode::Sub, new_reg, num_reg, one_reg));
                     const u32 set_site = new_site(prop_sym);
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        AnvilOpcode::SetPropIC, cur, new_reg, static_cast<u16>(set_site)));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        CinderOpcode::SetPropIC, cur, new_reg, static_cast<u16>(set_site)));
                     return new_reg;
                 }
                 const u32 get_site = new_site(prop_sym);
                 const u16 nxt = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::GetPropIC, nxt, cur, static_cast<u16>(get_site)));
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::GetPropIC, nxt, cur, static_cast<u16>(get_site)));
                 cur = nxt;
             } else if (match(TokenKind::LBracket)) {
                 const u16 idx_reg = compile_expr();
                 expect(TokenKind::RBracket);
                 if (peek().kind != TokenKind::Dot && peek().kind != TokenKind::LBracket) {
                     const u16 raw_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, raw_reg, cur, idx_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetElem, raw_reg, cur, idx_reg));
                     const u16 num_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, num_reg, raw_reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, num_reg, raw_reg, 0u));
                     const u16 one_reg = alloc_reg();
                     emit_load_number(one_reg, 1.0);
                     const u16 new_reg = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(
-                        is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub, new_reg, num_reg, one_reg));
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::SetElem, cur, idx_reg, new_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(
+                        is_inc ? CinderOpcode::Add : CinderOpcode::Sub, new_reg, num_reg, one_reg));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::SetElem, cur, idx_reg, new_reg));
                     return new_reg;
                 }
                 const u16 nxt = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::GetElem, nxt, cur, idx_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::GetElem, nxt, cur, idx_reg));
                 cur = nxt;
             }
         }
@@ -3333,12 +3333,12 @@ struct AnvilCompiler {
         }
         const u16 raw_reg = load_var(vr);
         const u16 num_reg = alloc_reg();
-        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, num_reg, raw_reg, 0u));
+        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, num_reg, raw_reg, 0u));
         const u16 one_reg = alloc_reg();
         emit_load_number(one_reg, 1.0);
         const u16 new_reg = alloc_reg();
-        ctx->program.emit(AnvilInstruction::make_abc(
-            is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub, new_reg, num_reg, one_reg));
+        ctx->program.emit(CinderInstruction::make_abc(
+            is_inc ? CinderOpcode::Add : CinderOpcode::Sub, new_reg, num_reg, one_reg));
         store_var(vr, new_reg);
         return new_reg;
     }
@@ -3350,25 +3350,25 @@ struct AnvilCompiler {
         if (match(TokenKind::Minus)) {
             const u16 operand = compile_unary();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Neg, dst, operand, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Neg, dst, operand, 0u));
             return dst;
         }
         if (match(TokenKind::Plus)) {
             const u16 operand = compile_unary();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::ToNum, dst, operand, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::ToNum, dst, operand, 0u));
             return dst;
         }
         if (match(TokenKind::Bang)) {
             const u16 operand = compile_unary();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Not, dst, operand, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Not, dst, operand, 0u));
             return dst;
         }
         if (match(TokenKind::Tilde)) {
             const u16 operand = compile_unary();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::BitNot, dst, operand, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::BitNot, dst, operand, 0u));
             return dst;
         }
         if (match(TokenKind::KwTypeof)) {
@@ -3387,14 +3387,14 @@ struct AnvilCompiler {
                     advance();
                     const u16 dst = alloc_reg();
                     const u32 usym = intern_name("undefined", 9u);
-                    const u32 cidx = ctx->program.add_constant(AnvilValue::make_string(usym));
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::LoadConst, dst, cidx));
+                    const u32 cidx = ctx->program.add_constant(CinderValue::make_string(usym));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::LoadConst, dst, cidx));
                     return dst;
                 }
             }
             const u16 operand = compile_unary();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::TypeOf, dst, operand, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::TypeOf, dst, operand, 0u));
             return dst;
         }
         if (match(TokenKind::KwVoid)) {
@@ -3407,20 +3407,20 @@ struct AnvilCompiler {
             const u16 operand = compile_unary();
             // If the last emitted instruction was GetPropIC or GetElem into `operand`, rewrite it to DeleteProp / DeleteElem.
             if (ctx->program.code_len > 0u) {
-                AnvilInstruction& last = ctx->program.code()[ctx->program.code_len - 1u];
-                if (last.op == AnvilOpcode::GetPropIC && last.a == operand) {
+                CinderInstruction& last = ctx->program.code()[ctx->program.code_len - 1u];
+                if (last.op == CinderOpcode::GetPropIC && last.a == operand) {
                     const u32 site_id = last.c;
                     const u32 prop_sym = (site_id < ctx->ic.site_count) ? ctx->ic.sites()[site_id].prop_sym : 0u;
-                    last = AnvilInstruction{AnvilOpcode::DeleteProp, 0u, operand, last.b, 0u, prop_sym};
+                    last = CinderInstruction{CinderOpcode::DeleteProp, 0u, operand, last.b, 0u, prop_sym};
                     return operand;
                 }
-                if (last.op == AnvilOpcode::GetElem && last.a == operand) {
-                    last = AnvilInstruction::make_abc(AnvilOpcode::DeleteElem, operand, last.b, last.c);
+                if (last.op == CinderOpcode::GetElem && last.a == operand) {
+                    last = CinderInstruction::make_abc(CinderOpcode::DeleteElem, operand, last.b, last.c);
                     return operand;
                 }
             }
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadTrue, dst, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadTrue, dst, 0u, 0u));
             return dst;
         }
         if (match(TokenKind::PlusPlus)) {
@@ -3437,7 +3437,7 @@ struct AnvilCompiler {
         if (match(TokenKind::StarStar)) {
             const u16 rhs = compile_exp(); // right-associative
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction{AnvilOpcode::CallMath2, 0u, dst, lhs, rhs, 1u});
+            ctx->program.emit(CinderInstruction{CinderOpcode::CallMath2, 0u, dst, lhs, rhs, 1u});
             return dst;
         }
         return lhs;
@@ -3451,10 +3451,10 @@ struct AnvilCompiler {
             const TokenKind op = advance().kind;
             const u16 rhs = compile_exp();
             const u16 dst = alloc_reg();
-            const AnvilOpcode opc = (op == TokenKind::Star)
-                ? AnvilOpcode::Mul
-                : (op == TokenKind::Slash ? AnvilOpcode::Div : AnvilOpcode::Mod);
-            ctx->program.emit(AnvilInstruction::make_abc(opc, dst, lhs, rhs));
+            const CinderOpcode opc = (op == TokenKind::Star)
+                ? CinderOpcode::Mul
+                : (op == TokenKind::Slash ? CinderOpcode::Div : CinderOpcode::Mod);
+            ctx->program.emit(CinderInstruction::make_abc(opc, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3466,8 +3466,8 @@ struct AnvilCompiler {
             const TokenKind op = advance().kind;
             const u16 rhs = compile_mul();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(
-                op == TokenKind::Plus ? AnvilOpcode::Add : AnvilOpcode::Sub,
+            ctx->program.emit(CinderInstruction::make_abc(
+                op == TokenKind::Plus ? CinderOpcode::Add : CinderOpcode::Sub,
                 dst,
                 lhs,
                 rhs
@@ -3485,10 +3485,10 @@ struct AnvilCompiler {
             const TokenKind op = advance().kind;
             const u16 rhs = compile_add();
             const u16 dst = alloc_reg();
-            const AnvilOpcode opc = (op == TokenKind::Shl)
-                ? AnvilOpcode::Shl
-                : (op == TokenKind::Shr ? AnvilOpcode::Shr : AnvilOpcode::UShr);
-            ctx->program.emit(AnvilInstruction::make_abc(opc, dst, lhs, rhs));
+            const CinderOpcode opc = (op == TokenKind::Shl)
+                ? CinderOpcode::Shl
+                : (op == TokenKind::Shr ? CinderOpcode::Shr : CinderOpcode::UShr);
+            ctx->program.emit(CinderInstruction::make_abc(opc, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3505,13 +3505,13 @@ struct AnvilCompiler {
             const TokenKind op = advance().kind;
             const u16 rhs = compile_shift();
             const u16 dst = alloc_reg();
-            AnvilOpcode opc = AnvilOpcode::CmpLt;
-            if (op == TokenKind::Le) opc = AnvilOpcode::CmpLe;
-            else if (op == TokenKind::Gt) opc = AnvilOpcode::CmpGt;
-            else if (op == TokenKind::Ge) opc = AnvilOpcode::CmpGe;
-            else if (op == TokenKind::KwIn) opc = AnvilOpcode::InOp;
-            else if (op == TokenKind::KwInstanceof) opc = AnvilOpcode::InstanceOf;
-            ctx->program.emit(AnvilInstruction::make_abc(opc, dst, lhs, rhs));
+            CinderOpcode opc = CinderOpcode::CmpLt;
+            if (op == TokenKind::Le) opc = CinderOpcode::CmpLe;
+            else if (op == TokenKind::Gt) opc = CinderOpcode::CmpGt;
+            else if (op == TokenKind::Ge) opc = CinderOpcode::CmpGe;
+            else if (op == TokenKind::KwIn) opc = CinderOpcode::InOp;
+            else if (op == TokenKind::KwInstanceof) opc = CinderOpcode::InstanceOf;
+            ctx->program.emit(CinderInstruction::make_abc(opc, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3524,15 +3524,15 @@ struct AnvilCompiler {
             const TokenKind op = advance().kind;
             const u16 rhs = compile_relational();
             const u16 dst = alloc_reg();
-            AnvilOpcode opc = AnvilOpcode::CmpEq;
+            CinderOpcode opc = CinderOpcode::CmpEq;
             if (op == TokenKind::BangEq) {
-                opc = AnvilOpcode::CmpNe;
+                opc = CinderOpcode::CmpNe;
             } else if (op == TokenKind::LooseEq) {
-                opc = AnvilOpcode::CmpLooseEq;
+                opc = CinderOpcode::CmpLooseEq;
             } else if (op == TokenKind::LooseNe) {
-                opc = AnvilOpcode::CmpLooseNe;
+                opc = CinderOpcode::CmpLooseNe;
             }
-            ctx->program.emit(AnvilInstruction::make_abc(opc, dst, lhs, rhs));
+            ctx->program.emit(CinderInstruction::make_abc(opc, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3544,7 +3544,7 @@ struct AnvilCompiler {
             advance();
             const u16 rhs = compile_equality();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::BitAnd, dst, lhs, rhs));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::BitAnd, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3556,7 +3556,7 @@ struct AnvilCompiler {
             advance();
             const u16 rhs = compile_bit_and();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::BitXor, dst, lhs, rhs));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::BitXor, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3568,7 +3568,7 @@ struct AnvilCompiler {
             advance();
             const u16 rhs = compile_bit_xor();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::BitOr, dst, lhs, rhs));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::BitOr, dst, lhs, rhs));
             lhs = dst;
         }
         return lhs;
@@ -3579,16 +3579,16 @@ struct AnvilCompiler {
         while (peek().kind == TokenKind::AndAnd) {
             advance();
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, lhs, 0u));
-            const u32 patch_pc = ctx->program.emit(AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfFalse,
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, lhs, 0u));
+            const u32 patch_pc = ctx->program.emit(CinderInstruction::make_abx(
+                CinderOpcode::JumpIfFalse,
                 dst,
                 0u
             ));
             const u16 rhs = compile_bitwise();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, rhs, 0u));
-            ctx->program.code()[patch_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfFalse,
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, rhs, 0u));
+            ctx->program.code()[patch_pc] = CinderInstruction::make_abx(
+                CinderOpcode::JumpIfFalse,
                 dst,
                 ctx->program.code_len
             );
@@ -3603,31 +3603,31 @@ struct AnvilCompiler {
             const TokenKind op = advance().kind;
             if (op == TokenKind::Nullish) {
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, lhs, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, lhs, 0u));
                 const u16 null_reg = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LoadNull, null_reg, 0u, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LoadNull, null_reg, 0u, 0u));
                 const u16 is_nullish = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CmpLooseEq, is_nullish, dst, null_reg));
-                const u32 patch_pc = ctx->program.emit(AnvilInstruction::make_abx(
-                    AnvilOpcode::JumpIfFalse, is_nullish, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CmpLooseEq, is_nullish, dst, null_reg));
+                const u32 patch_pc = ctx->program.emit(CinderInstruction::make_abx(
+                    CinderOpcode::JumpIfFalse, is_nullish, 0u));
                 const u16 rhs = compile_logical_and();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, rhs, 0u));
-                ctx->program.code()[patch_pc] = AnvilInstruction::make_abx(
-                    AnvilOpcode::JumpIfFalse, is_nullish, ctx->program.code_len);
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, rhs, 0u));
+                ctx->program.code()[patch_pc] = CinderInstruction::make_abx(
+                    CinderOpcode::JumpIfFalse, is_nullish, ctx->program.code_len);
                 lhs = dst;
                 continue;
             }
             const u16 dst = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, lhs, 0u));
-            const u32 patch_pc = ctx->program.emit(AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfTrue,
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, lhs, 0u));
+            const u32 patch_pc = ctx->program.emit(CinderInstruction::make_abx(
+                CinderOpcode::JumpIfTrue,
                 dst,
                 0u
             ));
             const u16 rhs = compile_logical_and();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, rhs, 0u));
-            ctx->program.code()[patch_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfTrue,
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, rhs, 0u));
+            ctx->program.code()[patch_pc] = CinderInstruction::make_abx(
+                CinderOpcode::JumpIfTrue,
                 dst,
                 ctx->program.code_len
             );
@@ -3641,21 +3641,21 @@ struct AnvilCompiler {
         if (match(TokenKind::Question)) {
             const u16 dst = alloc_reg();
             const u32 jfalse_pc = ctx->program.emit(
-                AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_or_val, 0u)
+                CinderInstruction::make_abx(CinderOpcode::JumpIfFalse, cond_or_val, 0u)
             );
             const u16 then_reg = compile_assignment();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, then_reg, 0u));
-            const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, then_reg, 0u));
+            const u32 jend_pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
             expect(TokenKind::Colon);
-            ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfFalse,
+            ctx->program.code()[jfalse_pc] = CinderInstruction::make_abx(
+                CinderOpcode::JumpIfFalse,
                 cond_or_val,
                 ctx->program.code_len
             );
             const u16 else_reg = compile_assignment();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, dst, else_reg, 0u));
-            ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::Jump,
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, dst, else_reg, 0u));
+            ctx->program.code()[jend_pc] = CinderInstruction::make_abx(
+                CinderOpcode::Jump,
                 0u,
                 ctx->program.code_len
             );
@@ -3717,7 +3717,7 @@ struct AnvilCompiler {
                     reject_if_expression_continues();
                     const u16 g_slot = global_slot(sym);
                     if (!had_error && g_slot < ctx->global_count) {
-                        AnvilGlobalBinding& gb = ctx->globals()[g_slot];
+                        CinderGlobalBinding& gb = ctx->globals()[g_slot];
                         if (gb.decl_depth != NO_DEPTH && gb.decl_depth != block_depth) {
                             reject_name(VM_REFUSE_UNSUPPORTED, "name declared again in an inner block", id_tok);
                             return 0u;
@@ -3728,7 +3728,7 @@ struct AnvilCompiler {
                             gb.exported = true;
                         }
                     }
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, val_reg, g_slot));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::SetGlobal, val_reg, g_slot));
                     last_reg = val_reg;
                 }
             } else {
@@ -3762,9 +3762,9 @@ struct AnvilCompiler {
             reg_floor = static_cast<u16>(exc_reg + 1u);
         }
         const u32 enter_pc = ctx->program.emit(
-            AnvilInstruction::make_abx(AnvilOpcode::EnterTry, exc_reg, 0u));
+            CinderInstruction::make_abx(CinderOpcode::EnterTry, exc_reg, 0u));
         const u32 set_fin_pc = ctx->program.emit(
-            AnvilInstruction::make_abx(AnvilOpcode::SetTryFinally, 0u, 0u));
+            CinderInstruction::make_abx(CinderOpcode::SetTryFinally, 0u, 0u));
 
         if (peek().kind != TokenKind::LBrace) {
             reject_syntax();
@@ -3772,9 +3772,9 @@ struct AnvilCompiler {
             return 0u;
         }
         compile_statement(); // try block
-        ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LeaveTry, 0u, 0u, 0u));
+        ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LeaveTry, 0u, 0u, 0u));
         const u32 j_after_try = ctx->program.emit(
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
 
         u32 catch_pc = 0u;
         u32 j_after_catch = NO_SLOT;
@@ -3795,7 +3795,7 @@ struct AnvilCompiler {
                     if (g_slot < ctx->global_count) {
                         ctx->globals()[g_slot].declared = true;
                     }
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, exc_reg, g_slot));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::SetGlobal, exc_reg, g_slot));
                 } else {
                     const u16 p_reg = declare_local(p_sym, false);
                     init_local(p_reg, fn_uses_cells, exc_reg);
@@ -3807,9 +3807,9 @@ struct AnvilCompiler {
                 return 0u;
             }
             compile_statement(); // catch block
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::LeaveTry, 0u, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::LeaveTry, 0u, 0u, 0u));
             j_after_catch = ctx->program.emit(
-                AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+                CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
         }
 
         u32 finally_pc = 0u;
@@ -3821,7 +3821,7 @@ struct AnvilCompiler {
                 return 0u;
             }
             compile_statement(); // finally block
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::EndFinally, 0u, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::EndFinally, 0u, 0u, 0u));
         }
 
         if (catch_pc == 0u && finally_pc == 0u) {
@@ -3831,20 +3831,20 @@ struct AnvilCompiler {
         }
 
         ctx->program.code()[enter_pc] =
-            AnvilInstruction::make_abx(AnvilOpcode::EnterTry, exc_reg, catch_pc);
+            CinderInstruction::make_abx(CinderOpcode::EnterTry, exc_reg, catch_pc);
         if (finally_pc != 0u) {
             ctx->program.code()[set_fin_pc] =
-                AnvilInstruction::make_abx(AnvilOpcode::SetTryFinally, 0u, finally_pc);
+                CinderInstruction::make_abx(CinderOpcode::SetTryFinally, 0u, finally_pc);
         } else {
-            ctx->program.code()[set_fin_pc] = AnvilInstruction::make_abc(AnvilOpcode::Nop, 0u, 0u, 0u);
+            ctx->program.code()[set_fin_pc] = CinderInstruction::make_abc(CinderOpcode::Nop, 0u, 0u, 0u);
         }
 
         const u32 normal_target = (finally_pc != 0u) ? finally_pc : ctx->program.code_len;
         ctx->program.code()[j_after_try] =
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, normal_target);
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, normal_target);
         if (j_after_catch != NO_SLOT) {
             ctx->program.code()[j_after_catch] =
-                AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, normal_target);
+                CinderInstruction::make_abx(CinderOpcode::Jump, 0u, normal_target);
         }
 
         reg_floor = saved_floor;
@@ -3869,7 +3869,7 @@ struct AnvilCompiler {
         }
 
         const u32 j_dispatch = ctx->program.emit(
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
 
         u32 case_cursors[128];
         u32 case_body_pcs[128];
@@ -3914,9 +3914,9 @@ struct AnvilCompiler {
         expect(TokenKind::RBrace);
 
         const u32 j_after_bodies = ctx->program.emit(
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
         ctx->program.code()[j_dispatch] =
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, ctx->program.code_len);
 
         const u32 saved_cursor = cursor;
         for (u32 i = 0u; i < case_count && !had_error; ++i) {
@@ -3924,8 +3924,8 @@ struct AnvilCompiler {
             const u16 cval_reg = compile_expr();
             expect(TokenKind::Colon);
             const u16 cmp_reg = alloc_reg();
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CmpEq, cmp_reg, disc_reg, cval_reg));
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::JumpIfTrue, cmp_reg, case_body_pcs[i]));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CmpEq, cmp_reg, disc_reg, cval_reg));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::JumpIfTrue, cmp_reg, case_body_pcs[i]));
             if (next_reg > reg_floor) {
                 next_reg = reg_floor;
             }
@@ -3933,10 +3933,10 @@ struct AnvilCompiler {
         cursor = saved_cursor;
 
         if (default_body_pc != NO_SLOT) {
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, default_body_pc));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, default_body_pc));
         }
         ctx->program.code()[j_after_bodies] =
-            AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, ctx->program.code_len);
+            CinderInstruction::make_abx(CinderOpcode::Jump, 0u, ctx->program.code_len);
 
         end_loop(0u);
         reg_floor = saved_floor;
@@ -3991,7 +3991,7 @@ struct AnvilCompiler {
             if (!in_function) {
                 const u16 g_slot = global_slot(cls_sym);
                 if (!had_error && g_slot < ctx->global_count) {
-                    AnvilGlobalBinding& gb = ctx->globals()[g_slot];
+                    CinderGlobalBinding& gb = ctx->globals()[g_slot];
                     gb.decl_depth = block_depth;
                     gb.declared = true;
                     if (block_depth == 0u) {
@@ -3999,7 +3999,7 @@ struct AnvilCompiler {
                     }
                 }
                 const u16 ctor_reg = compile_class_literal(cls_sym);
-                ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, ctor_reg, g_slot));
+                ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::SetGlobal, ctor_reg, g_slot));
                 return ctor_reg;
             } else {
                 const u16 dst = declare_local(cls_sym, false);
@@ -4029,7 +4029,7 @@ struct AnvilCompiler {
                 emit_load_undefined(ret_reg);
             }
             match(TokenKind::Semicolon);
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, ret_reg, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Return, ret_reg, 0u, 0u));
             return ret_reg;
         }
 
@@ -4037,7 +4037,7 @@ struct AnvilCompiler {
             const u16 val_reg = compile_expr();
             reject_if_expression_continues();
             match(TokenKind::Semicolon);
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Throw, val_reg, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Throw, val_reg, 0u, 0u));
             return val_reg;
         }
 
@@ -4055,28 +4055,28 @@ struct AnvilCompiler {
             const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             const u32 jfalse_pc = ctx->program.emit(
-                AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u)
+                CinderInstruction::make_abx(CinderOpcode::JumpIfFalse, cond_reg, 0u)
             );
             if (next_reg > cond_mark) {
                 next_reg = cond_mark;
             }
             u16 last_reg = compile_statement();
             if (match(TokenKind::KwElse)) {
-                const u32 jend_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
-                ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
-                    AnvilOpcode::JumpIfFalse,
+                const u32 jend_pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
+                ctx->program.code()[jfalse_pc] = CinderInstruction::make_abx(
+                    CinderOpcode::JumpIfFalse,
                     cond_reg,
                     ctx->program.code_len
                 );
                 last_reg = compile_statement();
-                ctx->program.code()[jend_pc] = AnvilInstruction::make_abx(
-                    AnvilOpcode::Jump,
+                ctx->program.code()[jend_pc] = CinderInstruction::make_abx(
+                    CinderOpcode::Jump,
                     0u,
                     ctx->program.code_len
                 );
             } else {
-                ctx->program.code()[jfalse_pc] = AnvilInstruction::make_abx(
-                    AnvilOpcode::JumpIfFalse,
+                ctx->program.code()[jfalse_pc] = CinderInstruction::make_abx(
+                    CinderOpcode::JumpIfFalse,
                     cond_reg,
                     ctx->program.code_len
                 );
@@ -4105,8 +4105,8 @@ struct AnvilCompiler {
         if (match(TokenKind::KwDo)) {
             const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
             const u32 loop_head_pc = ctx->program.code_len;
-            ctx->program.emit(AnvilInstruction::make_abc(
-                AnvilOpcode::LoopHeader,
+            ctx->program.emit(CinderInstruction::make_abc(
+                CinderOpcode::LoopHeader,
                 static_cast<u8>(loop_id),
                 0u,
                 0u
@@ -4121,8 +4121,8 @@ struct AnvilCompiler {
             const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             match(TokenKind::Semicolon);
-            ctx->program.emit(AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfTrue,
+            ctx->program.emit(CinderInstruction::make_abx(
+                CinderOpcode::JumpIfTrue,
                 cond_reg,
                 loop_head_pc
             ));
@@ -4133,8 +4133,8 @@ struct AnvilCompiler {
         if (match(TokenKind::KwWhile)) {
             const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
             const u32 loop_head_pc = ctx->program.code_len;
-            ctx->program.emit(AnvilInstruction::make_abc(
-                AnvilOpcode::LoopHeader,
+            ctx->program.emit(CinderInstruction::make_abc(
+                CinderOpcode::LoopHeader,
                 static_cast<u8>(loop_id),
                 0u,
                 0u
@@ -4143,19 +4143,19 @@ struct AnvilCompiler {
             const u16 cond_reg = compile_expr();
             expect(TokenKind::RParen);
             const u32 jexit_pc = ctx->program.emit(
-                AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u)
+                CinderInstruction::make_abx(CinderOpcode::JumpIfFalse, cond_reg, 0u)
             );
             if (!begin_loop()) {
                 return 0u;
             }
             const u16 body_reg = compile_statement();
-            ctx->program.emit(AnvilInstruction::make_abx(
-                AnvilOpcode::Jump,
+            ctx->program.emit(CinderInstruction::make_abx(
+                CinderOpcode::Jump,
                 0u,
                 loop_head_pc
             ));
-            ctx->program.code()[jexit_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::JumpIfFalse,
+            ctx->program.code()[jexit_pc] = CinderInstruction::make_abx(
+                CinderOpcode::JumpIfFalse,
                 cond_reg,
                 ctx->program.code_len
             );
@@ -4183,12 +4183,12 @@ struct AnvilCompiler {
                 const u16 saved_floor = reg_floor;
                 const u16 iter_reg = alloc_reg();
                 if (iter_reg != iter_expr_reg) {
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Move, iter_reg, iter_expr_reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Move, iter_reg, iter_expr_reg, 0u));
                 }
                 const u16 idx_reg = alloc_reg();
                 emit_load_number(idx_reg, 0.0);
                 const u16 len_reg = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::IterLen, len_reg, iter_reg, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::IterLen, len_reg, iter_reg, 0u));
                 if (len_reg + 1u > reg_floor) {
                     reg_floor = static_cast<u16>(len_reg + 1u);
                 }
@@ -4209,17 +4209,17 @@ struct AnvilCompiler {
 
                 const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
                 const u32 cond_pc = ctx->program.code_len;
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    AnvilOpcode::LoopHeader, static_cast<u8>(loop_id), 0u, 0u));
+                ctx->program.emit(CinderInstruction::make_abc(
+                    CinderOpcode::LoopHeader, static_cast<u8>(loop_id), 0u, 0u));
                 const u16 cond_reg = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CmpLt, cond_reg, idx_reg, len_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CmpLt, cond_reg, idx_reg, len_reg));
                 const u32 jexit_pc = ctx->program.emit(
-                    AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u));
+                    CinderInstruction::make_abx(CinderOpcode::JumpIfFalse, cond_reg, 0u));
 
                 const u16 elem_reg = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::IterGet, elem_reg, iter_reg, idx_reg));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::IterGet, elem_reg, iter_reg, idx_reg));
                 if (use_global) {
-                    ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::SetGlobal, elem_reg, g_slot));
+                    ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::SetGlobal, elem_reg, g_slot));
                 } else {
                     init_local(local_dst, fn_uses_cells, elem_reg);
                 }
@@ -4232,11 +4232,11 @@ struct AnvilCompiler {
                 const u32 step_pc = ctx->program.code_len;
                 const u16 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
-                ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Add, idx_reg, idx_reg, one_reg));
-                ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, cond_pc));
+                ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Add, idx_reg, idx_reg, one_reg));
+                ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, cond_pc));
 
                 ctx->program.code()[jexit_pc] =
-                    AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, ctx->program.code_len);
+                    CinderInstruction::make_abx(CinderOpcode::JumpIfFalse, cond_reg, ctx->program.code_len);
                 end_loop(step_pc);
                 reg_floor = saved_floor;
                 return body_reg;
@@ -4249,8 +4249,8 @@ struct AnvilCompiler {
             const u32 loop_locals_end = local_count;
             const u32 loop_id = (next_loop_id < 63u) ? next_loop_id++ : 63u;
             const u32 cond_pc = ctx->program.code_len;
-            ctx->program.emit(AnvilInstruction::make_abc(
-                AnvilOpcode::LoopHeader,
+            ctx->program.emit(CinderInstruction::make_abc(
+                CinderOpcode::LoopHeader,
                 static_cast<u8>(loop_id),
                 0u,
                 0u
@@ -4263,27 +4263,27 @@ struct AnvilCompiler {
                 expect(TokenKind::Semicolon);
             }
             const u32 jexit_pc = has_cond
-                ? ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::JumpIfFalse, cond_reg, 0u))
+                ? ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::JumpIfFalse, cond_reg, 0u))
                 : 0u;
-            const u32 jbody_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+            const u32 jbody_pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
 
             const u32 step_pc = ctx->program.code_len;
             for (u32 i = loop_locals_start; i < loop_locals_end; ++i) {
                 if (locals()[i].is_cell) {
                     const u16 reg = locals()[i].reg;
                     const u16 tmp = alloc_reg();
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::CellGet, tmp, reg, 0u));
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, reg, tmp, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::CellGet, tmp, reg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::NewCell, reg, tmp, 0u));
                 }
             }
             if (peek().kind != TokenKind::RParen) {
                 compile_statement_or_assign_no_semi();
             }
             expect(TokenKind::RParen);
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, cond_pc));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, cond_pc));
 
-            ctx->program.code()[jbody_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::Jump,
+            ctx->program.code()[jbody_pc] = CinderInstruction::make_abx(
+                CinderOpcode::Jump,
                 0u,
                 ctx->program.code_len
             );
@@ -4291,11 +4291,11 @@ struct AnvilCompiler {
                 return 0u;
             }
             const u16 body_reg = compile_statement();
-            ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, step_pc));
+            ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, step_pc));
 
             if (has_cond) {
-                ctx->program.code()[jexit_pc] = AnvilInstruction::make_abx(
-                    AnvilOpcode::JumpIfFalse,
+                ctx->program.code()[jexit_pc] = CinderInstruction::make_abx(
+                    CinderOpcode::JumpIfFalse,
                     cond_reg,
                     ctx->program.code_len
                 );
@@ -4375,7 +4375,7 @@ struct AnvilCompiler {
 
             fn_uses_cells = body_has_nested_function();
 
-            const u32 jskip_pc = ctx->program.emit(AnvilInstruction::make_abx(AnvilOpcode::Jump, 0u, 0u));
+            const u32 jskip_pc = ctx->program.emit(CinderInstruction::make_abx(CinderOpcode::Jump, 0u, 0u));
             const u32 fn_start_pc = ctx->program.code_len;
             if (fn_id < ctx->heap.function_count) {
                 ctx->heap.functions()[fn_id].code_start = fn_start_pc;
@@ -4385,21 +4385,21 @@ struct AnvilCompiler {
                 for (u32 i = local_floor; i < local_count; ++i) {
                     locals()[i].is_cell = true;
                     const u16 preg = locals()[i].reg;
-                    ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::NewCell, preg, preg, 0u));
+                    ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::NewCell, preg, preg, 0u));
                 }
             }
 
             compile_statement();
             const u16 fallthrough_reg = alloc_reg();
             emit_load_undefined(fallthrough_reg);
-            ctx->program.emit(AnvilInstruction::make_abc(AnvilOpcode::Return, fallthrough_reg, 0u, 0u));
+            ctx->program.emit(CinderInstruction::make_abc(CinderOpcode::Return, fallthrough_reg, 0u, 0u));
 
             if (fn_id < ctx->heap.function_count) {
                 ctx->heap.functions()[fn_id].local_count = high_reg;
                 ctx->heap.functions()[fn_id].code_len = ctx->program.code_len - fn_start_pc;
             }
-            ctx->program.code()[jskip_pc] = AnvilInstruction::make_abx(
-                AnvilOpcode::Jump,
+            ctx->program.code()[jskip_pc] = CinderInstruction::make_abx(
+                CinderOpcode::Jump,
                 0u,
                 ctx->program.code_len
             );
@@ -4442,8 +4442,8 @@ struct AnvilCompiler {
                 const u16 one_reg = alloc_reg();
                 emit_load_number(one_reg, 1.0);
                 const u16 dst = alloc_reg();
-                ctx->program.emit(AnvilInstruction::make_abc(
-                    is_inc ? AnvilOpcode::Add : AnvilOpcode::Sub,
+                ctx->program.emit(CinderInstruction::make_abc(
+                    is_inc ? CinderOpcode::Add : CinderOpcode::Sub,
                     dst,
                     cur_reg,
                     one_reg
@@ -4456,23 +4456,23 @@ struct AnvilCompiler {
     }
 };
 
-extern "C" u32 anvil_cpp_vm_compiler_bytes() {
-    return static_cast<u32>(sizeof(AnvilCompiler)) + ANVIL_COMPILER_ARENA_RESERVE_BYTES;
+extern "C" u32 cinder_cpp_vm_compiler_bytes() {
+    return static_cast<u32>(sizeof(CinderCompiler)) + CINDER_COMPILER_ARENA_RESERVE_BYTES;
 }
 
-extern "C" u32 anvil_cpp_vm_compiler_align() {
-    return static_cast<u32>(alignof(AnvilCompiler));
+extern "C" u32 cinder_cpp_vm_compiler_align() {
+    return static_cast<u32>(alignof(CinderCompiler));
 }
 
-bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept {
+bool compile_owned(CinderVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept {
     if (!src || !compiler_memory) {
         return false;
     }
-    auto& g_compiler = *static_cast<AnvilCompiler*>(compiler_memory);
+    auto& g_compiler = *static_cast<CinderCompiler*>(compiler_memory);
     g_compiler.arena.init(
-        static_cast<u8*>(compiler_memory) + sizeof(AnvilCompiler),
-        ANVIL_COMPILER_ARENA_RESERVE_BYTES,
-        ANVIL_COMPILER_ARENA_RESERVE_BYTES
+        static_cast<u8*>(compiler_memory) + sizeof(CinderCompiler),
+        CINDER_COMPILER_ARENA_RESERVE_BYTES,
+        CINDER_COMPILER_ARENA_RESERVE_BYTES
     );
     g_compiler.lexer.arena = &g_compiler.arena;
     g_compiler.ctx = &ctx;
@@ -4502,10 +4502,10 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
     g_compiler.stack_budget = ctx.effective_parse_stack_budget();
 
     if (!g_compiler.lexer.tokenize(src, len)) {
-        const AnvilLexer& lex = g_compiler.lexer;
+        const CinderLexer& lex = g_compiler.lexer;
         if (lex.fail_code == VM_REFUSE_TOKENS) {
             ctx.fail_limit(
-                VM_REFUSE_TOKENS, "source", ANVIL_COMPILER_ARENA_RESERVE_BYTES, "bytes"
+                VM_REFUSE_TOKENS, "source", CINDER_COMPILER_ARENA_RESERVE_BYTES, "bytes"
             );
         } else {
             ctx.fail_name(lex.fail_code, lex.fail_text, &src[lex.fail_offset], lex.fail_len);
@@ -4531,12 +4531,12 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
         last_reg = g_compiler.compile_statement();
     }
     ctx.program.top_frame_regs = g_compiler.high_reg;
-    ctx.program.emit(AnvilInstruction::make_abc(AnvilOpcode::Halt, last_reg, 0u, 0u));
+    ctx.program.emit(CinderInstruction::make_abc(CinderOpcode::Halt, last_reg, 0u, 0u));
     if (!ctx.program.compile_ok) {
         if (ctx.program.overflow == VM_REFUSE_CONSTANTS) {
             ctx.fail_limit(VM_REFUSE_HEAP, "heap", ctx.heap.arena.budget, "bytes");
         } else {
-            ctx.fail_limit(VM_REFUSE_CODE_SIZE, "code size", ANVIL_MAX_PROGRAM_INSTRUCTIONS, "instructions");
+            ctx.fail_limit(VM_REFUSE_CODE_SIZE, "code size", CINDER_MAX_PROGRAM_INSTRUCTIONS, "instructions");
         }
     }
     for (u32 i = 0u; i < ctx.global_count; ++i) {
@@ -4555,8 +4555,8 @@ bool compile_owned(AnvilVmContext& ctx, void* compiler_memory, const char* src, 
 
 } // namespace
 
-bool compile_js_to_bytecode(AnvilVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept {
+bool compile_js_to_bytecode(CinderVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept {
     return compile_owned(ctx, compiler_memory, src, len);
 }
 
-} // namespace anvil_vm
+} // namespace cinder_vm

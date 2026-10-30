@@ -3,8 +3,8 @@
 // Shared freestanding C++20 definitions and math helpers for anvil-raster.
 // Author: Buntato
 
-#ifndef ANVIL_RASTER_ACCEL_HPP
-#define ANVIL_RASTER_ACCEL_HPP
+#ifndef FORGE_RASTER_ACCEL_HPP
+#define FORGE_RASTER_ACCEL_HPP
 
 using u8  = unsigned char;
 using u16 = unsigned short;
@@ -12,7 +12,7 @@ using u32 = unsigned int;
 using i32 = int;
 using u64 = unsigned long long;
 
-namespace anvil_raster_cpp {
+namespace forge_raster_cpp {
 
 inline float f_abs(float v) noexcept {
     return v < 0.0f ? -v : v;
@@ -137,6 +137,6 @@ inline void blend_subpixel_lcd_rgba(
     pixels[offset + 3] = 255u;
 }
 
-} // namespace anvil_raster_cpp
+} // namespace forge_raster_cpp
 
-#endif // ANVIL_RASTER_ACCEL_HPP
+#endif // FORGE_RASTER_ACCEL_HPP

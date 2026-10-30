@@ -25,7 +25,7 @@
 //! (`0.5`–`2.5`). The clamp inside that method is wider (`0.25`–`4.0`).
 //! There is no node cap here; the list is as long as the box tree.
 
-use anvil_layout::{Color, Edge, Image, LayoutBox, Overflow, Position};
+use anvil_layout::{Color, Edge, Image, LayoutBox, ObjectFit, Overflow, Position};
 pub use anvil_layout::{Rect, StickyConstraint, Transform2D};
 
 /// One painting command. Positions and sizes are CSS pixels, y downward.
@@ -482,14 +482,61 @@ fn walk(
         let iw = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
         let ih = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
         if iw > 0.0 && ih > 0.0 {
+            let img_w = (image.width as f32).max(1.0);
+            let img_h = (image.height as f32).max(1.0);
+            let (dx, dy, dw, dh, clip_fit) = match tree.object_fit {
+                ObjectFit::Fill => (ix, iy, iw, ih, false),
+                ObjectFit::Contain => {
+                    let s = (iw / img_w).min(ih / img_h);
+                    let w = img_w * s;
+                    let h = img_h * s;
+                    (ix + (iw - w) * 0.5, iy + (ih - h) * 0.5, w, h, false)
+                }
+                ObjectFit::Cover => {
+                    let s = (iw / img_w).max(ih / img_h);
+                    let w = img_w * s;
+                    let h = img_h * s;
+                    (
+                        ix + (iw - w) * 0.5,
+                        iy + (ih - h) * 0.5,
+                        w,
+                        h,
+                        w > iw + 0.5 || h > ih + 0.5,
+                    )
+                }
+                ObjectFit::None => (
+                    ix + (iw - img_w) * 0.5,
+                    iy + (ih - img_h) * 0.5,
+                    img_w,
+                    img_h,
+                    img_w > iw + 0.5 || img_h > ih + 0.5,
+                ),
+                ObjectFit::ScaleDown => {
+                    let s = (iw / img_w).min(ih / img_h).min(1.0);
+                    let w = img_w * s;
+                    let h = img_h * s;
+                    (ix + (iw - w) * 0.5, iy + (ih - h) * 0.5, w, h, false)
+                }
+            };
+            if clip_fit && !is_clipped {
+                items.push(DisplayItem::PushClip {
+                    x: ix,
+                    y: iy,
+                    width: iw,
+                    height: ih,
+                });
+            }
             items.push(DisplayItem::Image {
-                x: ix,
-                y: iy,
-                width: iw,
-                height: ih,
+                x: dx,
+                y: dy,
+                width: dw,
+                height: dh,
                 border_radius: (tree.border_radius - tree.border.top).max(0.0),
                 image: image.clone(),
             });
+            if clip_fit && !is_clipped {
+                items.push(DisplayItem::PopClip);
+            }
         }
     }
     for run in &tree.text {
@@ -510,6 +557,15 @@ fn walk(
                 color: run.color,
             });
         }
+        if run.line_through && run.width > 0.0 {
+            items.push(DisplayItem::Rect {
+                x: run.x,
+                y: run.y + run.font_size * 0.62,
+                width: run.width,
+                height: 1.0,
+                color: run.color,
+            });
+        }
     }
     let mut order: Vec<(usize, &LayoutBox)> = tree.children.iter().enumerate().collect();
     order.sort_by_key(|(idx, child)| (child.stacking_key(), *idx));
@@ -517,8 +573,60 @@ fn walk(
         walk(child, items, layers, depth + 1);
     }
     if is_clipped {
+        let client_x = tree.rect.x + tree.border.left;
+        let client_y = tree.rect.y + tree.border.top;
+        let client_w = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
+        let client_h = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
+        if tree.scrollable_overflow
+            && tree.scroll_size.1 > client_h + 1.0
+            && client_w > 12.0
+            && client_h > 12.0
+        {
+            let track_w = 6.0;
+            let track_x = client_x + client_w - track_w - 1.0;
+            items.push(DisplayItem::Rect {
+                x: track_x,
+                y: client_y + 1.0,
+                width: track_w,
+                height: (client_h - 2.0).max(1.0),
+                color: Color {
+                    r: 28,
+                    g: 34,
+                    b: 46,
+                    a: 110,
+                },
+            });
+            let ratio = (client_h / tree.scroll_size.1).clamp(0.1, 1.0);
+            let thumb_h = ((client_h - 2.0) * ratio)
+                .max(12.0)
+                .min((client_h - 2.0).max(1.0));
+            let max_scroll = (tree.scroll_size.1 - client_h).max(1.0);
+            let scroll_frac = (tree.scroll_offset.1 / max_scroll).clamp(0.0, 1.0);
+            let thumb_y = client_y + 1.0 + ((client_h - 2.0 - thumb_h).max(0.0) * scroll_frac);
+            items.push(DisplayItem::RoundedRect {
+                x: track_x,
+                y: thumb_y,
+                width: track_w,
+                height: thumb_h,
+                radius: 3.0,
+                border_width: 0.0,
+                fill_color: Color {
+                    r: 120,
+                    g: 136,
+                    b: 164,
+                    a: 190,
+                },
+                border_color: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                },
+            });
+        }
         items.push(DisplayItem::PopClip);
     }
+    paint_outline(tree, items);
     let layer_end = items.len();
     if layer_end > layer_start {
         let effects = [
@@ -548,7 +656,7 @@ fn walk(
 fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
     let b = tree.border;
     let r = tree.rect;
-    let color = tree.border_color;
+    let colors = tree.border_colors;
     if r.width <= 0.0 || r.height <= 0.0 {
         return;
     }
@@ -558,7 +666,7 @@ fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
             y: r.y,
             width: r.width,
             height: b.top.min(r.height),
-            color,
+            color: colors[0],
         });
     }
     if b.bottom > 0.0 {
@@ -568,7 +676,7 @@ fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
             y: r.y + r.height - h,
             width: r.width,
             height: h,
-            color,
+            color: colors[2],
         });
     }
     if b.left > 0.0 {
@@ -577,7 +685,7 @@ fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
             y: r.y,
             width: b.left.min(r.width),
             height: r.height,
-            color,
+            color: colors[3],
         });
     }
     if b.right > 0.0 {
@@ -587,9 +695,52 @@ fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
             y: r.y,
             width: w,
             height: r.height,
-            color,
+            color: colors[1],
         });
     }
+}
+
+/// Paint `outline` around the border box offset by `outline_offset`.
+fn paint_outline(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
+    let w = tree.outline_width;
+    let color = tree.outline_color;
+    let r = tree.rect;
+    if w <= 0.0 || color.a == 0 || r.width <= 0.0 || r.height <= 0.0 {
+        return;
+    }
+    let off = tree.outline_offset;
+    let ox = r.x - off - w;
+    let oy = r.y - off - w;
+    let ow = (r.width + (off + w) * 2.0).max(w * 2.0);
+    let oh = (r.height + (off + w) * 2.0).max(w * 2.0);
+    items.push(DisplayItem::Rect {
+        x: ox,
+        y: oy,
+        width: ow,
+        height: w,
+        color,
+    });
+    items.push(DisplayItem::Rect {
+        x: ox,
+        y: oy + oh - w,
+        width: ow,
+        height: w,
+        color,
+    });
+    items.push(DisplayItem::Rect {
+        x: ox,
+        y: oy + w,
+        width: w,
+        height: (oh - w * 2.0).max(0.0),
+        color,
+    });
+    items.push(DisplayItem::Rect {
+        x: ox + ow - w,
+        y: oy + w,
+        width: w,
+        height: (oh - w * 2.0).max(0.0),
+        color,
+    });
 }
 
 #[cfg(test)]
@@ -617,7 +768,15 @@ mod tests {
             box_shadow: None,
             border: Edge::all(1.0),
             border_color: Color::BLACK,
+            border_colors: [Color::BLACK; 4],
             border_radius: 0.0,
+            outline_width: 0.0,
+            outline_color: Color::BLACK,
+            outline_offset: 0.0,
+            scrollable_overflow: false,
+            scroll_offset: (0.0, 0.0),
+            scroll_size: (30.0, 10.0),
+            object_fit: ObjectFit::Fill,
             image: None,
             sticky: None,
             transform: None,
@@ -631,6 +790,7 @@ mod tests {
                 font_size: 10.0,
                 color: Color::BLACK,
                 underline: true,
+                line_through: false,
             }],
             children: Vec::new(),
         };

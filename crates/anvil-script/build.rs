@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// Builds and links the native C++20 Anvil-JS engine (`AnvilVM`: NaN-boxed heap,
-// hidden classes, Inline Caches, and register VM) from `../../../anvil-browser/engines/anvil-js/cpp/`
+// Builds and links the native C++20 Cinder engine (`CinderVM`: NaN-boxed heap,
+// hidden classes, Inline Caches, and register VM) from `../../../anvil-browser/engines/cinder/cpp/`
 // directly into `anvil-script`.
 
 use std::env;
@@ -9,15 +9,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const ENGINE_CPP_DIR: &str = "../../../anvil-browser/engines/anvil-js/cpp";
+const ENGINE_CPP_DIR: &str = "../../../anvil-browser/engines/cinder/cpp";
 const LOCAL_CPP_DIR: &str = "cpp";
 
 const CPP_STEMS: &[&str] = &[
-    "anvil_vm_heap",
-    "anvil_vm_ic",
-    "anvil_vm_compiler",
-    "anvil_jit_accel",
-    "anvil_jit_native",
+    "cinder_vm_heap",
+    "cinder_vm_ic",
+    "cinder_vm_compiler",
+    "cinder_jit_accel",
+    "cinder_jit_native",
 ];
 
 fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
@@ -67,7 +67,7 @@ fn main() {
     } else {
         LOCAL_CPP_DIR
     };
-    println!("cargo:rerun-if-changed={cpp_dir}/anvil_vm.hpp");
+    println!("cargo:rerun-if-changed={cpp_dir}/cinder_vm.hpp");
     let mut units = Vec::with_capacity(CPP_STEMS.len());
     for stem in CPP_STEMS {
         let src = format!("{cpp_dir}/{stem}.cpp");
@@ -77,7 +77,7 @@ fn main() {
         }
         units.push((src, *stem));
     }
-    println!("cargo:rustc-check-cfg=cfg(anvil_cpp_jit)");
+    println!("cargo:rustc-check-cfg=cfg(cinder_cpp_jit)");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
@@ -107,7 +107,7 @@ fn main() {
                 obj_paths.push(obj_path);
             }
 
-            let lib_path = out_dir.join("anvil_jit_accel.lib");
+            let lib_path = out_dir.join("cinder_jit_accel.lib");
             let mut lib_cmd = Command::new(&lib_exe);
             lib_cmd
                 .arg("/NOLOGO")
@@ -117,9 +117,9 @@ fn main() {
             }
             if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
-                println!("cargo:rustc-link-lib=static=anvil_jit_accel");
+                println!("cargo:rustc-link-lib=static=cinder_jit_accel");
                 println!("cargo:rustc-link-lib=dylib=kernel32");
-                println!("cargo:rustc-cfg=anvil_cpp_jit");
+                println!("cargo:rustc-cfg=cinder_cpp_jit");
             }
         }
     } else {
@@ -146,7 +146,7 @@ fn main() {
             obj_paths.push(obj_path);
         }
 
-        let lib_path = out_dir.join("libanvil_jit_accel.a");
+        let lib_path = out_dir.join("libcinder_jit_accel.a");
         let mut ar_cmd = Command::new("ar");
         ar_cmd.arg("rcs").arg(lib_path.to_str().unwrap());
         for obj in &obj_paths {
@@ -154,8 +154,8 @@ fn main() {
         }
         if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
             println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=anvil_jit_accel");
-            println!("cargo:rustc-cfg=anvil_cpp_jit");
+            println!("cargo:rustc-link-lib=static=cinder_jit_accel");
+            println!("cargo:rustc-cfg=cinder_cpp_jit");
         }
     }
 }

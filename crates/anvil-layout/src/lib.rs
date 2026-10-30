@@ -68,8 +68,8 @@ use anvil_dom::{Document, NodeData};
 pub use anvil_image::Image;
 pub use anvil_style::{
     AlignContent, AlignItems, BoxShadow, BoxSizing, Color, Edge, FlexDirection, FlexWrap,
-    GridAutoFlow, JustifyContent, LinearGradient, Overflow, Position, TextAlign, Visibility,
-    WhiteSpace,
+    FontFaceRule, FontFamily, GridAutoFlow, JustifyContent, LinearGradient, ObjectFit, Overflow,
+    Position, TextAlign, TextTransform, Visibility, WhiteSpace,
 };
 use anvil_style::{
     ComputedStyle, Display, GridAutoRepeat, GridLine, GridPlacement, GridTrack, MAX_GRID_LINE,
@@ -120,6 +120,7 @@ pub struct TextRun {
     pub font_size: f32,
     pub color: Color,
     pub underline: bool,
+    pub line_through: bool,
 }
 
 /// A border box and the children laid out inside it.
@@ -139,7 +140,15 @@ pub struct LayoutBox {
     pub box_shadow: Option<BoxShadow>,
     pub border: Edge,
     pub border_color: Color,
+    pub border_colors: [Color; 4],
     pub border_radius: f32,
+    pub outline_width: f32,
+    pub outline_color: Color,
+    pub outline_offset: f32,
+    pub scrollable_overflow: bool,
+    pub scroll_offset: (f32, f32),
+    pub scroll_size: (f32, f32),
+    pub object_fit: ObjectFit,
     pub image: Option<Image>,
     /// Set on a `position: sticky` box whose scrollport is the viewport.
     /// The rect stays at the in-flow position; paint and raster apply the
@@ -170,6 +179,48 @@ impl LayoutBox {
         let layered =
             self.position == Position::Sticky || self.transform.is_some() || self.opacity < 1.0;
         (self.z_index, u8::from(layered))
+    }
+
+    /// Find the [`LayoutBox`] for `target` anywhere in this layout subtree.
+    pub fn find_node_box(&self, target: NodeId) -> Option<&LayoutBox> {
+        if self.node == target {
+            return Some(self);
+        }
+        for child in &self.children {
+            if let Some(found) = child.find_node_box(target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find the innermost scrollable overflow container under `(x, y)` in page coordinates,
+    /// returning `(node_id, scroll_offset, max_scroll)` where `max_scroll = (max_scroll_x, max_scroll_y)`.
+    pub fn find_scrollable_container(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<(NodeId, (f32, f32), (f32, f32))> {
+        if !self.rect.contains(x, y) && self.overflow == Overflow::Hidden {
+            return None;
+        }
+        let mut order: Vec<(usize, &LayoutBox)> = self.children.iter().enumerate().collect();
+        order.sort_by_key(|(idx, child)| (child.stacking_key(), *idx));
+        for (_, child) in order.into_iter().rev() {
+            if let Some(found) = child.find_scrollable_container(x, y) {
+                return Some(found);
+            }
+        }
+        if self.scrollable_overflow && self.rect.contains(x, y) {
+            let client_w = (self.rect.width - self.border.left - self.border.right).max(0.0);
+            let client_h = (self.rect.height - self.border.top - self.border.bottom).max(0.0);
+            let max_x = (self.scroll_size.0 - client_w).max(0.0);
+            let max_y = (self.scroll_size.1 - client_h).max(0.0);
+            if max_x > 0.5 || max_y > 0.5 {
+                return Some((self.node, self.scroll_offset, (max_x, max_y)));
+            }
+        }
+        None
     }
 
     /// Find the border-box [`Rect`] for `target` anywhere in this layout subtree.
@@ -382,12 +433,52 @@ fn box_transform(rect: Rect, style: &ComputedStyle, styles: &StyleMap) -> Transf
 /// Give every box its [`LayoutBox::transform`] and [`LayoutBox::opacity`],
 /// once boxes have their final positions. Only element boxes that are not
 /// inline are transformable; text keeps its parent's style but not a box of
-/// its own.
+/// its own. Also computes `scroll_size` and applies `scroll_offset` for
+/// `overflow: auto | scroll` containers.
 fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
     let style = styles.get(tree.node);
     let is_element = doc.get(tree.node).data().tag().is_some();
     if is_element && !style.transform.is_none() && style.display != Display::Inline {
         tree.transform = Some(box_transform(tree.rect, style, styles));
+    }
+    let client_x = tree.rect.x + tree.border.left;
+    let client_y = tree.rect.y + tree.border.top;
+    let client_w = (tree.rect.width - tree.border.left - tree.border.right).max(0.0);
+    let client_h = (tree.rect.height - tree.border.top - tree.border.bottom).max(0.0);
+    let mut max_right = client_x + client_w;
+    let mut max_bottom = client_y + client_h;
+    for run in &tree.text {
+        max_right = max_right.max(run.x + run.width + style.padding.right);
+        max_bottom = max_bottom.max(run.y + line_height(run.font_size) + style.padding.bottom);
+    }
+    for child in &tree.children {
+        if child.position != Position::Fixed {
+            let cs = styles.get(child.node);
+            max_right = max_right
+                .max(child.rect.x + child.rect.width + cs.margin.right + style.padding.right);
+            max_bottom = max_bottom
+                .max(child.rect.y + child.rect.height + cs.margin.bottom + style.padding.bottom);
+        }
+    }
+    let scroll_w = client_w.max((max_right - client_x).max(0.0));
+    let scroll_h = client_h.max((max_bottom - client_y).max(0.0));
+    tree.scroll_size = (scroll_w, scroll_h);
+    if tree.scrollable_overflow {
+        let (raw_sx, raw_sy) = doc.node_scroll_offset(tree.node);
+        let sx = raw_sx.clamp(0.0, (scroll_w - client_w).max(0.0));
+        let sy = raw_sy.clamp(0.0, (scroll_h - client_h).max(0.0));
+        tree.scroll_offset = (sx, sy);
+        if sx != 0.0 || sy != 0.0 {
+            for run in &mut tree.text {
+                run.x -= sx;
+                run.y -= sy;
+            }
+            for child in &mut tree.children {
+                if child.position != Position::Fixed {
+                    offset_box(child, -sx, -sy);
+                }
+            }
+        }
     }
     if is_element {
         tree.opacity = style.opacity;
@@ -401,6 +492,8 @@ fn resolve_effects(tree: &mut LayoutBox, doc: &Document, styles: &StyleMap) {
                 b: 0,
                 a: 0,
             };
+            tree.border_colors = [tree.border_color; 4];
+            tree.outline_width = 0.0;
             tree.image = None;
             tree.text.clear();
         }
@@ -522,6 +615,32 @@ struct Segment {
     line_height: Option<f32>,
     color: Color,
     underline: bool,
+    line_through: bool,
+    letter_spacing: f32,
+    word_spacing: f32,
+}
+
+impl Segment {
+    fn plain(
+        node: NodeId,
+        text: String,
+        font_size: f32,
+        line_height: Option<f32>,
+        color: Color,
+        underline: bool,
+    ) -> Self {
+        Self {
+            node,
+            text,
+            font_size,
+            line_height,
+            color,
+            underline,
+            line_through: false,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
+        }
+    }
 }
 
 /// One word, a single space, a forced break (`\n`), or one character split
@@ -534,6 +653,36 @@ struct Token {
     line_height: Option<f32>,
     color: Color,
     underline: bool,
+    line_through: bool,
+    letter_spacing: f32,
+    word_spacing: f32,
+}
+
+/// Apply `text-transform` (`uppercase`, `lowercase`, `capitalize`) to `text`.
+pub fn apply_text_transform(text: &str, transform: TextTransform) -> String {
+    match transform {
+        TextTransform::None => text.to_string(),
+        TextTransform::Uppercase => text.to_uppercase(),
+        TextTransform::Lowercase => text.to_lowercase(),
+        TextTransform::Capitalize => {
+            let mut out = String::with_capacity(text.len());
+            let mut new_word = true;
+            for ch in text.chars() {
+                if ch.is_whitespace() {
+                    new_word = true;
+                    out.push(ch);
+                } else if new_word {
+                    new_word = false;
+                    for upper in ch.to_uppercase() {
+                        out.push(upper);
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+    }
 }
 
 /// Lay out `doc` from the `html` element in a viewport `viewport_width` pixels wide.
@@ -1333,28 +1482,28 @@ fn layout_block(
         if let Some(alt) = data.attr("alt")
             && !alt.trim().is_empty()
         {
-            let segments = vec![Segment {
-                node: id,
-                text: format!("[{alt}]"),
-                font_size: style.font_size,
-                line_height: style.line_height,
-                color: style.color,
-                underline: false,
-            }];
+            let segments = vec![Segment::plain(
+                id,
+                format!("[{alt}]"),
+                style.font_size,
+                style.line_height,
+                style.color,
+                false,
+            )];
             let (runs, h) = place_lines(&segments, content_x, cursor_y, content_width, false);
             text.extend(runs);
             cursor_y += h;
         }
     } else if is_checkbox {
         let mark = if doc.is_checked(id) { "X" } else { " " };
-        let segments = vec![Segment {
-            node: id,
-            text: mark.to_string(),
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: style.color,
-            underline: false,
-        }];
+        let segments = vec![Segment::plain(
+            id,
+            mark.to_string(),
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
         let (runs, h) = place_lines(
             &segments,
             content_x,
@@ -1366,14 +1515,14 @@ fn layout_block(
         cursor_y += h;
     } else if is_radio {
         let mark = if doc.is_checked(id) { "(o)" } else { "( )" };
-        let segments = vec![Segment {
-            node: id,
-            text: mark.to_string(),
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: style.color,
-            underline: false,
-        }];
+        let segments = vec![Segment::plain(
+            id,
+            mark.to_string(),
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
         let (runs, h) = place_lines(
             &segments,
             content_x,
@@ -1385,14 +1534,14 @@ fn layout_block(
         cursor_y += h;
     } else if is_submit_input {
         let label = data.attr("value").unwrap_or("Submit");
-        let segments = vec![Segment {
-            node: id,
-            text: label.to_string(),
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: style.color,
-            underline: false,
-        }];
+        let segments = vec![Segment::plain(
+            id,
+            label.to_string(),
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
         let (runs, h) = place_lines(
             &segments,
             content_x,
@@ -1404,14 +1553,14 @@ fn layout_block(
         cursor_y += h;
     } else if is_select {
         let label = format!("{}  v", doc.select_display_label(id));
-        let segments = vec![Segment {
-            node: id,
-            text: label,
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: style.color,
-            underline: false,
-        }];
+        let segments = vec![Segment::plain(
+            id,
+            label,
+            style.font_size,
+            style.line_height,
+            style.color,
+            false,
+        )];
         let (runs, h) = place_lines(
             &segments,
             content_x,
@@ -1472,14 +1621,14 @@ fn layout_block(
         } else {
             display_str
         };
-        let segments = vec![Segment {
-            node: id,
-            text: single_line_str,
-            font_size: style.font_size,
-            line_height: style.line_height,
-            color: text_color,
-            underline: false,
-        }];
+        let segments = vec![Segment::plain(
+            id,
+            single_line_str,
+            style.font_size,
+            style.line_height,
+            text_color,
+            false,
+        )];
         // Single-line controls do not wrap. Overflow keeps the tail while focused
         // and the head otherwise. Textareas wrap inside the content box.
         let wrap_w = if !is_textarea {
@@ -1797,6 +1946,11 @@ fn layout_block(
     } else {
         style.border_color
     };
+    let border_colors = if focused_input == Some(id) {
+        [border_color; 4]
+    } else {
+        style.border_colors
+    };
 
     LayoutBox {
         node: id,
@@ -1809,7 +1963,15 @@ fn layout_block(
         box_shadow: style.box_shadow,
         border,
         border_color,
+        border_colors,
         border_radius: style.border_radius,
+        outline_width: style.outline_width,
+        outline_color: style.outline_color,
+        outline_offset: style.outline_offset,
+        scrollable_overflow: style.scrollable_overflow,
+        scroll_offset: (0.0, 0.0),
+        scroll_size: (0.0, 0.0),
+        object_fit: style.object_fit,
         image: decoded_image,
         sticky: None,
         transform: None,
@@ -1919,11 +2081,14 @@ fn layout_pseudo_box(
     if !pseudo_text.is_empty() {
         let segs = vec![Segment {
             node: owner_id,
-            text: pseudo_text.to_string(),
+            text: apply_text_transform(pseudo_text, style.text_transform),
             font_size: style.font_size,
             line_height: style.line_height,
             color: style.color,
             underline: style.underline,
+            line_through: style.line_through,
+            letter_spacing: style.letter_spacing,
+            word_spacing: style.word_spacing,
         }];
         let (runs, h) = place_lines(
             &segs,
@@ -1959,7 +2124,15 @@ fn layout_pseudo_box(
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
+        border_colors: style.border_colors,
         border_radius: style.border_radius,
+        outline_width: style.outline_width,
+        outline_color: style.outline_color,
+        outline_offset: style.outline_offset,
+        scrollable_overflow: style.scrollable_overflow,
+        scroll_offset: (0.0, 0.0),
+        scroll_size: (0.0, 0.0),
+        object_fit: style.object_fit,
         image: None,
         sticky: None,
         transform: None,
@@ -2222,7 +2395,15 @@ fn layout_table_row(
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
+        border_colors: style.border_colors,
         border_radius: style.border_radius,
+        outline_width: style.outline_width,
+        outline_color: style.outline_color,
+        outline_offset: style.outline_offset,
+        scrollable_overflow: style.scrollable_overflow,
+        scroll_offset: (0.0, 0.0),
+        scroll_size: (0.0, 0.0),
+        object_fit: style.object_fit,
         image: None,
         sticky: None,
         transform: None,
@@ -3365,7 +3546,15 @@ fn layout_grid(
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
+        border_colors: style.border_colors,
         border_radius: style.border_radius,
+        outline_width: style.outline_width,
+        outline_color: style.outline_color,
+        outline_offset: style.outline_offset,
+        scrollable_overflow: style.scrollable_overflow,
+        scroll_offset: (0.0, 0.0),
+        scroll_size: (0.0, 0.0),
+        object_fit: style.object_fit,
         image: None,
         sticky: None,
         transform: None,
@@ -3975,7 +4164,15 @@ fn layout_flex(
             box_shadow: style.box_shadow,
             border,
             border_color: style.border_color,
+            border_colors: style.border_colors,
             border_radius: style.border_radius,
+            outline_width: style.outline_width,
+            outline_color: style.outline_color,
+            outline_offset: style.outline_offset,
+            scrollable_overflow: style.scrollable_overflow,
+            scroll_offset: (0.0, 0.0),
+            scroll_size: (0.0, 0.0),
+            object_fit: style.object_fit,
             image: None,
             sticky: None,
             transform: None,
@@ -4341,7 +4538,15 @@ fn layout_flex(
         box_shadow: style.box_shadow,
         border,
         border_color: style.border_color,
+        border_colors: style.border_colors,
         border_radius: style.border_radius,
+        outline_width: style.outline_width,
+        outline_color: style.outline_color,
+        outline_offset: style.outline_offset,
+        scrollable_overflow: style.scrollable_overflow,
+        scroll_offset: (0.0, 0.0),
+        scroll_size: (0.0, 0.0),
+        object_fit: style.object_fit,
         image: None,
         sticky: None,
         transform: None,
@@ -4479,23 +4684,26 @@ fn place_inlines(
     let block_style = styles.get(block_id);
     let mut segments = Vec::new();
     if let Some(marker) = pending_marker.take() {
-        segments.push(Segment {
-            node: block_id,
-            text: marker,
-            font_size: block_style.font_size,
-            line_height: block_style.line_height,
-            color: block_style.color,
-            underline: false,
-        });
+        segments.push(Segment::plain(
+            block_id,
+            marker,
+            block_style.font_size,
+            block_style.line_height,
+            block_style.color,
+            false,
+        ));
     }
     if let Some((b_txt, b_style)) = pending_before.take() {
         segments.push(Segment {
             node: block_id,
-            text: b_txt,
+            text: apply_text_transform(&b_txt, b_style.text_transform),
             font_size: b_style.font_size,
             line_height: b_style.line_height,
             color: b_style.color,
             underline: b_style.underline,
+            line_through: b_style.line_through,
+            letter_spacing: b_style.letter_spacing,
+            word_spacing: b_style.word_spacing,
         });
     }
     for id in inline_ids.drain(..) {
@@ -4504,11 +4712,14 @@ fn place_inlines(
     if let Some((a_txt, a_style)) = after_inline {
         segments.push(Segment {
             node: block_id,
-            text: a_txt.to_string(),
+            text: apply_text_transform(a_txt, a_style.text_transform),
             font_size: a_style.font_size,
             line_height: a_style.line_height,
             color: a_style.color,
             underline: a_style.underline,
+            line_through: a_style.line_through,
+            letter_spacing: a_style.letter_spacing,
+            word_spacing: a_style.word_spacing,
         });
     }
     let wrap_width = if block_style.white_space == WhiteSpace::Nowrap
@@ -4544,25 +4755,28 @@ fn gather(
     match doc.get(id).data() {
         NodeData::Text(text) => out.push(Segment {
             node: id,
-            text: text.clone(),
+            text: apply_text_transform(text, style.text_transform),
             font_size: style.font_size,
             line_height: style.line_height,
             color: style.color,
             underline: style.underline,
+            line_through: style.line_through,
+            letter_spacing: style.letter_spacing,
+            word_spacing: style.word_spacing,
         }),
         NodeData::Element { tag, .. } => {
             if styles.get(id).display == Display::None || tag == "svg" {
                 return;
             }
             if tag == "br" {
-                out.push(Segment {
-                    node: id,
-                    text: "\n".to_string(),
-                    font_size: style.font_size,
-                    line_height: style.line_height,
-                    color: style.color,
-                    underline: false,
-                });
+                out.push(Segment::plain(
+                    id,
+                    "\n".to_string(),
+                    style.font_size,
+                    style.line_height,
+                    style.color,
+                    false,
+                ));
                 return;
             }
             if let Some((b_txt, b_style)) = styles.before_style(id)
@@ -4571,11 +4785,14 @@ fn gather(
             {
                 out.push(Segment {
                     node: id,
-                    text: b_txt.clone(),
+                    text: apply_text_transform(b_txt, b_style.text_transform),
                     font_size: b_style.font_size,
                     line_height: b_style.line_height,
                     color: b_style.color,
                     underline: b_style.underline,
+                    line_through: b_style.line_through,
+                    letter_spacing: b_style.letter_spacing,
+                    word_spacing: b_style.word_spacing,
                 });
             }
             let style = *styles.get(id);
@@ -4588,11 +4805,14 @@ fn gather(
             {
                 out.push(Segment {
                     node: id,
-                    text: a_txt.clone(),
+                    text: apply_text_transform(a_txt, a_style.text_transform),
                     font_size: a_style.font_size,
                     line_height: a_style.line_height,
                     color: a_style.color,
                     underline: a_style.underline,
+                    line_through: a_style.line_through,
+                    letter_spacing: a_style.letter_spacing,
+                    word_spacing: a_style.word_spacing,
                 });
             }
         }
@@ -4757,6 +4977,19 @@ fn render_control_bar_image(
     Image::from_rgba(w, h, rgba).ok()
 }
 
+fn measure_token(text: &str, font_size: f32, letter_spacing: f32, word_spacing: f32) -> f32 {
+    let base = measure(text, font_size);
+    if text.is_empty() || text == "\n" {
+        return 0.0;
+    }
+    if letter_spacing == 0.0 && word_spacing == 0.0 {
+        return base;
+    }
+    let chars = text.chars().count() as f32;
+    let spaces = text.chars().filter(|&c| c == ' ').count() as f32;
+    (base + chars * letter_spacing + spaces * word_spacing).max(0.0)
+}
+
 /// Break `segments` into line boxes inside `max_width`, starting at
 /// `(origin_x, origin_y)` with y downward.
 ///
@@ -4787,7 +5020,12 @@ fn place_lines(
         if !preserve_spaces && token.text == " " && (current.is_empty() || line_width == 0.0) {
             continue;
         }
-        let width = measure(&token.text, token.font_size);
+        let width = measure_token(
+            &token.text,
+            token.font_size,
+            token.letter_spacing,
+            token.word_spacing,
+        );
         // Overflow wraps before this token. A wrapping space is discarded.
         if line_width > 0.0 && line_width + width > max_width {
             trim_trailing_space(&mut current);
@@ -4830,17 +5068,28 @@ fn place_lines(
                     && run.font_size == token.font_size
                     && run.color == token.color
                     && run.underline == token.underline
+                    && run.line_through == token.line_through
             });
             if same {
                 let run = combined.as_mut().expect("checked");
                 run.text.push_str(&token.text);
-                run.width = measure(&run.text, run.font_size);
+                run.width = measure_token(
+                    &run.text,
+                    run.font_size,
+                    token.letter_spacing,
+                    token.word_spacing,
+                );
             } else {
                 if let Some(run) = combined.take() {
                     x += run.width;
                     runs.push(run);
                 }
-                let width = measure(&token.text, token.font_size);
+                let width = measure_token(
+                    &token.text,
+                    token.font_size,
+                    token.letter_spacing,
+                    token.word_spacing,
+                );
                 combined = Some(TextRun {
                     node: token.node,
                     text: token.text,
@@ -4850,6 +5099,7 @@ fn place_lines(
                     font_size: token.font_size,
                     color: token.color,
                     underline: token.underline,
+                    line_through: token.line_through,
                 });
             }
         }
@@ -4873,6 +5123,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                 line_height: segment.line_height,
                 color: segment.color,
                 underline: segment.underline,
+                line_through: segment.line_through,
+                letter_spacing: segment.letter_spacing,
+                word_spacing: segment.word_spacing,
             });
             continue;
         }
@@ -4890,6 +5143,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                         line_height: segment.line_height,
                         color: segment.color,
                         underline: segment.underline,
+                        line_through: segment.line_through,
+                        letter_spacing: segment.letter_spacing,
+                        word_spacing: segment.word_spacing,
                     });
                 }
                 tokens.push(Token {
@@ -4899,6 +5155,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                     line_height: segment.line_height,
                     color: segment.color,
                     underline: segment.underline,
+                    line_through: segment.line_through,
+                    letter_spacing: segment.letter_spacing,
+                    word_spacing: segment.word_spacing,
                 });
             } else if ch == ' ' {
                 if !word.is_empty() {
@@ -4909,6 +5168,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                         line_height: segment.line_height,
                         color: segment.color,
                         underline: segment.underline,
+                        line_through: segment.line_through,
+                        letter_spacing: segment.letter_spacing,
+                        word_spacing: segment.word_spacing,
                     });
                 }
                 tokens.push(Token {
@@ -4918,6 +5180,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                     line_height: segment.line_height,
                     color: segment.color,
                     underline: segment.underline,
+                    line_through: segment.line_through,
+                    letter_spacing: segment.letter_spacing,
+                    word_spacing: segment.word_spacing,
                 });
             } else {
                 word.push(ch);
@@ -4931,6 +5196,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
                 line_height: segment.line_height,
                 color: segment.color,
                 underline: segment.underline,
+                line_through: segment.line_through,
+                letter_spacing: segment.letter_spacing,
+                word_spacing: segment.word_spacing,
             });
         }
     }
@@ -4948,7 +5216,12 @@ fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
     for token in tokens {
         if token.text == " "
             || token.text == "\n"
-            || measure(&token.text, token.font_size) <= max_width
+            || measure_token(
+                &token.text,
+                token.font_size,
+                token.letter_spacing,
+                token.word_spacing,
+            ) <= max_width
         {
             out.push(token);
             continue;
@@ -4961,6 +5234,9 @@ fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
                 line_height: token.line_height,
                 color: token.color,
                 underline: token.underline,
+                line_through: token.line_through,
+                letter_spacing: token.letter_spacing,
+                word_spacing: token.word_spacing,
             });
         }
     }
@@ -5057,14 +5333,14 @@ mod tests {
 
     #[test]
     fn wraps_a_line_on_the_width() {
-        let segments = vec![Segment {
-            node: NodeId::from_raw(1),
-            text: "hello hello".to_string(),
-            font_size: 10.0,
-            line_height: None,
-            color: Color::BLACK,
-            underline: false,
-        }];
+        let segments = vec![Segment::plain(
+            NodeId::from_raw(1),
+            "hello hello".to_string(),
+            10.0,
+            None,
+            Color::BLACK,
+            false,
+        )];
         let (runs, height) = place_lines(&segments, 0.0, 0.0, 30.0, false);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "hello");
@@ -6225,5 +6501,39 @@ mod tests {
         assert_eq!(r1c1.rect.x, r0c1.rect.x);
         assert_eq!(r1c1.rect.width, 120.0);
         assert!(r0c0.rect.height >= r0c1.rect.height + r1c1.rect.height);
+    }
+
+    #[test]
+    fn lays_out_text_transform_letter_spacing_line_through_and_scrollable_overflow() {
+        let mut doc = parse_html(
+            "<style>
+                html, body { margin: 0; padding: 0; }
+                #caps { text-transform: capitalize; letter-spacing: 2px; font-size: 10px; }
+                #scroll { overflow: auto; width: 120px; height: 50px; border: 2px solid #222; }
+                #inner { height: 140px; }
+             </style>
+             <p id=\"caps\">hello world <del id=\"del\">old</del></p>
+             <div id=\"scroll\"><div id=\"inner\">Content</div></div>",
+        );
+        let scroll_id = doc.get_element_by_id("scroll").unwrap();
+        doc.set_node_scroll_offset(scroll_id, 0.0, 30.0);
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let tree = layout_document(&doc, &styles, 300.0);
+
+        let caps = find_box(&doc, &tree, "caps");
+        let combined: String = caps.text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(combined, "Hello World Old");
+        assert!(caps.text.iter().any(|r| r.line_through));
+
+        let scroll_box = find_box(&doc, &tree, "scroll");
+        assert!(scroll_box.scrollable_overflow);
+        assert_eq!(scroll_box.scroll_offset, (0.0, 30.0));
+        assert!(scroll_box.scroll_size.1 >= 140.0);
+        let inner_box = find_box(&doc, &tree, "inner");
+        assert!((inner_box.rect.y - (scroll_box.rect.y + 2.0 - 30.0)).abs() < 0.5);
+        assert!(
+            tree.find_scrollable_container(10.0, scroll_box.rect.y + 10.0)
+                .is_some()
+        );
     }
 }

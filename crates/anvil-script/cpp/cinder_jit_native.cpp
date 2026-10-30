@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-// x86-64 baseline JIT for numeric AnvilVM programs.
+// x86-64 baseline JIT for numeric CinderVM programs.
 // Author: Buntato
 //
 // Compiles a bytecode program to native machine code and runs it.
@@ -10,7 +10,7 @@
 // and leaves 32 bytes of shadow space. If the page cannot be made executable,
 // the interpreter runs the program instead.
 
-#include "anvil_vm.hpp"
+#include "cinder_vm.hpp"
 
 using uint8_t = u8;
 inline void copy_bytes(void* dst, const void* src, u32 n) noexcept { auto* d = static_cast<u8*>(dst); const auto* s = static_cast<const u8*>(src); for (u32 i = 0u; i < n; ++i) d[i] = s[i]; }
@@ -33,7 +33,7 @@ using DWORD = u32;
 #include <unistd.h>
 #endif
 
-namespace anvil_vm {
+namespace cinder_vm {
 
 namespace {
 
@@ -291,52 +291,52 @@ struct Asm {
     }
 };
 
-bool opcode_supported(AnvilOpcode op) noexcept {
+bool opcode_supported(CinderOpcode op) noexcept {
     switch (op) {
-        case AnvilOpcode::Nop:
-        case AnvilOpcode::LoadConst:
-        case AnvilOpcode::LoadSmi:
-        case AnvilOpcode::LoadTrue:
-        case AnvilOpcode::LoadFalse:
-        case AnvilOpcode::Move:
-        case AnvilOpcode::Add:
-        case AnvilOpcode::Sub:
-        case AnvilOpcode::Mul:
-        case AnvilOpcode::Div:
-        case AnvilOpcode::Mod:
-        case AnvilOpcode::Neg:
-        case AnvilOpcode::Not:
-        case AnvilOpcode::BitAnd:
-        case AnvilOpcode::BitOr:
-        case AnvilOpcode::BitXor:
-        case AnvilOpcode::Shl:
-        case AnvilOpcode::Shr:
-        case AnvilOpcode::UShr:
-        case AnvilOpcode::CmpEq:
-        case AnvilOpcode::CmpNe:
-        case AnvilOpcode::CmpLooseEq:
-        case AnvilOpcode::CmpLooseNe:
-        case AnvilOpcode::CmpLt:
-        case AnvilOpcode::CmpLe:
-        case AnvilOpcode::CmpGt:
-        case AnvilOpcode::CmpGe:
-        case AnvilOpcode::Jump:
-        case AnvilOpcode::JumpIfFalse:
-        case AnvilOpcode::JumpIfTrue:
-        case AnvilOpcode::GetGlobal:
-        case AnvilOpcode::SetGlobal:
-        case AnvilOpcode::CallMath:
-        case AnvilOpcode::LoopHeader:
-        case AnvilOpcode::Return:
-        case AnvilOpcode::Halt:
-        case AnvilOpcode::HostSetText:
+        case CinderOpcode::Nop:
+        case CinderOpcode::LoadConst:
+        case CinderOpcode::LoadSmi:
+        case CinderOpcode::LoadTrue:
+        case CinderOpcode::LoadFalse:
+        case CinderOpcode::Move:
+        case CinderOpcode::Add:
+        case CinderOpcode::Sub:
+        case CinderOpcode::Mul:
+        case CinderOpcode::Div:
+        case CinderOpcode::Mod:
+        case CinderOpcode::Neg:
+        case CinderOpcode::Not:
+        case CinderOpcode::BitAnd:
+        case CinderOpcode::BitOr:
+        case CinderOpcode::BitXor:
+        case CinderOpcode::Shl:
+        case CinderOpcode::Shr:
+        case CinderOpcode::UShr:
+        case CinderOpcode::CmpEq:
+        case CinderOpcode::CmpNe:
+        case CinderOpcode::CmpLooseEq:
+        case CinderOpcode::CmpLooseNe:
+        case CinderOpcode::CmpLt:
+        case CinderOpcode::CmpLe:
+        case CinderOpcode::CmpGt:
+        case CinderOpcode::CmpGe:
+        case CinderOpcode::Jump:
+        case CinderOpcode::JumpIfFalse:
+        case CinderOpcode::JumpIfTrue:
+        case CinderOpcode::GetGlobal:
+        case CinderOpcode::SetGlobal:
+        case CinderOpcode::CallMath:
+        case CinderOpcode::LoopHeader:
+        case CinderOpcode::Return:
+        case CinderOpcode::Halt:
+        case CinderOpcode::HostSetText:
             return true;
         default:
             return false;
     }
 }
 
-bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
+bool program_is_numeric(const CinderBytecodeProgram& program) noexcept {
     if (program.code_len == 0u || !program.compile_ok) {
         return false;
     }
@@ -346,23 +346,23 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
         return false;
     }
     for (u32 i = 0u; i < program.code_len; ++i) {
-        const AnvilInstruction inst = program.code()[i];
+        const CinderInstruction inst = program.code()[i];
         if (!opcode_supported(inst.op)) {
             return false;
         }
-        if (inst.op == AnvilOpcode::LoadConst) {
+        if (inst.op == CinderOpcode::LoadConst) {
             const u32 idx = inst.imm32();
             if (idx >= program.const_len || !program.constants()[idx].is_number()) {
                 return false;
             }
         }
-        if (inst.op == AnvilOpcode::Jump || inst.op == AnvilOpcode::JumpIfFalse ||
-            inst.op == AnvilOpcode::JumpIfTrue) {
+        if (inst.op == CinderOpcode::Jump || inst.op == CinderOpcode::JumpIfFalse ||
+            inst.op == CinderOpcode::JumpIfTrue) {
             if (inst.imm32() >= program.code_len) {
                 return false;
             }
         }
-        if (inst.op == AnvilOpcode::HostSetText && inst.imm32() >= 8u) {
+        if (inst.op == CinderOpcode::HostSetText && inst.imm32() >= 8u) {
             return false;
         }
         // Every register operand must land in the JIT's fixed register file.
@@ -376,18 +376,18 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
         }
         // Native code keeps every value as a double, so true would read
         // back as 1. A boolean may only feed the jump right after it.
-        const bool makes_bool = inst.op == AnvilOpcode::LoadTrue || inst.op == AnvilOpcode::LoadFalse ||
-                                inst.op == AnvilOpcode::Not || inst.op == AnvilOpcode::CmpEq ||
-                                inst.op == AnvilOpcode::CmpNe || inst.op == AnvilOpcode::CmpLt ||
-                                inst.op == AnvilOpcode::CmpLe || inst.op == AnvilOpcode::CmpGt ||
-                                inst.op == AnvilOpcode::CmpGe || inst.op == AnvilOpcode::CmpLooseEq ||
-                                inst.op == AnvilOpcode::CmpLooseNe;
+        const bool makes_bool = inst.op == CinderOpcode::LoadTrue || inst.op == CinderOpcode::LoadFalse ||
+                                inst.op == CinderOpcode::Not || inst.op == CinderOpcode::CmpEq ||
+                                inst.op == CinderOpcode::CmpNe || inst.op == CinderOpcode::CmpLt ||
+                                inst.op == CinderOpcode::CmpLe || inst.op == CinderOpcode::CmpGt ||
+                                inst.op == CinderOpcode::CmpGe || inst.op == CinderOpcode::CmpLooseEq ||
+                                inst.op == CinderOpcode::CmpLooseNe;
         if (makes_bool) {
             if (i + 1u >= program.code_len) {
                 return false;
             }
-            const AnvilInstruction next = program.code()[i + 1u];
-            const bool jump = next.op == AnvilOpcode::JumpIfFalse || next.op == AnvilOpcode::JumpIfTrue;
+            const CinderInstruction next = program.code()[i + 1u];
+            const bool jump = next.op == CinderOpcode::JumpIfFalse || next.op == CinderOpcode::JumpIfTrue;
             if (!jump || next.a != inst.a) {
                 return false;
             }
@@ -396,7 +396,7 @@ bool program_is_numeric(const AnvilBytecodeProgram& program) noexcept {
     return true;
 }
 
-int step_budget(AnvilVmContext* ctx) noexcept {
+int step_budget(CinderVmContext* ctx) noexcept {
     const u32 limit = ctx->effective_step_limit();
     if (++ctx->steps_executed > limit) {
         ctx->fail_limit(VM_STOP_STEPS, "step", limit, "steps");
@@ -405,25 +405,25 @@ int step_budget(AnvilVmContext* ctx) noexcept {
     return 1;
 }
 
-double global_load(AnvilVmContext* ctx, u32 slot) noexcept {
+double global_load(CinderVmContext* ctx, u32 slot) noexcept {
     if (slot >= ctx->global_count) {
         return 0.0;
     }
     return ctx->globals()[slot].value.as_number();
 }
 
-void global_store(AnvilVmContext* ctx, u32 slot, double value) noexcept {
+void global_store(CinderVmContext* ctx, u32 slot, double value) noexcept {
     if (slot >= ctx->globals_cap) {
         return;
     }
-    ctx->globals()[slot].value = AnvilValue::make_number(value);
+    ctx->globals()[slot].value = CinderValue::make_number(value);
     ctx->globals()[slot].occupied = true;
     if (slot >= ctx->global_count) {
         ctx->global_count = slot + 1u;
     }
 }
 
-void loop_header(AnvilVmContext* ctx, u32 lid) noexcept {
+void loop_header(CinderVmContext* ctx, u32 lid) noexcept {
     const u32 id = lid & 63u;
     ++ctx->program.loop_trip_counts[id];
     if (ctx->program.loop_trip_counts[id] == HOT_LOOP_THRESHOLD) {
@@ -480,7 +480,7 @@ double cmp_le(double lhs, double rhs) noexcept { return lhs <= rhs ? 1.0 : 0.0; 
 double cmp_gt(double lhs, double rhs) noexcept { return lhs > rhs ? 1.0 : 0.0; }
 double cmp_ge(double lhs, double rhs) noexcept { return lhs >= rhs ? 1.0 : 0.0; }
 
-void host_set_text_bridge(AnvilVmContext* ctx, u32 slot, double value) noexcept {
+void host_set_text_bridge(CinderVmContext* ctx, u32 slot, double value) noexcept {
     if (!ctx || !ctx->host_set_text || slot >= ctx->host_id_count || slot >= 8u) {
         return;
     }
@@ -524,7 +524,7 @@ bool emit_setcc_bool(Asm& as, u8 dst, uint8_t setcc) noexcept {
 
 } // namespace
 
-bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexcept {
+bool cinder_jit_try_run(CinderVmContext* ctx, u32 entry_pc, f64* out_number) noexcept {
     if (!ctx || !out_number || entry_pc != 0u) {
         return false;
     }
@@ -587,22 +587,22 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
 
     for (u32 pc = 0u; ok && pc < ctx->program.code_len; ++pc) {
         as.pc_at[pc] = page.length;
-        const AnvilInstruction inst = ctx->program.code()[pc];
+        const CinderInstruction inst = ctx->program.code()[pc];
         ok = ok && as.step_or_abort(step_fn);
         switch (inst.op) {
-            case AnvilOpcode::Nop:
+            case CinderOpcode::Nop:
                 break;
-            case AnvilOpcode::LoadSmi:
+            case CinderOpcode::LoadSmi:
                 ok = ok && as.mov_eax_imm(inst.signed_imm16()) && as.cvtsi2sd_xmm0_eax() &&
                      as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::LoadTrue:
+            case CinderOpcode::LoadTrue:
                 ok = ok && as.mov_eax_imm(1) && as.cvtsi2sd_xmm0_eax() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::LoadFalse:
+            case CinderOpcode::LoadFalse:
                 ok = ok && as.xorpd_xmm(0u) && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::LoadConst: {
+            case CinderOpcode::LoadConst: {
                 const f64 n = ctx->program.constants()[inst.imm32()].as_number();
                 u64 bits = 0;
                 copy_bytes(&bits, &n, 8u);
@@ -612,82 +612,82 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 ok = ok && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
             }
-            case AnvilOpcode::Move:
+            case CinderOpcode::Move:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.b) && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::Add:
+            case CinderOpcode::Add:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.b) && as.movsd_xmm_from_reg(1u, inst.c) &&
                      as.addsd() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::Sub:
+            case CinderOpcode::Sub:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.b) && as.movsd_xmm_from_reg(1u, inst.c) &&
                      as.subsd() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::Mul:
+            case CinderOpcode::Mul:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.b) && as.movsd_xmm_from_reg(1u, inst.c) &&
                      as.mulsd() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::Div:
+            case CinderOpcode::Div:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&num_div), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::Mod:
+            case CinderOpcode::Mod:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&num_mod), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::Neg:
+            case CinderOpcode::Neg:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.b) && as.mov_rax_imm(reinterpret_cast<u64>(&num_neg)) &&
                      as.call_rax() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::Not:
+            case CinderOpcode::Not:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.b) && as.mov_rax_imm(reinterpret_cast<u64>(&num_not)) &&
                      as.call_rax() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::BitAnd:
+            case CinderOpcode::BitAnd:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&bit_and), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::BitOr:
+            case CinderOpcode::BitOr:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&bit_or), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::BitXor:
+            case CinderOpcode::BitXor:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&bit_xor), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::Shl:
+            case CinderOpcode::Shl:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&bit_shl), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::Shr:
+            case CinderOpcode::Shr:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&bit_shr), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::UShr:
+            case CinderOpcode::UShr:
                 ok = ok && as.call_binary(reinterpret_cast<u64>(&bit_ushr), inst.a, inst.b, inst.c);
                 break;
-            case AnvilOpcode::CmpEq:
-            case AnvilOpcode::CmpNe:
-            case AnvilOpcode::CmpLooseEq:
-            case AnvilOpcode::CmpLooseNe:
-            case AnvilOpcode::CmpLt:
-            case AnvilOpcode::CmpLe:
-            case AnvilOpcode::CmpGt:
-            case AnvilOpcode::CmpGe: {
+            case CinderOpcode::CmpEq:
+            case CinderOpcode::CmpNe:
+            case CinderOpcode::CmpLooseEq:
+            case CinderOpcode::CmpLooseNe:
+            case CinderOpcode::CmpLt:
+            case CinderOpcode::CmpLe:
+            case CinderOpcode::CmpGt:
+            case CinderOpcode::CmpGe: {
                 // Native code only runs programs where every value is a
                 // number, and there `==` is the same as `===`.
                 double (*fn)(double, double) = &cmp_eq;
-                if (inst.op == AnvilOpcode::CmpNe || inst.op == AnvilOpcode::CmpLooseNe) fn = &cmp_ne;
-                if (inst.op == AnvilOpcode::CmpLt) fn = &cmp_lt;
-                if (inst.op == AnvilOpcode::CmpLe) fn = &cmp_le;
-                if (inst.op == AnvilOpcode::CmpGt) fn = &cmp_gt;
-                if (inst.op == AnvilOpcode::CmpGe) fn = &cmp_ge;
+                if (inst.op == CinderOpcode::CmpNe || inst.op == CinderOpcode::CmpLooseNe) fn = &cmp_ne;
+                if (inst.op == CinderOpcode::CmpLt) fn = &cmp_lt;
+                if (inst.op == CinderOpcode::CmpLe) fn = &cmp_le;
+                if (inst.op == CinderOpcode::CmpGt) fn = &cmp_gt;
+                if (inst.op == CinderOpcode::CmpGe) fn = &cmp_ge;
                 ok = ok && as.call_binary(reinterpret_cast<u64>(fn), inst.a, inst.b, inst.c);
                 break;
             }
-            case AnvilOpcode::Jump:
+            case CinderOpcode::Jump:
                 ok = ok && as.jmp_rel32_to_pc(inst.imm32());
                 break;
-            case AnvilOpcode::JumpIfFalse:
+            case CinderOpcode::JumpIfFalse:
                 // xorpd xmm1,xmm1 ; movsd xmm0, reg ; ucomisd ; jp taken ; je taken
                 ok = ok && as.xorpd_xmm(1u) && as.movsd_xmm_from_reg(0u, inst.a) && as.ucomisd_xmm0_xmm1();
                 ok = ok && as.jcc_rel32_to_pc(0x8A, inst.imm32()); // jp
                 ok = ok && as.jcc_rel32_to_pc(0x84, inst.imm32()); // je
                 break;
-            case AnvilOpcode::JumpIfTrue: {
+            case CinderOpcode::JumpIfTrue: {
                 // Taken when not NaN and not zero. jp skip ; je skip ; jmp taken
                 ok = ok && as.xorpd_xmm(1u) && as.movsd_xmm_from_reg(0u, inst.a) && as.ucomisd_xmm0_xmm1();
                 const u32 skip_site_base = page.length;
@@ -701,15 +701,15 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                 ok = ok && as.jmp_rel32_to_pc(inst.imm32());
                 break;
             }
-            case AnvilOpcode::GetGlobal:
+            case CinderOpcode::GetGlobal:
                 ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.imm32()) &&
                      as.mov_rax_imm(load_fn) && as.call_rax() && as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
-            case AnvilOpcode::SetGlobal:
+            case CinderOpcode::SetGlobal:
                 ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm32()) &&
                      as.mov_rax_imm(store_fn) && as.call_rax();
                 break;
-            case AnvilOpcode::CallMath: {
+            case CinderOpcode::CallMath: {
                 // xmm0 = op as double, xmm1 = value
                 ok = ok && as.mov_eax_imm(static_cast<i32>(inst.b)) && as.cvtsi2sd_xmm0_eax();
                 // that put op in xmm0. Need value in xmm1 and op still in xmm0.
@@ -719,15 +719,15 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
                      as.movsd_reg_from_xmm(inst.a, 0u);
                 break;
             }
-            case AnvilOpcode::LoopHeader:
+            case CinderOpcode::LoopHeader:
                 ok = ok && as.mov_arg0_r13() && as.mov_arg1_imm(inst.a) && as.mov_rax_imm(loop_fn) && as.call_rax();
                 break;
-            case AnvilOpcode::HostSetText:
+            case CinderOpcode::HostSetText:
                 ok = ok && as.load_ptr_u32_f64(inst.a, inst.imm32()) &&
                      as.mov_rax_imm(reinterpret_cast<u64>(&host_set_text_bridge)) && as.call_rax();
                 break;
-            case AnvilOpcode::Return:
-            case AnvilOpcode::Halt:
+            case CinderOpcode::Return:
+            case CinderOpcode::Halt:
                 ok = ok && as.movsd_xmm_from_reg(0u, inst.a);
                 if (!as.emit(0xE9)) {
                     ok = false;
@@ -773,7 +773,7 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
         return false;
     }
 
-    using Entry = double (*)(double*, AnvilVmContext*);
+    using Entry = double (*)(double*, CinderVmContext*);
     auto entry = reinterpret_cast<Entry>(page.bytes);
     double regs[kRegSlots];
     for (u32 i = 0u; i < kRegSlots; ++i) {
@@ -785,4 +785,4 @@ bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexc
     return true;
 }
 
-} // namespace anvil_vm
+} // namespace cinder_vm

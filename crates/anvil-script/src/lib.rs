@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
 // Copyright (c) 2026 Buntato
-//! Hybrid Rust + WebAssembly 1.0 (`WASM`) + C++20 (`AnvilVM`) script runtime, bytecode compiler, and DOM binding layer.
+//! Hybrid Rust + WebAssembly 1.0 (`WASM`) + C++20 (`CinderVM`) script runtime, bytecode compiler, and DOM binding layer.
 //!
 //! `anvil-browser` owns the [`ScriptRuntime`]. It sets the page origin, optionally
 //! imports persisted `localStorage` entries from `profile.anvil`, runs external
@@ -20,9 +20,9 @@
 //! a socket. The C++20 numeric VM does not perform `fetch()`.
 //!
 //! When `build.rs` compiles the freestanding C++20 translation units under `cpp/`
-//! (`anvil_vm_heap.cpp`, `anvil_vm_ic.cpp`, `anvil_vm_compiler.cpp`, `anvil_jit_accel.cpp`),
-//! it sets `cfg(anvil_cpp_jit)` and links the C++20 `AnvilVM` engine (64-bit NaN-boxed
-//! values, `AnvilShape` hidden classes, 4-way polymorphic Inline Caches, Mark-Sweep
+//! (`cinder_vm_heap.cpp`, `cinder_vm_ic.cpp`, `cinder_vm_compiler.cpp`, `cinder_jit_accel.cpp`),
+//! it sets `cfg(cinder_cpp_jit)` and links the C++20 `CinderVM` engine (64-bit NaN-boxed
+//! values, `CinderShape` hidden classes, 4-way polymorphic Inline Caches, Mark-Sweep
 //! garbage collection, register bytecode execution, and vector reduction kernels).
 //! If no C++20 compiler is present at build time, `anvil-script` falls back cleanly
 //! to its pure-Rust execution path.
@@ -34,14 +34,14 @@
 
 use std::sync::Arc;
 
-/// Direct linkage to the in-tree `Anvil-JS` engine (`engines/anvil-js`).
-#[path = "../../../../anvil-browser/engines/anvil-js/src/lib.rs"]
-pub mod anvil_js;
+/// Direct linkage to the in-tree `Cinder` engine (`engines/cinder`).
+#[path = "../../../../anvil-browser/engines/cinder/src/lib.rs"]
+pub mod cinder;
 
 pub mod engine_host;
 pub mod wasm;
 
-pub use engine_host::AnvilJsDomHost;
+pub use engine_host::CinderDomHost;
 pub use wasm::{
     MAX_WASM_CALL_DEPTH, MAX_WASM_PAGES, MAX_WASM_STACK, MAX_WASM_STEPS, WASM_MAGIC,
     WASM_PAGE_SIZE, WASM_VERSION, WasmCodeBody, WasmDataSegment, WasmElementSegment, WasmError,
@@ -50,11 +50,11 @@ pub use wasm::{
 };
 
 use anvil_dom::{Document, NodeId};
-pub use anvil_js::{
+use anvil_json::{JsonValue, parse_json, to_json_string};
+pub use cinder::{
     RUNTIME_BUILTINS_JS, RUNTIME_JSON_CODEC_JS, RUNTIME_WEB_APIS_JS, self_hosted_bundle,
     self_hosted_bundle_hash, self_hosted_runtime_bundle,
 };
-use anvil_json::{JsonValue, parse_json, to_json_string};
 
 /// Maximum bytes of a `fetch()` body kept by the interpreter.
 ///
@@ -116,10 +116,10 @@ pub const RUNTIME_CORE_JS: &str = include_str!("../js/runtime_core.js");
 /// Built-in JavaScript async/URL/storage/DOM helper prelude (`crates/anvil-script/js/runtime_async_web.js`).
 pub const RUNTIME_ASYNC_WEB_JS: &str = include_str!("../js/runtime_async_web.js");
 
-/// C ABI telemetry struct populated by the C++20 `AnvilVM` (`cpp/anvil_vm.hpp`).
+/// C ABI telemetry struct populated by the C++20 `CinderVM` (`cpp/cinder_vm.hpp`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AnvilVmTelemetry {
+pub struct CinderVmTelemetry {
     pub kernel_version: u32,
     pub bytecode_ops_executed: u32,
     pub heap_objects_live: u32,
@@ -135,7 +135,7 @@ pub struct AnvilVmTelemetry {
     exports: VmExports,
 }
 
-impl AnvilVmTelemetry {
+impl CinderVmTelemetry {
     /// Why the C++ VM stopped this run or refused the script, `None` when
     /// it ran to the end.
     pub fn stop_reason(&self) -> Option<VmError> {
@@ -150,10 +150,10 @@ impl AnvilVmTelemetry {
     }
 }
 
-impl AnvilVmTelemetry {
+impl CinderVmTelemetry {
     /// Top-level variables the run left for later scripts. `Err` names one
     /// that holds an object, array or function, or says they did not fit.
-    #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+    #[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
     fn exported_globals(&self) -> Result<Vec<(String, Value)>, String> {
         if self.exports.full != 0 {
             return Err(format!(
@@ -202,7 +202,7 @@ impl AnvilVmTelemetry {
 
 /// One argument of a host call the C++ VM passed back (for example to
 /// `console.log`). Strings only appear once the VM has string values.
-#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 enum HostArg {
     Number(f64),
@@ -215,7 +215,7 @@ enum HostArg {
 
 /// A host call the VM reached and paused on: which host function and its
 /// arguments, read from the out buffer's export area.
-#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 struct PendingHostCall {
     fn_id: u32,
@@ -223,10 +223,10 @@ struct PendingHostCall {
     args: Vec<HostArg>,
 }
 
-impl AnvilVmTelemetry {
+impl CinderVmTelemetry {
     /// Read the pending host call the C++ VM wrote while paused on a HostCall.
     /// `None` when the bytes are not a well-formed host-call record.
-    #[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+    #[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
     fn pending_host_call(&self) -> Option<PendingHostCall> {
         let len = (self.exports.len as usize).min(VM_EXPORT_BYTES);
         let mut reader = ExportReader {
@@ -270,7 +270,7 @@ impl AnvilVmTelemetry {
 }
 
 /// Reads the records in [`VmExports`].
-#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
 struct ExportReader<'a> {
     bytes: &'a [u8],
 }
@@ -292,11 +292,11 @@ impl<'a> ExportReader<'a> {
     }
 }
 
-/// Size of the export buffer at the end of [`AnvilVmTelemetry`].
+/// Size of the export buffer at the end of [`CinderVmTelemetry`].
 const VM_EXPORT_BYTES: usize = 4096;
 
 /// Top-level variables a C++ VM run left, as records written by
-/// `fill_exports` in `cpp/anvil_jit_accel.cpp`.
+/// `fill_exports` in `cpp/cinder_jit_accel.cpp`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VmExports {
@@ -315,12 +315,12 @@ impl Default for VmExports {
     }
 }
 
-/// Length of the reason the C++ VM writes into [`AnvilVmTelemetry`].
+/// Length of the reason the C++ VM writes into [`CinderVmTelemetry`].
 const VM_STOP_TEXT: usize = 160;
 
-// `AnvilVmTelemetryC` in `cpp/anvil_vm.hpp` has the same layout.
+// `CinderVmTelemetryC` in `cpp/cinder_vm.hpp` has the same layout.
 const _: () = assert!(
-    std::mem::size_of::<AnvilVmTelemetry>() == 11 * 4 + 8 + VM_STOP_TEXT + 8 + VM_EXPORT_BYTES
+    std::mem::size_of::<CinderVmTelemetry>() == 11 * 4 + 8 + VM_STOP_TEXT + 8 + VM_EXPORT_BYTES
 );
 
 /// The stop code and reason at the end of the C++ telemetry struct.
@@ -472,59 +472,59 @@ mod vm_request {
 }
 
 /// Out-buffer size a request asks for by default: the whole telemetry struct.
-const DEFAULT_OUT_CAP: u32 = std::mem::size_of::<AnvilVmTelemetry>() as u32;
+const DEFAULT_OUT_CAP: u32 = std::mem::size_of::<CinderVmTelemetry>() as u32;
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 unsafe extern "C" {
-    fn anvil_cpp_jit_kernel_version() -> u32;
-    fn anvil_cpp_jit_eval_binary(opcode: u32, lhs: f64, rhs: f64) -> f64;
-    fn anvil_cpp_jit_sum_range_i64(start: i64, end_exclusive: i64, step: i64) -> i64;
-    fn anvil_cpp_vm_context_bytes() -> u32;
-    fn anvil_cpp_vm_context_align() -> u32;
-    fn anvil_cpp_vm_compiler_bytes() -> u32;
-    fn anvil_cpp_vm_compiler_align() -> u32;
-    fn anvil_cpp_vm_run_script(
+    fn cinder_cpp_jit_kernel_version() -> u32;
+    fn cinder_cpp_jit_eval_binary(opcode: u32, lhs: f64, rhs: f64) -> f64;
+    fn cinder_cpp_jit_sum_range_i64(start: i64, end_exclusive: i64, step: i64) -> i64;
+    fn cinder_cpp_vm_context_bytes() -> u32;
+    fn cinder_cpp_vm_context_align() -> u32;
+    fn cinder_cpp_vm_compiler_bytes() -> u32;
+    fn cinder_cpp_vm_compiler_align() -> u32;
+    fn cinder_cpp_vm_run_script(
         context: *mut u8,
         compiler: *mut u8,
         source_ptr: *const u8,
         source_len: u32,
-        telemetry_out: *mut AnvilVmTelemetry,
+        telemetry_out: *mut CinderVmTelemetry,
         numeric_result_out: *mut f64,
     ) -> u32;
-    fn anvil_cpp_vm_global_count(context: *mut u8) -> u32;
-    fn anvil_cpp_vm_copy_global(
+    fn cinder_cpp_vm_global_count(context: *mut u8) -> u32;
+    fn cinder_cpp_vm_copy_global(
         context: *mut u8,
         index: u32,
         name_out: *mut u8,
         name_cap: u32,
         value_out: *mut f64,
     ) -> u32;
-    fn anvil_cpp_vm_set_text_host(
+    fn cinder_cpp_vm_set_text_host(
         host_fn: Option<extern "C" fn(*mut std::ffi::c_void, *const u8, u32, f64)>,
         host: *mut std::ffi::c_void,
     );
-    fn anvil_cpp_vm_run_ic_benchmark(
+    fn cinder_cpp_vm_run_ic_benchmark(
         context: *mut u8,
         iterations: u32,
-        telemetry_out: *mut AnvilVmTelemetry,
+        telemetry_out: *mut CinderVmTelemetry,
     ) -> u32;
-    fn anvil_cpp_vm_vector_reduce(op: u32, data_ptr: *const f64, len: u32) -> f64;
+    fn cinder_cpp_vm_vector_reduce(op: u32, data_ptr: *const f64, len: u32) -> f64;
 }
 
-/// `true` when the C++20 `AnvilVM` library is linked and its version symbol is 18.
+/// `true` when the C++20 `CinderVM` library is linked and its version symbol is 18.
 pub fn is_cpp_jit_kernel_active() -> bool {
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     {
-        unsafe { anvil_cpp_jit_kernel_version() == 18 }
+        unsafe { cinder_cpp_jit_kernel_version() == 18 }
     }
-    #[cfg(not(anvil_cpp_jit))]
+    #[cfg(not(cinder_cpp_jit))]
     {
         false
     }
 }
 
 /// Caller-owned numeric VM memory. A clone does not share the allocation.
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 struct VmOwner {
     context: *mut u8,
     context_layout: std::alloc::Layout,
@@ -532,7 +532,7 @@ struct VmOwner {
     compiler_layout: std::alloc::Layout,
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl VmOwner {
     fn empty() -> Self {
         Self {
@@ -547,8 +547,8 @@ impl VmOwner {
         unsafe {
             if self.context.is_null() {
                 let Some((layout, ptr)) = alloc_vm_bytes(
-                    anvil_cpp_vm_context_bytes() as usize,
-                    anvil_cpp_vm_context_align() as usize,
+                    cinder_cpp_vm_context_bytes() as usize,
+                    cinder_cpp_vm_context_align() as usize,
                 ) else {
                     return false;
                 };
@@ -557,8 +557,8 @@ impl VmOwner {
             }
             if self.compiler.is_null() {
                 let Some((layout, ptr)) = alloc_vm_bytes(
-                    anvil_cpp_vm_compiler_bytes() as usize,
-                    anvil_cpp_vm_compiler_align() as usize,
+                    cinder_cpp_vm_compiler_bytes() as usize,
+                    cinder_cpp_vm_compiler_align() as usize,
                 ) else {
                     return false;
                 };
@@ -583,28 +583,28 @@ impl VmOwner {
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl Drop for VmOwner {
     fn drop(&mut self) {
         self.release();
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl Clone for VmOwner {
     fn clone(&self) -> Self {
         Self::empty()
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl PartialEq for VmOwner {
     fn eq(&self, _other: &Self) -> bool {
         true
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl std::fmt::Debug for VmOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -614,10 +614,10 @@ impl std::fmt::Debug for VmOwner {
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 unsafe impl Send for VmOwner {}
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 fn alloc_vm_bytes(bytes: usize, align: usize) -> Option<(std::alloc::Layout, *mut u8)> {
     let align = align.max(1);
     let mut size = bytes.max(1);
@@ -637,11 +637,11 @@ fn alloc_vm_bytes(bytes: usize, align: usize) -> Option<(std::alloc::Layout, *mu
     }
 }
 
-#[cfg(not(anvil_cpp_jit))]
+#[cfg(not(cinder_cpp_jit))]
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 struct VmOwner;
 
-#[cfg(not(anvil_cpp_jit))]
+#[cfg(not(cinder_cpp_jit))]
 impl VmOwner {
     fn empty() -> Self {
         Self
@@ -651,23 +651,23 @@ impl VmOwner {
 }
 
 /// Compile and execute a self-contained JS script inside a caller-owned C++20
-/// `AnvilVM`, returning `(numeric_result, telemetry)`. The compiler subset is
+/// `CinderVM`, returning `(numeric_result, telemetry)`. The compiler subset is
 /// numeric. This is not a general compiler. `None` when the VM refused or
 /// stopped the script; [`eval_cpp_vm_script_checked`] says why.
-pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, AnvilVmTelemetry)> {
+pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, CinderVmTelemetry)> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return None;
     }
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     unsafe {
         let mut owner = VmOwner::empty();
         if !owner.ensure() {
             return None;
         }
-        let mut telemetry = AnvilVmTelemetry::default();
+        let mut telemetry = CinderVmTelemetry::default();
         let mut result = 0.0_f64;
-        let ok = anvil_cpp_vm_run_script(
+        let ok = cinder_cpp_vm_run_script(
             owner.context,
             owner.compiler,
             trimmed.as_ptr(),
@@ -680,18 +680,18 @@ pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, AnvilVmTelemetry)> {
         }
         None
     }
-    #[cfg(not(anvil_cpp_jit))]
+    #[cfg(not(cinder_cpp_jit))]
     {
         let mut doc = Document::new();
         let mut rt = ScriptRuntime::new();
         let val = rt.eval_expr(&mut doc, trimmed);
-        val.as_number().map(|n| (n, AnvilVmTelemetry::default()))
+        val.as_number().map(|n| (n, CinderVmTelemetry::default()))
     }
 }
 
 /// Like [`eval_cpp_vm_script`], with the reason when the VM refused the
 /// script or stopped it at a limit.
-pub fn eval_cpp_vm_script_checked(source: &str) -> Result<(f64, AnvilVmTelemetry), VmError> {
+pub fn eval_cpp_vm_script_checked(source: &str) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -714,7 +714,10 @@ pub fn eval_cpp_vm_script_checked(source: &str) -> Result<(f64, AnvilVmTelemetry
 /// of `out_cap` bytes. A buffer too small for the telemetry gives the error
 /// with code 4 and nothing is written. This is how the exchange-buffer path is
 /// exercised; plain-script callers go through [`eval_cpp_vm_script`].
-pub fn eval_cpp_vm_request(source: &str, out_cap: u32) -> Result<(f64, AnvilVmTelemetry), VmError> {
+pub fn eval_cpp_vm_request(
+    source: &str,
+    out_cap: u32,
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -739,7 +742,7 @@ pub fn eval_cpp_vm_request(source: &str, out_cap: u32) -> Result<(f64, AnvilVmTe
 pub fn eval_cpp_vm_request_configured(
     step_budget: u32,
     source: &str,
-) -> Result<(f64, AnvilVmTelemetry), VmError> {
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -762,7 +765,7 @@ pub fn eval_cpp_vm_request_configured(
 }
 
 /// Halt value, numeric globals, and telemetry from [`eval_cpp_vm_script_bindings`].
-type VmBindings = (f64, Vec<(String, f64)>, AnvilVmTelemetry);
+type VmBindings = (f64, Vec<(String, f64)>, CinderVmTelemetry);
 
 /// Run `source` on the C++ VM and return numeric globals along with the halt value.
 /// `None` when the compiler rejects the script.
@@ -773,7 +776,7 @@ pub fn eval_cpp_vm_request_tuned(
     step_budget: u32,
     heap_byte_budget: u32,
     source: &str,
-) -> Result<(f64, AnvilVmTelemetry), VmError> {
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -808,7 +811,7 @@ pub fn eval_cpp_vm_request_parse_stack(
     parse_stack_budget: u32,
     step_budget: u32,
     source: &str,
-) -> Result<(f64, AnvilVmTelemetry), VmError> {
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -834,7 +837,7 @@ pub fn eval_cpp_vm_request_parse_stack(
 pub fn eval_cpp_vm_request_heap_budget(
     heap_byte_budget: u32,
     source: &str,
-) -> Result<(f64, AnvilVmTelemetry), VmError> {
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -864,7 +867,7 @@ pub fn eval_cpp_vm_request_depth(
     call_depth_limit: u32,
     step_budget: u32,
     source: &str,
-) -> Result<(f64, AnvilVmTelemetry), VmError> {
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -895,7 +898,7 @@ pub fn eval_cpp_vm_request_resumed(
     yield_interval: u32,
     step_budget: u32,
     source: &str,
-) -> Result<(f64, AnvilVmTelemetry), VmError> {
+) -> Result<(f64, CinderVmTelemetry), VmError> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return Err(VmError {
@@ -932,7 +935,7 @@ pub fn eval_cpp_vm_request_resumed(
 
 /// A number formatted as JavaScript's `Number.prototype.toString` would,
 /// which is how `console.log` prints a bare number.
-#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
 fn js_number_to_string(n: f64) -> String {
     if n.is_nan() {
         return "NaN".to_string();
@@ -953,7 +956,7 @@ fn js_number_to_string(n: f64) -> String {
 /// Format one host-call line the way `console.log` prints its arguments:
 /// each value as JavaScript would, joined by a single space. Strings and
 /// other reference values are not supported yet and are refused cleanly.
-#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
 fn format_console_line(call: &PendingHostCall) -> Result<String, VmError> {
     let mut parts: Vec<String> = Vec::with_capacity(call.args.len());
     for arg in &call.args {
@@ -981,7 +984,7 @@ pub struct ConsoleRun {
     /// The script's final value (the Halt result).
     pub result: f64,
     /// Telemetry from the final step.
-    pub telemetry: AnvilVmTelemetry,
+    pub telemetry: CinderVmTelemetry,
 }
 
 /// A refused or stopped console run: the lines printed before it stopped and
@@ -1028,9 +1031,9 @@ fn quote_js_string_literal(raw: &str) -> String {
 }
 
 /// Compile ES2022+ JavaScript source (`source`) into Core JS by running the
-/// self-hosted `anvil-js` compiler bundle (`anvil_js::self_hosted_bundle()`)
-/// directly on the C++20 `AnvilVM`.
-pub fn compile_es2022_with_anvil_js(source: &str, is_module: bool) -> Result<String, String> {
+/// self-hosted `cinder` compiler bundle (`cinder::self_hosted_bundle()`)
+/// directly on the C++20 `CinderVM`.
+pub fn compile_es2022_with_cinder(source: &str, is_module: bool) -> Result<String, String> {
     let bundle = self_hosted_bundle();
     let quoted = quote_js_string_literal(source);
     let mod_flag = if is_module { "true" } else { "false" };
@@ -1042,14 +1045,14 @@ pub fn compile_es2022_with_anvil_js(source: &str, is_module: bool) -> Result<Str
     match run.output.first().map(String::as_str) {
         Some("OK") => Ok(run.output[1..].join("\n")),
         Some("ERR") => Err(run.output[1..].join("\n")),
-        _ => Err("anvil-js compiler returned no status line".to_string()),
+        _ => Err("cinder compiler returned no status line".to_string()),
     }
 }
 
 /// Compile and execute an ES2022+ script (`source`) using the self-hosted
-/// `anvil-js` compiler and the C++20 `AnvilVM`.
-pub fn eval_es2022_with_anvil_js(source: &str) -> Result<ConsoleRun, ConsoleError> {
-    let core_js = compile_es2022_with_anvil_js(source, false).map_err(|msg| ConsoleError {
+/// `cinder` compiler and the C++20 `CinderVM`.
+pub fn eval_es2022_with_cinder(source: &str) -> Result<ConsoleRun, ConsoleError> {
+    let core_js = compile_es2022_with_cinder(source, false).map_err(|msg| ConsoleError {
         output: Vec::new(),
         error: VmError {
             code: 33,
@@ -1060,15 +1063,15 @@ pub fn eval_es2022_with_anvil_js(source: &str) -> Result<ConsoleRun, ConsoleErro
 }
 
 /// Compile an ES2022+ web application script (`app_script`) via the self-hosted
-/// `anvil-js` compiler, link it with the self-hosted Core JS Web/DOM runtime
-/// (`anvil_js::self_hosted_runtime_bundle()`), and execute the complete browser
-/// environment on `AnvilVM`.
-pub fn eval_webapp_with_anvil_js(
+/// `cinder` compiler, link it with the self-hosted Core JS Web/DOM runtime
+/// (`cinder::self_hosted_runtime_bundle()`), and execute the complete browser
+/// environment on `CinderVM`.
+pub fn eval_webapp_with_cinder(
     initial_url: &str,
     app_script: &str,
 ) -> Result<ConsoleRun, ConsoleError> {
     let lowered_app =
-        compile_es2022_with_anvil_js(app_script, false).map_err(|msg| ConsoleError {
+        compile_es2022_with_cinder(app_script, false).map_err(|msg| ConsoleError {
             output: Vec::new(),
             error: VmError {
                 code: 33,
@@ -1101,8 +1104,8 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
     eval_cpp_vm_with_console_configured(&full_program, 80_000_000, 64 * 1024 * 1024, 10_000)
 }
 
-/// Compile an ES2022+ web application script (`app_script`) via `anvil-js`, execute it
-/// on `AnvilVM` with the self-hosted Web/DOM runtime, and synchronize all recorded
+/// Compile an ES2022+ web application script (`app_script`) via `cinder`, execute it
+/// on `CinderVM` with the self-hosted Web/DOM runtime, and synchronize all recorded
 /// `AnvilDOMDocument` mutations (`createElement`, `appendChild`, `setAttribute`, `classList`,
 /// `style`, `attachShadow`, `customElements.define`, and 2D `<canvas>` operations) back onto
 /// the live [`anvil_dom::Document`].
@@ -1202,15 +1205,15 @@ fn build_hierarchical_dom_seed_js(
     seed_js
 }
 
-const ANVIL_VM_MUTATION_EXPORT_FOOTER: &str = r#"
+const CINDER_VM_MUTATION_EXPORT_FOOTER: &str = r#"
 const __rows = document.exportDomMutationRows();
 for (let __rIdx = 0; __rIdx < __rows.length; __rIdx = __rIdx + 1) {
     console.log("__ANVIL_DOM_MUT__:" + anvilJsonStringify(__rows[__rIdx]));
 }
 "#;
 
-/// Compile an ES2022+ web application script (`app_script`) via `anvil-js`, execute it
-/// on `AnvilVM` with the self-hosted Web/DOM runtime, and synchronize all recorded
+/// Compile an ES2022+ web application script (`app_script`) via `cinder`, execute it
+/// on `CinderVM` with the self-hosted Web/DOM runtime, and synchronize all recorded
 /// `AnvilDOMDocument` mutations (`createElement`, `appendChild`, `insertBefore`,
 /// `setAttribute`, `setInnerHTML`, `insertAdjacentHTML`, `setValue`, `classList`,
 /// `style`, `attachShadow`, `customElements.define`, `localStorage`, `location`,
@@ -1221,7 +1224,7 @@ pub fn eval_webapp_with_live_dom_bridge(
     app_script: &str,
 ) -> Result<ConsoleRun, ConsoleError> {
     let lowered_app =
-        compile_es2022_with_anvil_js(app_script, false).map_err(|msg| ConsoleError {
+        compile_es2022_with_cinder(app_script, false).map_err(|msg| ConsoleError {
             output: Vec::new(),
             error: VmError {
                 code: 33,
@@ -1252,7 +1255,7 @@ const encodeURIComponent = anvilEncodeURIComponent;\n\
 const decodeURIComponent = anvilDecodeURIComponent;\n\
 {seed_js}\n\
 {lowered_app}\n\
-{ANVIL_VM_MUTATION_EXPORT_FOOTER}\n"
+{CINDER_VM_MUTATION_EXPORT_FOOTER}\n"
     );
     let mut run =
         eval_cpp_vm_with_console_configured(&full_program, 80_000_000, 64 * 1024 * 1024, 10_000)?;
@@ -1274,7 +1277,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
 }
 
 /// Apply a JSON array of DOM mutation records emitted by `AnvilDOMDocument.takeDomMutations()`
-/// inside `AnvilVM` directly onto a live [`anvil_dom::Document`].
+/// inside `CinderVM` directly onto a live [`anvil_dom::Document`].
 pub fn apply_vm_dom_mutations(doc: &mut Document, mutations: &JsonValue) {
     let _ = apply_vm_dom_mutations_with_runtime(doc, mutations, None);
 }
@@ -1973,7 +1976,7 @@ fn parse_canvas_color(raw: &str) -> [u8; 4] {
 }
 
 #[allow(dead_code)]
-fn needs_anvil_js_lowering(source: &str) -> bool {
+fn needs_cinder_lowering(source: &str) -> bool {
     source.contains('#')
         || source.contains("static {")
         || source.contains("static{")
@@ -2023,15 +2026,15 @@ pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
     if trimmed.is_empty() {
         return None;
     }
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     unsafe {
         let mut owner = VmOwner::empty();
         if !owner.ensure() {
             return None;
         }
         let mut result = 0.0_f64;
-        let mut telemetry = AnvilVmTelemetry::default();
-        let code = anvil_cpp_vm_run_script(
+        let mut telemetry = CinderVmTelemetry::default();
+        let code = cinder_cpp_vm_run_script(
             owner.context,
             owner.compiler,
             trimmed.as_ptr(),
@@ -2043,11 +2046,11 @@ pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
             return None;
         }
         let mut bindings = Vec::new();
-        let count = anvil_cpp_vm_global_count(owner.context);
+        let count = cinder_cpp_vm_global_count(owner.context);
         for index in 0..count {
             let mut name = [0u8; 64];
             let mut value = 0.0_f64;
-            let copied = anvil_cpp_vm_copy_global(
+            let copied = cinder_cpp_vm_copy_global(
                 owner.context,
                 index,
                 name.as_mut_ptr(),
@@ -2068,22 +2071,23 @@ pub fn eval_cpp_vm_script_bindings(source: &str) -> Option<VmBindings> {
         }
         Some((result, bindings, telemetry))
     }
-    #[cfg(not(anvil_cpp_jit))]
+    #[cfg(not(cinder_cpp_jit))]
     {
         let _ = trimmed;
         None
     }
 }
 
-/// Run the C++20 `AnvilShape` hidden-class transition, 4-way polymorphic Inline Cache,
+/// Run the C++20 `CinderShape` hidden-class transition, 4-way polymorphic Inline Cache,
 /// and Mark-Sweep GC benchmark for `iterations` cycles.
-pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, AnvilVmTelemetry) {
-    #[cfg(anvil_cpp_jit)]
+pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, CinderVmTelemetry) {
+    #[cfg(cinder_cpp_jit)]
     unsafe {
         let mut owner = VmOwner::empty();
         if owner.ensure() {
-            let mut telemetry = AnvilVmTelemetry::default();
-            let checksum = anvil_cpp_vm_run_ic_benchmark(owner.context, iterations, &mut telemetry);
+            let mut telemetry = CinderVmTelemetry::default();
+            let checksum =
+                cinder_cpp_vm_run_ic_benchmark(owner.context, iterations, &mut telemetry);
             return (checksum, telemetry);
         }
     }
@@ -2095,7 +2099,7 @@ pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, AnvilVmTelemetry) {
         }
         (
             acc as u32,
-            AnvilVmTelemetry {
+            CinderVmTelemetry {
                 kernel_version: 0,
                 bytecode_ops_executed: capped * 4,
                 heap_objects_live: capped,
@@ -2119,11 +2123,11 @@ pub fn eval_cpp_vector_reduce(op: u32, values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     unsafe {
-        anvil_cpp_vm_vector_reduce(op, values.as_ptr(), values.len() as u32)
+        cinder_cpp_vm_vector_reduce(op, values.as_ptr(), values.len() as u32)
     }
-    #[cfg(not(anvil_cpp_jit))]
+    #[cfg(not(cinder_cpp_jit))]
     match op {
         0 => values.iter().sum(),
         1 => values.iter().copied().fold(values[0], f64::min),
@@ -2135,11 +2139,11 @@ pub fn eval_cpp_vector_reduce(op: u32, values: &[f64]) -> f64 {
 
 /// Evaluate an integer range sum `start + (start + step) + ...` via the C++20 kernel.
 pub fn eval_cpp_sum_range(start: i64, end_exclusive: i64, step: i64) -> i64 {
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     unsafe {
-        anvil_cpp_jit_sum_range_i64(start, end_exclusive, step)
+        cinder_cpp_jit_sum_range_i64(start, end_exclusive, step)
     }
-    #[cfg(not(anvil_cpp_jit))]
+    #[cfg(not(cinder_cpp_jit))]
     {
         if step <= 0 || start >= end_exclusive {
             return 0;
@@ -2157,11 +2161,11 @@ pub fn eval_cpp_sum_range(start: i64, end_exclusive: i64, step: i64) -> i64 {
 }
 
 fn eval_jit_binary_op(opcode: u32, lhs: f64, rhs: f64) -> f64 {
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     unsafe {
-        anvil_cpp_jit_eval_binary(opcode, lhs, rhs)
+        cinder_cpp_jit_eval_binary(opcode, lhs, rhs)
     }
-    #[cfg(not(anvil_cpp_jit))]
+    #[cfg(not(cinder_cpp_jit))]
     match opcode {
         0 => lhs + rhs,
         1 => lhs - rhs,
@@ -2200,7 +2204,7 @@ pub enum CompiledOp {
     EvalStatement(String),
 }
 
-/// Counters for the statement compiler, DOM lookup cache, and C++20 `AnvilVM`.
+/// Counters for the statement compiler, DOM lookup cache, and C++20 `CinderVM`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitStats {
     pub jit_enabled: bool,
@@ -2209,7 +2213,7 @@ pub struct JitStats {
     pub compiled_ops_executed: usize,
     pub folded_constants: usize,
     pub inline_cache_hits: usize,
-    pub vm_telemetry: AnvilVmTelemetry,
+    pub vm_telemetry: CinderVmTelemetry,
 }
 
 impl Default for JitStats {
@@ -2221,7 +2225,7 @@ impl Default for JitStats {
             compiled_ops_executed: 0,
             folded_constants: 0,
             inline_cache_hits: 0,
-            vm_telemetry: AnvilVmTelemetry::default(),
+            vm_telemetry: CinderVmTelemetry::default(),
         }
     }
 }
@@ -2601,8 +2605,8 @@ struct ClassDef {
 }
 
 struct EngineSession {
-    vm: anvil_js::vm::Vm,
-    host: AnvilJsDomHost,
+    vm: cinder::vm::Vm,
+    host: CinderDomHost,
 }
 
 #[derive(Default)]
@@ -2631,7 +2635,7 @@ impl std::fmt::Debug for EngineSessionOwner {
     }
 }
 
-/// Interpreter and C++20 `AnvilVM` runtime state for one page.
+/// Interpreter and C++20 `CinderVM` runtime state for one page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptRuntime {
     vars: Vec<(String, Value)>,
@@ -2684,7 +2688,7 @@ pub struct ScriptRuntime {
     last_vm_error: Option<VmError>,
     // Telemetry from the last paused VM step (status 3), so the console
     // driver can read the pending host call without a second FFI entry.
-    last_vm_telemetry: Option<Box<AnvilVmTelemetry>>,
+    last_vm_telemetry: Option<Box<CinderVmTelemetry>>,
     in_rust_eval: bool,
     vm_owner: VmOwner,
     wasm_modules: Vec<WasmModule>,
@@ -4668,13 +4672,13 @@ impl ScriptRuntime {
                 continue;
             }
             let cleaned = strip_comments(&script);
-            if should_route_dom_script_to_anvil_js(&cleaned) {
+            if should_route_dom_script_to_cinder(&cleaned) {
                 if self.vm_initial_dom_seed.is_none() {
                     let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
                     let env_seed = self.build_vm_storage_and_location_seed();
                     self.vm_initial_dom_seed = Some(format!("{dom_seed}\n{env_seed}"));
                 }
-                if let Ok(lowered) = compile_es2022_with_anvil_js(cleaned.trim(), false) {
+                if let Ok(lowered) = compile_es2022_with_cinder(cleaned.trim(), false) {
                     if !self.vm_scripts.iter().any(|s| s == &lowered) {
                         self.vm_scripts.push(lowered);
                     }
@@ -4688,11 +4692,32 @@ impl ScriptRuntime {
                     }
                 }
             }
-            if should_route_to_anvil_js_engine(&cleaned)
+            if should_route_to_cinder_engine(&cleaned)
                 && self.engine_session.inner.is_none()
                 && cleaned.contains(".addEventListener(")
             {
-                let _ = self.eval_with_anvil_js_engine(doc, cleaned.trim());
+                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
+                continue;
+            }
+            if should_route_to_cinder_engine(&cleaned)
+                && self.engine_session.inner.is_none()
+                && cleaned.contains(".addEventListener(")
+            {
+                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
+                continue;
+            }
+            if should_route_to_cinder_engine(&cleaned)
+                && self.engine_session.inner.is_none()
+                && cleaned.contains(".addEventListener(")
+            {
+                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
+                continue;
+            }
+            if should_route_to_cinder_engine(&cleaned)
+                && self.engine_session.inner.is_none()
+                && cleaned.contains(".addEventListener(")
+            {
+                let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
                 continue;
             }
             for stmt in split_statements(&cleaned) {
@@ -5011,14 +5036,14 @@ impl ScriptRuntime {
         out
     }
 
-    /// Compile and run `source` on `AnvilVM` with the live hierarchical DOM bridge,
+    /// Compile and run `source` on `CinderVM` with the live hierarchical DOM bridge,
     /// applying all DOM, `localStorage`, and `location` mutations back to `doc`
     /// and `self`.
-    pub fn eval_with_anvil_js_dom_bridge(&mut self, doc: &mut Document, source: &str) -> bool {
+    pub fn eval_with_cinder_dom_bridge(&mut self, doc: &mut Document, source: &str) -> bool {
         if !is_cpp_jit_kernel_active() {
             return false;
         }
-        let Ok(lowered_app) = compile_es2022_with_anvil_js(source, false) else {
+        let Ok(lowered_app) = compile_es2022_with_cinder(source, false) else {
             return false;
         };
         let dom_seed = build_hierarchical_dom_seed_js(doc, &[], None);
@@ -5051,7 +5076,7 @@ const encodeURIComponent = anvilEncodeURIComponent;\n\
 const decodeURIComponent = anvilDecodeURIComponent;\n\
 {initial_seed}\n\
 {lowered_app}\n\
-{ANVIL_VM_MUTATION_EXPORT_FOOTER}\n"
+{CINDER_VM_MUTATION_EXPORT_FOOTER}\n"
         );
         let Ok(run) = eval_cpp_vm_with_console_configured(
             &full_program,
@@ -5183,7 +5208,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
 {input_sync_js}\n\
 {reset_mutations_js}\n\
 {current_event_js}\n\
-{ANVIL_VM_MUTATION_EXPORT_FOOTER}\n"
+{CINDER_VM_MUTATION_EXPORT_FOOTER}\n"
         );
         let Ok(run) = eval_cpp_vm_with_console_configured(
             &full_program,
@@ -5225,12 +5250,12 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         true
     }
 
-    /// Compile and execute `source` directly on the `anvil-js` register bytecode VM
-    /// (`anvil_js::vm::Vm`) with live [`AnvilJsDomHost`] bindings against `doc`.
+    /// Compile and execute `source` directly on the `cinder` register bytecode VM
+    /// (`cinder::vm::Vm`) with live [`CinderDomHost`] bindings against `doc`.
     ///
     /// Returns the formatted completion value on success, or the compiler/runtime
     /// diagnostic message on failure.
-    pub fn eval_with_anvil_js_engine(
+    pub fn eval_with_cinder_engine(
         &mut self,
         doc: &mut Document,
         source: &str,
@@ -5242,9 +5267,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             .unwrap_or_else(|| "https://localhost/".to_string());
         if self.engine_session.inner.is_none() {
             let mut vm =
-                anvil_js::vm::Vm::new(anvil_js::Limits::default()).map_err(|e| e.to_string())?;
-            anvil_js::install(&mut vm).map_err(|e| e.to_string())?;
-            let mut host = AnvilJsDomHost::new(Document::new(), &initial_url);
+                cinder::vm::Vm::new(cinder::Limits::default()).map_err(|e| e.to_string())?;
+            cinder::install(&mut vm).map_err(|e| e.to_string())?;
+            let mut host = CinderDomHost::new(Document::new(), &initial_url);
             host.install(&mut vm).map_err(|e| e.to_string())?;
             self.engine_session.inner = Some(Box::new(EngineSession { vm, host }));
         }
@@ -5271,15 +5296,15 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             session.host.console.clear();
 
             let limits = session.vm.limits().clone();
-            let block = match anvil_js::compile_script(source, &limits) {
+            let block = match cinder::compile_script(source, &limits) {
                 Ok(b) => b,
                 Err(first_err) => {
-                    if let Ok(lowered) = compile_es2022_with_anvil_js(source, false)
-                        && let Ok(b) = anvil_js::compile_script(&lowered, &limits)
+                    if let Ok(lowered) = compile_es2022_with_cinder(source, false)
+                        && let Ok(b) = cinder::compile_script(&lowered, &limits)
                     {
                         b
                     } else if let Some(recovered_block) =
-                        recover_script_statements_for_anvil_js(source, &limits)
+                        recover_script_statements_for_cinder(source, &limits)
                     {
                         recovered_block
                     } else {
@@ -5416,6 +5441,28 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         handled
     }
 
+    /// Update the active layout viewport dimensions and vertical scroll position,
+    /// re-evaluating active `IntersectionObserver` and `ResizeObserver` callbacks.
+    pub fn notify_layout_and_scroll(
+        &mut self,
+        doc: &mut Document,
+        viewport_w: f32,
+        viewport_h: f32,
+        scroll_y: f32,
+    ) -> bool {
+        if let Some(session) = self.engine_session.inner.as_mut() {
+            session.host.viewport_width = viewport_w.max(1.0);
+            session.host.viewport_height = viewport_h.max(1.0);
+        }
+        if self.engine_session.inner.is_some() {
+            let js = format!(
+                "if (typeof window.__notifyLayoutAndScroll === 'function') {{ window.__notifyLayoutAndScroll({viewport_w}, {viewport_h}, {scroll_y}); }}"
+            );
+            return self.eval_with_cinder_engine(doc, &js).is_ok();
+        }
+        false
+    }
+
     pub fn eval_script(&mut self, doc: &mut Document, source: &str) {
         if self.aborted {
             return;
@@ -5446,8 +5493,8 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             // a fallback to the interpreter never double-prints a line.
             let (mut output, mut outcome) = self.run_cpp_vm_console(cleaned.trim(), 0, 0, 0);
             if matches!(&outcome, Err(err) if err.refused() && !err.is_limit())
-                && needs_anvil_js_lowering(&cleaned)
-                && let Ok(lowered) = compile_es2022_with_anvil_js(cleaned.trim(), false)
+                && needs_cinder_lowering(&cleaned)
+                && let Ok(lowered) = compile_es2022_with_cinder(cleaned.trim(), false)
             {
                 let (low_out, low_res) = self.run_cpp_vm_console(&lowered, 0, 0, 0);
                 if low_res.is_ok() {
@@ -5490,15 +5537,15 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             }
         }
         if !self.in_rust_eval
-            && should_route_dom_script_to_anvil_js(&cleaned)
-            && self.eval_with_anvil_js_dom_bridge(doc, cleaned.trim())
+            && should_route_dom_script_to_cinder(&cleaned)
+            && self.eval_with_cinder_dom_bridge(doc, cleaned.trim())
         {
             return;
         }
         if !self.in_rust_eval
-            && (self.engine_session.inner.is_some() || should_route_to_anvil_js_engine(&cleaned))
+            && (self.engine_session.inner.is_some() || should_route_to_cinder_engine(&cleaned))
         {
-            let _ = self.eval_with_anvil_js_engine(doc, cleaned.trim());
+            let _ = self.eval_with_cinder_engine(doc, cleaned.trim());
             return;
         }
         let outer = self.in_rust_eval;
@@ -5567,7 +5614,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         step_budget: u32,
         heap_byte_budget: u32,
         call_depth_limit: u32,
-    ) -> (Vec<String>, Result<(f64, Box<AnvilVmTelemetry>), VmError>) {
+    ) -> (Vec<String>, Result<(f64, Box<CinderVmTelemetry>), VmError>) {
         // Budgets apply to the Run and every Resume on this context; the source
         // size is capped only by the heap budget (script size 0).
         let configure = vm_request::configure(step_budget, 0, heap_byte_budget, call_depth_limit);
@@ -5630,15 +5677,15 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         if trimmed.is_empty() || trimmed.len() > u32::MAX as usize {
             return VmRun::Rejected(None);
         }
-        #[cfg(anvil_cpp_jit)]
+        #[cfg(cinder_cpp_jit)]
         {
             if !is_cpp_jit_kernel_active() || !self.vm_owner.ensure() {
                 return VmRun::Rejected(None);
             }
             let mut result = 0.0_f64;
-            let mut telemetry = AnvilVmTelemetry::default();
+            let mut telemetry = CinderVmTelemetry::default();
             let code = unsafe {
-                anvil_cpp_vm_run_script(
+                cinder_cpp_vm_run_script(
                     self.vm_owner.context,
                     self.vm_owner.compiler,
                     trimmed.as_ptr(),
@@ -5677,7 +5724,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                 _ => VmRun::Rejected(Some(reason())),
             }
         }
-        #[cfg(not(anvil_cpp_jit))]
+        #[cfg(not(cinder_cpp_jit))]
         {
             let _ = (self, trimmed);
             VmRun::Rejected(None)
@@ -5874,7 +5921,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
         }
     }
 
-    #[cfg_attr(not(anvil_cpp_jit), allow(unused_variables))]
+    #[cfg_attr(not(cinder_cpp_jit), allow(unused_variables))]
     fn try_native_page_loop(&mut self, doc: &mut Document, statement: &str) -> bool {
         if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
             return false;
@@ -5903,7 +5950,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             }
         }
         let source = format!("{prelude}{runnable}");
-        #[cfg(anvil_cpp_jit)]
+        #[cfg(cinder_cpp_jit)]
         let _guard = TextHostGuard::arm(doc);
         let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
             return false;
@@ -7300,9 +7347,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return Value::Str(hash);
         }
         if expr == "navigator.userAgent" || expr == "window.navigator.userAgent" {
-            return Value::Str(
-                "AnvilBrowser/23.3 (Win64; x64) AnvilEngine/23.3 AnvilJS/4.0".to_string(),
-            );
+            return Value::Str("AnvilBrowser/23.3 (Win64; x64) Forge/23.3 Cinder/4.0".to_string());
         }
         if expr == "navigator.language" || expr == "window.navigator.language" {
             return Value::Str("en-US".to_string());
@@ -11465,7 +11510,7 @@ fn make_aggregate_error(errors: &[JsonValue]) -> Value {
     Value::Json(obj)
 }
 
-fn should_route_dom_script_to_anvil_js(cleaned: &str) -> bool {
+fn should_route_dom_script_to_cinder(cleaned: &str) -> bool {
     if !is_cpp_jit_kernel_active() || !script_stays_on_rust(cleaned) {
         return false;
     }
@@ -11476,15 +11521,15 @@ fn should_route_dom_script_to_anvil_js(cleaned: &str) -> bool {
         || stripped.contains("??=")
         || stripped.contains("||=")
         || stripped.contains("&&=")
-        || cleaned.contains("\"use anvil-vm\"")
-        || cleaned.contains("'use anvil-vm'")
-        || cleaned.contains("@anvil-vm")
+        || cleaned.contains("\"use cinder-vm\"")
+        || cleaned.contains("'use cinder-vm'")
+        || cleaned.contains("@cinder-vm")
 }
 
-fn recover_script_statements_for_anvil_js(
+fn recover_script_statements_for_cinder(
     source: &str,
-    limits: &anvil_js::Limits,
-) -> Option<anvil_js::bytecode::CodeBlock> {
+    limits: &cinder::Limits,
+) -> Option<cinder::bytecode::CodeBlock> {
     let stmts = split_statements(source);
     if stmts.len() <= 1 {
         return None;
@@ -11497,7 +11542,7 @@ fn recover_script_statements_for_anvil_js(
             continue;
         }
         let candidate = format!("{s};");
-        if anvil_js::compile_script(&candidate, limits).is_ok() {
+        if cinder::compile_script(&candidate, limits).is_ok() {
             kept.push(candidate);
             valid_count += 1;
         } else {
@@ -11510,13 +11555,13 @@ fn recover_script_statements_for_anvil_js(
         return None;
     }
     let combined = kept.join("\n");
-    anvil_js::compile_script(&combined, limits).ok()
+    cinder::compile_script(&combined, limits).ok()
 }
 
-fn should_route_to_anvil_js_engine(cleaned: &str) -> bool {
-    cleaned.contains("\"use anvil-js\"")
-        || cleaned.contains("'use anvil-js'")
-        || cleaned.contains("@anvil-js")
+fn should_route_to_cinder_engine(cleaned: &str) -> bool {
+    cleaned.contains("\"use cinder\"")
+        || cleaned.contains("'use cinder'")
+        || cleaned.contains("@cinder")
         || cleaned.contains("Promise.withResolvers")
         || cleaned.contains("Object.groupBy")
         || cleaned.contains("Map.groupBy")
@@ -11574,6 +11619,25 @@ fn should_route_to_anvil_js_engine(cleaned: &str) -> bool {
         || cleaned.contains(".createRadialGradient(")
         || cleaned.contains(".quadraticCurveTo(")
         || cleaned.contains(".bezierCurveTo(")
+        || cleaned.contains("Symbol.asyncIterator")
+        || cleaned.contains(".showModal(")
+        || cleaned.contains(".checkValidity(")
+        || cleaned.contains(".reportValidity(")
+        || cleaned.contains(".setCustomValidity(")
+        || cleaned.contains("new File(")
+        || cleaned.contains("new FileReader")
+        || cleaned.contains("new DataTransfer")
+        || cleaned.contains("navigator.clipboard")
+        || cleaned.contains(".scrollTop")
+        || cleaned.contains(".scrollLeft")
+        || cleaned.contains(".scrollWidth")
+        || cleaned.contains(".scrollHeight")
+        || cleaned.contains(".offsetWidth")
+        || cleaned.contains(".offsetHeight")
+        || cleaned.contains(".clientWidth")
+        || cleaned.contains(".clientHeight")
+        || cleaned.contains(".scrollTo(")
+        || cleaned.contains(".scrollBy(")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -11890,10 +11954,10 @@ fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str
 }
 
 /// Result of offering a script to the caller-owned numeric VM.
-#[cfg_attr(not(anvil_cpp_jit), allow(dead_code))]
+#[cfg_attr(not(cinder_cpp_jit), allow(dead_code))]
 enum VmRun {
     /// The compiler accepted the script and execution finished.
-    Value(f64, Box<AnvilVmTelemetry>),
+    Value(f64, Box<CinderVmTelemetry>),
     /// The compiler accepted the script and a limit stopped it.
     Stopped(VmError),
     /// The compiler rejected the script, or the VM is not linked (`None`).
@@ -11990,22 +12054,22 @@ fn strip_string_literals(source: &str) -> String {
     out
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 static TEXT_HOST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 struct TextHostGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl TextHostGuard {
     fn arm(doc: &mut Document) -> Self {
         let guard = TEXT_HOST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
-            anvil_cpp_vm_set_text_host(
+            cinder_cpp_vm_set_text_host(
                 Some(rust_host_set_text),
                 doc as *mut Document as *mut std::ffi::c_void,
             );
@@ -12014,16 +12078,16 @@ impl TextHostGuard {
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 impl Drop for TextHostGuard {
     fn drop(&mut self) {
         unsafe {
-            anvil_cpp_vm_set_text_host(None, std::ptr::null_mut());
+            cinder_cpp_vm_set_text_host(None, std::ptr::null_mut());
         }
     }
 }
 
-#[cfg(anvil_cpp_jit)]
+#[cfg(cinder_cpp_jit)]
 extern "C" fn rust_host_set_text(host: *mut std::ffi::c_void, id: *const u8, len: u32, value: f64) {
     if host.is_null() || id.is_null() || len == 0 {
         return;
@@ -13330,7 +13394,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_cpp_anvil_vm_bytecode_shapes_inline_caches_and_gc() {
+    fn executes_cpp_cinder_vm_bytecode_shapes_inline_caches_and_gc() {
         let vm_source = "
             function square(n) {
                 return n * n;
@@ -13343,7 +13407,7 @@ mod tests {
             acc;
         ";
         if is_cpp_jit_kernel_active() {
-            let (res, telemetry) = eval_cpp_vm_script(vm_source).expect("AnvilVM compiled & ran");
+            let (res, telemetry) = eval_cpp_vm_script(vm_source).expect("CinderVM compiled & ran");
             // sum_{i=1..20} (i + i^2) = 210 + 2870 = 3080
             assert_eq!(res, 3080.0);
             assert_eq!(telemetry.kernel_version, 18);
@@ -14226,7 +14290,7 @@ mod tests {
         assert!(!rt.was_aborted());
     }
 
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     #[test]
     fn the_numeric_vm_refuses_event_loop_scripts() {
         if !is_cpp_jit_kernel_active() {
@@ -14296,9 +14360,9 @@ mod tests {
         assert_eq!(&surf.rgba[0..4], &[255, 0, 0, 255]);
     }
 
-    #[cfg(anvil_cpp_jit)]
+    #[cfg(cinder_cpp_jit)]
     #[test]
-    fn live_dom_bridge_synchronizes_anvil_vm_mutations_and_canvas_to_document() {
+    fn live_dom_bridge_synchronizes_cinder_vm_mutations_and_canvas_to_document() {
         if !is_cpp_jit_kernel_active() {
             return;
         }
@@ -14314,7 +14378,7 @@ mod tests {
             app.style.backgroundColor = 'rgb(10, 20, 30)';
             const child = document.createElement('p');
             child.setAttribute('id', 'created-p');
-            child.textContent = 'FromAnvilVM';
+            child.textContent = 'FromCinderVM';
             app.appendChild(child);
             const sr = app.attachShadow({ mode: 'open' });
             const sh = document.createElement('span');
@@ -14345,7 +14409,7 @@ mod tests {
         let created = doc
             .get_element_by_id("created-p")
             .expect("created-p synced");
-        assert_eq!(doc.text_content(created), "FromAnvilVM");
+        assert_eq!(doc.text_content(created), "FromCinderVM");
         let sr = doc.shadow_root(app).expect("shadow root synced");
         assert_eq!(doc.text_content(sr), "ShadowChild");
 
@@ -14401,7 +14465,7 @@ mod tests {
     }
 
     #[test]
-    fn anvil_js_engine_executes_es2024_builtins_promises_and_live_dom_host() {
+    fn cinder_engine_executes_es2024_builtins_promises_and_live_dom_host() {
         let mut doc = parse_html(
             "<html><head><title>Old</title></head>
              <body>
@@ -14417,7 +14481,7 @@ mod tests {
         rt.local_storage_set("seed", "42");
 
         let res = rt
-            .eval_with_anvil_js_engine(
+            .eval_with_cinder_engine(
                 &mut doc,
                 r#"
                 const root = document.getElementById("root");
@@ -14446,7 +14510,7 @@ mod tests {
                 sorted.join("")
                 "#,
             )
-            .expect("anvil-js engine should execute script");
+            .expect("cinder engine should execute script");
         assert_eq!(res, "abc");
         assert!(rt.last_script_used_vm());
         assert_eq!(doc.title(), "EngineActive");
@@ -14465,7 +14529,7 @@ mod tests {
     }
 
     #[test]
-    fn anvil_js_engine_interactive_events_maintain_closure_state_and_prevent_default() {
+    fn cinder_engine_interactive_events_maintain_closure_state_and_prevent_default() {
         let mut doc = parse_html(
             "<html><body>
                <form id=\"f\">
@@ -14479,7 +14543,7 @@ mod tests {
         rt.eval_script(
             &mut doc,
             r#"
-            "use anvil-js";
+            "use cinder";
             let count = 0;
             const seen = new Set();
             const btn = document.getElementById("btn");
@@ -14523,7 +14587,7 @@ mod tests {
     }
 
     #[test]
-    fn anvil_js_engine_executes_classes_async_canvas_observers_and_web_apis() {
+    fn cinder_engine_executes_classes_async_canvas_observers_and_web_apis() {
         let mut doc = parse_html(
             "<html><body>
                <div id=\"app\"></div>
@@ -14536,7 +14600,7 @@ mod tests {
         rt.set_page_origin("https://app.example.com/studio?mode=pro#canvas");
 
         let res = rt
-            .eval_with_anvil_js_engine(
+            .eval_with_cinder_engine(
                 &mut doc,
                 r##"
                 class Shape {
@@ -14645,7 +14709,7 @@ mod tests {
                 "ok"
                 "##,
             )
-            .expect("anvil-js full web runtime test should succeed");
+            .expect("cinder full web runtime test should succeed");
         assert_eq!(res, "ok");
 
         let summary = doc.get_element_by_id("summary").unwrap();
@@ -14662,12 +14726,11 @@ mod tests {
     }
 
     #[test]
-    fn anvil_js_engine_executes_generators_bigint_proxy_reflect_weak_collections_dataview_and_intl()
-    {
+    fn cinder_engine_executes_generators_bigint_proxy_reflect_weak_collections_dataview_and_intl() {
         let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
         let mut rt = ScriptRuntime::new();
         let res = rt
-            .eval_with_anvil_js_engine(
+            .eval_with_cinder_engine(
                 &mut doc,
                 r#"
                 function* innerGen() {
@@ -14748,7 +14811,7 @@ mod tests {
     }
 
     #[test]
-    fn anvil_js_engine_executes_3phase_dom_events_traversal_fetch_crypto_history_and_canvas_gradients()
+    fn cinder_engine_executes_3phase_dom_events_traversal_fetch_crypto_history_and_canvas_gradients()
      {
         let mut doc = parse_html(
             "<html><body>
@@ -14765,7 +14828,7 @@ mod tests {
         rt.set_page_origin("https://app.example.com/start");
         rt.register_fetch_response("https://app.example.com/api/items", 200, "{\"count\":7}");
 
-        rt.eval_with_anvil_js_engine(
+        rt.eval_with_cinder_engine(
             &mut doc,
             r##"
             const phases = [];
@@ -14859,7 +14922,7 @@ mod tests {
         let btn = doc.get_element_by_id("btn").unwrap();
         assert!(rt.dispatch_click(&mut doc, btn));
 
-        rt.eval_with_anvil_js_engine(&mut doc, "window.__finalizeSummary();")
+        rt.eval_with_cinder_engine(&mut doc, "window.__finalizeSummary();")
             .expect("finalize summary");
 
         let out = doc.get_element_by_id("out").unwrap();
@@ -14870,12 +14933,12 @@ mod tests {
     }
 
     #[test]
-    fn anvil_js_engine_isolates_broken_scripts_and_fires_window_onerror() {
+    fn cinder_engine_isolates_broken_scripts_and_fires_window_onerror() {
         let mut doc = parse_html(
             "<html><body>
                <p id=\"out\">init</p>
                <script>
-                 \"use anvil-js\";
+                 \"use cinder\";
                  window.__errors = [];
                  window.onerror = function(msg) {
                    window.__errors.push(\"onerror:\" + (msg.length > 0));
@@ -14894,5 +14957,91 @@ mod tests {
         rt.run_document_scripts(&mut doc);
         let out = doc.get_element_by_id("out").unwrap();
         assert_eq!(doc.text_content(out), "recovered:onerror:true");
+    }
+
+    #[test]
+    fn cinder_engine_runs_async_generators_dialog_validation_live_geometry_and_file_apis() {
+        let mut doc = parse_html(
+            "<html><head><style>
+               #scroller { width: 200px; height: 100px; border: 4px solid #333; overflow: auto; }
+               #tall { width: 180px; height: 320px; }
+               #badge::before { content: 'TAG:'; color: rgb(255, 0, 0); }
+             </style></head><body>
+               <div id=\"scroller\"><div id=\"tall\">content</div></div>
+               <span id=\"badge\">hello</span>
+               <dialog id=\"dlg\">Modal</dialog>
+               <form id=\"frm\">
+                 <input id=\"email\" type=\"email\" required value=\"\" />
+               </form>
+               <p id=\"out\">init</p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.eval_with_cinder_engine(
+            &mut doc,
+            r##"
+            const scroller = document.getElementById("scroller");
+            const rect = scroller.getBoundingClientRect();
+            const ow = scroller.offsetWidth;
+            const cw = scroller.clientWidth;
+            const sh = scroller.scrollHeight;
+            scroller.scrollTop = 45;
+            scroller.scrollBy(0, 15);
+            const st = scroller.scrollTop;
+
+            const cs = getComputedStyle(scroller);
+            const beforeCs = getComputedStyle(document.getElementById("badge"), "::before");
+
+            const dlg = document.getElementById("dlg");
+            dlg.showModal();
+            const wasOpen = dlg.open;
+            dlg.close("confirmed");
+            const retVal = dlg.returnValue + ":" + dlg.open;
+
+            const email = document.getElementById("email");
+            const v0 = email.checkValidity() + ":" + email.validity.valueMissing;
+            email.value = "user@example.com";
+            const v1 = email.checkValidity();
+            email.setCustomValidity("Taken");
+            const v2 = email.checkValidity() + ":" + email.validity.customError + ":" + email.validationMessage;
+            email.setCustomValidity("");
+            const v3 = email.checkValidity();
+
+            async function* asyncStream() {
+                yield await Promise.resolve(10);
+                yield await Promise.resolve(20);
+                yield 30;
+            }
+
+            (async () => {
+                let sum = 0;
+                for await (const n of asyncStream()) {
+                    sum += n;
+                }
+                const f = new File(["hello-anvil"], "note.txt", { type: "text/plain" });
+                const readerTxt = await new Promise((resolve) => {
+                    const fr = new FileReader();
+                    fr.addEventListener("load", () => resolve(fr.result));
+                    fr.readAsText(f);
+                });
+                await navigator.clipboard.writeText("clip:" + readerTxt);
+                const clipOut = await navigator.clipboard.readText();
+
+                document.getElementById("out").textContent =
+                    rect.width + "/" + ow + "/" + cw + "/" + sh + "/" + st +
+                    "|" + cs.overflow + "/" + beforeCs.content +
+                    "|" + wasOpen + "/" + retVal +
+                    "|" + v0 + "/" + v1 + "/" + v2 + "/" + v3 +
+                    "|" + sum + "|" + f.name + ":" + clipOut;
+            })();
+            "##,
+        )
+        .expect("run v24.4 pillar 2.3 and pillar 4 suite");
+
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "208/208/200/320/60|auto/\"TAG:\"|true/confirmed:false|false:true/true/false:true:Taken/true|60|note.txt:clip:hello-anvil"
+        );
     }
 }

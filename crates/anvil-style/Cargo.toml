@@ -1,4 +1,4 @@
-# CSS parser and cascade. Reads anvil-dom nodes and links the Anvil-CSS engine directly.
+# CSS parser and cascade. Reads anvil-dom nodes and links the Prism engine directly.
 # Does not place boxes. anvil-layout reads the computed style. anvil-raster also reads style values
 # that the display list did not fully flatten.
 
