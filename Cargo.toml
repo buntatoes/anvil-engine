@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
-# Page engine. Crate version 0.24.2. Not published.
+# Page engine. Crate version 0.24.3. Not published.
 #
 # Page pipeline, in order:
 #   anvil-dom parses HTML into one node list.
@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.24.2"
+version = "0.24.3"
 edition = "2024"
 rust-version = "1.99.1"
 authors = ["Buntato <324143321+buntatoes@users.noreply.github.com>"]

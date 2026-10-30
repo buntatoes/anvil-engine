@@ -2099,24 +2099,25 @@ impl Framebuffer {
 
     /// Draw with the built-in 5x7 bitmap from `glyph`.
     pub fn draw_bitmap_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
-        if font_size <= 0.0 || color.a == 0 {
+        if !font_size.is_finite() || font_size <= 0.0 || color.a == 0 {
             return;
         }
-        let scale = ((font_size / 12.0).floor() as i32).max(1);
-        let advance = font_size * 0.5;
-        let glyph_height = 7 * scale;
-        let line_height = (font_size * 1.25).round() as i32;
-        let pad_y = ((line_height - glyph_height) / 2).max(0);
+        let clamped_fs = font_size.min(4096.0);
+        let scale = ((clamped_fs / 12.0).floor() as i32).clamp(1, 512);
+        let advance = clamped_fs * 0.5;
+        let glyph_height = 7_i32.saturating_mul(scale);
+        let line_height = (clamped_fs * 1.25).round() as i32;
+        let pad_y = (line_height.saturating_sub(glyph_height) / 2).max(0);
         let base_y = (y.round() as i32).saturating_add(pad_y);
 
         for (index, ch) in text.chars().enumerate() {
             let char_x = (x + index as f32 * advance).round() as i32;
             let rows = glyph(ch);
             for (row_idx, row_bits) in rows.iter().copied().enumerate() {
-                for col_idx in 0..5 {
+                for col_idx in 0..5_i32 {
                     if (row_bits >> (4 - col_idx)) & 1 == 1 {
-                        let gx = char_x.saturating_add(col_idx * scale);
-                        let gy = base_y.saturating_add((row_idx as i32) * scale);
+                        let gx = char_x.saturating_add(col_idx.saturating_mul(scale));
+                        let gy = base_y.saturating_add((row_idx as i32).saturating_mul(scale));
                         let px0 = gx.max(0);
                         let py0 = gy.max(0);
                         let px1 = gx.saturating_add(scale).min(self.width as i32);

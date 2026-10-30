@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0-OR-Commercial
+# Copyright (c) 2026 Buntato
+# GitHub Linguist language classification for Anvil Engine
+
+*.rs linguist-language=Rust linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.js linguist-language=JavaScript linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.css linguist-language=CSS linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.cpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.hpp linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false
+*.h linguist-language=C++ linguist-detectable=true linguist-vendored=false linguist-generated=false

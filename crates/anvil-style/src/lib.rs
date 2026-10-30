@@ -1312,6 +1312,10 @@ pub struct ComputedStyle {
     /// Preferred `width / height` ratio from CSS `aspect-ratio` (`None` when `auto`).
     pub aspect_ratio: Option<f32>,
     pub underline: bool,
+    /// Truncate overflowing single-line inline text with `…` (`text-overflow: ellipsis`).
+    pub text_overflow_ellipsis: bool,
+    /// Break long unbreakable words at arbitrary character boundaries (`overflow-wrap: break-word` / `word-break: break-all`).
+    pub word_break_any: bool,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
     /// Visual order of a flex or grid item (`order`). Initial value is 0.
@@ -1420,6 +1424,8 @@ impl ComputedStyle {
             max_height: Size::Auto,
             aspect_ratio: None,
             underline: false,
+            text_overflow_ellipsis: false,
+            word_break_any: false,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             order: 0,
@@ -1497,6 +1503,7 @@ impl ComputedStyle {
             white_space: self.white_space,
             visibility: self.visibility,
             underline: self.underline,
+            word_break_any: self.word_break_any,
             border_color: self.color,
             ..Self::initial()
         }
@@ -1508,6 +1515,8 @@ impl ComputedStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleMap {
     styles: Vec<ComputedStyle>,
+    before_styles: HashMap<NodeId, (String, ComputedStyle)>,
+    after_styles: HashMap<NodeId, (String, ComputedStyle)>,
     root_font_px: f32,
     viewport_width: f32,
     viewport_height: f32,
@@ -1518,6 +1527,16 @@ impl StyleMap {
     /// style, not an error. The reference lives as long as `self`.
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         self.styles.get(id.index()).unwrap_or(&FALLBACK)
+    }
+
+    /// Generated `(content, style)` for `id::before`, when present and not `display: none`.
+    pub fn before_style(&self, id: NodeId) -> Option<&(String, ComputedStyle)> {
+        self.before_styles.get(&id)
+    }
+
+    /// Generated `(content, style)` for `id::after`, when present and not `display: none`.
+    pub fn after_style(&self, id: NodeId) -> Option<&(String, ComputedStyle)> {
+        self.after_styles.get(&id)
     }
 
     /// Computed `font-size` of the `html` element, in CSS pixels.
@@ -2274,8 +2293,12 @@ pub fn compute_styles_parallel(
                 }
             }
         }
+        let (before_styles, after_styles) =
+            cascade_pseudo_elements(doc, sheet, viewport_width, root_font_px, &styles, &matcher);
         return StyleMap {
             styles,
+            before_styles,
+            after_styles,
             root_font_px,
             viewport_width,
             viewport_height,
@@ -2384,12 +2407,188 @@ fn cascade_document(
     if let Some(html_style) = styles.get(doc.html().index()) {
         root_font_px = html_style.font_size;
     }
+    let (before_styles, after_styles) =
+        cascade_pseudo_elements(doc, sheet, viewport_width, root_font_px, &styles, &matcher);
     StyleMap {
         styles,
+        before_styles,
+        after_styles,
         root_font_px,
         viewport_width,
         viewport_height,
     }
+}
+
+fn cascade_pseudo_elements(
+    doc: &Document,
+    sheet: &Stylesheet,
+    viewport_width: f32,
+    root_font_px: f32,
+    styles: &[ComputedStyle],
+    matcher: &selectors::Matcher,
+) -> (
+    HashMap<NodeId, (String, ComputedStyle)>,
+    HashMap<NodeId, (String, ComputedStyle)>,
+) {
+    let mut before_styles = HashMap::new();
+    let mut after_styles = HashMap::new();
+    let has_pseudo_rules = sheet.rules.iter().any(|rule| {
+        rule.media
+            .as_ref()
+            .is_none_or(|mq| mq.matches(viewport_width))
+            && rule
+                .selectors
+                .iter()
+                .any(|s| s.pseudo_before_or_after().is_some())
+    });
+    if !has_pseudo_rules {
+        return (before_styles, after_styles);
+    }
+
+    let mut stack = vec![doc.root()];
+    while let Some(id) = stack.pop() {
+        for &child in doc.children(id).iter().rev() {
+            stack.push(child);
+        }
+        let NodeData::Element { .. } = doc.get(id).data() else {
+            continue;
+        };
+        let Some(host_style) = styles.get(id.index()) else {
+            continue;
+        };
+        if host_style.display == Display::None {
+            continue;
+        }
+        for is_after in [false, true] {
+            let mut matched: Vec<((bool, (u16, u16, u16), usize, usize), &Declaration)> =
+                Vec::new();
+            for (rule_idx, rule) in sheet.rules.iter().enumerate() {
+                if let Some(mq) = &rule.media
+                    && !mq.matches(viewport_width)
+                {
+                    continue;
+                }
+                let scope_root = match &rule.scope {
+                    Some(scope) => match scope_proximity(doc, id, scope, matcher) {
+                        Some((_, root_id)) => Some(root_id),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                let spec = rule
+                    .selectors
+                    .iter()
+                    .filter(|sel| matcher.matches_pseudo_with_scope(sel, id, is_after, scope_root))
+                    .map(Selector::specificity)
+                    .max();
+                if let Some(specificity) = spec {
+                    for (decl_idx, decl) in rule.declarations.iter().enumerate() {
+                        matched.push(((decl.important, specificity, rule_idx, decl_idx), decl));
+                    }
+                }
+            }
+            if matched.is_empty() {
+                continue;
+            }
+            matched.sort_by_key(|(k, _)| *k);
+            let mut pseudo_style = host_style.inherited_child();
+            let mut vars = HashMap::new();
+            let mut content: Option<String> = None;
+            for (_, decl) in matched {
+                if decl.name == "content" {
+                    content = resolve_pseudo_content(&decl.value, doc, id);
+                } else {
+                    apply_declaration(
+                        &mut pseudo_style,
+                        &mut vars,
+                        decl,
+                        host_style.font_size,
+                        root_font_px,
+                    );
+                }
+            }
+            if let Some(text) = content
+                && pseudo_style.display != Display::None
+            {
+                if is_after {
+                    after_styles.insert(id, (text, pseudo_style));
+                } else {
+                    before_styles.insert(id, (text, pseudo_style));
+                }
+            }
+        }
+    }
+    (before_styles, after_styles)
+}
+
+fn resolve_pseudo_content(raw: &str, doc: &Document, id: NodeId) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("normal")
+    {
+        return None;
+    }
+    let mut out = String::new();
+    let mut matched_token = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            chars.next();
+            matched_token = true;
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if c == quote {
+                    break;
+                } else {
+                    out.push(c);
+                }
+            }
+            continue;
+        }
+        let mut word = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() || c == '"' || c == '\'' || c == '(' {
+                break;
+            }
+            word.push(c);
+            chars.next();
+        }
+        if word.eq_ignore_ascii_case("attr") && chars.peek() == Some(&'(') {
+            chars.next();
+            let mut attr_name = String::new();
+            for c in chars.by_ref() {
+                if c == ')' {
+                    break;
+                }
+                attr_name.push(c);
+            }
+            let attr_key = attr_name.trim();
+            if !attr_key.is_empty() {
+                matched_token = true;
+                if let Some(val) = doc.get(id).data().attr(attr_key) {
+                    out.push_str(val);
+                }
+            }
+        } else if word.eq_ignore_ascii_case("open-quote") {
+            matched_token = true;
+            out.push('\u{201C}');
+        } else if word.eq_ignore_ascii_case("close-quote") {
+            matched_token = true;
+            out.push('\u{201D}');
+        } else {
+            break;
+        }
+    }
+    matched_token.then_some(out)
 }
 
 /// What stays the same across one cascade walk.
@@ -2890,6 +3089,8 @@ fn copy_property(dst: &mut ComputedStyle, src: &ComputedStyle, name: &str) {
         "text-align" => dst.text_align = src.text_align,
         "white-space" => dst.white_space = src.white_space,
         "text-decoration" | "text-decoration-line" => dst.underline = src.underline,
+        "text-overflow" => dst.text_overflow_ellipsis = src.text_overflow_ellipsis,
+        "overflow-wrap" | "word-wrap" | "word-break" => dst.word_break_any = src.word_break_any,
         "margin" => {
             dst.margin = src.margin;
             dst.margin_top_auto = src.margin_top_auto;
@@ -3518,6 +3719,23 @@ fn apply_declaration(
                 }
             }
         }
+        "text-overflow" => {
+            if value.eq_ignore_ascii_case("ellipsis") {
+                style.text_overflow_ellipsis = true;
+            } else if value.eq_ignore_ascii_case("clip") {
+                style.text_overflow_ellipsis = false;
+            }
+        }
+        "overflow-wrap" | "word-wrap" => match value.to_ascii_lowercase().as_str() {
+            "break-word" | "anywhere" => style.word_break_any = true,
+            "normal" => style.word_break_any = false,
+            _ => {}
+        },
+        "word-break" => match value.to_ascii_lowercase().as_str() {
+            "break-all" | "break-word" => style.word_break_any = true,
+            "normal" | "keep-all" => style.word_break_any = false,
+            _ => {}
+        },
         "margin" => {
             apply_margin_shorthand(style, value, root_font_px);
         }
@@ -4506,7 +4724,7 @@ fn parse_grid_template_areas(value: &str) -> Option<GridTemplateAreas> {
 /// `solid` are ignored by [`parse_border_side`].
 fn resolve_css_vars(input: &str, vars: &HashMap<String, String>) -> String {
     let mut out = input.to_string();
-    for _ in 0..8 {
+    for _ in 0..16 {
         let lower = out.to_ascii_lowercase();
         let Some(pos) = lower.find("var(") else {
             break;
@@ -4840,17 +5058,26 @@ fn parse_border_side(value: &str) -> Option<(f32, Option<Color>)> {
     let mut width = None;
     let mut color = None;
     for token in split_css_tokens(value) {
-        if let Some(px) = parse_px(token) {
+        if let Some(px) = parse_border_width_token(token) {
             width = Some(px);
         } else if !matches!(
             token.to_ascii_lowercase().as_str(),
-            "solid" | "dashed" | "dotted" | "double"
+            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
         ) && let Some(c) = Color::parse(token)
         {
             color = Some(c);
         }
     }
     Some((width?, color))
+}
+
+fn parse_border_width_token(token: &str) -> Option<f32> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        _ => parse_box_px(token, 16.0, 16.0).map(|v| v.max(0.0)),
+    }
 }
 
 /// Whitespace-separated tokens. Parentheses keep internal spaces, so
@@ -5064,31 +5291,49 @@ fn strip_unit<'a>(value: &'a str, unit: &str) -> Option<&'a str> {
 }
 
 /// Resolve `font-size`. `%` and `em` use the parent font size. `rem` uses the
-/// root font size. `px` and `0` are already pixels. Other units, including
-/// viewport units and `ch`, return `None`.
+/// root font size. `px`, `vw`, `vh`, `vmin`, `vmax`, `ch`, keywords, and `calc()`
+/// resolve to CSS pixels.
 fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
-    Some(match parse_length(value)? {
-        Size::Px(value) => value,
-        Size::Em(value) => parent_px * value,
-        Size::Rem(value) => root_px * value,
-        Size::Percent(value) => parent_px * value / 100.0,
-        Size::Vw(_) | Size::Vh(_) | Size::Vmin(_) | Size::Vmax(_) | Size::Ch(_) => return None,
+    match value.trim().to_ascii_lowercase().as_str() {
+        "xx-small" => return Some(9.0),
+        "x-small" => return Some(10.0),
+        "small" => return Some(13.0),
+        "medium" => return Some(16.0),
+        "large" => return Some(18.0),
+        "x-large" => return Some(24.0),
+        "xx-large" => return Some(32.0),
+        "xxx-large" => return Some(48.0),
+        "smaller" => return Some(parent_px * (5.0 / 6.0)),
+        "larger" => return Some(parent_px * 1.2),
+        _ => {}
+    }
+    let raw = match parse_length(value)? {
+        Size::Px(value) if value.is_finite() => value,
+        Size::Em(value) if value.is_finite() => parent_px * value,
+        Size::Rem(value) if value.is_finite() => root_px * value,
+        Size::Percent(value) if value.is_finite() => parent_px * value / 100.0,
+        Size::Vw(value) | Size::Vh(value) | Size::Vmin(value) | Size::Vmax(value)
+            if value.is_finite() =>
+        {
+            960.0 * value / 100.0
+        }
+        Size::Ch(value) if value.is_finite() => parent_px * 0.5 * value,
         Size::Calc {
             px,
             percent,
             em,
             rem,
         } => px + (parent_px * percent / 100.0) + (parent_px * em) + (root_px * rem),
-        Size::Auto => return None,
-    })
+        _ => return None,
+    };
+    (raw.is_finite() && raw >= 0.0).then(|| raw.min(4096.0))
 }
 
-/// One to four pixel lengths into an [`Edge`], using the CSS shorthand cycle.
-/// `None` when a token is not a pixel length or there are more than four.
+/// One to four border widths into an [`Edge`], using the CSS shorthand cycle.
 fn parse_edge(value: &str) -> Option<Edge> {
     let parts: Vec<f32> = split_css_tokens(value)
         .into_iter()
-        .map(parse_px)
+        .map(parse_border_width_token)
         .collect::<Option<_>>()?;
     Some(match parts.as_slice() {
         [all] => Edge::all(*all),
@@ -5115,21 +5360,24 @@ fn parse_edge(value: &str) -> Option<Edge> {
 }
 
 fn parse_box_px(value: &str, em_px: f32, rem_px: f32) -> Option<f32> {
-    match parse_length(value)? {
-        Size::Px(v) if v.is_finite() => Some(v),
-        Size::Em(v) if v.is_finite() => Some(v * em_px),
-        Size::Rem(v) if v.is_finite() => Some(v * rem_px),
+    let raw = match parse_length(value)? {
+        Size::Px(v) if v.is_finite() => v,
+        Size::Em(v) if v.is_finite() => v * em_px,
+        Size::Rem(v) if v.is_finite() => v * rem_px,
+        Size::Percent(v) if v.is_finite() => 960.0 * v / 100.0,
+        Size::Vw(v) | Size::Vh(v) | Size::Vmin(v) | Size::Vmax(v) if v.is_finite() => {
+            960.0 * v / 100.0
+        }
+        Size::Ch(v) if v.is_finite() => v * em_px * 0.5,
         Size::Calc {
             px,
-            percent: 0.0,
+            percent,
             em,
             rem,
-        } => {
-            let v = px + em * em_px + rem * rem_px;
-            v.is_finite().then_some(v)
-        }
-        _ => None,
-    }
+        } => px + (960.0 * percent / 100.0) + em * em_px + rem * rem_px,
+        _ => return None,
+    };
+    raw.is_finite().then(|| raw.clamp(-1.0e6, 1.0e6))
 }
 
 fn parse_box_edge(value: &str, em_px: f32, rem_px: f32) -> Option<Edge> {
@@ -5517,9 +5765,23 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
 fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let inner = lower
+    let mut is_radial = false;
+    let inner = if let Some(s) = lower
         .strip_prefix("linear-gradient(")
-        .and_then(|s| s.strip_suffix(')'))?;
+        .or_else(|| lower.strip_prefix("repeating-linear-gradient("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        s
+    } else if let Some(s) = lower
+        .strip_prefix("radial-gradient(")
+        .or_else(|| lower.strip_prefix("repeating-radial-gradient("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        is_radial = true;
+        s
+    } else {
+        return None;
+    };
 
     let mut args = Vec::new();
     let mut start = 0usize;
@@ -5540,10 +5802,25 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
         return None;
     }
 
+    let parse_stop_color = |stop: &str| -> Option<Color> {
+        let tokens = split_css_tokens(stop);
+        Color::parse(tokens.first().copied()?)
+    };
+
     let mut angle_deg = 180.0f32;
     let mut color_start_idx = 0usize;
     let first = args[0];
-    if let Some(deg_str) = first.strip_suffix("deg") {
+    if is_radial {
+        if parse_stop_color(first).is_none()
+            && (first.starts_with("circle")
+                || first.starts_with("ellipse")
+                || first.starts_with("closest-")
+                || first.starts_with("farthest-")
+                || first.starts_with("at "))
+        {
+            color_start_idx = 1;
+        }
+    } else if let Some(deg_str) = first.strip_suffix("deg") {
         if let Ok(deg) = deg_str.trim().parse::<f32>() {
             angle_deg = deg;
             color_start_idx = 1;
@@ -5562,10 +5839,6 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     if args.len() < color_start_idx + 2 {
         return None;
     }
-    let parse_stop_color = |stop: &str| -> Option<Color> {
-        let tokens = split_css_tokens(stop);
-        Color::parse(tokens.first().copied()?)
-    };
     let start_color = parse_stop_color(args[color_start_idx])?;
     let end_color = parse_stop_color(args[args.len() - 1])?;
     Some(LinearGradient {
@@ -7089,5 +7362,33 @@ mod tests {
         assert_eq!(updated.get(qty).width, Size::Px(160.0));
         assert_eq!(updated.get(sec).margin.top, 32.0);
         assert_eq!(updated.get(sec_p).font_weight, 700);
+    }
+
+    #[test]
+    fn parses_builtin_ua_stylesheets_and_executes_cpp_css_engine_kernels() {
+        let sheets = anvil_css::builtin_user_agent_stylesheets();
+        assert_eq!(sheets.len(), 4);
+        for css_src in sheets {
+            let parsed = anvil_css::parse_stylesheet(css_src, &anvil_css::Options::default())
+                .expect("built-in UA stylesheet should parse within limits");
+            assert!(!parsed.rules.is_empty());
+            let cascade_sheet = parse_css(css_src);
+            assert!(!cascade_sheet.rules.is_empty());
+        }
+
+        assert_eq!(anvil_css::classify_pseudo_element_fast(".badge::before"), 1);
+        assert_eq!(anvil_css::classify_pseudo_element_fast(".badge::after"), 2);
+        assert_eq!(anvil_css::classify_pseudo_element_fast(".badge:hover"), 0);
+        assert_eq!(
+            anvil_css::resolve_length_px_fast(2.0, 2, 14.0, 16.0, 1280.0, 720.0, 400.0),
+            32.0
+        );
+        assert_eq!(anvil_css::eval_clamp_fast(12.0, 40.0, 24.0), 24.0);
+        let center_px = anvil_css::sample_radial_gradient_fast(0.5, 0.5, 0xFF00_00FF, 0x0000_FFFF);
+        assert_eq!(center_px, 0xFF00_00FF);
+        assert_eq!(
+            anvil_css::pack_specificity_fast(1, 2, 3),
+            (1 << 20) | (2 << 10) | 3
+        );
     }
 }

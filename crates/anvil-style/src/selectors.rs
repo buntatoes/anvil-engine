@@ -287,8 +287,9 @@ enum Simple {
     Lang(Vec<String>),
     /// `:dir()`. `None` for a direction other than `ltr` or `rtl`.
     Dir(Option<bool>),
-    /// Any pseudo-element. Selects no element of the tree itself.
-    PseudoElement,
+    /// Any pseudo-element (`Some(false)` for `::before`, `Some(true)` for `::after`,
+    /// `None` for any other pseudo-element). Selects no element of the tree itself.
+    PseudoElement(Option<bool>),
 }
 
 impl Simple {
@@ -300,7 +301,7 @@ impl Simple {
             | Simple::Unresolved { .. }
             | Simple::Id(_)
             | Simple::Class(_)
-            | Simple::PseudoElement => 0,
+            | Simple::PseudoElement(_) => 0,
             Simple::Attr(_) | Simple::State(_) | Simple::Nth(_) | Simple::Dir(_) => 1,
             Simple::Lang(_)
             | Simple::Is(_)
@@ -927,7 +928,14 @@ fn parse_compound(cur: &mut Cursor, cx: Ctx) -> Parsed<Compound> {
                     if !known || cx.nested {
                         return Err(Fail::Invalid);
                     }
-                    parts.push(Simple::PseudoElement);
+                    let pseudo_kind = if arg.is_none() && name == "before" {
+                        Some(false)
+                    } else if arg.is_none() && name == "after" {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    parts.push(Simple::PseudoElement(pseudo_kind));
                     after_pseudo_element = true;
                 } else {
                     let part = match arg {
@@ -1240,7 +1248,7 @@ fn max_specificity(list: &[Selector]) -> Spec {
 
 fn simple_specificity(part: &Simple) -> Spec {
     match part {
-        Simple::Type(_) | Simple::PseudoElement => (0, 0, 1),
+        Simple::Type(_) | Simple::PseudoElement(_) => (0, 0, 1),
         Simple::Unresolved { types } => (0, 0, u32::from(*types)),
         Simple::Id(_) => (1, 0, 0),
         Simple::Class(_)
@@ -1278,6 +1286,22 @@ impl Selector {
     /// specific selector in `S`. Each part stops at `u16::MAX`.
     pub fn specificity(&self) -> (u16, u16, u16) {
         self.specificity
+    }
+
+    /// Returns `Some(false)` when this selector targets `::before`, `Some(true)`
+    /// when it targets `::after`, and `None` otherwise.
+    pub(crate) fn pseudo_before_or_after(&self) -> Option<bool> {
+        let subject = self.compounds.last()?;
+        let mut target = None;
+        for part in &subject.parts {
+            if let Simple::PseudoElement(kind) = part {
+                if target.is_some() {
+                    return None;
+                }
+                target = Some(*kind);
+            }
+        }
+        target.flatten()
     }
 
     fn last(&self) -> usize {
@@ -1531,6 +1555,82 @@ impl<'d> Matcher<'d> {
         self.scope_root
             .set(scope_root.map_or(NONE, |id| id.index() as u32));
         let res = self.matches(sel, node);
+        self.scope_root.set(prev);
+        res
+    }
+
+    pub(crate) fn matches_pseudo_with_scope(
+        &self,
+        sel: &Selector,
+        node: NodeId,
+        is_after: bool,
+        scope_root: Option<NodeId>,
+    ) -> bool {
+        if sel.pseudo_before_or_after() != Some(is_after) {
+            return false;
+        }
+        let n = node.index() as u32;
+        if let Some(slot) = self.slot(n)
+            && sel.subject_bits & !slot.bits != 0
+        {
+            return false;
+        }
+        let Some(subject) = sel.compounds.last() else {
+            return false;
+        };
+        let prev = self.scope_root.get();
+        self.scope_root
+            .set(scope_root.map_or(NONE, |id| id.index() as u32));
+        let data = self.data(n);
+        let res = if let Some(tag) = data.tag() {
+            let subject_ok = subject.parts.iter().all(|part| match part {
+                Simple::PseudoElement(Some(p)) => *p == is_after,
+                Simple::Type(name) => tag == name,
+                Simple::Class(class) => data.has_class(class),
+                Simple::Id(id) => data.id() == Some(id.as_str()),
+                _ => self.simple(part, n, data, tag),
+            });
+            if !subject_ok {
+                false
+            } else if sel.compounds.len() == 1 {
+                true
+            } else {
+                let idx = sel.last();
+                let limit = self.walk_limit(sel, NONE);
+                match sel.combinators[idx - 1] {
+                    Combinator::Child => {
+                        let p = self.parent_el(n);
+                        p != NONE
+                            && p != limit
+                            && self.match_from(sel, idx - 1, p, NONE) == Outcome::Matched
+                    }
+                    Combinator::Next => {
+                        let p = self.prev(n);
+                        p != NONE && self.match_from(sel, idx - 1, p, NONE) == Outcome::Matched
+                    }
+                    Combinator::Descendant => {
+                        let mut p = self.parent_el(n);
+                        let mut matched = false;
+                        while p != NONE && p != limit {
+                            match self.match_from(sel, idx - 1, p, NONE) {
+                                Outcome::Matched => {
+                                    matched = true;
+                                    break;
+                                }
+                                Outcome::Nowhere => break,
+                                Outcome::TryNext | Outcome::TryAncestor => p = self.parent_el(p),
+                            }
+                        }
+                        matched
+                    }
+                    Combinator::Subsequent => {
+                        self.any_earlier(sel, idx - 1, n, NONE) == Outcome::Matched
+                    }
+                }
+            }
+        } else {
+            false
+        };
         self.scope_root.set(prev);
         res
     }
@@ -1827,7 +1927,7 @@ impl<'d> Matcher<'d> {
     fn simple(&self, part: &Simple, n: u32, data: &NodeData, tag: &str) -> bool {
         match part {
             Simple::Type(name) => tag == name,
-            Simple::Unresolved { .. } | Simple::PseudoElement => false,
+            Simple::Unresolved { .. } | Simple::PseudoElement(_) => false,
             Simple::Id(id) => data.id() == Some(id.as_str()),
             Simple::Class(class) => data.has_class(class),
             Simple::Attr(attr) => attr_matches(attr, data),

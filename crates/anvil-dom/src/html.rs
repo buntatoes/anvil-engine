@@ -73,7 +73,7 @@ pub fn parse_html(input: &str) -> Document {
             if bytes.get(index + 1) == Some(&b'/') {
                 let (name, next) = read_end_tag(input, index);
                 index = next;
-                close_tag(&doc, &mut stack, &name);
+                close_tag(&mut doc, &mut stack, &name);
                 continue;
             }
 
@@ -179,13 +179,61 @@ fn is_void(tag: &str) -> bool {
     VOID_TAGS.contains(&tag)
 }
 
-/// Pop implied end tags before a table cell, row, section, or `option`.
+/// Pop implied end tags before block elements, list items, definition items,
+/// headings, table cells/rows/sections, `<option>`, or `<optgroup>`.
 ///
 /// Only the open stack is changed. Already-built nodes stay where they are.
-/// Tags other than `td`, `th`, `tr`, `thead`, `tbody`, `tfoot`, and `option`
-/// do not auto-close anything.
 fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &str) {
     match new_tag {
+        "address" | "article" | "aside" | "blockquote" | "details" | "div" | "dl" | "fieldset"
+        | "figcaption" | "figure" | "footer" | "form" | "header" | "hgroup" | "hr" | "main"
+        | "menu" | "nav" | "ol" | "p" | "pre" | "search" | "section" | "table" | "ul" => {
+            close_p_in_button_scope(doc, stack);
+        }
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            close_p_in_button_scope(doc, stack);
+            if let Some(&top) = stack.last()
+                && matches!(
+                    doc.get(top).data().tag(),
+                    Some("h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+                )
+            {
+                stack.pop();
+            }
+        }
+        "li" => {
+            close_p_in_button_scope(doc, stack);
+            let mut idx = stack.len();
+            while idx > 1 {
+                idx -= 1;
+                let tag = doc.get(stack[idx]).data().tag();
+                if tag == Some("li") {
+                    stack.truncate(idx);
+                    break;
+                }
+                if matches!(
+                    tag,
+                    Some("ul" | "ol" | "menu" | "table" | "template" | "html" | "body")
+                ) {
+                    break;
+                }
+            }
+        }
+        "dt" | "dd" => {
+            close_p_in_button_scope(doc, stack);
+            let mut idx = stack.len();
+            while idx > 1 {
+                idx -= 1;
+                let tag = doc.get(stack[idx]).data().tag();
+                if matches!(tag, Some("dt" | "dd")) {
+                    stack.truncate(idx);
+                    break;
+                }
+                if matches!(tag, Some("dl" | "table" | "template" | "html" | "body")) {
+                    break;
+                }
+            }
+        }
         "td" | "th" => {
             if let Some(&top) = stack.last()
                 && matches!(doc.get(top).data().tag(), Some("td" | "th"))
@@ -222,7 +270,37 @@ fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &s
                 stack.pop();
             }
         }
+        "optgroup" => {
+            if let Some(&top) = stack.last()
+                && doc.get(top).data().tag() == Some("option")
+            {
+                stack.pop();
+            }
+            if let Some(&top) = stack.last()
+                && doc.get(top).data().tag() == Some("optgroup")
+            {
+                stack.pop();
+            }
+        }
         _ => {}
+    }
+}
+
+fn close_p_in_button_scope(doc: &Document, stack: &mut Vec<NodeId>) {
+    let mut idx = stack.len();
+    while idx > 1 {
+        idx -= 1;
+        let tag = doc.get(stack[idx]).data().tag();
+        if tag == Some("p") {
+            stack.truncate(idx);
+            return;
+        }
+        if matches!(
+            tag,
+            Some("table" | "template" | "html" | "body" | "td" | "th" | "caption" | "button")
+        ) {
+            return;
+        }
     }
 }
 
@@ -257,11 +335,13 @@ fn merge_attributes(doc: &mut Document, id: NodeId, attrs: Vec<(String, String)>
     }
 }
 
-/// Pop the open stack through the matching start tag.
+/// Pop the open stack through the matching start tag when that tag is in scope.
 ///
-/// `head`, `body`, and `html` reset the stack to `body`. An unknown name pops
-/// until the stack would be empty, then restores `body`. Nodes are not removed.
-fn close_tag(doc: &Document, stack: &mut Vec<NodeId>, name: &str) {
+/// `head`, `body`, and `html` reset the stack to `body`. Stray closing tags whose
+/// opening tag is not in scope on the stack are ignored without unwinding outer
+/// containers. Per HTML5, a stray `</p>` when no `<p>` is in scope inserts an
+/// empty `<p></p>` element, and `</br>` inserts a `<br>`.
+fn close_tag(doc: &mut Document, stack: &mut Vec<NodeId>, name: &str) {
     if name.is_empty() {
         return;
     }
@@ -270,11 +350,45 @@ fn close_tag(doc: &Document, stack: &mut Vec<NodeId>, name: &str) {
         stack.push(doc.body());
         return;
     }
-    while stack.len() > 1 {
-        let top = stack.pop().expect("stack length was checked");
-        if doc.get(top).data().tag() == Some(name) {
+    if name == "br" {
+        if doc.node_count() < MAX_DOM_NODES {
+            let parent = *stack.last().unwrap_or(&doc.body());
+            let br = doc.create_element("br", Vec::new());
+            let _ = doc.append(parent, br);
+        }
+        return;
+    }
+    let is_heading = matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+    let is_table_scope_target = matches!(
+        name,
+        "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption"
+    );
+    let mut found_idx: Option<usize> = None;
+    let mut idx = stack.len();
+    while idx > 1 {
+        idx -= 1;
+        let tag = doc.get(stack[idx]).data().tag();
+        if tag == Some(name)
+            || (is_heading && matches!(tag, Some("h1" | "h2" | "h3" | "h4" | "h5" | "h6")))
+        {
+            found_idx = Some(idx);
             break;
         }
+        if !is_table_scope_target
+            && matches!(
+                tag,
+                Some("table" | "template" | "html" | "td" | "th" | "caption")
+            )
+        {
+            break;
+        }
+    }
+    if let Some(target_idx) = found_idx {
+        stack.truncate(target_idx);
+    } else if name == "p" && doc.node_count() < MAX_DOM_NODES {
+        let parent = *stack.last().unwrap_or(&doc.body());
+        let p = doc.create_element("p", Vec::new());
+        let _ = doc.append(parent, p);
     }
     if stack.is_empty() {
         stack.push(doc.body());
@@ -390,15 +504,17 @@ fn read_attr_value(input: &str, index: &mut usize) -> String {
     decode_entities(&input[start..*index])
 }
 
-/// Take raw text until the case-insensitive end tag `</tag`.
+/// Take raw text until the case-insensitive end tag `</tag` or end of input.
 ///
-/// Returns `None` when that end tag is absent; the caller then leaves the
-/// following source to the normal scanner. The text is owned and not parsed
-/// as markup. The end index is just after the end tag's `>`.
+/// When the closing tag is absent at EOF, consumes the remaining input as raw text
+/// so an unclosed `<script>`, `<style>`, or `<noscript>` never leaks raw JS/CSS
+/// tokens into the HTML element tree.
 fn read_raw_text(input: &str, start: usize, tag: &str) -> Option<(String, usize)> {
     let lower = input[start..].to_ascii_lowercase();
     let marker = format!("</{tag}");
-    let found = lower.find(&marker)?;
+    let Some(found) = lower.find(&marker) else {
+        return Some((input[start..].to_string(), input.len()));
+    };
     let text = input[start..start + found].to_string();
     let mut end = start + found + marker.len();
     let bytes = input.as_bytes();
@@ -471,12 +587,136 @@ fn decode_entities(input: &str) -> String {
 /// or the trailing `;`. `None` when it is not a reference this parser knows.
 fn decode_one_entity(entity: &str) -> Option<char> {
     let named = match entity {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
+        "amp" | "AMP" => Some('&'),
+        "lt" | "LT" => Some('<'),
+        "gt" | "GT" => Some('>'),
+        "quot" | "QUOT" => Some('"'),
         "apos" => Some('\''),
-        "nbsp" => Some('\u{00a0}'),
+        "nbsp" | "NBSP" => Some('\u{00a0}'),
+        "iexcl" => Some('\u{00a1}'),
+        "cent" => Some('\u{00a2}'),
+        "pound" => Some('\u{00a3}'),
+        "curren" => Some('\u{00a4}'),
+        "yen" => Some('\u{00a5}'),
+        "brvbar" => Some('\u{00a6}'),
+        "sect" => Some('\u{00a7}'),
+        "uml" => Some('\u{00a8}'),
+        "copy" | "COPY" => Some('\u{00a9}'),
+        "ordf" => Some('\u{00aa}'),
+        "laquo" => Some('\u{00ab}'),
+        "not" => Some('\u{00ac}'),
+        "shy" => Some('\u{00ad}'),
+        "reg" | "REG" => Some('\u{00ae}'),
+        "macr" => Some('\u{00af}'),
+        "deg" => Some('\u{00b0}'),
+        "plusmn" => Some('\u{00b1}'),
+        "sup2" => Some('\u{00b2}'),
+        "sup3" => Some('\u{00b3}'),
+        "acute" => Some('\u{00b4}'),
+        "micro" => Some('\u{00b5}'),
+        "para" => Some('\u{00b6}'),
+        "middot" => Some('\u{00b7}'),
+        "cedil" => Some('\u{00b8}'),
+        "sup1" => Some('\u{00b9}'),
+        "ordm" => Some('\u{00ba}'),
+        "raquo" => Some('\u{00bb}'),
+        "frac14" => Some('\u{00bc}'),
+        "frac12" => Some('\u{00bd}'),
+        "frac34" => Some('\u{00be}'),
+        "iquest" => Some('\u{00bf}'),
+        "times" => Some('\u{00d7}'),
+        "divide" => Some('\u{00f7}'),
+        "Alpha" => Some('\u{0391}'),
+        "Beta" => Some('\u{0392}'),
+        "Gamma" => Some('\u{0393}'),
+        "Delta" => Some('\u{0394}'),
+        "Omega" => Some('\u{03a9}'),
+        "alpha" => Some('\u{03b1}'),
+        "beta" => Some('\u{03b2}'),
+        "gamma" => Some('\u{03b3}'),
+        "delta" => Some('\u{03b4}'),
+        "epsilon" => Some('\u{03b5}'),
+        "pi" => Some('\u{03c0}'),
+        "sigma" => Some('\u{03c3}'),
+        "omega" => Some('\u{03c9}'),
+        "ensp" => Some('\u{2002}'),
+        "emsp" => Some('\u{2003}'),
+        "thinsp" => Some('\u{2009}'),
+        "zwnj" => Some('\u{200c}'),
+        "zwj" => Some('\u{200d}'),
+        "lrm" => Some('\u{200e}'),
+        "rlm" => Some('\u{200f}'),
+        "ndash" => Some('\u{2013}'),
+        "mdash" => Some('\u{2014}'),
+        "lsquo" => Some('\u{2018}'),
+        "rsquo" => Some('\u{2019}'),
+        "sbquo" => Some('\u{201a}'),
+        "ldquo" => Some('\u{201c}'),
+        "rdquo" => Some('\u{201d}'),
+        "bdquo" => Some('\u{201e}'),
+        "dagger" => Some('\u{2020}'),
+        "Dagger" => Some('\u{2021}'),
+        "bull" => Some('\u{2022}'),
+        "hellip" => Some('\u{2026}'),
+        "permil" => Some('\u{2030}'),
+        "prime" => Some('\u{2032}'),
+        "Prime" => Some('\u{2033}'),
+        "lsaquo" => Some('\u{2039}'),
+        "rsaquo" => Some('\u{203a}'),
+        "oline" => Some('\u{203e}'),
+        "frasl" => Some('\u{2044}'),
+        "euro" => Some('\u{20ac}'),
+        "trade" | "TRADE" => Some('\u{2122}'),
+        "larr" => Some('\u{2190}'),
+        "uarr" => Some('\u{2191}'),
+        "rarr" => Some('\u{2192}'),
+        "darr" => Some('\u{2193}'),
+        "harr" => Some('\u{2194}'),
+        "crarr" => Some('\u{21b5}'),
+        "forall" => Some('\u{2200}'),
+        "part" => Some('\u{2202}'),
+        "exist" => Some('\u{2203}'),
+        "empty" => Some('\u{2205}'),
+        "nabla" => Some('\u{2207}'),
+        "isin" => Some('\u{2208}'),
+        "notin" => Some('\u{2209}'),
+        "ni" => Some('\u{220b}'),
+        "prod" => Some('\u{220f}'),
+        "sum" => Some('\u{2211}'),
+        "minus" => Some('\u{2212}'),
+        "lowast" => Some('\u{2217}'),
+        "radic" => Some('\u{221a}'),
+        "prop" => Some('\u{221d}'),
+        "infin" => Some('\u{221e}'),
+        "ang" => Some('\u{2220}'),
+        "and" => Some('\u{2227}'),
+        "or" => Some('\u{2228}'),
+        "cap" => Some('\u{2229}'),
+        "cup" => Some('\u{222a}'),
+        "int" => Some('\u{222b}'),
+        "there4" => Some('\u{2234}'),
+        "sim" => Some('\u{223c}'),
+        "cong" => Some('\u{2245}'),
+        "asymp" => Some('\u{2248}'),
+        "ne" => Some('\u{2260}'),
+        "equiv" => Some('\u{2261}'),
+        "le" => Some('\u{2264}'),
+        "ge" => Some('\u{2265}'),
+        "sub" => Some('\u{2282}'),
+        "sup" => Some('\u{2283}'),
+        "nsub" => Some('\u{2284}'),
+        "sube" => Some('\u{2286}'),
+        "supe" => Some('\u{2287}'),
+        "oplus" => Some('\u{2295}'),
+        "otimes" => Some('\u{2297}'),
+        "perp" => Some('\u{22a5}'),
+        "sdot" => Some('\u{22c5}'),
+        "spades" => Some('\u{2660}'),
+        "clubs" => Some('\u{2663}'),
+        "hearts" => Some('\u{2665}'),
+        "diams" => Some('\u{2666}'),
+        "check" => Some('\u{2713}'),
+        "cross" => Some('\u{2717}'),
         _ => None,
     };
     if named.is_some() {
@@ -497,7 +737,37 @@ fn decode_one_entity(entity: &str) -> Option<char> {
         }
         digits.parse::<u32>().ok()?
     };
-    char::from_u32(code).filter(|ch| *ch != '\0')
+    // HTML5 numeric character reference Windows-1252 replacement table (0x80..=0x9F)
+    let remapped = match code {
+        0x80 => 0x20AC,
+        0x82 => 0x201A,
+        0x83 => 0x0192,
+        0x84 => 0x201E,
+        0x85 => 0x2026,
+        0x86 => 0x2020,
+        0x87 => 0x2021,
+        0x88 => 0x02C6,
+        0x89 => 0x2030,
+        0x8A => 0x0160,
+        0x8B => 0x2039,
+        0x8C => 0x0152,
+        0x8E => 0x017D,
+        0x91 => 0x2018,
+        0x92 => 0x2019,
+        0x93 => 0x201C,
+        0x94 => 0x201D,
+        0x95 => 0x2022,
+        0x96 => 0x2013,
+        0x97 => 0x2014,
+        0x98 => 0x02DC,
+        0x99 => 0x2122,
+        0x9A => 0x0161,
+        0x9C => 0x0153,
+        0x9E => 0x017E,
+        0x9F => 0x0178,
+        other => other,
+    };
+    char::from_u32(remapped).filter(|ch| *ch != '\0')
 }
 
 /// Collapse whitespace, but keep one leading or trailing space when the

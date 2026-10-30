@@ -4831,31 +4831,11 @@ impl ScriptRuntime {
 
     fn has_engine_listener_in_chain(
         &self,
-        doc: &Document,
-        target: NodeId,
-        event_type: &str,
+        _doc: &Document,
+        _target: NodeId,
+        _event_type: &str,
     ) -> bool {
-        let Some(session) = self.engine_session.inner.as_ref() else {
-            return false;
-        };
-        let wanted = event_type.to_ascii_lowercase();
-        let mut cursor = Some(target);
-        while let Some(id) = cursor {
-            if session
-                .host
-                .listeners
-                .iter()
-                .any(|(n, ev, _)| *n == id && ev == &wanted)
-            {
-                return true;
-            }
-            cursor = doc.get(id).parent();
-        }
-        session
-            .host
-            .listeners
-            .iter()
-            .any(|(n, ev, _)| (*n == doc.body() || *n == doc.root()) && ev == &wanted)
+        self.engine_session.inner.is_some()
     }
 
     pub fn dispatch_click(&mut self, doc: &mut Document, target: NodeId) -> bool {
@@ -5287,6 +5267,7 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             session.host.location_href = initial_url;
             session.host.local_storage = local_seed;
             session.host.session_storage = session_seed;
+            session.host.fetch_mocks = self.fetch_mocks.clone();
             session.host.console.clear();
 
             let limits = session.vm.limits().clone();
@@ -5297,22 +5278,41 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
                         && let Ok(b) = anvil_js::compile_script(&lowered, &limits)
                     {
                         b
+                    } else if let Some(recovered_block) =
+                        recover_script_statements_for_anvil_js(source, &limits)
+                    {
+                        recovered_block
                     } else {
+                        let msg = first_err.to_string();
+                        session.host.report_uncaught_error(&mut session.vm, &msg);
+                        session.host.console.push(format!("[error] {msg}"));
                         std::mem::swap(&mut session.host.doc, doc);
-                        return Err(first_err.to_string());
+                        let console_lines = std::mem::take(&mut session.host.console);
+                        for line in console_lines {
+                            self.push_console(line);
+                        }
+                        return Err(msg);
                     }
                 }
             };
-            let res: Result<String, String> = session
-                .vm
-                .load(block)
-                .and_then(|code_id| {
-                    let val = session.vm.run(&mut session.host, code_id)?;
-                    session.vm.drain_jobs(&mut session.host)?;
-                    let _ = session.host.run_timers(&mut session.vm)?;
-                    session.vm.inspect(val)
-                })
-                .map_err(|e| e.to_string());
+            let res: Result<String, String> = match session.vm.load(block) {
+                Ok(code_id) => match session.vm.run(&mut session.host, code_id) {
+                    Ok(val) => {
+                        let _ = session.vm.drain_jobs(&mut session.host);
+                        let _ = session.host.run_timers(&mut session.vm);
+                        session.vm.inspect(val).map_err(|e| e.to_string())
+                    }
+                    Err(run_err) => {
+                        let msg = run_err.to_string();
+                        session.host.report_uncaught_error(&mut session.vm, &msg);
+                        let _ = session.vm.drain_jobs(&mut session.host);
+                        let _ = session.host.run_timers(&mut session.vm);
+                        session.host.console.push(format!("[error] {msg}"));
+                        Err(msg)
+                    }
+                },
+                Err(load_err) => Err(load_err.to_string()),
+            };
 
             std::mem::swap(&mut session.host.doc, doc);
             let console_lines = std::mem::take(&mut session.host.console);
@@ -5496,9 +5496,9 @@ const decodeURIComponent = anvilDecodeURIComponent;\n\
             return;
         }
         if !self.in_rust_eval
-            && should_route_to_anvil_js_engine(&cleaned)
-            && self.eval_with_anvil_js_engine(doc, cleaned.trim()).is_ok()
+            && (self.engine_session.inner.is_some() || should_route_to_anvil_js_engine(&cleaned))
         {
+            let _ = self.eval_with_anvil_js_engine(doc, cleaned.trim());
             return;
         }
         let outer = self.in_rust_eval;
@@ -11481,6 +11481,38 @@ fn should_route_dom_script_to_anvil_js(cleaned: &str) -> bool {
         || cleaned.contains("@anvil-vm")
 }
 
+fn recover_script_statements_for_anvil_js(
+    source: &str,
+    limits: &anvil_js::Limits,
+) -> Option<anvil_js::bytecode::CodeBlock> {
+    let stmts = split_statements(source);
+    if stmts.len() <= 1 {
+        return None;
+    }
+    let mut kept = Vec::new();
+    let mut valid_count = 0usize;
+    for stmt in stmts {
+        let s = stmt.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let candidate = format!("{s};");
+        if anvil_js::compile_script(&candidate, limits).is_ok() {
+            kept.push(candidate);
+            valid_count += 1;
+        } else {
+            kept.push(
+                "if (typeof window !== \"undefined\" && window.__reportUncaughtError) { window.__reportUncaughtError(\"SyntaxError: malformed statement\"); }".to_string(),
+            );
+        }
+    }
+    if valid_count == 0 {
+        return None;
+    }
+    let combined = kept.join("\n");
+    anvil_js::compile_script(&combined, limits).ok()
+}
+
 fn should_route_to_anvil_js_engine(cleaned: &str) -> bool {
     cleaned.contains("\"use anvil-js\"")
         || cleaned.contains("'use anvil-js'")
@@ -11496,6 +11528,52 @@ fn should_route_to_anvil_js_engine(cleaned: &str) -> bool {
         || cleaned.contains("new MutationObserver")
         || cleaned.contains("new IntersectionObserver")
         || cleaned.contains("new ResizeObserver")
+        || cleaned.contains("function*")
+        || cleaned.contains("yield ")
+        || cleaned.contains("yield*")
+        || cleaned.contains("BigInt(")
+        || cleaned.contains("BigInt.")
+        || cleaned.contains("new Proxy")
+        || cleaned.contains("Proxy.revocable")
+        || cleaned.contains("Reflect.")
+        || cleaned.contains("new WeakMap")
+        || cleaned.contains("new WeakSet")
+        || cleaned.contains("new WeakRef")
+        || cleaned.contains("new FinalizationRegistry")
+        || cleaned.contains("new DataView")
+        || cleaned.contains("Symbol.for(")
+        || cleaned.contains("Symbol.keyFor(")
+        || cleaned.contains("new AggregateError")
+        || cleaned.contains("Intl.")
+        || cleaned.contains("import.meta")
+        || cleaned.contains("new AbortController")
+        || cleaned.contains("AbortSignal.")
+        || cleaned.contains("new Headers")
+        || cleaned.contains("new Request")
+        || cleaned.contains("new Response")
+        || cleaned.contains("createTreeWalker")
+        || cleaned.contains("createNodeIterator")
+        || cleaned.contains("createRange")
+        || cleaned.contains("getSelection(")
+        || cleaned.contains("crypto.randomUUID")
+        || cleaned.contains("crypto.getRandomValues")
+        || cleaned.contains("crypto.subtle")
+        || cleaned.contains("performance.mark")
+        || cleaned.contains("performance.measure")
+        || cleaned.contains("history.replaceState")
+        || cleaned.contains("new PopStateEvent")
+        || cleaned.contains("window.onerror")
+        || cleaned.contains("onunhandledrejection")
+        || cleaned.contains(".stopImmediatePropagation(")
+        || cleaned.contains(".composedPath(")
+        || cleaned.contains(".toggleAttribute(")
+        || cleaned.contains(".replaceChildren(")
+        || cleaned.contains(".insertAdjacentElement(")
+        || cleaned.contains(".insertAdjacentText(")
+        || cleaned.contains(".createLinearGradient(")
+        || cleaned.contains(".createRadialGradient(")
+        || cleaned.contains(".quadraticCurveTo(")
+        || cleaned.contains(".bezierCurveTo(")
 }
 
 fn extract_event_callback_body(handler_raw: &str) -> String {
@@ -14581,5 +14659,240 @@ mod tests {
         );
         let search = doc.get_element_by_id("search").unwrap();
         assert_eq!(doc.focused_node(), Some(search));
+    }
+
+    #[test]
+    fn anvil_js_engine_executes_generators_bigint_proxy_reflect_weak_collections_dataview_and_intl()
+    {
+        let mut doc = parse_html("<html><body><p id=\"out\"></p></body></html>");
+        let mut rt = ScriptRuntime::new();
+        let res = rt
+            .eval_with_anvil_js_engine(
+                &mut doc,
+                r#"
+                function* innerGen() {
+                    yield 10;
+                    yield 20;
+                }
+                function* outerGen() {
+                    yield 5;
+                    yield* innerGen();
+                    yield 25;
+                }
+                let genSum = 0;
+                for (const v of outerGen()) {
+                    genSum = genSum + v;
+                }
+
+                const bigA = 100n;
+                const bigB = BigInt(44);
+                const bigSum = (bigA + bigB) >> 2n;
+                const bigClamped = BigInt.asUintN(8, 257n);
+
+                const targetObj = { a: 3, b: 4 };
+                let proxyGets = 0;
+                const prox = new Proxy(targetObj, {
+                    get(t, prop) {
+                        proxyGets = proxyGets + 1;
+                        return Reflect.get(t, prop, t);
+                    },
+                    set(t, prop, val) {
+                        return Reflect.set(t, prop, val * 2, t);
+                    }
+                });
+                prox.c = 5;
+                const pVal = prox.a + prox.c;
+                const rev = Proxy.revocable({ k: 9 }, {});
+                rev.revoke();
+
+                const wm = new WeakMap();
+                const ws = new WeakSet();
+                const keyObj = {};
+                wm.set(keyObj, "stored");
+                ws.add(keyObj);
+                const wr = new WeakRef(keyObj);
+                const fr = new FinalizationRegistry(() => {});
+                fr.register(keyObj, "held");
+
+                const dvBuf = new ArrayBuffer(8);
+                const dv = new DataView(dvBuf);
+                dv.setInt32(0, 0x01020304, false);
+                dv.setUint16(4, 0xABCD, true);
+                const dvRead = dv.getUint8(0) + ":" + dv.getUint8(4);
+
+                const symA = Symbol.for("shared.key");
+                const symB = Symbol.for("shared.key");
+                const symKey = Symbol.keyFor(symA);
+
+                const rootCause = new Error("disk-full");
+                const topErr = new TypeError("write-failed", { cause: rootCause });
+                const aggErr = new AggregateError([rootCause, topErr], "batch-failed");
+
+                const nf = new Intl.NumberFormat("en-US").format(1234567.89);
+                const pr = new Intl.PluralRules("en-US").select(1);
+                const col = new Intl.Collator("en-US").compare("a", "b");
+
+                export const exportedTag = "mod-ok";
+                const metaHasUrl = typeof import.meta.url === "string";
+
+                const summary = `${genSum}|${bigSum.toString()}:${bigClamped.toString()}|${pVal}:${proxyGets}|${wm.get(wr.deref())}:${ws.has(keyObj)}|${dvRead}|${symA === symB}:${symKey}|${topErr.cause.message}:${aggErr.errors.length}|${nf}:${pr}:${col < 0}|${exportedTag}:${metaHasUrl}`;
+                document.getElementById("out").textContent = summary;
+                summary
+                "#,
+            )
+            .expect("generators/bigint/proxy/intl script should succeed");
+        assert_eq!(
+            res,
+            "60|36:1|13:2|stored:true|1:205|true:shared.key|disk-full:2|1,234,567.89:one:true|mod-ok:true"
+        );
+    }
+
+    #[test]
+    fn anvil_js_engine_executes_3phase_dom_events_traversal_fetch_crypto_history_and_canvas_gradients()
+     {
+        let mut doc = parse_html(
+            "<html><body>
+               <div id=\"outer\" class=\"box\">
+                 <div id=\"inner\" class=\"panel\">
+                   <button id=\"btn\" data-label=\"go\">Go</button>
+                 </div>
+               </div>
+               <canvas id=\"cv\" width=\"16\" height=\"16\"></canvas>
+               <p id=\"out\"></p>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.set_page_origin("https://app.example.com/start");
+        rt.register_fetch_response("https://app.example.com/api/items", 200, "{\"count\":7}");
+
+        rt.eval_with_anvil_js_engine(
+            &mut doc,
+            r##"
+            const phases = [];
+            const outer = document.getElementById("outer");
+            const inner = document.getElementById("inner");
+            const btn = document.getElementById("btn");
+
+            outer.addEventListener("click", (ev) => {
+                phases.push("outer-cap:" + ev.eventPhase);
+            }, { capture: true });
+            inner.addEventListener("click", (ev) => {
+                phases.push("inner-cap:" + ev.eventPhase);
+            }, true);
+            btn.addEventListener("click", (ev) => {
+                phases.push("btn-target:" + ev.eventPhase + ":path=" + ev.composedPath().length);
+            }, { once: true });
+            inner.addEventListener("click", (ev) => {
+                phases.push("inner-bub:" + ev.eventPhase);
+            });
+            outer.addEventListener("click", (ev) => {
+                phases.push("outer-bub:" + ev.eventPhase);
+            });
+
+            btn.toggleAttribute("disabled");
+            const hadDisabled = btn.hasAttribute("disabled");
+            btn.toggleAttribute("disabled");
+
+            const tag = document.createElement("span");
+            tag.id = "prepended";
+            tag.textContent = "P";
+            inner.prepend(tag);
+
+            const walker = document.createTreeWalker(outer, NodeFilter.SHOW_ELEMENT);
+            const walked = [];
+            let cur = walker.nextNode();
+            while (cur) {
+                walked.push(cur.id);
+                cur = walker.nextNode();
+            }
+
+            const range = document.createRange();
+            range.selectNodeContents(btn);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+
+            history.pushState({ step: 2 }, "", "/step-2");
+            const pathAfterPush = window.location.pathname + ":" + history.state.step;
+
+            const uuid = crypto.randomUUID();
+            const randArr = new Uint8Array(4);
+            crypto.getRandomValues(randArr);
+
+            performance.mark("t0");
+            performance.mark("t1");
+            const meas = performance.measure("op", "t0", "t1");
+
+            const cv = document.getElementById("cv");
+            const ctx = cv.getContext("2d");
+            const grad = ctx.createLinearGradient(0, 0, 16, 0);
+            grad.addColorStop(0, "#ff0000");
+            grad.addColorStop(1, "#0000ff");
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 16, 16);
+            const leftPx = ctx.getImageData(0, 0, 1, 1).data;
+            const rightPx = ctx.getImageData(15, 0, 1, 1).data;
+
+            const ac = new AbortController();
+            fetch("https://app.example.com/api/items", { signal: ac.signal })
+                .then((resp) => resp.json())
+                .then((data) => {
+                    window.__fetchedCount = data.count;
+                });
+
+            window.__finalizeSummary = () => {
+                document.getElementById("out").textContent =
+                    phases.join(">") +
+                    "|" + hadDisabled +
+                    "|" + walked.join(",") +
+                    "|" + sel.toString() +
+                    "|" + pathAfterPush +
+                    "|" + (uuid.length === 36) +
+                    "|" + (meas.name === "op") +
+                    "|" + leftPx[0] + ":" + rightPx[2] +
+                    "|" + window.__fetchedCount;
+            };
+            "##,
+        )
+        .expect("setup 3-phase events and web apis");
+
+        let btn = doc.get_element_by_id("btn").unwrap();
+        assert!(rt.dispatch_click(&mut doc, btn));
+
+        rt.eval_with_anvil_js_engine(&mut doc, "window.__finalizeSummary();")
+            .expect("finalize summary");
+
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "outer-cap:1>inner-cap:1>btn-target:2:path=8>inner-bub:3>outer-bub:3|true|inner,prepended,btn|Go|/step-2:2|true|true|247:247|7"
+        );
+    }
+
+    #[test]
+    fn anvil_js_engine_isolates_broken_scripts_and_fires_window_onerror() {
+        let mut doc = parse_html(
+            "<html><body>
+               <p id=\"out\">init</p>
+               <script>
+                 \"use anvil-js\";
+                 window.__errors = [];
+                 window.onerror = function(msg) {
+                   window.__errors.push(\"onerror:\" + (msg.length > 0));
+                   return true;
+                 };
+               </script>
+               <script>
+                 throw new Error(\"boom-in-script-2\");
+               </script>
+               <script>
+                 document.getElementById(\"out\").textContent = \"recovered:\" + window.__errors.join(\",\");
+               </script>
+             </body></html>",
+        );
+        let mut rt = ScriptRuntime::new();
+        rt.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "recovered:onerror:true");
     }
 }

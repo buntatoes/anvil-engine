@@ -943,6 +943,176 @@ impl Document {
         }
     }
 
+    /// Read back a rectangular RGBA pixel region (`sw * sh * 4` bytes) from `<canvas>` element `id`'s
+    /// 2D surface (`getImageData`). Out-of-bounds pixels are transparent black (`[0, 0, 0, 0]`).
+    pub fn canvas_get_image_data(&self, id: NodeId, sx: i32, sy: i32, sw: u32, sh: u32) -> Vec<u8> {
+        let w = sw.clamp(1, 2048);
+        let h = sh.clamp(1, 2048);
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        let Some(surf) = self.canvas_surfaces.get(&id) else {
+            return out;
+        };
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        for row in 0..(h as i32) {
+            let py = sy + row;
+            if py < 0 || py >= ch {
+                continue;
+            }
+            for col in 0..(w as i32) {
+                let px = sx + col;
+                if px < 0 || px >= cw {
+                    continue;
+                }
+                let src_off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                let dst_off = ((row as usize) * (w as usize) + (col as usize)) * 4;
+                if src_off + 4 <= surf.rgba.len() && dst_off + 4 <= out.len() {
+                    out[dst_off..dst_off + 4].copy_from_slice(&surf.rgba[src_off..src_off + 4]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Draw a line segment with configurable pixel thickness (`lineWidth`) on `<canvas>` `id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn canvas_draw_line_width(
+        &mut self,
+        id: NodeId,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        width: u32,
+        rgba: [u8; 4],
+    ) {
+        let w = width.max(1) as i32;
+        if w <= 1 {
+            self.canvas_draw_line(id, x0, y0, x1, y1, rgba);
+            return;
+        }
+        let half = w / 2;
+        for oy in -half..=(w - 1 - half) {
+            for ox in -half..=(w - 1 - half) {
+                self.canvas_draw_line(id, x0 + ox, y0 + oy, x1 + ox, y1 + oy, rgba);
+            }
+        }
+    }
+
+    /// Fill a disk/circle centered at `(cx, cy)` with radius `r` on `<canvas>` `id`.
+    pub fn canvas_fill_circle(&mut self, id: NodeId, cx: i32, cy: i32, r: i32, rgba: [u8; 4]) {
+        if r <= 0 {
+            return;
+        }
+        let surf = self.ensure_canvas_surface(id);
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        let r2 = (r as i64) * (r as i64);
+        let y0 = (cy - r).clamp(0, ch);
+        let y1 = (cy + r + 1).clamp(0, ch);
+        let x0 = (cx - r).clamp(0, cw);
+        let x1 = (cx + r + 1).clamp(0, cw);
+        for py in y0..y1 {
+            let dy = (py - cy) as i64;
+            for px in x0..x1 {
+                let dx = (px - cx) as i64;
+                if dx * dx + dy * dy <= r2 {
+                    let off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                    if off + 4 <= surf.rgba.len() {
+                        surf.rgba[off..off + 4].copy_from_slice(&rgba);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill a closed polygon defined by `points` using scanline even-odd/nonzero winding on `<canvas>` `id`.
+    pub fn canvas_fill_polygon(&mut self, id: NodeId, points: &[(f32, f32)], rgba: [u8; 4]) {
+        if points.len() < 3 {
+            return;
+        }
+        let surf = self.ensure_canvas_surface(id);
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        let mut min_y = ch;
+        let mut max_y = 0i32;
+        for &(_, y) in points {
+            min_y = min_y.min(y.floor() as i32);
+            max_y = max_y.max(y.ceil() as i32);
+        }
+        let y0 = min_y.clamp(0, ch);
+        let y1 = (max_y + 1).clamp(0, ch);
+        let mut nodes = Vec::with_capacity(points.len());
+        for py in y0..y1 {
+            let scan_y = py as f32 + 0.5;
+            nodes.clear();
+            let mut j = points.len() - 1;
+            for i in 0..points.len() {
+                let (xi, yi) = points[i];
+                let (xj, yj) = points[j];
+                if (yi < scan_y && yj >= scan_y) || (yj < scan_y && yi >= scan_y) {
+                    let dy = yj - yi;
+                    if dy.abs() > 1e-6 {
+                        nodes.push(xi + (scan_y - yi) / dy * (xj - xi));
+                    }
+                }
+                j = i;
+            }
+            nodes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            for pair in nodes.chunks_exact(2) {
+                let x_start = (pair[0].floor() as i32).clamp(0, cw);
+                let x_end = (pair[1].ceil() as i32).clamp(0, cw);
+                for px in x_start..x_end {
+                    let off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                    if off + 4 <= surf.rgba.len() {
+                        surf.rgba[off..off + 4].copy_from_slice(&rgba);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill a rectangle with a multi-stop linear gradient on `<canvas>` `id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn canvas_fill_linear_gradient(
+        &mut self,
+        id: NodeId,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        gx0: f32,
+        gy0: f32,
+        gx1: f32,
+        gy1: f32,
+        stops: &[(f32, [u8; 4])],
+    ) {
+        if stops.is_empty() {
+            return;
+        }
+        let surf = self.ensure_canvas_surface(id);
+        let cw = surf.width as i32;
+        let ch = surf.height as i32;
+        let x0 = x.clamp(0, cw);
+        let y0 = y.clamp(0, ch);
+        let x1 = (x.saturating_add(w as i32)).clamp(0, cw);
+        let y1 = (y.saturating_add(h as i32)).clamp(0, ch);
+        let vx = gx1 - gx0;
+        let vy = gy1 - gy0;
+        let len2 = (vx * vx + vy * vy).max(1e-6);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let t = (((px as f32 + 0.5 - gx0) * vx + (py as f32 + 0.5 - gy0) * vy) / len2)
+                    .clamp(0.0, 1.0);
+                let rgba = sample_gradient_stops(stops, t);
+                let off = ((py as usize) * (surf.width as usize) + (px as usize)) * 4;
+                if off + 4 <= surf.rgba.len() {
+                    surf.rgba[off..off + 4].copy_from_slice(&rgba);
+                }
+            }
+        }
+    }
+
     /// Rasterize a compact 5x7 bitmap glyph string onto `<canvas>` element `id`'s 2D surface (`fillText`).
     pub fn canvas_draw_text_bitmap(
         &mut self,
@@ -2522,6 +2692,23 @@ impl Document {
                                     break;
                                 }
                             }
+                        } else if let Some(next_sel) = rel.strip_prefix('+') {
+                            let next_sel = next_sel.trim();
+                            if let Some(sib) = self.next_element_sibling(id)
+                                && self.node_matches_selector(sib, next_sel)
+                            {
+                                matched_desc = true;
+                            }
+                        } else if let Some(sub_sel) = rel.strip_prefix('~') {
+                            let sub_sel = sub_sel.trim();
+                            let mut cur = self.next_element_sibling(id);
+                            while let Some(sib) = cur {
+                                if self.node_matches_selector(sib, sub_sel) {
+                                    matched_desc = true;
+                                    break;
+                                }
+                                cur = self.next_element_sibling(sib);
+                            }
                         } else if self.query_selector_within(id, rel).is_some() {
                             matched_desc = true;
                         }
@@ -2530,6 +2717,158 @@ impl Document {
                         }
                     }
                     if !matched_desc {
+                        return false;
+                    }
+                }
+                ("scope", None) => {}
+                ("first-child", None) => {
+                    if self.previous_element_sibling(id).is_some() {
+                        return false;
+                    }
+                }
+                ("last-child", None) => {
+                    if self.next_element_sibling(id).is_some() {
+                        return false;
+                    }
+                }
+                ("only-child", None) => {
+                    if self.previous_element_sibling(id).is_some()
+                        || self.next_element_sibling(id).is_some()
+                    {
+                        return false;
+                    }
+                }
+                ("first-of-type", None) => {
+                    let Some(tag) = self.get(id).data().tag() else {
+                        return false;
+                    };
+                    let mut prev = self.previous_element_sibling(id);
+                    while let Some(sib) = prev {
+                        if self.get(sib).data().tag() == Some(tag) {
+                            return false;
+                        }
+                        prev = self.previous_element_sibling(sib);
+                    }
+                }
+                ("last-of-type", None) => {
+                    let Some(tag) = self.get(id).data().tag() else {
+                        return false;
+                    };
+                    let mut next = self.next_element_sibling(id);
+                    while let Some(sib) = next {
+                        if self.get(sib).data().tag() == Some(tag) {
+                            return false;
+                        }
+                        next = self.next_element_sibling(sib);
+                    }
+                }
+                ("only-of-type", None) => {
+                    let Some(tag) = self.get(id).data().tag() else {
+                        return false;
+                    };
+                    let mut prev = self.previous_element_sibling(id);
+                    while let Some(sib) = prev {
+                        if self.get(sib).data().tag() == Some(tag) {
+                            return false;
+                        }
+                        prev = self.previous_element_sibling(sib);
+                    }
+                    let mut next = self.next_element_sibling(id);
+                    while let Some(sib) = next {
+                        if self.get(sib).data().tag() == Some(tag) {
+                            return false;
+                        }
+                        next = self.next_element_sibling(sib);
+                    }
+                }
+                ("nth-child", Some(expr)) | ("nth-last-child", Some(expr)) => {
+                    let from_end = name == "nth-last-child";
+                    if !self.matches_nth_child(id, expr, from_end) {
+                        return false;
+                    }
+                }
+                ("nth-of-type", Some(expr)) | ("nth-last-of-type", Some(expr)) => {
+                    let from_end = name == "nth-last-of-type";
+                    if !self.matches_nth_of_type(id, expr, from_end) {
+                        return false;
+                    }
+                }
+                ("link" | "any-link", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(data.tag(), Some("a" | "area")) || data.attr("href").is_none() {
+                        return false;
+                    }
+                }
+                ("read-only", None) => {
+                    let data = self.get(id).data();
+                    let is_editable_control = matches!(data.tag(), Some("input" | "textarea"))
+                        && !data
+                            .attr("readonly")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                        && !data
+                            .attr("disabled")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+                    let is_contenteditable = data
+                        .attr("contenteditable")
+                        .is_some_and(|v| v.is_empty() || v.eq_ignore_ascii_case("true"));
+                    if is_editable_control || is_contenteditable {
+                        return false;
+                    }
+                }
+                ("read-write", None) => {
+                    let data = self.get(id).data();
+                    let is_editable_control = matches!(data.tag(), Some("input" | "textarea"))
+                        && !data
+                            .attr("readonly")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                        && !data
+                            .attr("disabled")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+                    let is_contenteditable = data
+                        .attr("contenteditable")
+                        .is_some_and(|v| v.is_empty() || v.eq_ignore_ascii_case("true"));
+                    if !is_editable_control && !is_contenteditable {
+                        return false;
+                    }
+                }
+                ("placeholder-shown", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(data.tag(), Some("input" | "textarea"))
+                        || data.attr("placeholder").is_none_or(|p| p.is_empty())
+                        || !self.input_value(id).is_empty()
+                    {
+                        return false;
+                    }
+                }
+                ("open", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(data.tag(), Some("details" | "dialog"))
+                        || !data
+                            .attr("open")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                    {
+                        return false;
+                    }
+                }
+                ("closed", None) => {
+                    let data = self.get(id).data();
+                    if !matches!(data.tag(), Some("details" | "dialog"))
+                        || data
+                            .attr("open")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"))
+                    {
+                        return false;
+                    }
+                }
+                ("indeterminate", None) => {
+                    let data = self.get(id).data();
+                    let is_indet_check = self.is_checkbox_input(id)
+                        && data
+                            .attr("indeterminate")
+                            .is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+                    let is_indet_prog =
+                        data.tag() == Some("progress") && data.attr("value").is_none();
+                    if !is_indet_check && !is_indet_prog {
                         return false;
                     }
                 }
@@ -2693,6 +3032,61 @@ impl Document {
         true
     }
 
+    fn matches_nth_child(&self, id: NodeId, expr: &str, from_end: bool) -> bool {
+        let Some(parent) = self.get(id).parent() else {
+            return false;
+        };
+        let (an_b_str, of_sel) = split_nth_of_clause(expr);
+        let Some((a, b)) = parse_an_plus_b(an_b_str) else {
+            return false;
+        };
+        let siblings: Vec<NodeId> = self
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|&cid| {
+                self.get(cid).data().tag().is_some()
+                    && of_sel.is_none_or(|sel| self.node_matches_selector(cid, sel))
+            })
+            .collect();
+        let Some(pos) = siblings.iter().position(|&cid| cid == id) else {
+            return false;
+        };
+        let index_1 = if from_end {
+            (siblings.len() - pos) as i64
+        } else {
+            (pos + 1) as i64
+        };
+        eval_an_plus_b(a, b, index_1)
+    }
+
+    fn matches_nth_of_type(&self, id: NodeId, expr: &str, from_end: bool) -> bool {
+        let Some(parent) = self.get(id).parent() else {
+            return false;
+        };
+        let Some(tag) = self.get(id).data().tag() else {
+            return false;
+        };
+        let Some((a, b)) = parse_an_plus_b(expr.trim()) else {
+            return false;
+        };
+        let siblings: Vec<NodeId> = self
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|&cid| self.get(cid).data().tag() == Some(tag))
+            .collect();
+        let Some(pos) = siblings.iter().position(|&cid| cid == id) else {
+            return false;
+        };
+        let index_1 = if from_end {
+            (siblings.len() - pos) as i64
+        } else {
+            (pos + 1) as i64
+        };
+        eval_an_plus_b(a, b, index_1)
+    }
+
     fn match_ancestor_steps(
         &self,
         current_id: NodeId,
@@ -2726,6 +3120,31 @@ impl Document {
                         return true;
                     }
                     cursor = self.get(anc).parent();
+                }
+                false
+            }
+            SelectorCombinator::NextSibling => {
+                let Some(prev_sib) = self.previous_element_sibling(current_id) else {
+                    return false;
+                };
+                if !self.node_matches_compound_selector(prev_sib, target_compound) {
+                    return false;
+                }
+                if rest.is_empty() {
+                    true
+                } else {
+                    self.match_ancestor_steps(prev_sib, rest, *prev_comb)
+                }
+            }
+            SelectorCombinator::SubsequentSibling => {
+                let mut cursor = self.previous_element_sibling(current_id);
+                while let Some(sib) = cursor {
+                    if self.node_matches_compound_selector(sib, target_compound)
+                        && (rest.is_empty() || self.match_ancestor_steps(sib, rest, *prev_comb))
+                    {
+                        return true;
+                    }
+                    cursor = self.previous_element_sibling(sib);
                 }
                 false
             }
@@ -3340,6 +3759,86 @@ fn is_void_tag(tag: &str) -> bool {
 enum SelectorCombinator {
     Descendant,
     Child,
+    NextSibling,
+    SubsequentSibling,
+}
+
+fn sample_gradient_stops(stops: &[(f32, [u8; 4])], t: f32) -> [u8; 4] {
+    if stops.len() == 1 || t <= stops[0].0 {
+        return stops[0].1;
+    }
+    let last = stops[stops.len() - 1];
+    if t >= last.0 {
+        return last.1;
+    }
+    for pair in stops.windows(2) {
+        let (t0, c0) = pair[0];
+        let (t1, c1) = pair[1];
+        if t >= t0 && t <= t1 {
+            let span = (t1 - t0).max(1e-6);
+            let f = ((t - t0) / span).clamp(0.0, 1.0);
+            return [
+                (c0[0] as f32 + (c1[0] as f32 - c0[0] as f32) * f).round() as u8,
+                (c0[1] as f32 + (c1[1] as f32 - c0[1] as f32) * f).round() as u8,
+                (c0[2] as f32 + (c1[2] as f32 - c0[2] as f32) * f).round() as u8,
+                (c0[3] as f32 + (c1[3] as f32 - c0[3] as f32) * f).round() as u8,
+            ];
+        }
+    }
+    last.1
+}
+
+fn split_nth_of_clause(expr: &str) -> (&str, Option<&str>) {
+    let trimmed = expr.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(pos) = lower.find(" of ") {
+        let an_b = trimmed[..pos].trim();
+        let sel = trimmed[pos + 4..].trim();
+        if !sel.is_empty() {
+            return (an_b, Some(sel));
+        }
+    }
+    (trimmed, None)
+}
+
+fn parse_an_plus_b(expr: &str) -> Option<(i64, i64)> {
+    let s: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    let lower = s.to_ascii_lowercase();
+    if lower == "odd" {
+        return Some((2, 1));
+    }
+    if lower == "even" {
+        return Some((2, 0));
+    }
+    if let Some(n_pos) = lower.find('n') {
+        let a_part = &lower[..n_pos];
+        let b_part = &lower[n_pos + 1..];
+        let a = match a_part {
+            "" | "+" => 1,
+            "-" => -1,
+            other => other.parse::<i64>().ok()?,
+        };
+        let b = if b_part.is_empty() {
+            0
+        } else {
+            b_part.parse::<i64>().ok()?
+        };
+        Some((a, b))
+    } else {
+        let b = lower.parse::<i64>().ok()?;
+        Some((0, b))
+    }
+}
+
+fn eval_an_plus_b(a: i64, b: i64, index_1: i64) -> bool {
+    if a == 0 {
+        return index_1 == b;
+    }
+    let diff = index_1 - b;
+    if (diff > 0 && a < 0) || (diff < 0 && a > 0) {
+        return false;
+    }
+    diff % a == 0
 }
 
 fn split_selector_commas(selector: &str) -> Vec<&str> {
@@ -3423,6 +3922,22 @@ fn parse_combinator_chain(chain: &str) -> Vec<(SelectorCombinator, String)> {
                 }
                 pending = SelectorCombinator::Child;
             }
+            '+' if bracket_depth == 0 && paren_depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    steps.push((pending, trimmed));
+                    current.clear();
+                }
+                pending = SelectorCombinator::NextSibling;
+            }
+            '~' if bracket_depth == 0 && paren_depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    steps.push((pending, trimmed));
+                    current.clear();
+                }
+                pending = SelectorCombinator::SubsequentSibling;
+            }
             c if c.is_whitespace() && bracket_depth == 0 && paren_depth == 0 => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
@@ -3469,25 +3984,86 @@ fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
 
     for attr_filter in &attrs_to_check {
         if let Some((attr_name, raw_val)) = attr_filter.split_once('=') {
-            let name = attr_name.trim().trim_end_matches(['~', '|', '^', '$', '*']);
-            let expected = raw_val.trim().trim_matches('"').trim_matches('\'');
+            let attr_name_trim = attr_name.trim();
+            let op = if attr_name_trim.ends_with('~') {
+                "~="
+            } else if attr_name_trim.ends_with('|') {
+                "|="
+            } else if attr_name_trim.ends_with('^') {
+                "^="
+            } else if attr_name_trim.ends_with('$') {
+                "$="
+            } else if attr_name_trim.ends_with('*') {
+                "*="
+            } else {
+                "="
+            };
+            let name = attr_name_trim
+                .trim_end_matches(['~', '|', '^', '$', '*'])
+                .trim();
+            let mut val_part = raw_val.trim();
+            let mut case_insensitive = false;
+            if let Some(stripped) = val_part
+                .strip_suffix(" i")
+                .or_else(|| val_part.strip_suffix(" I"))
+            {
+                case_insensitive = true;
+                val_part = stripped.trim();
+            } else if let Some(stripped) = val_part
+                .strip_suffix(" s")
+                .or_else(|| val_part.strip_suffix(" S"))
+            {
+                val_part = stripped.trim();
+            }
+            let expected = val_part.trim_matches('"').trim_matches('\'');
             let Some(actual) = data.attr(name) else {
                 return false;
             };
-            if attr_filter.contains("*=") {
-                if !actual.contains(expected) {
-                    return false;
+            let actual_cmp = if case_insensitive {
+                actual.to_ascii_lowercase()
+            } else {
+                actual.to_string()
+            };
+            let expected_cmp = if case_insensitive {
+                expected.to_ascii_lowercase()
+            } else {
+                expected.to_string()
+            };
+            match op {
+                "*=" => {
+                    if expected_cmp.is_empty() || !actual_cmp.contains(&expected_cmp) {
+                        return false;
+                    }
                 }
-            } else if attr_filter.contains("^=") {
-                if !actual.starts_with(expected) {
-                    return false;
+                "^=" => {
+                    if expected_cmp.is_empty() || !actual_cmp.starts_with(&expected_cmp) {
+                        return false;
+                    }
                 }
-            } else if attr_filter.contains("$=") {
-                if !actual.ends_with(expected) {
-                    return false;
+                "$=" => {
+                    if expected_cmp.is_empty() || !actual_cmp.ends_with(&expected_cmp) {
+                        return false;
+                    }
                 }
-            } else if actual != expected {
-                return false;
+                "~=" => {
+                    if expected_cmp.is_empty()
+                        || !actual_cmp.split_whitespace().any(|w| w == expected_cmp)
+                    {
+                        return false;
+                    }
+                }
+                "|=" => {
+                    if actual_cmp != expected_cmp
+                        && !actual_cmp.starts_with(&format!("{expected_cmp}-"))
+                    {
+                        return false;
+                    }
+                }
+                _ => {
+                    if actual_cmp != expected_cmp {
+                        return false;
+                    }
+                }
             }
         } else if data.attr(attr_filter.trim()).is_none() {
             return false;
@@ -4101,6 +4677,96 @@ mod tests {
         assert!((doc.control_fill_ratio(rng).unwrap() - 0.625).abs() < 1e-4);
         assert!((doc.control_fill_ratio(prog).unwrap() - 0.5).abs() < 1e-4);
         assert!((doc.control_fill_ratio(mtr).unwrap() - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn html5_error_recovery_handles_unclosed_tags_stray_closers_and_entities() {
+        let doc = parse_html(
+            "<div id=\"card\"></span></section>\
+             <p id=\"p1\">Para 1<div id=\"blk\">Block</div>\
+             <ul id=\"lst\"><li id=\"li1\">One<li id=\"li2\">Two</ul>\
+             <dl id=\"defs\"><dt id=\"dt1\">Term<dd id=\"dd1\">Def</dl>\
+             <p id=\"ent\">&copy; 2026 &mdash; &#147;Anvil&#148; &euro;50&hellip;</p>\
+             </p></br>\
+             </div>\
+             <script>var unclosed = 42;",
+        );
+        let card = doc.get_element_by_id("card").unwrap();
+        let blk = doc.get_element_by_id("blk").unwrap();
+        let p1 = doc.get_element_by_id("p1").unwrap();
+        // Stray `</span></section>` did not unwind `#card`: `#blk` is still inside `#card`.
+        assert_eq!(doc.parent_element(blk), Some(card));
+        // `<div id="blk">` auto-closed `<p id="p1">`, so `#blk` is a sibling of `#p1`, not inside `#p1`.
+        assert_eq!(doc.parent_element(p1), Some(card));
+        assert!(!doc.contains_node(p1, blk));
+
+        // `<li>` auto-closed previous `<li>` inside `<ul>`
+        let lst = doc.get_element_by_id("lst").unwrap();
+        let li1 = doc.get_element_by_id("li1").unwrap();
+        let li2 = doc.get_element_by_id("li2").unwrap();
+        assert_eq!(doc.element_children(lst), vec![li1, li2]);
+
+        // `<dd>` auto-closed `<dt>` inside `<dl>`
+        let defs = doc.get_element_by_id("defs").unwrap();
+        let dt1 = doc.get_element_by_id("dt1").unwrap();
+        let dd1 = doc.get_element_by_id("dd1").unwrap();
+        assert_eq!(doc.element_children(defs), vec![dt1, dd1]);
+
+        // Named & Windows-1252 numeric character references
+        let ent = doc.get_element_by_id("ent").unwrap();
+        assert_eq!(
+            doc.text_content(ent),
+            "\u{00a9} 2026 \u{2014} \u{201c}Anvil\u{201d} \u{20ac}50\u{2026}"
+        );
+
+        // Unclosed `<script>` at EOF still extracted its script text without leaking tags
+        assert_eq!(doc.scripts(), vec!["var unclosed = 42;"]);
+    }
+
+    #[test]
+    fn selectors_level_4_sibling_combinators_nth_child_and_state_pseudos_work() {
+        let doc = parse_html(
+            "<div id=\"root\">\
+               <h2 id=\"hdr\">Title</h2>\
+               <p id=\"first-p\" class=\"item active\" data-tags=\"alpha beta\" lang=\"en-US\">One</p>\
+               <p id=\"second-p\" class=\"item\" data-role=\"Admin\">Two</p>\
+               <p id=\"third-p\" class=\"item active\">Three</p>\
+               <a id=\"lnk\" href=\"https://example.com\">Link</a>\
+               <input id=\"ro\" type=\"text\" readonly placeholder=\"Enter name\" value=\"\">\
+               <details id=\"det-open\" open><summary>Open</summary></details>\
+             </div>",
+        );
+        let first_p = doc.get_element_by_id("first-p").unwrap();
+        let second_p = doc.get_element_by_id("second-p").unwrap();
+        let third_p = doc.get_element_by_id("third-p").unwrap();
+        let lnk = doc.get_element_by_id("lnk").unwrap();
+        let ro = doc.get_element_by_id("ro").unwrap();
+        let det_open = doc.get_element_by_id("det-open").unwrap();
+
+        assert_eq!(doc.query_selector("h2 + p"), Some(first_p));
+        assert_eq!(
+            doc.query_selector_all("h2 ~ p.item"),
+            vec![first_p, second_p, third_p]
+        );
+        assert_eq!(doc.query_selector("p:nth-of-type(2)"), Some(second_p));
+        assert_eq!(
+            doc.query_selector("p:nth-child(2 of .active)"),
+            Some(third_p)
+        );
+        assert_eq!(
+            doc.query_selector("[data-tags~=beta][lang|=en]"),
+            Some(first_p)
+        );
+        assert_eq!(
+            doc.query_selector("[data-role=\"admin\" i]"),
+            Some(second_p)
+        );
+        assert_eq!(doc.query_selector("a:any-link"), Some(lnk));
+        assert_eq!(
+            doc.query_selector("input:read-only:placeholder-shown"),
+            Some(ro)
+        );
+        assert_eq!(doc.query_selector("details:open"), Some(det_open));
     }
 }
 

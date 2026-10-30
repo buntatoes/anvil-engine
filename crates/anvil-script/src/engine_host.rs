@@ -68,6 +68,8 @@ pub struct AnvilJsDomHost {
     pub canvas_paths: std::collections::HashMap<NodeId, Vec<(i32, i32)>>,
     /// Active `MutationObserver` registrations: `(callback, observed_node)`.
     pub mutation_observers: Vec<(Persistent, NodeId)>,
+    /// Registered mock responses for `fetch(url)`: `(url, status, body)`.
+    pub fetch_mocks: Vec<(String, u16, String)>,
 }
 
 impl Default for AnvilJsDomHost {
@@ -104,6 +106,7 @@ impl AnvilJsDomHost {
             next_timer_id: 1,
             canvas_paths: std::collections::HashMap::new(),
             mutation_observers: Vec::new(),
+            fetch_mocks: Vec::new(),
         }
     }
 
@@ -120,6 +123,8 @@ impl AnvilJsDomHost {
             ("setAttribute", el_set_attribute),
             ("removeAttribute", el_remove_attribute),
             ("hasAttribute", el_has_attribute),
+            ("getAttributeNames", el_get_attribute_names),
+            ("hasAttributes", el_has_attributes),
             ("appendChild", el_append_child),
             ("removeChild", el_remove_child),
             ("insertBefore", el_insert_before),
@@ -184,13 +189,24 @@ impl AnvilJsDomHost {
             ("value", Some(el_get_value), Some(el_set_value)),
             ("checked", Some(el_get_checked), Some(el_set_checked)),
             ("tagName", Some(el_get_tag_name), None),
-            ("nodeName", Some(el_get_tag_name), None),
+            ("nodeName", Some(el_get_node_name), None),
+            ("nodeType", Some(el_get_node_type), None),
+            (
+                "nodeValue",
+                Some(el_get_node_value),
+                Some(el_set_node_value),
+            ),
+            ("ownerDocument", Some(el_get_owner_document), None),
+            ("isConnected", Some(el_get_is_connected), None),
             ("parentElement", Some(el_get_parent_element), None),
-            ("parentNode", Some(el_get_parent_element), None),
+            ("parentNode", Some(el_get_parent_node), None),
             ("firstElementChild", Some(el_get_first_element_child), None),
             ("lastElementChild", Some(el_get_last_element_child), None),
             ("firstChild", Some(el_get_first_child), None),
             ("lastChild", Some(el_get_last_child), None),
+            ("childNodes", Some(el_get_child_nodes), None),
+            ("nextSibling", Some(el_get_next_sibling), None),
+            ("previousSibling", Some(el_get_previous_sibling), None),
             (
                 "nextElementSibling",
                 Some(el_get_next_element_sibling),
@@ -357,6 +373,12 @@ impl AnvilJsDomHost {
         vm.define_accessor(doc_obj, "readyState", Some(doc_get_ready_state), None)?;
         vm.define_accessor(doc_obj, "URL", Some(doc_get_url), None)?;
         vm.define_accessor(doc_obj, "documentURI", Some(doc_get_url), None)?;
+        vm.define_accessor(doc_obj, "nodeType", Some(doc_get_node_type), None)?;
+        vm.define_accessor(doc_obj, "nodeName", Some(doc_get_node_name), None)?;
+        vm.define_accessor(doc_obj, "childNodes", Some(doc_get_child_nodes), None)?;
+        vm.define_accessor(doc_obj, "firstChild", Some(doc_get_document_element), None)?;
+        vm.define_accessor(doc_obj, "lastChild", Some(doc_get_document_element), None)?;
+        vm.define_accessor(doc_obj, "isConnected", Some(doc_get_is_connected), None)?;
         let empty_sheets = vm.new_array_from(&[])?;
         vm.define_data(doc_obj, "_adoptedSheets", empty_sheets)?;
         self.document_obj = Some(doc_obj);
@@ -414,6 +436,7 @@ impl AnvilJsDomHost {
         // 8. Global bindings
         vm.define_data(g, "window", JsValue::object(g))?;
         vm.define_data(g, "self", JsValue::object(g))?;
+        vm.define_data(g, "__elementProto", JsValue::object(el_proto))?;
         vm.define_data(g, "document", JsValue::object(doc_obj))?;
         vm.define_data(g, "localStorage", JsValue::object(local_obj))?;
         vm.define_data(g, "sessionStorage", JsValue::object(session_obj))?;
@@ -433,6 +456,10 @@ impl AnvilJsDomHost {
             ("clearInterval", window_clear_timer),
             ("requestAnimationFrame", window_request_animation_frame),
             ("cancelAnimationFrame", window_clear_timer),
+            ("__nativePreventDefault", ev_prevent_default),
+            ("__nativeStopPropagation", ev_stop_propagation),
+            ("__nativeFetch", window_native_fetch),
+            ("__sha256Bytes", window_sha256_bytes),
             (
                 "__registerMutationObserver",
                 window_register_mutation_observer,
@@ -451,429 +478,7 @@ impl AnvilJsDomHost {
     }
 
     fn install_web_api_classes(&mut self, vm: &mut Vm) -> Result<(), RunError> {
-        let bootstrap = r#"
-(function() {
-    Object.defineProperty(document, 'adoptedStyleSheets', {
-        enumerable: true,
-        configurable: true,
-        get: function() { return this._adoptedSheets || []; },
-        set: function(arr) {
-            var list = Array.isArray(arr) ? arr : [];
-            this._adoptedSheets = list;
-            var texts = [];
-            for (var i = 0; i < list.length; i++) {
-                if (list[i] && typeof list[i]._cssText === 'string') {
-                    texts.push(list[i]._cssText);
-                }
-            }
-            document.__setAdoptedSheets(texts.join('\n'));
-        }
-    });
-
-    class Event {
-        constructor(type, init) {
-            this.type = String(type || '');
-            this.bubbles = Boolean(init && init.bubbles);
-            this.cancelable = Boolean(init && init.cancelable);
-            this.composed = Boolean(init && init.composed);
-            this.defaultPrevented = false;
-            this.target = null;
-            this.currentTarget = null;
-        }
-        preventDefault() {
-            if (this.cancelable) this.defaultPrevented = true;
-        }
-        stopPropagation() {
-            this._stopped = true;
-        }
-        stopImmediatePropagation() {
-            this._stopped = true;
-        }
-    }
-
-    class CustomEvent extends Event {
-        constructor(type, init) {
-            super(type, init);
-            this.detail = (init && 'detail' in init) ? init.detail : null;
-        }
-    }
-
-    class CSSStyleSheet {
-        constructor() {
-            this._cssText = '';
-            this.cssRules = [];
-        }
-        replaceSync(text) {
-            this._cssText = String(text || '');
-            this.cssRules = this._cssText ? [{ cssText: this._cssText }] : [];
-            var sheets = document._adoptedSheets || [];
-            if (sheets.indexOf(this) !== -1) {
-                document.adoptedStyleSheets = sheets;
-            }
-        }
-        replace(text) {
-            this.replaceSync(text);
-            return Promise.resolve(this);
-        }
-        insertRule(rule, index) {
-            var r = String(rule || '');
-            this._cssText = this._cssText ? (this._cssText + '\n' + r) : r;
-            var idx = (typeof index === 'number') ? index : this.cssRules.length;
-            this.cssRules.push({ cssText: r });
-            var sheets = document._adoptedSheets || [];
-            if (sheets.indexOf(this) !== -1) {
-                document.adoptedStyleSheets = sheets;
-            }
-            return idx;
-        }
-        deleteRule(index) {
-            if (typeof index === 'number' && index >= 0 && index < this.cssRules.length) {
-                this.cssRules.splice(index, 1);
-            }
-        }
-    }
-
-    class DOMParser {
-        parseFromString(markup, type) {
-            return document.__parseHTML(String(markup || ''));
-        }
-    }
-
-    class MutationObserver {
-        constructor(callback) {
-            this._cb = callback;
-            this._records = [];
-            var self = this;
-            this._notify = function(rec) {
-                self._records.push(rec);
-                if (!self._scheduled) {
-                    self._scheduled = true;
-                    queueMicrotask(function() {
-                        self._scheduled = false;
-                        if (self._records.length > 0 && typeof self._cb === 'function') {
-                            var batch = self._records.slice();
-                            self._records = [];
-                            self._cb(batch, self);
-                        }
-                    });
-                }
-            };
-        }
-        observe(target, options) {
-            if (target) {
-                window.__registerMutationObserver(this._notify, target);
-            }
-        }
-        disconnect() {
-            window.__unregisterMutationObserver(this._notify);
-            this._records = [];
-        }
-        takeRecords() {
-            var out = this._records.slice();
-            this._records = [];
-            return out;
-        }
-    }
-
-    class IntersectionObserver {
-        constructor(callback, options) {
-            this._cb = callback;
-            this.root = (options && options.root) || null;
-            this.rootMargin = (options && options.rootMargin) || '0px';
-            this.thresholds = [0];
-            this._entries = [];
-        }
-        observe(target) {
-            if (!target) return;
-            var rect = typeof target.getBoundingClientRect === 'function'
-                ? target.getBoundingClientRect()
-                : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-            var entry = {
-                target: target,
-                isIntersecting: true,
-                intersectionRatio: 1,
-                boundingClientRect: rect,
-                intersectionRect: rect,
-                rootBounds: rect,
-                time: 0
-            };
-            var cb = this._cb;
-            var self = this;
-            queueMicrotask(function() {
-                if (typeof cb === 'function') cb([entry], self);
-            });
-        }
-        unobserve() {}
-        disconnect() {}
-        takeRecords() { return []; }
-    }
-
-    class ResizeObserver {
-        constructor(callback) {
-            this._cb = callback;
-        }
-        observe(target) {
-            if (!target) return;
-            var rect = typeof target.getBoundingClientRect === 'function'
-                ? target.getBoundingClientRect()
-                : { x: 0, y: 0, top: 0, left: 0, width: 100, height: 24, right: 100, bottom: 24 };
-            var entry = {
-                target: target,
-                contentRect: rect,
-                borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
-                contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }]
-            };
-            var cb = this._cb;
-            var self = this;
-            queueMicrotask(function() {
-                if (typeof cb === 'function') cb([entry], self);
-            });
-        }
-        unobserve() {}
-        disconnect() {}
-    }
-
-    class URLSearchParams {
-        constructor(init) {
-            this._pairs = [];
-            if (!init) return;
-            if (typeof init === 'string') {
-                var s = init.charAt(0) === '?' ? init.slice(1) : init;
-                if (!s) return;
-                var parts = s.split('&');
-                for (var i = 0; i < parts.length; i++) {
-                    if (!parts[i]) continue;
-                    var eq = parts[i].indexOf('=');
-                    if (eq === -1) {
-                        this._pairs.push([decodeURIComponent(parts[i].replace(/\+/g, ' ')), '']);
-                    } else {
-                        var k = decodeURIComponent(parts[i].slice(0, eq).replace(/\+/g, ' '));
-                        var v = decodeURIComponent(parts[i].slice(eq + 1).replace(/\+/g, ' '));
-                        this._pairs.push([k, v]);
-                    }
-                }
-            } else if (Array.isArray(init)) {
-                for (var j = 0; j < init.length; j++) {
-                    if (init[j] && init[j].length >= 2) {
-                        this._pairs.push([String(init[j][0]), String(init[j][1])]);
-                    }
-                }
-            } else if (typeof init === 'object') {
-                var keys = Object.keys(init);
-                for (var m = 0; m < keys.length; m++) {
-                    this._pairs.push([keys[m], String(init[keys[m]])]);
-                }
-            }
-        }
-        append(name, value) {
-            this._pairs.push([String(name), String(value)]);
-            if (this._onChange) this._onChange();
-        }
-        set(name, value) {
-            var k = String(name);
-            var v = String(value);
-            var found = false;
-            var next = [];
-            for (var i = 0; i < this._pairs.length; i++) {
-                if (this._pairs[i][0] === k) {
-                    if (!found) {
-                        next.push([k, v]);
-                        found = true;
-                    }
-                } else {
-                    next.push(this._pairs[i]);
-                }
-            }
-            if (!found) next.push([k, v]);
-            this._pairs = next;
-            if (this._onChange) this._onChange();
-        }
-        get(name) {
-            var k = String(name);
-            for (var i = 0; i < this._pairs.length; i++) {
-                if (this._pairs[i][0] === k) return this._pairs[i][1];
-            }
-            return null;
-        }
-        getAll(name) {
-            var k = String(name);
-            var out = [];
-            for (var i = 0; i < this._pairs.length; i++) {
-                if (this._pairs[i][0] === k) out.push(this._pairs[i][1]);
-            }
-            return out;
-        }
-        has(name) {
-            return this.get(name) !== null;
-        }
-        delete(name) {
-            var k = String(name);
-            var next = [];
-            for (var i = 0; i < this._pairs.length; i++) {
-                if (this._pairs[i][0] !== k) next.push(this._pairs[i]);
-            }
-            this._pairs = next;
-            if (this._onChange) this._onChange();
-        }
-        toString() {
-            var out = [];
-            for (var i = 0; i < this._pairs.length; i++) {
-                out.push(encodeURIComponent(this._pairs[i][0]) + '=' + encodeURIComponent(this._pairs[i][1]));
-            }
-            return out.join('&');
-        }
-    }
-
-    class URL {
-        constructor(input, base) {
-            var raw = String(input || '');
-            if (raw.indexOf('://') === -1 && base) {
-                var b = String(base);
-                if (raw.charAt(0) === '/') {
-                    var m = b.match(/^([a-zA-Z]+:\/\/[^\/]+)/);
-                    raw = (m ? m[1] : 'https://localhost') + raw;
-                } else {
-                    var lastSlash = b.lastIndexOf('/');
-                    raw = (lastSlash >= 0 ? b.slice(0, lastSlash + 1) : b + '/') + raw;
-                }
-            }
-            var hashIdx = raw.indexOf('#');
-            this.hash = hashIdx >= 0 ? raw.slice(hashIdx) : '';
-            var beforeHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
-            var qIdx = beforeHash.indexOf('?');
-            var rawSearch = qIdx >= 0 ? beforeHash.slice(qIdx) : '';
-            var beforeQ = qIdx >= 0 ? beforeHash.slice(0, qIdx) : beforeHash;
-            var schemeSep = beforeQ.indexOf('://');
-            this.protocol = schemeSep >= 0 ? beforeQ.slice(0, schemeSep + 1) : 'https:';
-            var afterScheme = schemeSep >= 0 ? beforeQ.slice(schemeSep + 3) : beforeQ;
-            var slashIdx = afterScheme.indexOf('/');
-            this.host = slashIdx >= 0 ? afterScheme.slice(0, slashIdx) : afterScheme;
-            var colonIdx = this.host.indexOf(':');
-            this.hostname = colonIdx >= 0 ? this.host.slice(0, colonIdx) : this.host;
-            this.port = colonIdx >= 0 ? this.host.slice(colonIdx + 1) : '';
-            this.pathname = slashIdx >= 0 ? afterScheme.slice(slashIdx) : '/';
-            this.origin = this.protocol + '//' + this.host;
-            this.searchParams = new URLSearchParams(rawSearch);
-            var self = this;
-            this.searchParams._onChange = function() {
-                var s = self.searchParams.toString();
-                self.search = s ? ('?' + s) : '';
-                self.href = self.origin + self.pathname + self.search + self.hash;
-            };
-            this.searchParams._onChange();
-        }
-        toString() {
-            return this.href;
-        }
-        toJSON() {
-            return this.href;
-        }
-    }
-
-    class FormData {
-        constructor() {
-            this._entries = [];
-        }
-        append(name, value) {
-            this._entries.push([String(name), String(value)]);
-        }
-        set(name, value) {
-            var k = String(name);
-            var v = String(value);
-            var next = [];
-            var placed = false;
-            for (var i = 0; i < this._entries.length; i++) {
-                if (this._entries[i][0] === k) {
-                    if (!placed) {
-                        next.push([k, v]);
-                        placed = true;
-                    }
-                } else {
-                    next.push(this._entries[i]);
-                }
-            }
-            if (!placed) next.push([k, v]);
-            this._entries = next;
-        }
-        get(name) {
-            var k = String(name);
-            for (var i = 0; i < this._entries.length; i++) {
-                if (this._entries[i][0] === k) return this._entries[i][1];
-            }
-            return null;
-        }
-        has(name) {
-            return this.get(name) !== null;
-        }
-        delete(name) {
-            var k = String(name);
-            var next = [];
-            for (var i = 0; i < this._entries.length; i++) {
-                if (this._entries[i][0] !== k) next.push(this._entries[i]);
-            }
-            this._entries = next;
-        }
-    }
-
-    class Blob {
-        constructor(parts, options) {
-            var list = Array.isArray(parts) ? parts : [];
-            var acc = '';
-            for (var i = 0; i < list.length; i++) {
-                acc += String(list[i]);
-            }
-            this._text = acc;
-            this.size = acc.length;
-            this.type = (options && options.type) ? String(options.type) : '';
-        }
-        text() {
-            return Promise.resolve(this._text);
-        }
-    }
-
-    class TextEncoder {
-        constructor() {
-            this.encoding = 'utf-8';
-        }
-        encode(input) {
-            var s = String(input || '');
-            var out = [];
-            for (var i = 0; i < s.length; i++) {
-                out.push(s.charCodeAt(i) & 0xFF);
-            }
-            return out;
-        }
-    }
-
-    class TextDecoder {
-        constructor(label) {
-            this.encoding = String(label || 'utf-8').toLowerCase();
-        }
-        decode(bytes) {
-            if (!bytes) return '';
-            var out = '';
-            for (var i = 0; i < bytes.length; i++) {
-                out += String.fromCharCode(bytes[i]);
-            }
-            return out;
-        }
-    }
-
-    window.Event = Event;
-    window.CustomEvent = CustomEvent;
-    window.CSSStyleSheet = CSSStyleSheet;
-    window.DOMParser = DOMParser;
-    window.MutationObserver = MutationObserver;
-    window.IntersectionObserver = IntersectionObserver;
-    window.ResizeObserver = ResizeObserver;
-    window.URLSearchParams = URLSearchParams;
-    window.URL = URL;
-    window.FormData = FormData;
-    window.Blob = Blob;
-    window.TextEncoder = TextEncoder;
-    window.TextDecoder = TextDecoder;
-})();
-"#;
+        let bootstrap = anvil_js::DOM_WEB_BOOTSTRAP_JS;
         let limits = vm.limits().clone();
         let code = anvil_js::compile_script(bootstrap, &limits)
             .map_err(|e| RunError::internal(e.to_string()))?;
@@ -1055,6 +660,32 @@ impl AnvilJsDomHost {
         }
 
         let target_val = self.wrap_node_in_vm(vm, target)?;
+        let g = vm.global();
+        if let Ok(fn_key) = vm.heap_mut().key_from_str("__dispatchNativeDomEvent")
+            && let Ok(Some(prop)) = vm.heap().get_own(g, fn_key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+        {
+            let ev_js = vm.string(&wanted)?;
+            let val_js = match value {
+                Some(v) => vm.string(v)?,
+                None => JsValue::UNDEFINED,
+            };
+            let key_js = match key {
+                Some(k) => vm.string(k)?,
+                None => JsValue::UNDEFINED,
+            };
+            let ret = vm.call(
+                self,
+                fn_val,
+                JsValue::object(g),
+                &[target_val, ev_js, val_js, key_js],
+            )?;
+            vm.drain_jobs(self)?;
+            if ret.as_bool() == Some(true) {
+                return Ok(true);
+            }
+        }
         let mut handled = false;
 
         for current_id in chain {
@@ -1113,6 +744,21 @@ impl AnvilJsDomHost {
             }
         }
         Ok(handled)
+    }
+
+    /// Invoke `window.__reportUncaughtError(msg)` if installed, firing `window.onerror`
+    /// and any registered `'error'` event listeners without aborting the host session.
+    pub fn report_uncaught_error(&mut self, vm: &mut Vm, message: &str) {
+        let g = vm.global();
+        if let Ok(fn_key) = vm.heap_mut().key_from_str("__reportUncaughtError")
+            && let Ok(Some(prop)) = vm.heap().get_own(g, fn_key)
+            && let Some(fn_val) = prop.slot.data()
+            && fn_val.as_object().is_some()
+            && let Ok(msg_js) = vm.string(message)
+        {
+            let _ = vm.call(self, fn_val, JsValue::object(g), &[msg_js]);
+            let _ = vm.drain_jobs(self);
+        }
     }
 
     fn wrap_node_in_vm(&self, vm: &mut Vm, nid: NodeId) -> Result<JsValue, RunError> {
@@ -2252,6 +1898,7 @@ fn el_get_context(
         ("resetTransform", el_noop),
         ("setLineDash", el_noop),
         ("clip", el_noop),
+        ("__fillLinearGradient", canvas_fill_linear_gradient),
     ] {
         cx.vm().define_method(ctx_obj, name, func)?;
     }
@@ -2483,12 +2130,22 @@ fn canvas_stroke(
         return Ok(JsValue::UNDEFINED);
     };
     let rgba = canvas_style_color(cx, this, "strokeStyle");
+    let lw = if let Some(obj) = this.as_object()
+        && let Ok(key) = cx.heap().key_from_str("lineWidth")
+        && let Ok(Some(prop)) = cx.heap().get_own(obj, key)
+        && let Some(val) = prop.slot.data()
+        && let Some(n) = val.as_number()
+    {
+        n.round().max(1.0) as u32
+    } else {
+        1
+    };
     if let Some(host) = cx.host_as::<AnvilJsDomHost>()
         && let Some(pts) = host.canvas_paths.get(&nid).cloned()
     {
         for win in pts.windows(2) {
             host.doc
-                .canvas_draw_line(nid, win[0].0, win[0].1, win[1].0, win[1].1, rgba);
+                .canvas_draw_line_width(nid, win[0].0, win[0].1, win[1].0, win[1].1, lw, rgba);
         }
     }
     Ok(JsValue::UNDEFINED)
@@ -2507,13 +2164,18 @@ fn canvas_fill(
         && let Some(pts) = host.canvas_paths.get(&nid).cloned()
         && !pts.is_empty()
     {
-        let min_x = pts.iter().map(|p| p.0).min().unwrap_or(0);
-        let max_x = pts.iter().map(|p| p.0).max().unwrap_or(0);
-        let min_y = pts.iter().map(|p| p.1).min().unwrap_or(0);
-        let max_y = pts.iter().map(|p| p.1).max().unwrap_or(0);
-        let w = (max_x - min_x).max(1) as u32;
-        let h = (max_y - min_y).max(1) as u32;
-        host.doc.canvas_fill_rect(nid, min_x, min_y, w, h, rgba);
+        if pts.len() >= 3 {
+            let poly: Vec<(f32, f32)> = pts.iter().map(|&(x, y)| (x as f32, y as f32)).collect();
+            host.doc.canvas_fill_polygon(nid, &poly, rgba);
+        } else {
+            let min_x = pts.iter().map(|p| p.0).min().unwrap_or(0);
+            let max_x = pts.iter().map(|p| p.0).max().unwrap_or(0);
+            let min_y = pts.iter().map(|p| p.1).min().unwrap_or(0);
+            let max_y = pts.iter().map(|p| p.1).max().unwrap_or(0);
+            let w = (max_x - min_x).max(1) as u32;
+            let h = (max_y - min_y).max(1) as u32;
+            host.doc.canvas_fill_rect(nid, min_x, min_y, w, h, rgba);
+        }
     }
     Ok(JsValue::UNDEFINED)
 }
@@ -3896,6 +3558,493 @@ fn computed_style_get_prop(
         return Ok(val);
     }
     cx.vm().string("")
+}
+
+fn el_get_attribute_names(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().new_array_from(&[]);
+    };
+    let names: Vec<String> = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| {
+            if let NodeData::Element { attrs, .. } = h.doc.get(nid).data() {
+                Some(attrs.iter().map(|(k, _)| k.clone()).collect())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    let mut elems = Vec::with_capacity(names.len());
+    for n in names {
+        let s = cx.vm().string(&n)?;
+        cx.keep(s);
+        elems.push(s);
+    }
+    cx.vm().new_array_from(&elems)
+}
+
+fn el_has_attributes(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::FALSE);
+    };
+    let has = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| {
+            if let NodeData::Element { attrs, .. } = h.doc.get(nid).data() {
+                Some(!attrs.is_empty())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+    Ok(JsValue::boolean(has))
+}
+
+fn el_get_node_name(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return cx.vm().string("");
+    };
+    let name = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| match h.doc.get(nid).data() {
+            NodeData::Document => "#document".to_string(),
+            NodeData::Element { tag, .. } => tag.to_ascii_uppercase(),
+            NodeData::Text(_) => "#text".to_string(),
+        })
+        .unwrap_or_default();
+    cx.vm().string(&name)
+}
+
+fn el_get_node_type(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::number(1.0));
+    };
+    let nt = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| match h.doc.get(nid).data() {
+            NodeData::Element { .. } => 1.0,
+            NodeData::Text(_) => 3.0,
+            NodeData::Document => 9.0,
+        })
+        .unwrap_or(1.0);
+    Ok(JsValue::number(nt))
+}
+
+fn el_get_node_value(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let val = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| match h.doc.get(nid).data() {
+            NodeData::Text(t) => Some(t.clone()),
+            _ => None,
+        });
+    match val {
+        Some(s) => cx.vm().string(&s),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn el_set_node_value(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let text = arg_str(cx, args, 0)?;
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+        if let NodeData::Text(_) = host.doc.get(nid).data() {
+            host.doc.set_text_content(nid, &text);
+        }
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn el_get_parent_node(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let parent = cx
+        .host_as::<AnvilJsDomHost>()
+        .and_then(|h| h.doc.get(nid).parent());
+    match parent {
+        Some(pid) => wrap_node(cx, pid),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn el_get_owner_document(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let g = cx.vm().global();
+    if let Ok(key) = cx.heap().key_from_str("document")
+        && let Ok(Some(prop)) = cx.heap().get_own(g, key)
+        && let Some(val) = prop.slot.data()
+    {
+        return Ok(val);
+    }
+    Ok(JsValue::NULL)
+}
+
+fn el_get_is_connected(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::FALSE);
+    };
+    let connected = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| {
+            let root = h.doc.root();
+            let mut cur = Some(nid);
+            while let Some(id) = cur {
+                if id == root {
+                    return true;
+                }
+                cur = h.doc.get(id).parent();
+            }
+            false
+        })
+        .unwrap_or(false);
+    Ok(JsValue::boolean(connected))
+}
+
+fn el_get_child_nodes(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return wrap_node_list(cx, Vec::new());
+    };
+    let kids: Vec<NodeId> = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| h.doc.children(nid).to_vec())
+        .unwrap_or_default();
+    wrap_node_list(cx, kids)
+}
+
+fn el_get_next_sibling(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let next = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+        let pid = h.doc.get(nid).parent()?;
+        let siblings = h.doc.children(pid);
+        let pos = siblings.iter().position(|&c| c == nid)?;
+        siblings.get(pos + 1).copied()
+    });
+    match next {
+        Some(id) => wrap_node(cx, id),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn el_get_previous_sibling(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::NULL);
+    };
+    let prev = cx.host_as::<AnvilJsDomHost>().and_then(|h| {
+        let pid = h.doc.get(nid).parent()?;
+        let siblings = h.doc.children(pid);
+        let pos = siblings.iter().position(|&c| c == nid)?;
+        if pos > 0 {
+            siblings.get(pos - 1).copied()
+        } else {
+            None
+        }
+    });
+    match prev {
+        Some(id) => wrap_node(cx, id),
+        None => Ok(JsValue::NULL),
+    }
+}
+
+fn doc_get_node_type(
+    _cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    Ok(JsValue::number(9.0))
+}
+
+fn doc_get_node_name(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    cx.vm().string("#document")
+}
+
+fn doc_get_child_nodes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let kids: Vec<NodeId> = cx
+        .host_as::<AnvilJsDomHost>()
+        .map(|h| h.doc.children(h.doc.root()).to_vec())
+        .unwrap_or_default();
+    wrap_node_list(cx, kids)
+}
+
+fn doc_get_is_connected(
+    _cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    Ok(JsValue::TRUE)
+}
+
+fn window_native_fetch(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let url = arg_str(cx, args, 0)?;
+    let (status, body) =
+        if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+            if let Some((_, st, mock_body)) = host.fetch_mocks.iter().find(|(k, _, _)| {
+                k == &url || url.ends_with(k.as_str()) || k.ends_with(url.as_str())
+            }) {
+                (*st, mock_body.clone())
+            } else {
+                (200u16, "{}".to_string())
+            }
+        } else {
+            (200u16, "{}".to_string())
+        };
+    let obj = cx.vm().new_plain_object()?;
+    cx.vm()
+        .define_data(obj, "status", JsValue::number(status as f64))?;
+    let body_js = cx.vm().string(&body)?;
+    cx.vm().define_data(obj, "body", body_js)?;
+    let url_js = cx.vm().string(&url)?;
+    cx.vm().define_data(obj, "url", url_js)?;
+    Ok(JsValue::object(obj))
+}
+
+fn window_sha256_bytes(
+    cx: &mut NativeCx<'_>,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let mut input = Vec::new();
+    if let Some(first) = args.first().copied() {
+        if let Some(obj) = first.as_object() {
+            let len_key = cx
+                .heap()
+                .key_from_str("length")
+                .map_err(|e| RunError::internal(format!("{e:?}")))?;
+            let len = cx
+                .heap()
+                .get_own(obj, len_key)
+                .ok()
+                .flatten()
+                .and_then(|p| p.slot.data())
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0) as usize;
+            for i in 0..len.min(1_048_576) {
+                let k = cx
+                    .heap()
+                    .key_from_str(&i.to_string())
+                    .map_err(|e| RunError::internal(format!("{e:?}")))?;
+                let b = cx
+                    .heap()
+                    .get_own(obj, k)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.slot.data())
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as i64;
+                input.push((b & 0xFF) as u8);
+            }
+        } else if let Ok(s) = cx.to_display_string(first) {
+            input.extend_from_slice(s.as_bytes());
+        }
+    }
+    let digest = sha256_digest(&input);
+    let elems: Vec<JsValue> = digest.iter().map(|&b| JsValue::number(b as f64)).collect();
+    cx.vm().new_array_from(&elems)
+}
+
+fn canvas_fill_linear_gradient(
+    cx: &mut NativeCx<'_>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, RunError> {
+    let Some(nid) = unwrap_node(cx, this) else {
+        return Ok(JsValue::UNDEFINED);
+    };
+    let x = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let y = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
+    let w = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as u32;
+    let h = args
+        .get(3)
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+        .max(0.0) as u32;
+    let c0_str = arg_str(cx, args, 4).unwrap_or_else(|_| "#000000".to_string());
+    let c1_str = arg_str(cx, args, 5).unwrap_or_else(|_| "#ffffff".to_string());
+    let horizontal = args.get(6).and_then(|v| v.as_bool()).unwrap_or(true);
+    let c0 = crate::parse_canvas_color(&c0_str);
+    let c1 = crate::parse_canvas_color(&c1_str);
+    let x0 = x as f32;
+    let y0 = y as f32;
+    let x1 = if horizontal {
+        (x + w as i32) as f32
+    } else {
+        x0
+    };
+    let y1 = if horizontal {
+        y0
+    } else {
+        (y + h as i32) as f32
+    };
+    if let Some(host) = cx.host_as::<AnvilJsDomHost>() {
+        host.doc.canvas_fill_linear_gradient(
+            nid,
+            x,
+            y,
+            w,
+            h,
+            x0,
+            y0,
+            x1,
+            y1,
+            &[(0.0, c0), (1.0, c1)],
+        );
+    }
+    Ok(JsValue::UNDEFINED)
+}
+
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
 }
 
 #[allow(dead_code)]

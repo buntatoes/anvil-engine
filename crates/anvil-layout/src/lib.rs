@@ -994,7 +994,15 @@ fn intrinsic_box_width(
     } else if tag == "button" {
         measure(&doc.text_content(id), style.font_size) + 8.0
     } else {
-        let text_w = measure(doc.text_content(id).trim(), style.font_size);
+        let before_w = styles
+            .before_style(id)
+            .map(|(txt, bs)| measure(txt, bs.font_size))
+            .unwrap_or(0.0);
+        let after_w = styles
+            .after_style(id)
+            .map(|(txt, as_)| measure(txt, as_.font_size))
+            .unwrap_or(0.0);
+        let text_w = measure(doc.text_content(id).trim(), style.font_size) + before_w + after_w;
         let mut child_row_w = 0.0_f32;
         let mut child_max_w = 0.0_f32;
         for &cid in doc.children(id) {
@@ -1487,8 +1495,37 @@ fn layout_block(
     let parent_tag = tag;
     let mut li_index = 0_usize;
     let mut out_of_flow = Vec::new();
+    let mut pending_before_inline: Option<(String, ComputedStyle)> = None;
 
     if tag != "input" && !is_textarea && !is_select && !is_svg && !is_bar_ctrl {
+        if let Some((b_txt, b_style)) = styles.before_style(id)
+            && b_style.display != Display::None
+        {
+            if b_style.display == Display::Inline && !is_decorated_inline(b_style) {
+                if !b_txt.is_empty() {
+                    pending_before_inline = Some((b_txt.clone(), *b_style));
+                }
+            } else {
+                let pbox = layout_pseudo_box(
+                    id,
+                    b_txt,
+                    b_style,
+                    styles,
+                    content_x,
+                    cursor_y,
+                    content_width,
+                    child_cb_height,
+                );
+                if (b_style.inline_level && b_style.display != Display::Inline)
+                    || is_decorated_inline(b_style)
+                {
+                    pending_inline_blocks.push(pbox);
+                } else {
+                    cursor_y += b_style.margin.top + pbox.rect.height + b_style.margin.bottom;
+                    children.push(pbox);
+                }
+            }
+        }
         for child in doc.children(id) {
             if is_skipped(doc, styles, *child) {
                 continue;
@@ -1504,6 +1541,8 @@ fn layout_block(
                     styles,
                     id,
                     &mut pending_marker,
+                    &mut pending_before_inline,
+                    None,
                     &mut inline_ids,
                     content_x,
                     &mut cursor_y,
@@ -1600,17 +1639,61 @@ fn layout_block(
             style.text_align,
             &mut children,
         );
+        let after_entry = styles
+            .after_style(id)
+            .filter(|(_, a_style)| a_style.display != Display::None);
+        let after_is_inline_text = after_entry.is_some_and(|(_, a_style)| {
+            a_style.display == Display::Inline && !is_decorated_inline(a_style)
+        });
         place_inlines(
             doc,
             styles,
             id,
             &mut pending_marker,
+            &mut pending_before_inline,
+            if after_is_inline_text {
+                after_entry.and_then(|(txt, st)| (!txt.is_empty()).then_some((txt.as_str(), st)))
+            } else {
+                None
+            },
             &mut inline_ids,
             content_x,
             &mut cursor_y,
             content_width,
             &mut text,
         );
+        if let Some((a_txt, a_style)) = after_entry
+            && !after_is_inline_text
+        {
+            let pbox = layout_pseudo_box(
+                id,
+                a_txt,
+                a_style,
+                styles,
+                content_x,
+                cursor_y,
+                content_width,
+                child_cb_height,
+            );
+            if (a_style.inline_level && a_style.display != Display::Inline)
+                || is_decorated_inline(a_style)
+            {
+                pending_inline_blocks.push(pbox);
+                flush_inline_blocks(
+                    &mut pending_inline_blocks,
+                    styles,
+                    content_x,
+                    &mut cursor_y,
+                    content_width,
+                    style.text_align,
+                    &mut children,
+                );
+            } else {
+                cursor_y += a_style.margin.top + pbox.rect.height + a_style.margin.bottom;
+                children.push(pbox);
+            }
+        }
+        stretch_table_rowspan_cells(doc, &mut children);
     }
 
     let chrome_v = padding.top + padding.bottom + border.top + border.bottom;
@@ -1799,13 +1882,161 @@ fn layout_out_of_flow(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Lay out a `tr`. Cells share the content width equally, with a 24px floor.
-///
-/// Each cell is laid out as its own box with that column width as its
-/// containing width. The row's content height is the tallest cell, and every
-/// cell's border-box height is then overwritten to that height. Cells are
-/// placed left to right. This is not a column-balancing table: colspans,
-/// row groups, and column widths from the first row are not tracked.
+fn layout_pseudo_box(
+    owner_id: NodeId,
+    pseudo_text: &str,
+    style: &ComputedStyle,
+    styles: &StyleMap,
+    x: f32,
+    y: f32,
+    containing_width: f32,
+    containing_height: Option<f32>,
+) -> LayoutBox {
+    let padding = style.padding;
+    let border = style.border;
+    let chrome_h = padding.left + padding.right + border.left + border.right;
+    let chrome_v = padding.top + padding.bottom + border.top + border.bottom;
+    let mut border_width =
+        if let Some(w) = used_length(style.width, Some(containing_width), style, styles) {
+            match style.box_sizing {
+                BoxSizing::ContentBox => (w + chrome_h).max(0.0),
+                BoxSizing::BorderBox => w.max(chrome_h),
+            }
+        } else if style.inline_level || is_decorated_inline(style) {
+            (measure(pseudo_text, style.font_size) + chrome_h).min(containing_width.max(chrome_h))
+        } else {
+            resolve_border_width(style, containing_width, styles)
+        };
+    border_width = clamp_border_width(style, containing_width, styles, border_width);
+    let content_width = (border_width - chrome_h).max(0.0);
+    let border_x = resolve_border_x(style, x, containing_width, border_width);
+    let border_y = y + style.margin.top;
+    let content_x = border_x + border.left + padding.left;
+    let content_y = border_y + border.top + padding.top;
+
+    let mut text_runs = Vec::new();
+    let mut flow_h = 0.0_f32;
+    if !pseudo_text.is_empty() {
+        let segs = vec![Segment {
+            node: owner_id,
+            text: pseudo_text.to_string(),
+            font_size: style.font_size,
+            line_height: style.line_height,
+            color: style.color,
+            underline: style.underline,
+        }];
+        let (runs, h) = place_lines(
+            &segs,
+            content_x,
+            content_y,
+            content_width.max(16.0),
+            matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap),
+        );
+        text_runs = runs;
+        flow_h = h;
+    }
+    let content_height = match used_length(style.height, containing_height, style, styles) {
+        Some(h) => match style.box_sizing {
+            BoxSizing::ContentBox => h.max(0.0),
+            BoxSizing::BorderBox => (h - chrome_v).max(0.0),
+        },
+        None => flow_h,
+    };
+    let border_height = content_height + chrome_v;
+    LayoutBox {
+        node: owner_id,
+        rect: Rect {
+            x: border_x,
+            y: border_y,
+            width: border_width,
+            height: border_height,
+        },
+        position: style.position,
+        z_index: style.z_index,
+        overflow: style.overflow,
+        background: style.background,
+        background_gradient: style.background_gradient,
+        box_shadow: style.box_shadow,
+        border,
+        border_color: style.border_color,
+        border_radius: style.border_radius,
+        image: None,
+        sticky: None,
+        transform: None,
+        opacity: style.opacity.clamp(0.0, 1.0),
+        text: text_runs,
+        children: Vec::new(),
+    }
+}
+
+fn stretch_table_rowspan_cells(doc: &Document, children: &mut [LayoutBox]) {
+    let tr_indices: Vec<usize> = children
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, b)| (doc.get(b.node).data().tag() == Some("tr")).then_some(idx))
+        .collect();
+    if tr_indices.len() < 2 {
+        return;
+    }
+    let row_heights: Vec<f32> = tr_indices
+        .iter()
+        .map(|&idx| children[idx].rect.height)
+        .collect();
+    for (r_pos, &tr_idx) in tr_indices.iter().enumerate() {
+        for cell in &mut children[tr_idx].children {
+            let rspan = doc
+                .get(cell.node)
+                .data()
+                .attr("rowspan")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 12);
+            if rspan > 1 {
+                let end_r = (r_pos + rspan).min(row_heights.len());
+                let spanned_h: f32 = row_heights[r_pos..end_r].iter().sum();
+                cell.rect.height = cell.rect.height.max(spanned_h);
+            }
+        }
+    }
+}
+
+fn collect_table_rows(doc: &Document, styles: &StyleMap, tr_id: NodeId) -> Vec<NodeId> {
+    let mut table_root = doc.parent_element(tr_id);
+    if let Some(p) = table_root
+        && matches!(doc.get(p).data().tag(), Some("thead" | "tbody" | "tfoot"))
+        && let Some(gp) = doc.parent_element(p)
+        && doc.get(gp).data().tag() == Some("table")
+    {
+        table_root = Some(gp);
+    }
+    let Some(root) = table_root else {
+        return vec![tr_id];
+    };
+    let mut rows = Vec::new();
+    for &child in doc.children(root) {
+        if is_skipped(doc, styles, child) {
+            continue;
+        }
+        match doc.get(child).data().tag() {
+            Some("tr") => rows.push(child),
+            Some("thead" | "tbody" | "tfoot") => {
+                for &sub in doc.children(child) {
+                    if !is_skipped(doc, styles, sub) && doc.get(sub).data().tag() == Some("tr") {
+                        rows.push(sub);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if rows.is_empty() {
+        rows.push(tr_id);
+    }
+    rows
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Lay out a `tr` with cross-row `colspan`, `rowspan`, and explicit column widths.
 fn layout_table_row(
     doc: &Document,
     styles: &StyleMap,
@@ -1829,13 +2060,7 @@ fn layout_table_row(
     let content_x = border_x + border.left + padding.left;
     let content_y = border_y + border.top + padding.top;
 
-    let cell_ids: Vec<NodeId> = doc
-        .children(id)
-        .iter()
-        .copied()
-        .filter(|cid| !is_skipped(doc, styles, *cid))
-        .collect();
-    let cell_span = |cid: NodeId| -> usize {
+    let cell_colspan = |cid: NodeId| -> usize {
         doc.get(cid)
             .data()
             .attr("colspan")
@@ -1843,39 +2068,136 @@ fn layout_table_row(
             .unwrap_or(1)
             .clamp(1, 12)
     };
-    let col_count: usize = cell_ids
-        .iter()
-        .map(|&cid| cell_span(cid))
-        .sum::<usize>()
-        .max(1);
-    // Equal column units, respecting `colspan` on cells.
-    let col_width = (content_width / (col_count as f32)).max(24.0);
+    let cell_rowspan = |cid: NodeId| -> usize {
+        doc.get(cid)
+            .data()
+            .attr("rowspan")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 12)
+    };
 
-    let mut children = Vec::with_capacity(cell_ids.len());
+    let table_rows = collect_table_rows(doc, styles, id);
+    let mut occ = Occupancy {
+        cols: 1,
+        cells: Vec::new(),
+    };
+    let mut row_placements: Vec<(NodeId, Vec<(NodeId, usize, usize)>)> =
+        Vec::with_capacity(table_rows.len());
+    let mut max_cols = 1usize;
+
+    for (r_idx, &row_id) in table_rows.iter().enumerate() {
+        let r_cells: Vec<NodeId> = doc
+            .children(row_id)
+            .iter()
+            .copied()
+            .filter(|cid| !is_skipped(doc, styles, *cid))
+            .collect();
+        let mut placed = Vec::with_capacity(r_cells.len());
+        let mut col_cursor = 0usize;
+        for cid in r_cells {
+            let cspan = cell_colspan(cid);
+            let rspan = cell_rowspan(cid);
+            while !occ.fits_in_rows(r_idx, col_cursor, 1, cspan, usize::MAX) {
+                col_cursor += 1;
+            }
+            occ.take(GridArea {
+                row: r_idx,
+                col: col_cursor,
+                row_span: rspan,
+                col_span: cspan,
+            });
+            placed.push((cid, col_cursor, cspan));
+            col_cursor += cspan;
+            max_cols = max_cols.max(col_cursor);
+        }
+        row_placements.push((row_id, placed));
+    }
+    max_cols = max_cols.max(occ.cols).max(1);
+
+    let mut explicit_col_widths: Vec<Option<f32>> = vec![None; max_cols];
+    for (_, placed) in &row_placements {
+        for &(cid, col_start, cspan) in placed {
+            if cspan == 1 && col_start < max_cols {
+                let cstyle = styles.get(cid);
+                let explicit_w = used_length(cstyle.width, Some(content_width), cstyle, styles)
+                    .map(|w| w.max(24.0))
+                    .or_else(|| {
+                        doc.get(cid)
+                            .data()
+                            .attr("width")
+                            .and_then(|s| s.trim().trim_end_matches("px").parse::<f32>().ok())
+                            .map(|w| w.max(24.0))
+                    });
+                if let Some(ew) = explicit_w {
+                    explicit_col_widths[col_start] =
+                        Some(explicit_col_widths[col_start].map_or(ew, |prev: f32| prev.max(ew)));
+                }
+            }
+        }
+    }
+
+    let fixed_sum: f32 = explicit_col_widths.iter().flatten().sum();
+    let auto_cols = explicit_col_widths.iter().filter(|w| w.is_none()).count();
+    let auto_col_w = if auto_cols > 0 {
+        ((content_width - fixed_sum).max(0.0) / (auto_cols as f32)).max(24.0)
+    } else {
+        (content_width / (max_cols as f32)).max(24.0)
+    };
+    let col_widths: Vec<f32> = explicit_col_widths
+        .into_iter()
+        .map(|w| w.unwrap_or(auto_col_w))
+        .collect();
+    let mut col_offsets = Vec::with_capacity(max_cols + 1);
+    let mut acc_x = 0.0_f32;
+    for &cw in &col_widths {
+        col_offsets.push(acc_x);
+        acc_x += cw;
+    }
+    col_offsets.push(acc_x);
+
+    let active_placed = row_placements
+        .into_iter()
+        .find(|(rid, _)| *rid == id)
+        .map(|(_, p)| p)
+        .unwrap_or_default();
+
+    let mut children = Vec::with_capacity(active_placed.len());
     let mut row_height = 0.0_f32;
-    let mut cursor_x = content_x;
 
-    for cid in cell_ids {
-        let span_width = col_width * (cell_span(cid) as f32);
-        let cell_box = layout_node(
+    for (cid, col_start, cspan) in active_placed {
+        let col_end = (col_start + cspan).min(col_widths.len());
+        let cell_x = content_x + col_offsets.get(col_start).copied().unwrap_or(0.0);
+        let span_width = (col_offsets.get(col_end).copied().unwrap_or(acc_x)
+            - col_offsets.get(col_start).copied().unwrap_or(0.0))
+        .max(24.0);
+        let mut cell_box = layout_node(
             doc,
             styles,
             images,
             focused_input,
             cid,
-            cursor_x,
+            cell_x,
             content_y,
             span_width,
             containing_height,
             None,
         );
-        row_height = row_height.max(cell_box.rect.height);
-        cursor_x += cell_box.rect.width;
+        cell_box.rect.width = span_width;
+        if cell_rowspan(cid) == 1 {
+            row_height = row_height.max(cell_box.rect.height);
+        } else {
+            row_height = row_height.max(line_height(styles.get(cid).font_size));
+        }
         children.push(cell_box);
     }
 
     for cell in &mut children {
-        cell.rect.height = row_height;
+        if cell_rowspan(cell.node) == 1 {
+            cell.rect.height = row_height;
+        } else {
+            cell.rect.height = cell.rect.height.max(row_height);
+        }
     }
 
     let content_height = match used_length(style.height, containing_height, &style, styles) {
@@ -4077,6 +4399,58 @@ fn align_runs(runs: &mut [TextRun], origin_x: f32, max_width: f32, align: TextAl
     }
 }
 
+fn apply_text_overflow_ellipsis(runs: &mut Vec<TextRun>, origin_x: f32, max_width: f32) {
+    if runs.is_empty() || max_width <= 0.0 {
+        return;
+    }
+    let limit_x = origin_x + max_width;
+    let mut out = Vec::with_capacity(runs.len());
+    let mut idx = 0usize;
+    while idx < runs.len() {
+        let line_y = runs[idx].y;
+        let mut end = idx + 1;
+        while end < runs.len() && (runs[end].y - line_y).abs() < 0.01 {
+            end += 1;
+        }
+        let line_overflows = runs[idx..end]
+            .last()
+            .is_some_and(|r| r.x + r.width > limit_x + 0.01);
+        if !line_overflows {
+            out.extend_from_slice(&runs[idx..end]);
+            idx = end;
+            continue;
+        }
+        for run in &runs[idx..end] {
+            if run.x + run.width <= limit_x + 0.01 {
+                out.push(run.clone());
+                continue;
+            }
+            let avail = (limit_x - run.x).max(0.0);
+            let ellipsis = "…";
+            let ellipsis_w = measure(ellipsis, run.font_size);
+            let mut truncated = String::new();
+            for ch in run.text.chars() {
+                let next_w = measure(&truncated, run.font_size)
+                    + measure(&ch.to_string(), run.font_size)
+                    + ellipsis_w;
+                if next_w <= avail + 0.01 {
+                    truncated.push(ch);
+                } else {
+                    break;
+                }
+            }
+            truncated.push_str(ellipsis);
+            let mut new_run = run.clone();
+            new_run.width = measure(&truncated, new_run.font_size);
+            new_run.text = truncated;
+            out.push(new_run);
+            break;
+        }
+        idx = end;
+    }
+    *runs = out;
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Flush queued inline children into line boxes and advance `cursor_y`.
 ///
@@ -4087,13 +4461,19 @@ fn place_inlines(
     styles: &StyleMap,
     block_id: NodeId,
     pending_marker: &mut Option<String>,
+    pending_before: &mut Option<(String, ComputedStyle)>,
+    after_inline: Option<(&str, &ComputedStyle)>,
     inline_ids: &mut Vec<NodeId>,
     content_x: f32,
     cursor_y: &mut f32,
     content_width: f32,
     text: &mut Vec<TextRun>,
 ) {
-    if inline_ids.is_empty() && pending_marker.is_none() {
+    if inline_ids.is_empty()
+        && pending_marker.is_none()
+        && pending_before.is_none()
+        && after_inline.is_none()
+    {
         return;
     }
     let block_style = styles.get(block_id);
@@ -4108,8 +4488,28 @@ fn place_inlines(
             underline: false,
         });
     }
+    if let Some((b_txt, b_style)) = pending_before.take() {
+        segments.push(Segment {
+            node: block_id,
+            text: b_txt,
+            font_size: b_style.font_size,
+            line_height: b_style.line_height,
+            color: b_style.color,
+            underline: b_style.underline,
+        });
+    }
     for id in inline_ids.drain(..) {
         gather(doc, styles, id, styles.get(id), &mut segments);
+    }
+    if let Some((a_txt, a_style)) = after_inline {
+        segments.push(Segment {
+            node: block_id,
+            text: a_txt.to_string(),
+            font_size: a_style.font_size,
+            line_height: a_style.line_height,
+            color: a_style.color,
+            underline: a_style.underline,
+        });
     }
     let wrap_width = if block_style.white_space == WhiteSpace::Nowrap
         || block_style.white_space == WhiteSpace::Pre
@@ -4124,6 +4524,9 @@ fn place_inlines(
     );
     let (mut runs, height) =
         place_lines(&segments, content_x, *cursor_y, wrap_width, preserve_spaces);
+    if block_style.text_overflow_ellipsis && block_style.overflow == Overflow::Hidden {
+        apply_text_overflow_ellipsis(&mut runs, content_x, content_width);
+    }
     align_runs(&mut runs, content_x, content_width, block_style.text_align);
     text.extend(runs);
     *cursor_y += height;
@@ -4162,9 +4565,35 @@ fn gather(
                 });
                 return;
             }
+            if let Some((b_txt, b_style)) = styles.before_style(id)
+                && b_style.display != Display::None
+                && !b_txt.is_empty()
+            {
+                out.push(Segment {
+                    node: id,
+                    text: b_txt.clone(),
+                    font_size: b_style.font_size,
+                    line_height: b_style.line_height,
+                    color: b_style.color,
+                    underline: b_style.underline,
+                });
+            }
             let style = *styles.get(id);
             for child in doc.children(id) {
                 gather(doc, styles, *child, &style, out);
+            }
+            if let Some((a_txt, a_style)) = styles.after_style(id)
+                && a_style.display != Display::None
+                && !a_txt.is_empty()
+            {
+                out.push(Segment {
+                    node: id,
+                    text: a_txt.clone(),
+                    font_size: a_style.font_size,
+                    line_height: a_style.line_height,
+                    color: a_style.color,
+                    underline: a_style.underline,
+                });
             }
         }
         NodeData::Document => {}
@@ -5730,5 +6159,71 @@ mod tests {
         let ag_top = r("align_grid").y;
         assert_eq!((r("ag1").x, r("ag1").y - ag_top), (60.0, 60.0));
         assert_eq!((r("ag2").x, r("ag2").y - ag_top), (130.0, 60.0));
+    }
+
+    #[test]
+    fn lays_out_pseudo_elements_ellipsis_radial_gradient_universal_units_and_table_rowspan() {
+        let (doc, tree) = render(
+            "<style>
+                html, body { margin: 0; padding: 0; font-size: 16px; }
+                #badge {
+                    font-size: 125%;
+                    padding: 1rem 2em;
+                    margin: calc(10px + 6px);
+                    border: medium solid #112233;
+                    background: radial-gradient(circle, #ff0000, #0000ff);
+                }
+                #badge::before { content: \"[\"; }
+                #badge::after { content: \"] (\" attr(data-count) \")\"; }
+                #card::after {
+                    content: \"\";
+                    display: block;
+                    width: 40px;
+                    height: 8px;
+                    background: #00ff00;
+                }
+                #clip {
+                    width: 40px;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    font-size: 10px;
+                }
+                table { width: 200px; }
+             </style>
+             <div id=\"badge\" data-count=\"7\">Alerts</div>
+             <div id=\"card\">Header</div>
+             <div id=\"clip\">abcdefghijklmnop</div>
+             <table>
+                <tr><td id=\"r0c0\" rowspan=\"2\" style=\"width: 80px\">Tall</td><td id=\"r0c1\">Top</td></tr>
+                <tr><td id=\"r1c1\">Bottom</td></tr>
+             </table>",
+            400.0,
+        );
+        let badge_box = find_box(&doc, &tree, "badge");
+        // font-size: 125% of 16px = 20px; padding: 1rem (16px) top/bottom, 2em (40px) left/right; border: medium (3px).
+        assert_eq!(badge_box.border.left, 3.0);
+        assert!(badge_box.background_gradient.is_some());
+        let badge_text: String = badge_box.text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(badge_text, "[Alerts] (7)");
+
+        let card_box = find_box(&doc, &tree, "card");
+        assert_eq!(card_box.children.len(), 1);
+        assert_eq!(card_box.children[0].rect.width, 40.0);
+        assert_eq!(card_box.children[0].rect.height, 8.0);
+
+        let clip_box = find_box(&doc, &tree, "clip");
+        assert_eq!(clip_box.text.len(), 1);
+        assert!(clip_box.text[0].text.ends_with('…'));
+        assert!(clip_box.text[0].width <= 40.01);
+
+        let r0c0 = find_box(&doc, &tree, "r0c0");
+        let r0c1 = find_box(&doc, &tree, "r0c1");
+        let r1c1 = find_box(&doc, &tree, "r1c1");
+        assert_eq!(r0c0.rect.width, 80.0);
+        assert_eq!(r0c1.rect.width, 120.0);
+        assert_eq!(r1c1.rect.x, r0c1.rect.x);
+        assert_eq!(r1c1.rect.width, 120.0);
+        assert!(r0c0.rect.height >= r0c1.rect.height + r1c1.rect.height);
     }
 }
