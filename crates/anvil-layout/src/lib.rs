@@ -196,6 +196,7 @@ impl LayoutBox {
 
     /// Find the innermost scrollable overflow container under `(x, y)` in page coordinates,
     /// returning `(node_id, scroll_offset, max_scroll)` where `max_scroll = (max_scroll_x, max_scroll_y)`.
+    #[allow(clippy::type_complexity)]
     pub fn find_scrollable_container(
         &self,
         x: f32,
@@ -1163,14 +1164,13 @@ fn intrinsic_box_width(
                 let cw = intrinsic_box_width(doc, styles, images, cid, containing_width)
                     + cstyle.margin.left
                     + cstyle.margin.right;
-                if style.display == Display::Flex
+                if (style.display == Display::Flex
                     && matches!(
                         style.flex_direction,
                         FlexDirection::Row | FlexDirection::RowReverse
-                    )
+                    ))
+                    || cstyle.inline_level
                 {
-                    child_row_w += cw;
-                } else if cstyle.inline_level {
                     child_row_w += cw;
                 } else {
                     child_max_w = child_max_w.max(cw);
@@ -2255,7 +2255,8 @@ fn layout_table_row(
         cols: 1,
         cells: Vec::new(),
     };
-    let mut row_placements: Vec<(NodeId, Vec<(NodeId, usize, usize)>)> =
+    type TableCellPlacement = (NodeId, usize, usize);
+    let mut row_placements: Vec<(NodeId, Vec<TableCellPlacement>)> =
         Vec::with_capacity(table_rows.len());
     let mut max_cols = 1usize;
 
@@ -3710,13 +3711,13 @@ fn resolve_flexible_lengths(
 
         let mut any_violation = false;
         for i in 0..count {
-            if !frozen[i] {
-                if targets[i] < line[i].min_main - 0.01 || targets[i] > line[i].max_main + 0.01 {
-                    let clamped = targets[i].clamp(line[i].min_main, line[i].max_main);
-                    set_main(&mut line[i], clamped);
-                    frozen[i] = true;
-                    any_violation = true;
-                }
+            if !frozen[i]
+                && (targets[i] < line[i].min_main - 0.01 || targets[i] > line[i].max_main + 0.01)
+            {
+                let clamped = targets[i].clamp(line[i].min_main, line[i].max_main);
+                set_main(&mut line[i], clamped);
+                frozen[i] = true;
+                any_violation = true;
             }
         }
         if !any_violation {
@@ -6118,7 +6119,7 @@ mod tests {
         assert!(icon.text.is_empty());
         let svg_img = icon.image.as_ref().expect("svg rasterized to Image");
         assert_eq!((svg_img.width, svg_img.height), (24, 24));
-        assert!(svg_img.pixels.chunks_exact(4).any(|px| px[3] > 0));
+        assert!(svg_img.pixels.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
 
         let tall_p = find_box(&doc, &tree, "tall_p");
         assert_eq!(tall_p.rect.height, 60.0);

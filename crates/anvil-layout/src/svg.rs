@@ -236,6 +236,7 @@ struct Subpath {
     closed: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_child(
     doc: &Document,
     styles: &StyleMap,
@@ -398,7 +399,7 @@ fn build_poly_subpath(data: &NodeData, xform: &SvgTransform, closed: bool) -> Ve
     };
     let nums = collect_numbers(raw);
     let mut points = Vec::with_capacity(nums.len() / 2);
-    for pair in nums.chunks_exact(2) {
+    for pair in nums.as_chunks::<2>().0 {
         points.push(xform.map(pair[0], pair[1]));
     }
     if points.len() < 2 {
@@ -652,6 +653,7 @@ fn parse_svg_path(d: &str, xform: &SvgTransform) -> Vec<Subpath> {
     subpaths
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flatten_cubic(
     x0: f32,
     y0: f32,
@@ -674,6 +676,7 @@ fn flatten_cubic(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flatten_quad(
     x0: f32,
     y0: f32,
@@ -792,7 +795,7 @@ fn fill_subpaths(
             }
             crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             if even_odd {
-                for pair in crossings.chunks_exact(2) {
+                for pair in crossings.as_chunks::<2>().0 {
                     add_span_coverage(&mut row_cov, pair[0].0, pair[1].0, w);
                 }
             } else {
