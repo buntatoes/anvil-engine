@@ -1,8 +1,8 @@
 # Security
 
-Report problems in private through the security advisory form on `anvil-browser`, which takes reports for the whole Anvil project, the browser and the engine included (please say which repository or engine component the problem is in):
+Private reporting isn't switched on for this repository or `anvil-browser` yet, so please use the private advisory form on one of the Anvil library repositories, for example `anvil-json`, and say which repository or engine component the problem is in:
 
-https://github.com/buntatoes/anvil-browser/security/advisories/new
+https://github.com/buntatoes/anvil-json/security/advisories/new
 
 Do not put the details in a public issue.
 
